@@ -315,19 +315,37 @@ pub fn warn_if_symlink_workdir(session_name: &str, workdir: &Path) {
 }
 
 impl SupervisorConfig {
+    /// Loads a session configuration file. The format is chosen by file
+    /// extension: `.toml` files are deserialized as TOML through the same
+    /// [`SessionConfig`]/[`SupervisorConfig`] structs (an array of tables for
+    /// the `sessions` array, field names identical to the JSON form), every
+    /// other extension is parsed as JSON.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
-        let content = fs::read_to_string(path.as_ref()).map_err(|e| {
-            format!(
-                "Failed to read config file {}: {}",
-                path.as_ref().display(),
-                e
-            )
-        })?;
-        Self::from_json_str(&content)
+        let path = path.as_ref();
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read config file {}: {}", path.display(), e))?;
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("toml") => Self::from_toml_str(&content),
+            _ => Self::from_json_str(&content),
+        }
     }
 
     pub fn from_json_str(s: &str) -> Result<Self, String> {
         serde_json::from_str(s).map_err(|e| format!("Failed to parse config JSON: {}", e))
+    }
+
+    /// Parses a TOML session configuration file. Field names match the JSON
+    /// form exactly; `sessions` is an array of tables. Error messages name
+    /// the TOML field, never the raw document content.
+    pub fn from_toml_str(s: &str) -> Result<Self, String> {
+        toml::from_str(s).map_err(|e| {
+            format!(
+                "Failed to parse config TOML at {}:{}: {}",
+                e.span().map(|sp| sp.start).unwrap_or(0),
+                e.span().map(|sp| sp.end).unwrap_or(0),
+                e.message(),
+            )
+        })
     }
 
     /// Resolves the session transcript file path for a session.
@@ -486,6 +504,119 @@ mod tests {
     fn test_invalid_json() {
         let res = SupervisorConfig::from_json_str("{ invalid json }");
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_parse_toml_config() {
+        let toml_data = r#"
+state_file = "/tmp/state-toml.json"
+heartbeat_interval_secs = 1.0
+stale_heartbeat_secs = 10.0
+shutdown_grace_secs = 2.5
+
+[[sessions]]
+name = "sess1"
+workdir = "/tmp/work"
+session_id = "1111-2222"
+claude_binary = "/usr/local/bin/my-claude"
+claude_args = ["--foo", "bar"]
+env = { KEY = "VAL" }
+session_file = "/custom/session.jsonl"
+readiness_poll_secs = 1.0
+hang_timeout_secs = 5.0
+kill_grace_secs = 1.0
+base_backoff_secs = 0.5
+max_backoff_secs = 10.0
+healthy_run_secs = 15.0
+max_crashes = 3
+crash_window_secs = 30.0
+prefix_output = true
+failed_cooldown_secs = 60.0
+backoff_window_secs = 120.0
+"#;
+        let cfg = SupervisorConfig::from_toml_str(toml_data).expect("Must parse");
+        assert_eq!(cfg.state_file, PathBuf::from("/tmp/state-toml.json"));
+        assert_eq!(cfg.shutdown_grace_secs, 2.5);
+        let s = &cfg.sessions[0];
+        assert_eq!(s.name, "sess1");
+        assert_eq!(s.claude_binary, PathBuf::from("/usr/local/bin/my-claude"));
+        assert_eq!(s.claude_args, vec!["--foo".to_string(), "bar".to_string()]);
+        assert_eq!(s.env.get("KEY").unwrap(), "VAL");
+        assert_eq!(s.session_file, Some(PathBuf::from("/custom/session.jsonl")));
+        assert_eq!(s.hang_timeout_secs, 5.0);
+        assert_eq!(s.max_crashes, 3);
+        assert!(s.prefix_output);
+        assert_eq!(s.failed_cooldown_secs, 60.0);
+        assert_eq!(s.backoff_window_secs, 120.0);
+        // Unknown/defaulted fields get the same defaults as JSON.
+        assert_eq!(s.pty_eof_grace_secs, 10.0);
+        assert_eq!(s.kill_wait_secs, 15.0);
+        assert_eq!(cfg.heartbeat_interval_secs, 1.0);
+    }
+
+    #[test]
+    fn test_parse_toml_multiple_sessions_with_defaults() {
+        let toml_data = r#"
+[[sessions]]
+name = "a"
+workdir = "/tmp/a"
+session_id = "id-a"
+
+[[sessions]]
+name = "b"
+workdir = "/tmp/b"
+session_id = "id-b"
+"#;
+        let cfg = SupervisorConfig::from_toml_str(toml_data).expect("Must parse");
+        assert_eq!(cfg.sessions.len(), 2);
+        for s in &cfg.sessions {
+            // Defaults applied identically to the JSON path.
+            assert_eq!(s.claude_binary, PathBuf::from("claude"));
+            assert_eq!(s.max_crashes, 5);
+            assert_eq!(s.hang_timeout_secs, 0.0);
+            assert_eq!(s.readiness_poll_secs, 5.0);
+            assert_eq!(s.base_backoff_secs, 2.0);
+        }
+        assert_eq!(
+            cfg.state_file,
+            PathBuf::from("/tmp/claude-supervisor-state.json")
+        );
+        assert_eq!(cfg.heartbeat_interval_secs, 2.0);
+    }
+
+    #[test]
+    fn test_parse_toml_invalid() {
+        // Not an array-of-tables for sessions.
+        let bad = "sessions = 5\n";
+        let err = SupervisorConfig::from_toml_str(bad).unwrap_err();
+        assert!(err.contains("Failed to parse config TOML"), "{err}");
+        // Malformed TOML.
+        let bad2 = "heartbeat_interval_secs = \"\n";
+        let err2 = SupervisorConfig::from_toml_str(bad2).unwrap_err();
+        assert!(err2.contains("Failed to parse config TOML"), "{err2}");
+    }
+
+    #[test]
+    fn test_from_file_extension_selects_format() {
+        let temp_dir = std::env::temp_dir().join(format!("test_cfg_toml_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let toml_file = temp_dir.join("config.toml");
+        fs::write(
+            &toml_file,
+            "heartbeat_interval_secs = 1.1\n[[sessions]]\nname=\"s\"\nworkdir=\"/tmp\"\nsession_id=\"i\"\n",
+        )
+        .unwrap();
+        let cfg = SupervisorConfig::from_file(&toml_file).expect("TOML parses");
+        assert_eq!(cfg.heartbeat_interval_secs, 1.1);
+        assert_eq!(cfg.sessions.len(), 1);
+
+        let json_file = temp_dir.join("config.json");
+        fs::write(&json_file, "{\"heartbeat_interval_secs\": 2.2}").unwrap();
+        let cfg2 = SupervisorConfig::from_file(&json_file).expect("JSON parses");
+        assert_eq!(cfg2.heartbeat_interval_secs, 2.2);
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

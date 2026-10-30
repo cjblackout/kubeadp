@@ -24,6 +24,7 @@
 
 #[cfg(feature = "cli")]
 pub mod cli;
+pub mod config_file;
 pub mod core;
 #[cfg(feature = "server")]
 pub mod orchestrate;

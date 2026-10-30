@@ -25,8 +25,96 @@ One cargo package for the whole agent stack. It consolidates the former crates `
 
 `cargo test --features a2a,test-hooks`, `bash tests/orchestrate/run-tests.sh` (supervisor black-box suite), `bash tests/cli/run-all.sh` (CLI suite, never touches the real server; see tests/cli/README.md).
 
-# Module notes: core
+## Configuration file
 
+Both long-lived roles of the `kubeadp-agent` binary (`KUBEADP_ROLE=orchestrator|worker`) and the thin `agent-orchestrate` / `agent-run-api` wrappers can be configured from a single TOML file that maps 1:1 onto the environment variables the code already reads. The pattern mirrors `info-hub-mcp`'s `src/config.rs`.
+
+File resolution:
+
+- `KUBEADP_CONFIG_FILE` selects the file; an empty value is an error.
+- When unset, `/etc/kubeadp-agent/config.toml` is used **only if it exists**.
+- An absent file means environment-only configuration (behaviour unchanged).
+
+Sections: `[common]`, `[orchestrator]`, `[worker]`. Keys are lower-case; a key in the wrong section, an unknown key, a duplicate key or a non-scalar value is a hard error naming `section.key`. Booleans are written `true`/`false`, numbers as decimal strings.
+
+**Precedence: the environment always wins.** The role applies `[common]` plus its own section; the other role's section is parsed and validated but its values are not applied, so one ConfigMap can serve both roles.
+
+### Key table
+
+| Section | Key | Environment variable |
+|---|---|---|
+| `[common]` | `http_proxy` | `AGENT_RUN_HTTP_PROXY` |
+| `[common]` | `https_proxy` | `AGENT_RUN_HTTPS_PROXY` |
+| `[common]` | `no_proxy` | `AGENT_RUN_NO_PROXY` |
+| `[orchestrator]` | `listen` | `AGENT_ORCHESTRATE_LISTEN` |
+| `[orchestrator]` | `token_file` | `AGENT_ORCHESTRATE_TOKEN_FILE` |
+| `[orchestrator]` | `session_log_ring_bytes` | `AGENT_ORCHESTRATE_SESSION_LOG_RING_BYTES` |
+| `[orchestrator]` | `config` | `AGENT_ORCHESTRATE_CONFIG` |
+| `[orchestrator]` | `workspaces` | `CLAUDE_WORKSPACES` |
+| `[orchestrator]` | `workspace_root` | `CLAUDE_WORKSPACE_ROOT` |
+| `[orchestrator]` | `remote_prefix` | `CLAUDE_REMOTE_PREFIX` |
+| `[orchestrator]` | `default_session` | `CLAUDE_DEFAULT_SESSION` |
+| `[orchestrator]` | `default_session_id` | `CLAUDE_DEFAULT_SESSION_ID` |
+| `[orchestrator]` | `session_args` | `CLAUDE_SESSION_ARGS` |
+| `[orchestrator]` | `claude_max_crashes` | `CLAUDE_MAX_CRASHES` |
+| `[worker]` | `workspace_root` | `AGENT_RUN_WORKSPACE_ROOT` |
+| `[worker]` | `jobs_dir_name` | `AGENT_RUN_JOBS_DIR_NAME` |
+| `[worker]` | `agy_path` | `AGENT_RUN_AGY_PATH` |
+| `[worker]` | `default_model` | `AGENT_RUN_DEFAULT_MODEL` |
+| `[worker]` | `default_effort` | `AGENT_RUN_DEFAULT_EFFORT` |
+| `[worker]` | `default_base_branch` | `AGENT_RUN_DEFAULT_BASE_BRANCH` |
+| `[worker]` | `state_root` | `AGENT_RUN_STATE_ROOT` |
+| `[worker]` | `repos_root` | `AGENT_RUN_REPOS_ROOT` |
+| `[worker]` | `gc_max_age_days` | `AGENT_RUN_GC_MAX_AGE_DAYS` |
+| `[worker]` | `max_parallel` | `AGENT_RUN_MAX_PARALLEL` |
+| `[worker]` | `shutdown_grace_secs` | `AGENT_RUN_SHUTDOWN_GRACE` |
+| `[worker]` | `launch_timeout_secs` | `AGENT_RUN_LAUNCH_TIMEOUT_SECS` |
+| `[worker]` | `stall_minutes` | `AGENT_RUN_STALL_MINUTES` |
+| `[worker]` | `max_runtime` | `AGENT_RUN_MAX_RUNTIME` |
+| `[worker]` | `hindsight_enabled` | `AGENT_RUN_HINDSIGHT_ENABLED` |
+| `[worker]` | `hindsight_bank` | `AGENT_RUN_HINDSIGHT_BANK` |
+| `[worker]` | `hindsight_tag` | `AGENT_RUN_HINDSIGHT_TAG` |
+| `[worker]` | `hindsight_path` | `AGENT_RUN_HINDSIGHT_PATH` |
+| `[worker]` | `hindsight_auto_recall` | `AGENT_RUN_HINDSIGHT_AUTO_RECALL` |
+| `[worker]` | `hindsight_auto_retain` | `AGENT_RUN_HINDSIGHT_AUTO_RETAIN` |
+| `[worker]` | `hindsight_url` | `AGENT_RUN_HINDSIGHT_URL` |
+| `[worker]` | `hindsight_profile` | `AGENT_RUN_HINDSIGHT_PROFILE` |
+| `[worker]` | `remote_control` | `AGENT_RUN_REMOTE_CONTROL` |
+| `[worker]` | `remote_control_autostart` | `AGENT_RUN_REMOTE_CONTROL_AUTOSTART` |
+| `[worker]` | `remote_control_check_secs` | `AGENT_RUN_REMOTE_CONTROL_CHECK_SECS` |
+| `[worker]` | `api_listen` | `AGENT_RUN_API_LISTEN` |
+| `[worker]` | `agy_mcp_source` | `AGENT_RUN_AGY_MCP_SOURCE` |
+
+### Secrets
+
+Secrets are never inline. Only the `_FILE` form is accepted:
+
+- `[orchestrator] token_file` -> `AGENT_ORCHESTRATE_TOKEN_FILE` (the bearer token; the inline `AGENT_ORCHESTRATE_TOKEN` variable has no TOML key).
+- The worker's Hindsight API key has no file key: set `AGENT_RUN_HINDSIGHT_API_KEY` in the environment from a Secret.
+
+A key that would put either secret inline is rejected with a message pointing at the `_FILE` form.
+
+Example (one ConfigMap for both roles):
+
+```toml
+[common]
+http_proxy = "http://proxy.example:3128"
+
+[orchestrator]
+listen = "0.0.0.0:8003"
+token_file = "/run/secrets/agent-token"
+claude_max_crashes = 7
+
+[worker]
+max_parallel = 4
+hindsight_url = "https://hindsight.example"
+```
+
+### Orchestrator session configuration as TOML
+
+The orchestrator's JSON session configuration (`AGENT_ORCHESTRATE_CONFIG`, default `/etc/agent-orchestrate/config.json`) is also accepted as TOML, chosen by file extension (`.toml` vs `.json`) and deserialized through the same serde structs: the top-level fields (`state_file`, `heartbeat_interval_secs`, `stale_heartbeat_secs`, `shutdown_grace_secs`, `claude_config_dir`) plus an array of tables for `sessions` with the same field names as the JSON form. Sessions are not embedded in the main configuration file.
+
+# Module notes: core
 ## agent-core
 
 The `agent-core` crate is the shared execution engine and library backing `agent-run-cli`, `agent-run-api` and `agent-orchestrate`. It implements Git worktree isolation, SQLite job metadata persistence, process lifecycle management, activity monitoring, Hindsight memory integration, and (behind the `server` cargo feature) the axum-based HTTP API server module (`kubeadp_agent::core::server`) that both `agent-run-api` and `agent-orchestrate` re-export. The `server` module carries the shared `/api/v1` route group plus the observability/auth/error layers both servers build on: `server::obs::add_observability` wraps the authenticated sub-router in one bearer-auth layer and appends the never-auth `GET /healthz` and `GET /readyz` probes and the auth-gated `GET /metrics`; `server::reject` provides `ApiJson`/`ApiQuery`/`ApiPath` extractors whose rejections render as the standard `{"error","code"}` JSON shape (400/413/415/422). Build the library with `cargo build --manifest-path src/kubeadp-agent/Cargo.toml [--features server]` and run tests with `cargo test --manifest-path src/kubeadp-agent/Cargo.toml`. Architectural specifications and subsystem designs are detailed in [docs/agent-run/architecture.md](../../docs/agent-run/architecture.md).
