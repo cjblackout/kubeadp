@@ -215,7 +215,7 @@ RUN apt_update() { for i in 1 2 3 4 5 6; do apt-get -o Acquire::Retries=5 update
 # orchestrator pod's fsGroup 1000 mounts make the group bit not matter.
 # The shell is /bin/bash so the interactive ttyd OAuth shell in the orchestrator
 # pod behaves like today's code-server shell.
-RUN useradd -m -u 1000 -g 1000 -s /bin/bash agent
+RUN groupadd -g 1000 agent && useradd -m -u 1000 -g 1000 -s /bin/bash agent
 
 # agy (antigravity CLI), installed at the core's default agy_path
 # /usr/local/libexec/agy exactly as docker/agent-run-api/Dockerfile does (this
