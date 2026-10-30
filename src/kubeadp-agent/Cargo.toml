@@ -1,0 +1,85 @@
+[package]
+name = "kubeadp-agent"
+version = "0.1.0"
+edition = "2021"
+description = "One package for the agy AI coding agent stack: core job-execution engine, the agent orchestrator (process supervisor + REST API) and the agent-run worker/CLI (job execution API daemon and remote CLI client). Consolidates the former agent-core, agent-orchestrate, agent-run-api and agent-run-cli crates."
+
+[lib]
+name = "kubeadp_agent"
+path = "src/lib.rs"
+
+[features]
+default = ["cli", "server"]
+# The axum-based HTTP stack shared by the core server module (`core::server`),
+# the orchestrator (supervisor HTTP API) and the worker (agent-run API daemon).
+server = [
+    "dep:axum",
+    "dep:tokio",
+    "dep:tokio-stream",
+    "dep:serde_urlencoded",
+    "dep:tower",
+    "dep:http-body-util",
+    "dep:uuid",
+]
+# The agent-run remote CLI client (`cli` module, ureq).
+cli = ["dep:ureq"]
+# A2A v1 agent protocol surface (agent card + JSON-RPC/REST bindings).
+# Merges the three old `a2a` features (agent-core/a2a, agent-orchestrate/a2a,
+# agent-run-api/a2a). Depends on `server` for the shared axum stack.
+a2a = ["server", "dep:a2a"]
+# Test-only hooks used by the supervisor black-box suite (agent-orchestrate).
+# Implies `server` (the old agent-orchestrate crate always compiled its HTTP
+# stack; the supervisor binary needs it).
+test-hooks = ["server"]
+
+[dependencies]
+clap = { version = "=4.5.20", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+thiserror = "1.0"
+rand = "0.8"
+humantime = "2.1"
+dirs = "5.0"
+rusqlite = { version = "0.31", features = ["bundled"] }
+libc = "0.2"
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
+serde_urlencoded = { version = "0.7", optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+uuid = { version = "1", features = ["v5"], optional = true }
+ureq = { version = "2", features = ["json"], optional = true }
+a2a = { package = "a2a-lf", version = "=0.4.2", optional = true }
+
+[dev-dependencies]
+tempfile = "=3.10.1"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+axum = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde_json = "1.0"
+chrono = { version = "0.4" }
+
+[[bin]]
+name = "kubeadp-agent"
+path = "src/bin/kubeadp-agent.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "agent-run"
+path = "src/bin/agent-run.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "agent-orchestrate"
+path = "src/bin/agent-orchestrate.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "agent-run-api"
+path = "src/bin/agent-run-api.rs"
+required-features = ["server"]
