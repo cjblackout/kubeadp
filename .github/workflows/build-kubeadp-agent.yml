@@ -1,0 +1,330 @@
+name: build-kubeadp-agent
+
+# Builds the kubeadp-agent image (docker/kubeadp-agent/Dockerfile) when the
+# one agent package (src/kubeadp-agent) or its docker dir changes, versions
+# it, pushes it to GHCR, and -- on main -- tags the release and commits the
+# new image tag back to main. This is the image that will replace
+# build-ai-server.yml (orchestrator pod) and build-agent-run-api.yml (worker
+# pod); NOTHING consumes it yet (cut-over is later, test pods first), so the
+# deploy commit only touches the `kubeadp-agent` key in versions/versions.env
+# -- no manifest carries an image line for it yet.
+#
+# Versioning: YYYY.MM.<X> with prerelease suffix -rc<N>; MajorVersion lives
+# in src/kubeadp-agent/VERSION and appears in rc tags only:
+#   PR build      -> YYYY.MM.<Major>-rc<N>   (N = next rc of the month)
+#   push to main  -> YYYY.MM.<X>             (X = next stable of the month)
+# Every build is git-tagged kubeadp-agent-<version>; the counters derive from
+# those tags, so the pipeline sequences itself. versions/versions.env is NOT
+# in the path filter, so the bump can never re-trigger this workflow. The
+# rationale is that a merge touching the workflow during a build cannot
+# invalidate the tag (tag creation via the REST API references the existing
+# commit).
+#
+# Runner notes (verified live 2026-09-28 against the exact images -- same as
+# build-ai-server.yml and build-agent-run-api.yml):
+# - runs-on: arc-runners (ARC scale set, min 0 / max 5).
+# - Runner pods run on the gVisor (runsc) runtime; standard
+#   bwcloud-preferred affinity (100/50), so they land on bwcloud-worker1,
+#   falling back to home x86 agents (compute3/compute4).
+# - The runner container runs as ROOT: the image's sudoers has no root entry,
+#   so this workflow calls dockerd/apt directly, no sudo. Containment is the
+#   gVisor sandbox.
+# - The runner image ships the docker CLI + dockerd but starts no daemon and
+#   has no iptables binary; the build job starts
+#   `dockerd --storage-driver=vfs`. vfs: the pod writable layer is overlayfs
+#   and the kernel forbids overlay-on-overlay.
+# - Only GITHUB_TOKEN auth is used (contents + packages write).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/kubeadp-agent/**'   # one package compiled into the image
+      - 'src/kubeadp-agent/VERSION'
+      - 'docker/kubeadp-agent/**'
+      - '.github/workflows/build-kubeadp-agent.yml'
+      - '!src/kubeadp-agent/tests/**'
+      - '!**/*.md'
+  pull_request:
+    paths:
+      - 'src/kubeadp-agent/**'   # one package compiled into the image
+      - 'src/kubeadp-agent/VERSION'
+      - 'docker/kubeadp-agent/**'
+      - '.github/workflows/build-kubeadp-agent.yml'
+      - '!src/kubeadp-agent/tests/**'
+      - '!**/*.md'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: kubeadp-agent-${{ github.ref_name }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+
+jobs:
+  version:
+    runs-on: arc-runners
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: calc
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          MONTH="$(date -u +%Y.%m)"
+          ESC_MONTH="${MONTH//./\\.}"
+          MAJOR="$(tr -d '[:space:]' < src/kubeadp-agent/VERSION)"
+          case "$MAJOR" in
+            ''|*[!0-9]*) echo "::error::src/kubeadp-agent/VERSION must contain a plain integer (MajorVersion)"; exit 1 ;;
+          esac
+          # All kubeadp-agent-* tags on the remote (base names only, no ^{} peels)
+          # Fresh ARC runners can have transient DNS failures right at start: retry up to 6 times.
+          RAW_TAGS=""
+          for i in 1 2 3 4 5 6; do
+            if RAW_TAGS="$(git ls-remote --tags origin)"; then
+              break
+            fi
+            if [ "$i" -eq 6 ]; then
+              echo "::error::git ls-remote failed after 6 attempts"
+              exit 1
+            fi
+            echo "::warning::git ls-remote attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          TAGS="$(printf '%s\n' "$RAW_TAGS" | awk -F'\t' '/refs\/tags\// { t = $2; sub(/^refs\/tags\//, "", t); if (t !~ /\^\{\}$/) print t }')"
+          # rc counter: any tag YYYY.MM.<major>-rc<N> in this month
+          MAX_RC="$(printf '%s\n' "$TAGS" | grep -oE "^kubeadp-agent-${ESC_MONTH}\.[0-9]+-rc[0-9]+$" | grep -oE '[0-9]+$' | sort -n | tail -1 || true)"
+          # stable counter: any plain tag YYYY.MM.<X> in this month
+          MAX_STABLE="$(printf '%s\n' "$TAGS" | grep -oE "^kubeadp-agent-${ESC_MONTH}\.[0-9]+$" | grep -oE '[0-9]+$' | sort -n | tail -1 || true)"
+          MAX_RC="${MAX_RC:-0}"
+          MAX_STABLE="${MAX_STABLE:-0}"
+          if [ "$EVENT" = "pull_request" ]; then
+            VERSION="${MONTH}.${MAJOR}-rc$((MAX_RC + 1))"
+          else
+            VERSION="${MONTH}.$((MAX_STABLE + 1))"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Computed kubeadp-agent version: ${VERSION}"
+
+  build:
+    needs: version
+    runs-on: arc-runners
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reset docker data dir (vfs layers from prior builds)
+        # The runner Pod mounts the node's /mnt/data on /var/lib/docker
+        # (scale-set-values.yaml) so vfs layers stop pinning sandbox
+        # memory, but on vfs every layer is a full on-disk copy, so anything
+        # left here from previous builds would accumulate without bound. Empty
+        # it before every build; this also drops stale state from a crashed
+        # dockerd. Cleanup must never fail the job (the dir is host-owned, so
+        # the fallback covers a failed sudo).
+        run: |
+          set -uo pipefail
+          sudo rm -rf /var/lib/docker/* 2>/dev/null || rm -rf /var/lib/docker/* 2>/dev/null || true
+      - name: Wait for DNS
+        # Fresh runner pods can have a broken DNS for the first minutes
+        # (BuildKit base-image metadata requests failing with
+        # "lookup registry-1.docker.io: i/o timeout" while the same lookups
+        # succeeded minutes later). Poll until the hosts the build needs all
+        # resolve; on timeout, print /etc/resolv.conf for diagnostics but do
+        # NOT fail -- the retried build/push below decide.
+        run: |
+          set -euo pipefail
+          HOSTS="registry-1.docker.io ghcr.io github.com"
+          START=$(date +%s)
+          ok=1
+          for i in $(seq 1 60); do
+            ok=1
+            for h in $HOSTS; do
+              getent hosts "$h" >/dev/null 2>&1 || { ok=0; break; }
+            done
+            if [ "$ok" = 1 ]; then
+              ELAPSED=$(( $(date +%s) - START ))
+              echo "DNS healthy after ${ELAPSED}s: $(getent hosts $HOSTS | awk '{print $2}' | sort -u | tr '\n' ' ')"
+              exit 0
+            fi
+            if [ "$i" = 60 ]; then break; fi
+            sleep 3
+          done
+          ELAPSED=$(( $(date +%s) - START ))
+          echo "::warning::DNS still not resolving all hosts after ${ELAPSED}s; continuing anyway (build/push retries below cover it)"
+          cat /etc/resolv.conf
+          exit 0
+      - name: Start local docker daemon
+        run: |
+          set -euo pipefail
+          # gVisor has no netfilter (NETLINK_NETFILTER: "Protocol not supported",
+          # verified live 2026-09-28, run 36436293773: dockerd died creating the
+          # NAT chain DOCKER), so the daemon runs with --bridge=none + iptables
+          # off. Consequence: in-daemon containers get no bridge network -- the
+          # `docker build` below passes --network=host so RUN steps execute in
+          # the sandbox's own netns (egress + DNS) instead of a dead bridge.
+          # --bridge=none makes any container run without host networking fail
+          # fast instead of hanging on a blackholed route.
+          dockerd --storage-driver=vfs --bridge=none --iptables=false --ip6tables=false >/tmp/dockerd.log 2>&1 &
+          for i in $(seq 1 60); do
+            if docker info >/dev/null 2>&1; then break; fi
+            if [ "$i" = 60 ]; then
+              echo "::error::dockerd failed to start"
+              tail -40 /tmp/dockerd.log
+              exit 1
+            fi
+            sleep 1
+          done
+          docker info --format 'dockerd ready: driver={{.Driver}} os={{.OperatingSystem}}'
+      - name: Run CI checks (fmt, clippy, test via check stage)
+        run: |
+          set -euo pipefail
+          retry() { local n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 3 ]; then return 1; fi; echo "::warning::command failed (attempt $n), retrying in 20s: $*" >&2; sleep 20; done; }
+          echo "Running check stage (fmt, clippy x4 feature sets, test)..."
+          retry docker build --progress=plain --network=host --target check \
+            -f docker/kubeadp-agent/Dockerfile .
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build + push image
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Transient network blips (fresh-runner DNS, registry hiccups) used
+          # to kill whole builds; wrap each docker build/push in a retry.
+          # Cached layers make retries cheap (only the failed network step
+          # repeats). A final failure still fails the step (set -e).
+          retry() { local n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 3 ]; then return 1; fi; echo "::warning::command failed (attempt $n), retrying in 20s: $*" >&2; sleep 20; done; }
+          IMAGE="ghcr.io/cjblackout/homelab/kubeadp-agent:${VERSION}"
+          # --network=host: dockerd runs --bridge=none (no netfilter under gVisor),
+          # so build RUN steps must use the sandbox netns for egress.
+          # --progress=plain: explicit plain log stream for build diagnostics.
+          #
+          # The heavy stages are built ONE AT A TIME first, then the full image.
+          # Why: a single `docker build .` makes BuildKit pull AND extract ALL
+          # base images concurrently (rust, node, debian) and run the early RUN
+          # steps of all stages in parallel -- which ran the old ai-server pod
+          # up to 8102 MiB of its 8192 MiB limit in the PULL+EXTRACT phase (run
+          # 36716311565). Building the stages sequentially flattens that peak.
+          # Stage names: cli-tools agent-builder tools-builder (the runtime
+          # stage is tiny and pulled last). The separate builds share this
+          # daemon's BuildKit cache, so the final build reuses every
+          # already-built stage step.
+          # Each temp tag is removed right after its stage build: tags hold no
+          # data of their own, but rmi drops the stage image reference so the
+          # extra tags cannot pin extra copies in the vfs store.
+          for STAGE in cli-tools agent-builder tools-builder; do
+            echo "Building stage ${STAGE} (isolated base-image pull/extract + RUN)..."
+            retry docker build --progress=plain --network=host --target "$STAGE" \
+              --build-arg BUILD_SHA=${{ github.sha }} \
+              -t "kubeadp-agent-stage-${STAGE}" -f docker/kubeadp-agent/Dockerfile .
+            docker rmi "kubeadp-agent-stage-${STAGE}" || true
+          done
+          echo "Building final image (earlier stages served from BuildKit cache)..."
+          retry docker build --progress=plain --network=host \
+            --build-arg BUILD_SHA=${{ github.sha }} \
+            -t "$IMAGE" -f docker/kubeadp-agent/Dockerfile .
+          # Smoke test BEFORE the push: runs every installed tool's --version
+          # once (plus a bogus-role exit-2 check and the ttyd serve test) and
+          # scans for dangling symlinks. Failing here aborts the step (set -e,
+          # and we are before `docker push`), so a broken image is never pushed.
+          # The script is MOUNTED, not copied into the image: an extra COPY/RUN
+          # layer would be another full-image copy on the runners' vfs storage
+          # driver. --entrypoint bash: the image's ENTRYPOINT is tini ->
+          # kubeadp-agent (which would exit 2 on the missing KUBEADP_ROLE
+          # instead of running the smoke test).
+          docker run --rm --network=host \
+            -v "$PWD/docker/kubeadp-agent/smoke-test.sh:/smoke-test.sh:ro" \
+            --entrypoint bash "$IMAGE" /smoke-test.sh
+          retry docker push "$IMAGE"
+      - name: Tag release
+        if: github.ref == 'refs/heads/main'
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Create the tag through the REST API instead of `git push`: the build
+          # job's checkout is a shallow clone of the pushed commit, and when main
+          # moved during the (long) build the push sends the old commit's trees
+          # and GitHub refuses it. The API call only references the existing
+          # commit. 422 = tag already exists (re-run): fine.
+          code=$(curl -sS -o /tmp/tag.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs" \
+            -d "{\"ref\":\"refs/tags/kubeadp-agent-${VERSION}\",\"sha\":\"${{ github.sha }}\"}")
+          if [ "$code" != 201 ] && [ "$code" != 422 ]; then cat /tmp/tag.json; echo "tag creation failed: HTTP $code" >&2; exit 1; fi
+      - name: Stop dockerd + empty docker data dir
+        # if: always(): this is the job's final step, and the mirror of the
+        # "Reset docker data dir" step above -- it must run even when the
+        # build fails, otherwise a failed build leaves the vfs store of the
+        # node's data disk in place for the next build. Stop dockerd first so
+        # it drops all open file handles.
+        if: always()
+        run: |
+          set -uo pipefail
+          sudo pkill dockerd 2>/dev/null || pkill dockerd 2>/dev/null || true
+          sleep 2
+          sudo rm -rf /var/lib/docker/* 2>/dev/null || rm -rf /var/lib/docker/* 2>/dev/null || true
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: [version, build]
+    runs-on: arc-runners
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # Builds take tens of minutes; main may have moved since this run's
+      # checkout. Re-base the working tree on the LATEST main so the deploy
+      # commit applies cleanly.
+      - name: Sync checkout to latest main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git reset --hard origin/main
+      - name: Update versions key
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Neither PyYAML nor a manifest edit is needed for the deploy: the
+          # kubeadp-agent image has no manifest yet (test pods first), so the
+          # commit only rewrites the kubeadp-agent key in versions/versions.env.
+          # The replace is exact, matching the other CI-built keys.
+          python3 - <<'PY'
+          import os, pathlib, re, sys
+
+          version = os.environ["VERSION"]
+          v = pathlib.Path("versions/versions.env")
+          vnew, vn = re.subn(r"(?m)^kubeadp-agent=.*$", "kubeadp-agent=" + version, v.read_text())
+          if vn != 1:
+              sys.exit("kubeadp-agent key not found in versions/versions.env")
+          v.write_text(vnew)
+          PY
+      - name: Commit + push (nothing deploys yet; test pods consume it later)
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "No changes (image tag already current) -- nothing to deploy."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add versions/versions.env
+          git commit -m "ci: kubeadp-agent image ${VERSION} (source build ${{ github.sha }})"
+          for i in 1 2 3 4 5 6; do
+            if git push origin main; then exit 0; fi
+            echo "::warning::push rejected (attempt $i), rebasing onto origin/main"
+            git fetch origin main
+            if ! git rebase origin/main; then git rebase --abort || true; echo "::error::rebase conflict; aborting"; exit 1; fi
+            sleep $((i * 5))
+          done
+          echo "::error::could not push after 6 attempts"; exit 1
