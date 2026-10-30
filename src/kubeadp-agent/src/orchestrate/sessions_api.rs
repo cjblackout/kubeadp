@@ -474,37 +474,82 @@ async fn inject_message(
     ApiPath(name): ApiPath<String>,
     crate::core::server::reject::ApiJson(req): crate::core::server::reject::ApiJson<MessageRequest>,
 ) -> Response {
-    // 404 for an unknown session (checked before any body parsing).
-    let control = match state.controls.get(&name) {
-        Some(c) => c,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": format!("no session named '{}'", name), "code": "session_not_found" })),
-            )
-                .into_response();
-        }
-    };
-
     let MessageRequest { text } = req;
-    // 413 too_large is evaluated on the trimmed byte length.
-    let text = text.trim();
-    if text.is_empty() {
-        return (
+    match deliver_message(&state, &name, &text) {
+        DeliverOutcome::Accepted { bytes } => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "session": name, "accepted": true, "bytes": bytes })),
+        )
+            .into_response(),
+        DeliverOutcome::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no session named '{name}'"), "code": "session_not_found" })),
+        )
+            .into_response(),
+        DeliverOutcome::Empty => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "message text must not be empty", "code": "invalid_body" })),
         )
-            .into_response();
-    }
-    if text.len() > MESSAGE_MAX_BYTES {
-        return (
+            .into_response(),
+        DeliverOutcome::TooLarge => (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(json!({ "error": "message text is too large", "code": "too_large" })),
         )
-            .into_response();
+            .into_response(),
+        DeliverOutcome::RateLimited { retry_after_secs } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                (axum::http::header::RETRY_AFTER, retry_after_secs.to_string()),
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "application/json".to_string(),
+                ),
+            ],
+            Json(json!({ "code": "rate_limited" })),
+        )
+            .into_response(),
+        DeliverOutcome::NotRunning => (StatusCode::CONFLICT, Json(json!({ "code": "not_running" }))).into_response(),
+    }
+}
+
+/// Outcome of a [`deliver_message`] attempt, shared by the REST handler and
+/// the A2A `SendMessage` sink so both paths use the same session lookup, PTY
+/// write and message budget.
+pub enum DeliverOutcome {
+    /// The message was written to the session PTY.
+    Accepted { bytes: usize },
+    /// No such session.
+    NotFound,
+    /// Trimmed text is empty.
+    Empty,
+    /// Text exceeds [`MESSAGE_MAX_BYTES`].
+    TooLarge,
+    /// The per-session budget is exhausted.
+    RateLimited { retry_after_secs: u64 },
+    /// The session has no live PTY (stopped/paused/stale slot).
+    NotRunning,
+}
+
+/// Shared message-delivery core behind both `POST /api/v1/sessions/{name}/message`
+/// and the A2A `SendMessage` sink: validates the session and text, sanitizes
+/// the payload, respects the shared per-session rate budget and writes a
+/// bracketed-paste payload (never a raw command line) into the session PTY.
+pub fn deliver_message(state: &SessionsApiState, name: &str, text: &str) -> DeliverOutcome {
+    // 404/not_found for an unknown session.
+    let Some(control) = state.controls.get(name) else {
+        return DeliverOutcome::NotFound;
+    };
+
+    // 413 too_large is evaluated on the trimmed byte length.
+    let text = text.trim();
+    if text.is_empty() {
+        return DeliverOutcome::Empty;
+    }
+    if text.len() > MESSAGE_MAX_BYTES {
+        return DeliverOutcome::TooLarge;
     }
 
-    // 409 not_running when the session has no live PTY (stopped/paused or a
+    // not_running when the session has no live PTY (stopped/paused or a
     // dead thread left a stale slot).
     let payload = sanitize_message_text(text);
     let write_ok = {
@@ -516,19 +561,10 @@ async fn inject_message(
                 .message_limits
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(retry_after) = limits.record(&name, Instant::now()) {
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [
-                        (axum::http::header::RETRY_AFTER, retry_after.to_string()),
-                        (
-                            axum::http::header::CONTENT_TYPE,
-                            "application/json".to_string(),
-                        ),
-                    ],
-                    Json(json!({ "code": "rate_limited" })),
-                )
-                    .into_response();
+            if let Some(retry_after) = limits.record(name, Instant::now()) {
+                return DeliverOutcome::RateLimited {
+                    retry_after_secs: retry_after,
+                };
             }
             let written = slot
                 .write_all(PASTE_START)
@@ -541,24 +577,19 @@ async fn inject_message(
     let n = payload.len();
 
     if !write_ok {
-        return (StatusCode::CONFLICT, Json(json!({ "code": "not_running" }))).into_response();
+        return DeliverOutcome::NotRunning;
     }
 
     // Audit line: session, byte count and a hash prefix, never the message
     // text itself (the session log ring is never touched).
     log_event(
-        &name,
+        name,
         &format!(
-            "message injected bytes={} sha={}",
-            n,
+            "message injected bytes={n} sha={}",
             message_hash_prefix(&payload, 12)
         ),
     );
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({ "session": name, "accepted": true, "bytes": n })),
-    )
-        .into_response()
+    DeliverOutcome::Accepted { bytes: n }
 }
 
 /// Builds the bearer token from env (file takes precedence over inline).

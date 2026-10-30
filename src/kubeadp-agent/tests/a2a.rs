@@ -91,7 +91,7 @@ fn verifier_ok() -> AuthVerifier {
 }
 
 fn test_router(backend: Arc<dyn TaskBackend>, auth: Option<AuthVerifier>) -> Router {
-    a2a_router(test_model(), backend, auth)
+    a2a_router(test_model(), backend, None, auth)
 }
 
 async fn body_string(body: Body) -> String {
@@ -122,6 +122,7 @@ fn post_auth(uri: &str, body: &str) -> Request<Body> {
         .method("POST")
         .uri(uri)
         .header("authorization", "Bearer good-token")
+        .header("a2a-version", "1.0")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .expect("request")
@@ -201,33 +202,39 @@ async fn protected_routes_require_bearer_token() {
     let req = Request::builder()
         .method("POST")
         .uri("/rpc")
+        .header("a2a-version", "1.0")
         .header("content-type", "application/json")
         .body(Body::from(
             r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"t1"}}"#.to_string(),
         ))
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    // JSON-RPC keeps HTTP 200 and reports auth failure in the envelope.
+    assert_eq!(res.status(), StatusCode::OK);
     let value: serde_json::Value =
         serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    assert_eq!(value["code"], "unauthorized");
-    assert!(value["error"].is_string());
+    assert_eq!(value["error"]["code"], -32600); // INVALID_REQUEST
 
-    // No auth header on a REST route -> 401.
+    // No auth header on a REST route -> the SDK maps the authorizer's
+    // INVALID_REQUEST to HTTP 400 (A2A problem+json envelope).
     let res = app.clone().oneshot(get("/tasks")).await.unwrap();
-    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     let value: serde_json::Value =
         serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    assert_eq!(value["code"], "unauthorized");
+    assert!(value["error"].is_object());
 
-    // Wrong token -> 401.
+    // Wrong token -> same rejection.
     let req = Request::builder()
         .uri("/tasks")
         .header("authorization", "Bearer wrong-token")
         .body(Body::empty())
         .unwrap();
-    let res = app.oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // Correct token -> 200.
+    let res = app.clone().oneshot(get_auth("/tasks")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
 }
 
 // ---------------------------------------------------------------------------
@@ -302,10 +309,11 @@ async fn list_tasks_through_rest_and_jsonrpc_with_filters() {
     assert_eq!(list[0]["id"], "t1");
     assert_eq!(v["totalSize"], 1);
 
-    // REST GET /tasks?status=working
+    // REST GET /tasks?status=TASK_STATE_WORKING (SDK uses canonical TaskState
+    // names; the old bindings accepted the lowercase short names)
     let res = app
         .clone()
-        .oneshot(get_auth("/tasks?status=working"))
+        .oneshot(get_auth("/tasks?status=TASK_STATE_WORKING"))
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
@@ -363,7 +371,7 @@ async fn cancel_task_through_rest_and_jsonrpc() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    assert_eq!(v["code"], "taskNotCancelable");
+    assert_eq!(v["error"]["details"][0]["reason"], "TASK_NOT_CANCELABLE");
 
     // REST legacy POST /tasks/t1/cancel (already canceled) -> taskNotCancelable.
     let res = app
@@ -373,7 +381,7 @@ async fn cancel_task_through_rest_and_jsonrpc() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    assert_eq!(v["code"], "taskNotCancelable");
+    assert_eq!(v["error"]["details"][0]["reason"], "TASK_NOT_CANCELABLE");
 
     // JSON-RPC CancelTask on a completed task -> TaskNotCancelable error
     let body = r#"{"jsonrpc":"2.0","id":3,"method":"CancelTask","params":{"id":"t2"}}"#;
@@ -396,7 +404,9 @@ async fn unknown_task_returns_task_not_found() {
     let res = app.clone().oneshot(get_auth("/tasks/nope")).await.unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
     let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    assert_eq!(v["code"], "taskNotFound");
+    // SDK REST envelope: error.details[0].reason is the A2A error code.
+    assert_eq!(v["error"]["details"][0]["reason"], "TASK_NOT_FOUND");
+    assert_eq!(v["error"]["status"], "NOT_FOUND");
 
     // JSON-RPC: TASK_NOT_FOUND (-32001) error object.
     let body = r#"{"jsonrpc":"2.0","id":4,"method":"GetTask","params":{"id":"nope"}}"#;
@@ -406,11 +416,11 @@ async fn unknown_task_returns_task_not_found() {
 }
 
 // ---------------------------------------------------------------------------
-// 501 stubs for the not-yet-implemented methods (never 404)
+// Unsupported-method tests (SDK-wire behaviour; never 404, never 501)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn send_message_rest_is_501_unsupported() {
+async fn send_message_rest_is_unsupported_when_no_sink() {
     let backend: Arc<dyn TaskBackend> = FakeBackend::with(vec![]);
     let app = test_router(backend, Some(verifier_ok()));
 
@@ -420,66 +430,94 @@ async fn send_message_rest_is_501_unsupported() {
     assert_eq!(res.status(), StatusCode::OK);
     let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
     assert_eq!(v["error"]["code"], -32004); // UNSUPPORTED_OPERATION
-    assert_eq!(v["error"]["data"]["code"], "unsupported");
+    let reason = v["error"]["data"][0]["reason"].as_str().unwrap_or("");
+    assert_eq!(reason, "UNSUPPORTED_OPERATION");
 
-    // REST -> HTTP 501 with code "unsupported".
+    // REST -> the SDK maps UNSUPPORTED_OPERATION to HTTP 400 with the A2A
+    // problem+json envelope.
     let res = app
         .clone()
         .oneshot(post_auth("/message:send", "{}"))
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    assert_eq!(v["code"], "unsupported");
+    let reason = v["error"]["details"][0]["reason"].as_str().unwrap_or("");
+    assert_eq!(reason, "UNSUPPORTED_OPERATION");
 }
 
 #[tokio::test]
-async fn subscribe_streaming_push_and_extended_card_are_501() {
+async fn subscribe_streaming_push_and_extended_card_answer_sdk_codes() {
     let backend: Arc<dyn TaskBackend> = FakeBackend::with(vec![]);
     let app = test_router(backend, Some(verifier_ok()));
 
-    let cases: Vec<(&str, &str)> = vec![
-        // (REST path, HTTP method)
-        ("/message:stream", "POST"),
-        ("/message/send", "POST"),
-        ("/message/stream", "POST"),
-        ("/extendedAgentCard", "GET"),
-        ("/agent-card/extended", "GET"),
-        ("/tasks/t1/subscribe", "GET"),
-        ("/tasks/t1:subscribe", "GET"),
-        ("/tasks/t1/pushNotificationConfigs", "GET"),
-        ("/tasks/t1/pushNotificationConfigs/push-1", "GET"),
+    // The SDK REST binding serves all these paths; the capability is absent,
+    // so each answers HTTP 400 with the A2A problem+json envelope carrying the
+    // matching ErrorInfo reason in details[0].reason.
+    let cases: Vec<(&str, &str, &str)> = vec![
+        // (REST path, HTTP method, expected ErrorInfo reason)
+        ("/message:stream", "POST", "UNSUPPORTED_OPERATION"),
+        ("/message/send", "POST", "UNSUPPORTED_OPERATION"),
+        ("/message/stream", "POST", "UNSUPPORTED_OPERATION"),
+        (
+            "/extendedAgentCard",
+            "GET",
+            "EXTENDED_AGENT_CARD_NOT_CONFIGURED",
+        ),
+        (
+            "/agent-card/extended",
+            "GET",
+            "EXTENDED_AGENT_CARD_NOT_CONFIGURED",
+        ),
+        ("/tasks/t1/subscribe", "GET", "UNSUPPORTED_OPERATION"),
+        ("/tasks/t1/subscribe", "POST", "UNSUPPORTED_OPERATION"),
+        (
+            "/tasks/t1/pushNotificationConfigs",
+            "GET",
+            "PUSH_NOTIFICATION_NOT_SUPPORTED",
+        ),
+        (
+            "/tasks/t1/pushNotificationConfigs",
+            "POST",
+            "PUSH_NOTIFICATION_NOT_SUPPORTED",
+        ),
     ];
-    for (path, method) in cases {
+    for (path, method, reason) in cases {
+        let body = match method {
+            "POST" => r#"{}"#,
+            _ => "",
+        };
         let req = Request::builder()
             .method(method)
             .uri(path)
             .header("authorization", "Bearer good-token")
-            .body(Body::empty())
+            .header("content-type", "application/json")
+            .body(Body::from(body))
             .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED, "path {path}");
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "path {path}");
         let v: serde_json::Value =
             serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-        assert_eq!(v["code"], "unsupported", "path {path}");
+        let got = v["error"]["details"][0]["reason"].as_str().unwrap_or("");
+        assert_eq!(got, reason, "path {path}");
     }
 
-    // JSON-RPC SubscribeToTask and push config methods answer UNSUPPORTED.
-    for method in [
-        "SendStreamingMessage",
-        "SubscribeToTask",
-        "CreateTaskPushNotificationConfig",
-        "GetTaskPushNotificationConfig",
-        "ListTaskPushNotificationConfigs",
-        "DeleteTaskPushNotificationConfig",
-        "GetExtendedAgentCard",
-    ] {
+    // JSON-RPC: known method names answer their A2A error codes.
+    let rpc_cases: Vec<(&str, i64)> = vec![
+        ("SendStreamingMessage", -32004), // UNSUPPORTED_OPERATION
+        ("SubscribeToTask", -32004),
+        ("CreateTaskPushNotificationConfig", -32003), // PUSH_NOTIFICATION_NOT_SUPPORTED
+        ("GetTaskPushNotificationConfig", -32003),
+        ("ListTaskPushNotificationConfigs", -32003),
+        ("DeleteTaskPushNotificationConfig", -32003),
+        ("GetExtendedAgentCard", -32007), // EXTENDED_CARD_NOT_CONFIGURED
+    ];
+    for (method, code) in rpc_cases {
         let body = format!(r#"{{"jsonrpc":"2.0","id":6,"method":"{method}","params":{{}}}}"#);
         let res = app.clone().oneshot(post_auth("/rpc", &body)).await.unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-        assert_eq!(v["error"]["code"], -32004, "method {method}");
-        assert_eq!(v["error"]["data"]["code"], "unsupported", "method {method}");
+        assert_eq!(v["error"]["code"], code, "method {method}");
     }
 }
 

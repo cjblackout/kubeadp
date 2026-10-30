@@ -350,7 +350,7 @@ mod tests {
             json_rpc_url: "http://localhost:8001/rpc".to_string(),
         };
         let backend = Arc::new(JobTaskBackend::new(config));
-        let app = a2a_router(model, backend, None);
+        let app = a2a_router(model, backend, None, None);
 
         // 1. Agent card (public)
         let res = app
@@ -404,6 +404,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/rpc")
+                    .header("a2a-version", "1.0")
                     .header("content-type", "application/json")
                     .body(Body::from(rpc_req.to_string()))
                     .unwrap(),
@@ -412,7 +413,9 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        // 5. POST /message:send -> 501 Unsupported
+        // 5. POST /message:send -> the worker has no interactive input channel,
+        // so SendMessage is UNSUPPORTED_OPERATION; the SDK maps that to HTTP 400
+        // (the previous hand-written bindings answered 501).
         let res = app
             .clone()
             .oneshot(
@@ -425,6 +428,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 }

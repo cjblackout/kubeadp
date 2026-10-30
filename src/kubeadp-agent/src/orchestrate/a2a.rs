@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::core::a2a::{A2AError, A2aModel, A2aTask, AuthVerifier, TaskBackend};
+use crate::orchestrate::sessions_api;
 use a2a::TaskState;
 use axum::Router;
 
@@ -159,6 +160,43 @@ impl TaskBackend for SupervisorTaskBackend {
     }
 }
 
+/// A2A `SendMessage` sink that delivers text into a supervised session via
+/// the shared [`crate::orchestrate::sessions_api::deliver_message`] core, so
+/// the A2A path and the REST `POST /api/v1/sessions/{name}/message` path
+/// share the same session lookup, bracketed-paste writing and per-session
+/// rate budget.
+struct SessionMessageSink {
+    state: Arc<sessions_api::SessionsApiState>,
+}
+
+impl SessionMessageSink {
+    fn new(state: Arc<sessions_api::SessionsApiState>) -> Self {
+        Self { state }
+    }
+}
+
+impl crate::core::a2a::MessageSink for SessionMessageSink {
+    fn deliver(&self, task_id: &str, text: &str) -> Result<(), a2a::A2AError> {
+        use a2a::A2AError;
+        match sessions_api::deliver_message(&self.state, task_id, text) {
+            sessions_api::DeliverOutcome::Accepted { .. } => Ok(()),
+            sessions_api::DeliverOutcome::NotFound => Err(A2AError::task_not_found(task_id)),
+            sessions_api::DeliverOutcome::Empty => {
+                Err(A2AError::invalid_params("message text must not be empty"))
+            }
+            sessions_api::DeliverOutcome::TooLarge => {
+                Err(A2AError::invalid_params("message text is too large"))
+            }
+            sessions_api::DeliverOutcome::RateLimited { .. } => {
+                Err(A2AError::invalid_params("session message budget exhausted"))
+            }
+            sessions_api::DeliverOutcome::NotRunning => Err(A2AError::invalid_params(
+                "session is not running and has no live input",
+            )),
+        }
+    }
+}
+
 /// Builds the A2A router for agent-orchestrate.
 pub fn a2a_router(
     state: Arc<std::sync::Mutex<SupervisorState>>,
@@ -180,8 +218,16 @@ pub fn a2a_router(
         json_rpc_url: "/rpc".to_string(),
     };
 
+    let sink = Arc::new(SessionMessageSink::new(
+        sessions_api::SessionsApiState::new(
+            state.clone(),
+            controls.clone(),
+            Arc::new(crate::orchestrate::session_log::SessionLogs::from_env()),
+        ),
+    ));
+
     let backend = Arc::new(SupervisorTaskBackend::new(state, controls));
-    crate::core::a2a::a2a_router(model, backend, auth)
+    crate::core::a2a::a2a_router(model, backend, Some(sink), auth)
 }
 
 #[cfg(test)]
@@ -393,6 +439,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("/rpc")
+            .header("a2a-version", "1.0")
             .header("content-type", "application/json")
             .body(Body::from(
                 r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"sess-1"}}"#,
@@ -408,6 +455,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("/rpc")
+            .header("a2a-version", "1.0")
             .header("content-type", "application/json")
             .body(Body::from(
                 r#"{"jsonrpc":"2.0","id":2,"method":"CancelTask","params":{"id":"sess-1"}}"#,
@@ -447,13 +495,16 @@ mod tests {
         let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        // GET /tasks without token -> 401
+        // GET /tasks without token -> rejected. The SDK maps the authorizer's
+        // INVALID_REQUEST to HTTP 400 (its REST envelope is the A2A problem+json
+        // shape; the previous hand-written bindings answered 401 with the
+        // crate's {"error","code"} body).
         let req = Request::builder()
             .uri("/tasks")
             .body(Body::empty())
             .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
         // GET /tasks with correct token -> 200
         let req = Request::builder()

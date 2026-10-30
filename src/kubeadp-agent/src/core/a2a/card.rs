@@ -1,14 +1,11 @@
-//! Public agent card (`GET /.well-known/agent-card.json`).
+//! Public agent card type (`A2aModel`) and its conversion to the A2A
+//! [`AgentCard`]; served by the SDK's `agent_card_router`.
 
 use a2a::agent_card::{
     AgentCapabilities, AgentCard, AgentInterface, AgentSkill, HttpAuthSecurityScheme,
     SecurityScheme,
 };
 use a2a::TRANSPORT_PROTOCOL_JSONRPC;
-use axum::extract::State;
-use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde_json::json;
 use std::collections::HashMap;
 
 /// Well-known path for the public agent card (A2A §8.6).
@@ -88,13 +85,4 @@ impl A2aModel {
             signatures: None,
         }
     }
-}
-
-/// Serves the agent card without authentication (A2A §8.6.1).
-pub async fn agent_card(State(state): State<super::A2aState>) -> Response {
-    let card = state.model.to_agent_card();
-    // The card is built from a fixed, trusted struct -- never from request
-    // input -- so serialization cannot fail.
-    let body = serde_json::to_value(&card).unwrap_or_else(|_| json!({}));
-    Json(body).into_response()
 }

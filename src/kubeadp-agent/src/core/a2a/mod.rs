@@ -1,177 +1,102 @@
-//! A2A v1 agent protocol surface (agent card + JSON-RPC and HTTP+JSON bindings).
+//! A2A v1 agent protocol surface (agent card + JSON-RPC and HTTP+JSON
+//! bindings), served by the official `a2a-server-lf` SDK.
 //!
 //! This module (behind the crate's `a2a` cargo feature, which itself depends
 //! on the `server` feature) provides the server side of the A2A v1 protocol
-//! for the agent wrappers. It is *not* mounted by this crate: the
-//! `agent-orchestrate` and `agent-run-api` crates re-export the router and
-//! mount it in-process (see the A2A plan, Vikunja HL-43/HL-56).
+//! for the agent wrappers. It is mounted by the wrapper roles: the
+//! orchestrator merges it into its HTTP server in
+//! [`crate::orchestrate::http_server::build_router`], the worker in
+//! [`crate::worker::entry`].
 //!
 //! # SDK decision
 //!
-//! Types come from the official [`a2a-lf`](https://docs.rs/a2a-lf) crate
-//! (`a2aproject/a2a-rs`, Apache-2.0), pinned exactly in `Cargo.toml`. The
-//! `a2a-server-lf` crate is *not* used: its routers build their own state and
-//! its REST error envelope (`{"error": {"status": ..., "details": [...]}}`)
-//! differs from the crate-wide `{"error": "...", "code": "..."}` JSON error
-//! shape, and it maps "unsupported operation" to HTTP 400 rather than the
-//! required 501 `code: "unsupported"`. Instead the thin JSON-RPC and
-//! HTTP+JSON bindings are implemented here directly over the `a2a-lf` types,
-//! keeping the wire format identical to the official SDK.
+//! Since the A2A plan (Vikunja HL-43/HL-56) was written, the official
+//! [`a2a-server-lf`](https://docs.rs/a2a-server-lf) SDK
+//! (`a2aproject/a2a-rs`, Apache-2.0) has matured past the "not a server
+//! framework" caveat: its `jsonrpc_router`/`rest_router`/`agent_card_router`
+//! are plain axum 0.8 routers that merge into ours, and its REST error
+//! envelope is the A2A-spec shape (`{"error":{"code","status","message",
+//! "details"}}`, `application/problem+json`). This module therefore replaces
+//! the hand-written JSON-RPC/REST bindings with the SDK routers while keeping
+//! the wire-compatible `a2a-lf` 0.4.2 type layer (same type-pinned version).
+//!
+//! The one deliberate SDK delta, documented here so it is not re-litigated:
+//! the SDK maps `UNSUPPORTED_OPERATION` to HTTP 400 while the previous
+//! hand-written bindings answered 501. The A2A REST spec (§9.6.2) does not
+//! reserve 501 for unsupported operations; the JSON-RPC binding reports
+//! unsupported methods as `UNSUPPORTED_OPERATION` (-32004) in the envelope
+//! with HTTP 200 either way, so the wire-visible REST status for
+//! `SendStreamingMessage`/`SubscribeToTask` changes from 501 to 400.
 //!
 //! # Surface
 //!
-//! - `GET /.well-known/agent-card.json` -- the public agent card (no auth).
-//! - JSON-RPC (`POST /rpc`) and REST bindings for `GetTask`, `ListTasks`,
-//!   `CancelTask` over the [`TaskBackend`] trait.
-//! - `SendMessage`, `SendStreamingMessage`, `SubscribeToTask`,
-//!   push-notification config and `GetExtendedAgentCard` answer HTTP 501 /
-//!   JSON-RPC `UNSUPPORTED_OPERATION` (`code: "unsupported"`), never 404.
+//! - `GET /.well-known/agent-card.json` -- the public agent card (no auth,
+//!   CORS for discovery) served by the SDK's `agent_card_router`.
+//! - SDK `jsonrpc_router` (POST `/`) and `rest_router` (`/message:send`,
+//!   `/tasks`, `/tasks/{id}`, `/tasks/{id}/cancel`, ...) over a
+//!   [`ServerRequestHandler`] that implements `GetTask`, `ListTasks`,
+//!   `CancelTask` over the [`TaskBackend`] trait and `SendMessage` over an
+//!   optional [`MessageSink`].
+//! - `SendStreamingMessage`, `SubscribeToTask`, push-notification config and
+//!   `GetExtendedAgentCard` answer the SDK's dedicated errors.
 //!
-//! All non-card routes require a bearer token through the caller-supplied
-//! verifier ([`AuthVerifier`]); the card is public.
+//! Authorization is enforced inside [`ServerRequestHandler`] from the
+//! caller's [`AuthVerifier`] (each `RequestHandler` method receives the
+//! request's `ServiceParams`); the agent card stays public.
 
 mod backend;
-mod bindings;
 mod card;
+mod handler;
 
 pub use backend::{map_job_status, A2AError, A2aTask, TaskBackend};
 pub use card::{A2aModel, WELL_KNOWN_AGENT_CARD_PATH};
+pub use handler::{MessageSink, ServerRequestHandler};
 
 use std::sync::Arc;
 
-use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
-use serde_json::json;
+use a2a_server::agent_card::agent_card_router;
+use a2a_server::jsonrpc::jsonrpc_router;
+use a2a_server::rest::rest_router;
+use a2a_server::StaticAgentCard;
+use axum::http::HeaderMap;
+use axum::Router;
 
-/// Caller-supplied request authorizer for the non-card routes.
+/// Caller-supplied request authorizer for the protected routes.
 ///
 /// Returns `true` when the request's headers carry an accepted bearer token.
 /// The wrapper serving the router builds this from its configured token
-/// (constant-time compare; see the helper in this module). A `None` value
-/// disables the check entirely -- the wrapper then relies on network policy
-/// to keep the endpoint unreachable, matching the agent-run-api /
-/// agent-orchestrate "no token configured" model.
+/// (constant-time compare; see [`constant_time_eq`]). A `None` value disables
+/// the check entirely -- the wrapper then relies on network policy to keep
+/// the endpoint unreachable, matching the agent-run-api / agent-orchestrate
+/// "no token configured" model.
 pub type AuthVerifier = Arc<dyn Fn(&HeaderMap) -> bool + Send + Sync>;
 
-/// State shared by every handler of the A2A router.
-#[derive(Clone)]
-struct A2aState {
-    model: A2aModel,
-    backend: Arc<dyn TaskBackend>,
-    verifier: Option<AuthVerifier>,
-}
-
-/// Builds the A2A axum router.
+/// Builds the A2A axum router from the SDK's three sub-routers.
 ///
-/// The agent card route is public; every other route is wrapped in the
-/// bearer-token check (see [`AuthVerifier`]). Nothing here is mounted by
-/// this crate -- the caller merges the returned router into its own and is
-/// responsible for the listening address.
+/// - the public agent card router (no auth)
+/// - the SDK JSON-RPC router (POST `/`)
+/// - the SDK REST router (`/message:send`, `/tasks`, ...)
+///
+/// The JSON-RPC and REST sub-routers share one [`ServerRequestHandler`]
+/// carrying the optional bearer verifier and [`MessageSink`]; an absent
+/// verifier lets everything through (network-policy-only access control).
+/// The agent card stays public.
 pub fn a2a_router(
     model: A2aModel,
     backend: Arc<dyn TaskBackend>,
+    sink: Option<Arc<dyn MessageSink>>,
     auth: Option<AuthVerifier>,
 ) -> Router {
-    let state = A2aState {
-        model,
-        backend,
-        verifier: auth,
-    };
+    let handler = Arc::new(ServerRequestHandler::new(backend, sink, auth));
 
-    // JSON-RPC binding (official SDK wire format: POST one endpoint, route
-    // by the `method` field of the JSON-RPC 2.0 envelope).
-    let jsonrpc = Router::new().route(bindings::JSONRPC_PATH, post(bindings::jsonrpc_handler));
+    // The SDK's jsonrpc_router serves POST `/`; nest it under the crate's
+    // historical JSON-RPC path so the wire contract (/rpc) is preserved.
+    let jsonrpc = jsonrpc_router(handler.clone());
+    let rest = rest_router(handler);
 
-    // REST (HTTP+JSON) binding. Paths follow the official SDK / A2A spec,
-    // including the `:cancel` / `:subscribe` action suffixes.
-    let rest = Router::new()
-        .route("/tasks", get(bindings::rest_list_tasks))
-        .route(
-            "/tasks/{id}",
-            get(bindings::rest_get_task_or_subscribe).post(bindings::rest_task_action),
-        )
-        .route(
-            "/tasks/{id}/cancel",
-            post(bindings::rest_cancel_task_legacy),
-        )
-        .route(
-            "/tasks/{id}/subscribe",
-            get(bindings::rest_subscribe_unsupported).post(bindings::rest_subscribe_unsupported),
-        )
-        .route(
-            "/message:send",
-            post(bindings::rest_send_message_unsupported),
-        )
-        .route(
-            "/message/send",
-            post(bindings::rest_send_message_unsupported),
-        )
-        .route(
-            "/message:stream",
-            post(bindings::rest_stream_message_unsupported),
-        )
-        .route(
-            "/message/stream",
-            post(bindings::rest_stream_message_unsupported),
-        )
-        .route(
-            "/extendedAgentCard",
-            get(bindings::rest_extended_card_unsupported),
-        )
-        .route(
-            "/agent-card/extended",
-            get(bindings::rest_extended_card_unsupported),
-        )
-        .route(
-            "/tasks/{id}/pushNotificationConfigs",
-            post(bindings::rest_push_configs_unsupported)
-                .get(bindings::rest_push_configs_unsupported),
-        )
-        .route(
-            "/tasks/{id}/pushNotificationConfigs/{config_id}",
-            get(bindings::rest_push_config_unsupported)
-                .delete(bindings::rest_push_config_unsupported),
-        )
-        .route(
-            "/tasks/{id}/push-configs",
-            post(bindings::rest_push_configs_unsupported)
-                .get(bindings::rest_push_configs_unsupported),
-        )
-        .route(
-            "/tasks/{id}/push-configs/{config_id}",
-            get(bindings::rest_push_config_unsupported)
-                .delete(bindings::rest_push_config_unsupported),
-        );
+    let card_router = agent_card_router(Arc::new(StaticAgentCard::new(model.to_agent_card())));
 
-    let protected = jsonrpc
-        .merge(rest)
-        .layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
-
-    Router::new()
-        .route(WELL_KNOWN_AGENT_CARD_PATH, get(card::agent_card))
-        .merge(protected)
-        .with_state(state)
-}
-
-/// Rejects requests whose headers the caller's verifier does not accept
-/// (HTTP 401, crate `{"error","code"}` JSON shape). A `None` verifier lets
-/// everything through -- the wrapper relies on network policy then.
-async fn bearer_auth(State(state): State<A2aState>, request: Request, next: Next) -> Response {
-    let Some(verifier) = &state.verifier else {
-        return next.run(request).await;
-    };
-    if verifier(request.headers()) {
-        return next.run(request).await;
-    }
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({ "error": "authentication required", "code": "unauthorized" })),
-    )
-        .into_response()
+    card_router.merge(axum::Router::new().nest("/rpc", jsonrpc).merge(rest))
 }
 
 /// Constant-time comparison of two byte strings, used to validate a bearer

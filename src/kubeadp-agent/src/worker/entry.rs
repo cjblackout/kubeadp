@@ -172,7 +172,9 @@ pub async fn run() -> Result<()> {
         let a2a_backend = Arc::new(crate::worker::a2a::JobTaskBackend::new(state.clone()));
         // agent-run-api has no bearer token by default (cluster NetworkPolicy is access control).
         // Passing None as AuthVerifier allows unauthenticated in-cluster access.
-        let a2a_routes = crate::core::a2a::a2a_router(a2a_model, a2a_backend, None);
+        // No MessageSink: a running agy job has no interactive stdin channel,
+        // so SendMessage answers UNSUPPORTED_OPERATION for the worker role.
+        let a2a_routes = crate::core::a2a::a2a_router(a2a_model, a2a_backend, None, None);
         app.merge(a2a_routes)
     };
     eprintln!("agent-run-api: listening on {listen}");

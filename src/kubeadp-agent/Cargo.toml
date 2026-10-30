@@ -26,7 +26,7 @@ cli = ["dep:ureq"]
 # A2A v1 agent protocol surface (agent card + JSON-RPC/REST bindings).
 # Merges the three old `a2a` features (agent-core/a2a, agent-orchestrate/a2a,
 # agent-run-api/a2a). Depends on `server` for the shared axum stack.
-a2a = ["server", "dep:a2a"]
+a2a = ["server", "dep:a2a", "dep:a2a-server-lf", "dep:async-trait", "dep:futures", "dep:a2a-client-lf"]
 # Test-only hooks used by the supervisor black-box suite (agent-orchestrate).
 # Implies `server` (the old agent-orchestrate crate always compiled its HTTP
 # stack; the supervisor binary needs it).
@@ -54,6 +54,14 @@ http-body-util = { version = "0.1", optional = true }
 uuid = { version = "1", features = ["v5"], optional = true }
 ureq = { version = "2", features = ["json"], optional = true }
 a2a = { package = "a2a-lf", version = "=0.4.2", optional = true }
+a2a-server-lf = { version = "=0.5.3", default-features = false, optional = true }
+# Test-only A2A client used by tests/a2a_client.rs (only in the a2a build).
+# Default features pull in rustls so the reqwest client builds; this entire
+# dependency tree stays out of non-a2a builds (the a2a feature gates it).
+a2a-client-lf = { version = "=0.2.9", default-features = true, optional = true }
+# Direct deps needed to implement a2a_server::RequestHandler.
+async-trait = { version = "0.1", optional = true }
+futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "=3.10.1"
@@ -63,6 +71,10 @@ axum = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde_json = "1.0"
 chrono = { version = "0.4" }
+# Used only by tests/a2a_client.rs (feature a2a) to fetch the agent card and
+# to build the SDK client's reqwest client. Version matches the a2a-client-lf
+# dependency so the lock already resolves it.
+reqwest = { version = "0.13", default-features = false }
 
 [[bin]]
 name = "kubeadp-agent"
