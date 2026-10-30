@@ -44,9 +44,12 @@ FROM rust:1.99.0-slim-bookworm AS check
 
 RUN apt_update() { for i in 1 2 3 4 5 6; do apt-get -o Acquire::Retries=5 update && [ -n "$(ls /var/lib/apt/lists/*_Packages* /var/lib/apt/lists/*_Packages.* 2>/dev/null)" ] && return 0; echo "apt update retry $i" >&2; sleep 10; done; return 1; }; \
     apt_update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
-    gcc libc6-dev binutils \
+    gcc libc6-dev binutils git \
     && rm -rf /var/lib/apt/lists/* \
     && rustup component add clippy rustfmt
+
+# The crate's tests drive real git repositories (worktrees, commits): git and a commit identity are needed.
+ENV GIT_AUTHOR_NAME=ci GIT_AUTHOR_EMAIL=ci@localhost GIT_COMMITTER_NAME=ci GIT_COMMITTER_EMAIL=ci@localhost
 
 WORKDIR /build/kubeadp-agent
 COPY src/kubeadp-agent /build/kubeadp-agent
