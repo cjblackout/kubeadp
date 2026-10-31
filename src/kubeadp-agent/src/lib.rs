@@ -26,6 +26,8 @@
 pub mod cli;
 pub mod config_file;
 pub mod core;
+#[cfg(feature = "a2a")]
+pub mod mcp_a2a;
 #[cfg(feature = "server")]
 pub mod orchestrate;
 #[cfg(feature = "server")]

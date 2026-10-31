@@ -4,6 +4,9 @@
 //! - `orchestrator` -> the agent-orchestrate process supervisor
 //! - `worker`       -> the agent-run API daemon (remote job execution)
 //!
+//! The `mcp-a2a` subcommand (first argument) runs the A2A **sending** side as
+//! a stdio MCP server (feature `a2a`) and does not require `KUBEADP_ROLE`.
+//!
 //! `KUBEADP_ROLE` unset or set to any other value exits with code 2 and a
 //! clear message. Each role runs exactly the code that the corresponding old
 //! crate's `main()` ran, honouring the same env vars and CLI.
@@ -27,6 +30,13 @@ fn apply_config_for(role: &str) {
 }
 
 fn main() {
+    // The `mcp-a2a` subcommand is handled before the role dispatch: it is an
+    // explicit, self-describing entry that needs no KUBEADP_ROLE.
+    if std::env::args().nth(1).as_deref() == Some("mcp-a2a") {
+        run_mcp_a2a();
+        return;
+    }
+
     match std::env::var("KUBEADP_ROLE").as_deref() {
         Ok("orchestrator") => {
             apply_config_for("orchestrator");
@@ -62,4 +72,28 @@ fn main() {
             exit(2);
         }
     }
+}
+
+/// Runs the `mcp-a2a` stdio MCP server (the A2A sending side, feature `a2a`).
+#[cfg(feature = "a2a")]
+fn run_mcp_a2a() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    if let Err(e) = rt.block_on(async {
+        let server =
+            kubeadp_agent::mcp_a2a::build_server(std::env::var("A2A_KUBE_API").ok()).await?;
+        kubeadp_agent::mcp_a2a::run_stdio(server).await
+    }) {
+        eprintln!("kubeadp-agent (mcp-a2a): {e:#}");
+        exit(1);
+    }
+}
+
+/// Non-a2a build: the subcommand is not compiled in.
+#[cfg(not(feature = "a2a"))]
+fn run_mcp_a2a() {
+    eprintln!("kubeadp-agent: the 'mcp-a2a' subcommand requires the 'a2a' cargo feature");
+    exit(2);
 }

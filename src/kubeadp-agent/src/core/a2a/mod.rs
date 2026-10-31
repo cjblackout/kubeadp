@@ -48,6 +48,9 @@ mod backend;
 mod card;
 mod handler;
 
+#[cfg(feature = "a2a")]
+pub mod client;
+
 pub use backend::{map_job_status, A2AError, A2aTask, TaskBackend};
 pub use card::{A2aModel, WELL_KNOWN_AGENT_CARD_PATH};
 pub use handler::{MessageSink, ServerRequestHandler};

@@ -131,6 +131,18 @@ Router construction: `a2a_router(model, backend, sink, auth)` returns a standalo
 
 Feature-gated integration tests live in `tests/a2a.rs` (wire format) and `tests/a2a_client.rs` (the official client against an in-process server); run them with `cargo test --features a2a --manifest-path src/kubeadp-agent/Cargo.toml`.
 
+### `mcp-a2a` subcommand: the A2A sending side over MCP (feature `a2a`)
+
+The same `a2a` feature gates `kubeadp-agent mcp-a2a`, a stdio Model Context Protocol server exposing three tools for talking **to** peer agents (client side, `kubeadp_agent::core::a2a::client` + `kubeadp_agent::mcp_a2a`). It does **not** require `KUBEADP_ROLE`.
+
+- `list_agents` — the discovered peer agents (name, namespace, url, best-effort agent card).
+- `send_message` — send a text message (role `user`) to an agent by Service name, tagged with `a2a.sender` (from `A2A_SELF_NAME`, default the process name) and `a2a.hop` (incoming hop + 1). A hop above 4 is refused.
+- `get_task` — fetch the current state of a task on an agent by Service name.
+
+Agents are discovered from Kubernetes Services labelled `a2a.homelab/agent=true` in the pod's own namespace plus `A2A_NAMESPACES` (comma-separated); the in-cluster service account (`/var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt,namespace}`) authenticates the discovery, and `A2A_KUBE_API` overrides the API base for local development/tests. Each Service's URL is `http://<service>.<namespace>.svc:<port>` using the port named `a2a` (else the first port). The card fetch is best-effort (3 s timeout); a failure just omits `card`. `send_message`/`get_task` only accept a Service name from the registry (never an arbitrary URL). `A2A_URL_OVERRIDES` (`name=url,...`) is a test/development seam that redirects the *connection* (and card fetch) while the advertised URL stays the cluster-internal one.
+
+Errors are MCP tool errors (`isError: true`), never panics, and every response is bounded to 20 KB. Tests: `tests/a2a_client_mcp.rs` (in-process A2A server + in-memory MCP round trip) and `tests/a2a_discovery.rs` (fake Kubernetes API).
+
 # Module notes: orchestrate
 
 ## Agent Orchestrate

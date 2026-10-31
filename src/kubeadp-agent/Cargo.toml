@@ -26,7 +26,10 @@ cli = ["dep:ureq"]
 # A2A v1 agent protocol surface (agent card + JSON-RPC/REST bindings).
 # Merges the three old `a2a` features (agent-core/a2a, agent-orchestrate/a2a,
 # agent-run-api/a2a). Depends on `server` for the shared axum stack.
-a2a = ["server", "dep:a2a", "dep:a2a-server-lf", "dep:async-trait", "dep:futures", "dep:a2a-client-lf"]
+# The `mcp-a2a` subcommand (A2A sending side over MCP) lives on the same
+# feature: it reuses the official A2A client SDK plus rmcp for the stdio MCP
+# transport, so none of that dependency tree reaches non-a2a builds.
+a2a = ["server", "dep:a2a", "dep:a2a-server-lf", "dep:async-trait", "dep:futures", "dep:a2a-client-lf", "dep:rmcp", "dep:schemars", "dep:reqwest"]
 # Test-only hooks used by the supervisor black-box suite (agent-orchestrate).
 # Implies `server` (the old agent-orchestrate crate always compiled its HTTP
 # stack; the supervisor binary needs it).
@@ -62,6 +65,17 @@ a2a-client-lf = { version = "=0.2.9", default-features = true, optional = true }
 # Direct deps needed to implement a2a_server::RequestHandler.
 async-trait = { version = "0.1", optional = true }
 futures = { version = "0.3", optional = true }
+# MCP server transport for the `mcp-a2a` subcommand (A2A sending side).
+# Pinned to the same rmcp major the sibling info-hub-mcp crate ships, so the
+# lock already resolves it; default-features off keeps only the stdio server
+# surface (macros + schemars for the tool input schemas).
+rmcp = { version = "=3.5.1", default-features = false, features = ["server", "macros", "transport-io"], optional = true }
+schemars = { version = "1.2", default-features = false, features = ["derive"], optional = true }
+# Kubernetes discovery + agent-card fetch for the `mcp-a2a` subcommand.
+# Version matches a2a-client-lf's, so the lock already resolves it. rustls TLS
+# (the same provider a2a-client-lf's default builds use) keeps no native TLS
+# in the dependency tree.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 
 [dev-dependencies]
 tempfile = "=3.10.1"
@@ -71,6 +85,9 @@ axum = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde_json = "1.0"
 chrono = { version = "0.4" }
+# In-memory MCP client for the a2a-client MCP integration tests; only compiled
+# in the a2a+test-hooks CI feature set together with the same-pinned rmcp.
+rmcp = { version = "=3.5.1", default-features = false, features = ["server", "macros", "transport-io", "client"] }
 # Used only by tests/a2a_client.rs (feature a2a) to fetch the agent card and
 # to build the SDK client's reqwest client. Version matches the a2a-client-lf
 # dependency so the lock already resolves it.
