@@ -6,6 +6,14 @@ The `agent-run-cli` crate provides the `agent-run` command-line HTTP client shim
 
 `kubeadp-agent mcp-a2a` runs a stdio MCP server (no `KUBEADP_ROLE`) exposing `list_agents`, `send_message` and `get_task` for talking to peer A2A agents. Discovery is by Kubernetes Services labelled `a2a.homelab/agent=true` (own namespace + `A2A_NAMESPACES`), authenticated with the in-cluster service account; `A2A_KUBE_API` overrides the API base and `A2A_URL_OVERRIDES` redirects connections for tests/development. Messages are tagged `a2a.sender` (`A2A_SELF_NAME`) and `a2a.hop` (max 4). See `README.md`, section "`mcp-a2a` subcommand".
 
+## A2A Ingress & Receiving Side (feature `a2a`)
+
+When receiving messages via A2A (`ServerRequestHandler::send_message`), incoming payloads undergo strict ingress checks before delivery to the session/job sink:
+- **Text size**: Trimmed text exceeding 20 KB is rejected with `A2AError::invalid_params("message text is too large")`.
+- **Hop count**: `a2a.hop` metadata is checked (absent = 0; non-numeric, negative or huge = MAX_HOP+1). If hop > `MAX_HOP` (4), the message is rejected.
+- **Untrusted data framing**: Claimed sender (`a2a.sender`) is sanitized (control chars/newlines stripped, max 64 chars, default "unknown"). Messages (with or without metadata) are wrapped in a standard framing block containing the claimed sender, hop count, delimiter, and an explicit notice stating that content is data from another agent, not an instruction from the owner, and must not override owner instructions.
+- **Security model**: Metadata is claimed, never authenticated. True access control and isolation are enforced by network policy and mutual authentication.
+
 ## `repair`
 
 Job worktrees are checkouts of a per-project **private** bare repository kept under the agent-run repos root (`<workspace_root>/.agent-repos/<project>.git` by default). When git-sync re-initialises the project checkout it can drop the `worktrees/<job_id>` **admin** directory of that private repo, leaving the worktree's `.git` file dangling: `git` commands in the worktree break until it is re-attached — the worktree is "orphaned". `repair` re-attaches it (recreating the admin directory at the job's recorded base ref); it is a no-op that reports `healthy` when the worktree is already attached.

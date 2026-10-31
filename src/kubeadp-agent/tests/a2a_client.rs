@@ -279,7 +279,8 @@ async fn sdk_client_send_message_delivers_to_sink() {
         let delivered = sink.delivered.lock().unwrap();
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].0, "sess-1");
-        assert_eq!(delivered[0].1, "hello server");
+        assert!(delivered[0].1.contains("hello server"));
+        assert!(delivered[0].1.contains("claimed sender: unknown, hop: 0"));
     }
 
     // Session keeps running: GetTask still reports Working.

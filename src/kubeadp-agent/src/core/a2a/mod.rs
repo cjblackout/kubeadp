@@ -47,6 +47,8 @@
 mod backend;
 mod card;
 mod handler;
+#[cfg(feature = "a2a")]
+pub mod ingress;
 
 #[cfg(feature = "a2a")]
 pub mod client;

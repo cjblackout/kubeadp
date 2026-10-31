@@ -138,7 +138,7 @@ RUN for i in 1 2 3 4 5 6; do \
       [ "$i" -gt 1 ] && { sleep 10; echo "cargo fetch retry $i" >&2; }; \
       cargo fetch --locked && break; \
     done \
-    && cargo build --release --locked --bin kubeadp-agent --bin agent-run --bin agent-orchestrate --bin agent-run-api \
+    && cargo build --release --locked --features a2a --bin kubeadp-agent --bin agent-run --bin agent-orchestrate --bin agent-run-api \
     && strip target/release/kubeadp-agent target/release/agent-run target/release/agent-orchestrate target/release/agent-run-api \
     && mkdir -p /payload/usr/local/bin \
     && cp -a target/release/kubeadp-agent /payload/usr/local/bin/kubeadp-agent \

@@ -44,6 +44,8 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 use super::backend::{A2AError as CrateError, TaskBackend};
+#[cfg(feature = "a2a")]
+use super::ingress::process_ingress;
 use crate::core::a2a::AuthVerifier;
 
 /// Converts a crate [`CrateError`] into the SDK's A2A error.
@@ -158,10 +160,18 @@ impl RequestHandler for ServerRequestHandler {
             return Err(A2AError::invalid_params("message text must not be empty"));
         }
 
+        #[cfg(feature = "a2a")]
+        let text_to_deliver = {
+            let ingress = process_ingress(&text, req.message.metadata.as_ref())?;
+            ingress.framed_text
+        };
+        #[cfg(not(feature = "a2a"))]
+        let text_to_deliver = text;
+
         self.sink
             .as_ref()
             .expect("checked above")
-            .deliver(task_id, &text)?;
+            .deliver(task_id, &text_to_deliver)?;
 
         // Non-streaming delivery per A2A §7.4.2: return the (long-lived) task
         // in its current state; the session keeps running. The client then
