@@ -293,7 +293,7 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          # The worker Deployment (apps/agent-run-api) runs this image since HL-70 phase 3: swap its one
+          # The worker Deployment (apps/kubeadp-agent-worker) runs this image since HL-70 phase 3: swap its one
           # kubeadp-agent image line and the kubeadp-agent key in the same commit, like the other
           # CI-built images. The test pods (apps/kubeadp-agent-test) take the tag from the key only.
           apt-get update -qq
@@ -303,7 +303,7 @@ jobs:
           import yaml  # noqa: F401 -- imported to fail fast if PyYAML is missing
 
           version = os.environ["VERSION"]
-          m = pathlib.Path("apps/agent-run-api/manifest.yaml")
+          m = pathlib.Path("apps/kubeadp-agent-worker/manifest.yaml")
           text = m.read_text()
           new, n = re.subn(
               r"(image:\s*ghcr\.io/cjblackout/homelab/kubeadp-agent:)\S+",
@@ -312,7 +312,7 @@ jobs:
               count=1,
           )
           if n != 1:
-              sys.exit("kubeadp-agent image line not found in apps/agent-run-api/manifest.yaml")
+              sys.exit("kubeadp-agent image line not found in apps/kubeadp-agent-worker/manifest.yaml")
           list(yaml.safe_load_all(new))
           m.write_text(new)
           v = pathlib.Path("versions/versions.env")
@@ -332,7 +332,7 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add apps/agent-run-api/manifest.yaml versions/versions.env
+          git add apps/kubeadp-agent-worker/manifest.yaml versions/versions.env
           git commit -m "ci: kubeadp-agent image ${VERSION} (source build ${{ github.sha }})"
           for i in 1 2 3 4 5 6; do
             if git push origin main; then exit 0; fi

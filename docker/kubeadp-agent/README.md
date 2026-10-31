@@ -7,7 +7,7 @@ cargo package (`docker/ai-server/Dockerfile` for the orchestrator pod,
 `ghcr.io/cjblackout/homelab/kubeadp-agent` (public GHCR, like the other
 own-build images).
 
-> Consumers: the `agent-run-api` Deployment (apps/agent-run-api, `KUBEADP_ROLE=worker`) runs this
+> Consumers: the `agent-run-api` Deployment (apps/kubeadp-agent-worker, `KUBEADP_ROLE=worker`) runs this
 > image since the worker cut-over (HL-70 phase 3), and `build-kubeadp-agent.yml` deploys it there; the
 > throwaway test pods in apps/kubeadp-agent-test use it too. The orchestrator (ai-server) cut-over is
 > last; until then the ai-server image, Dockerfile, workflow and manifest stay untouched.
