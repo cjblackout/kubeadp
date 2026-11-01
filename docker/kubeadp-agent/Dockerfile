@@ -192,6 +192,8 @@ FROM debian:bookworm-slim AS runtime
 # worker-only but harmless and kept in the union so the identical image serves
 # both roles. rsync is orchestrator-only (repo-sync workflow over the mounted
 # SSH key) and kept for the same reason. python3/jq come from the tools image.
+# Orchestrator parity (HL-70 rehearsal): openssh-client (node SSH through the OpenBao CA), patch, zsh (the session
+# shell), less, psmisc, wget, nano, vim-tiny, htop, git-lfs and bash-completion were in the old ai-server image.
 # No sudo/acl/libcap2-bin (no privilege separation in the agent stack).
 RUN apt_update() { for i in 1 2 3 4 5 6; do apt-get -o Acquire::Retries=5 update && [ -n "$(ls /var/lib/apt/lists/*_Packages* /var/lib/apt/lists/*_Packages.* 2>/dev/null)" ] && return 0; echo "apt update retry $i" >&2; sleep 10; done; return 1; }; \
     apt_update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
@@ -204,6 +206,17 @@ RUN apt_update() { for i in 1 2 3 4 5 6; do apt-get -o Acquire::Retries=5 update
     libc6-dev \
     make \
     pkg-config \
+    openssh-client \
+    patch \
+    zsh \
+    less \
+    psmisc \
+    wget \
+    nano \
+    vim-tiny \
+    htop \
+    git-lfs \
+    bash-completion \
     && rm -rf /var/lib/apt/lists/*
 
 # The uid/gid layout. Both old images ran the container as uid 1000:
