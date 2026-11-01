@@ -7,10 +7,11 @@ cargo package (`docker/ai-server/Dockerfile` for the orchestrator pod,
 `ghcr.io/cjblackout/homelab/kubeadp-agent` (public GHCR, like the other
 own-build images).
 
-> Consumers: the `agent-run-api` Deployment (apps/kubeadp-agent-worker, `KUBEADP_ROLE=worker`) runs this
-> image since the worker cut-over (HL-70 phase 3), and `build-kubeadp-agent.yml` deploys it there; the
-> throwaway test pods in apps/kubeadp-agent-test use it too. The orchestrator (ai-server) cut-over is
-> last; until then the ai-server image, Dockerfile, workflow and manifest stay untouched.
+> Consumers: both agent Deployments in namespace `opencode` run this image: `kubeadp-agent-worker`
+> (apps/kubeadp-agent-worker, `KUBEADP_ROLE=worker`, gVisor on bwcloud-worker1) and
+> `kubeadp-agent-orchestrator` (apps/ai-server, `KUBEADP_ROLE=orchestrator`, Kata on a home node); both take the
+> tag from the shared `kubeadp-agent` key in `versions/versions.env`, and `build-kubeadp-agent.yml` moves it on
+> main. PR builds push an rc tag only, used for throwaway test pods (apps/kubeadp-agent-test).
 
 ## What is inside
 
@@ -31,7 +32,7 @@ parts:
   the orchestrator pod runs its interactive OAuth shell as a ttyd sidecar from
   this same image.
 - Runtime packages: the union of both images' lists
-  (`git curl ca-certificates procps rsync gcc libc6-dev make pkg-config`), tini
+  (`git curl ca-certificates procps rsync gcc libc6-dev make pkg-config`, plus `openssh-client patch zsh less psmisc wget nano vim-tiny htop git-lfs bash-completion` that the old ai-server image had), tini
   as PID 1, and `agent` (uid/gid 1000, `/bin/bash`) as the container user.
 - The toolchains/CLIs are **not** baked in: they come from the read-only tools
   image volume `/opt/tools` (`docker/modules`), mounted by the pod manifests as
