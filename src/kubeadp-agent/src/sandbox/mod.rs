@@ -60,11 +60,13 @@ impl SandboxInfo {
 
 /// Locates the `kubeadp-agent` binary executable to run `sandbox-exec`.
 ///
-/// In production the `kubeadp-agent` binary IS the process, so
-/// `std::env::current_exe()` is exactly the launcher. That is the ONLY path a
-/// non-test build uses -- there is no env-variable override and no
-/// `target/deps/` scanning, so the release binary can never be talked into
-/// executing an unexpected binary.
+/// Only `kubeadp-agent` implements `sandbox-exec`; the thin wrappers
+/// (`agent-orchestrate`, `agent-run-api`) do not. So the launcher is the
+/// `kubeadp-agent` binary next to `std::env::current_exe()` when that exists
+/// (all binaries live in one directory in the image), and `current_exe()`
+/// itself otherwise (the process already is `kubeadp-agent`). There is no
+/// env-variable override and no `target/deps/` scanning, so the release binary
+/// can never be talked into executing an unexpected binary.
 ///
 /// In integration/unit tests or harness runs `current_exe()` is often a test
 /// runner in `deps/` that does not handle `sandbox-exec`, so the test build
@@ -74,10 +76,28 @@ pub fn find_launcher_exe() -> std::path::PathBuf {
     #[cfg(not(test))]
     {
         // Production: resolve only via the process's own executable path.
-        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("kubeadp-agent"))
+        match std::env::current_exe() {
+            Ok(cur) => sibling_launcher(&cur),
+            Err(_) => std::path::PathBuf::from("kubeadp-agent"),
+        }
     }
     #[cfg(test)]
     find_launcher_exe_test()
+}
+
+/// Maps the running executable to the binary that handles `sandbox-exec`: the
+/// `kubeadp-agent` sibling when `cur` is a different binary (a wrapper), else
+/// `cur` unchanged.
+#[cfg_attr(test, allow(dead_code))]
+fn sibling_launcher(cur: &std::path::Path) -> std::path::PathBuf {
+    if cur.file_name().and_then(|n| n.to_str()) != Some("kubeadp-agent") {
+        if let Some(cand) = cur.parent().map(|d| d.join("kubeadp-agent")) {
+            if cand.is_file() {
+                return cand;
+            }
+        }
+    }
+    cur.to_path_buf()
 }
 
 /// Test/harness-only launcher resolution: prefers `CARGO_BIN_EXE_kubeadp-agent`,
@@ -135,4 +155,29 @@ fn find_launcher_exe_test() -> std::path::PathBuf {
         return cur;
     }
     std::path::PathBuf::from("kubeadp-agent")
+}
+
+#[cfg(test)]
+mod launcher_tests {
+    use super::sibling_launcher;
+    use std::fs;
+
+    #[test]
+    fn wrapper_resolves_to_kubeadp_agent_sibling() {
+        let d = tempfile::tempdir().unwrap();
+        let ka = d.path().join("kubeadp-agent");
+        let wrap = d.path().join("agent-orchestrate");
+        fs::write(&ka, b"").unwrap();
+        fs::write(&wrap, b"").unwrap();
+        assert_eq!(sibling_launcher(&wrap), ka);
+        assert_eq!(sibling_launcher(&ka), ka);
+    }
+
+    #[test]
+    fn wrapper_without_sibling_falls_back_to_current() {
+        let d = tempfile::tempdir().unwrap();
+        let wrap = d.path().join("agent-orchestrate");
+        fs::write(&wrap, b"").unwrap();
+        assert_eq!(sibling_launcher(&wrap), wrap);
+    }
 }
