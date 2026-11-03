@@ -19,6 +19,10 @@ fn default_shutdown_grace() -> f64 {
     5.0
 }
 
+fn default_sandbox() -> bool {
+    true
+}
+
 fn default_claude_binary() -> PathBuf {
     PathBuf::from("claude")
 }
@@ -165,6 +169,13 @@ pub struct SessionConfig {
 
     #[serde(default = "default_kill_wait")]
     pub kill_wait_secs: f64,
+
+    /// Run the session under `sandbox-exec` (default). `false` marks a TRUSTED
+    /// session that runs directly with the supervisor's full environment,
+    /// filesystem and ServiceAccount token (the pre-sandbox behaviour); set
+    /// it explicitly per session in the supervisor config, never globally.
+    #[serde(default = "default_sandbox")]
+    pub sandbox: bool,
 
     #[serde(default = "default_base_backoff")]
     pub base_backoff_secs: f64,
@@ -723,6 +734,7 @@ session_id = "id-b"
             kill_grace_secs: 5.0,
             pty_eof_grace_secs: 10.0,
             kill_wait_secs: 15.0,
+            sandbox: true,
             base_backoff_secs: 2.0,
             max_backoff_secs: 60.0,
             healthy_run_secs: 30.0,
@@ -765,6 +777,7 @@ session_id = "id-b"
             kill_grace_secs: 5.0,
             pty_eof_grace_secs: 10.0,
             kill_wait_secs: 15.0,
+            sandbox: true,
             base_backoff_secs: 2.0,
             max_backoff_secs: 60.0,
             healthy_run_secs: 30.0,
@@ -925,5 +938,21 @@ session_id = "id-b"
         assert_eq!(s.memory_file, Some(PathBuf::from("project-CLAUDE.md")));
         let err = s.validate_durations().unwrap_err();
         assert!(err.contains("memory_file"), "err: {}", err);
+    }
+}
+
+#[cfg(test)]
+mod sandbox_flag_tests {
+    use super::SessionConfig;
+
+    #[test]
+    fn sandbox_defaults_on_and_can_be_disabled_per_session() {
+        let on: SessionConfig =
+            serde_json::from_str(r#"{"name":"a","workdir":"/w","session_id":"s"}"#).unwrap();
+        assert!(on.sandbox);
+        let off: SessionConfig =
+            serde_json::from_str(r#"{"name":"a","workdir":"/w","session_id":"s","sandbox":false}"#)
+                .unwrap();
+        assert!(!off.sandbox);
     }
 }

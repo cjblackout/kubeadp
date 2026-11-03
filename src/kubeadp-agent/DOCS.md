@@ -61,6 +61,8 @@ Job status (`agent-run status <id>`) and info (`agent-run info`) JSON outputs in
 ```
 `agent-run status` and `agent-run info` print the active sandbox backend, runtime, and policy path.
 
+**Trusted orchestrator sessions.** An orchestrator session configured with `"sandbox": false` (per session, in the supervisor config; default `true`) is NOT wrapped in `sandbox-exec`: it runs with the pod's full environment, `/workspace` and the ServiceAccount token. The kata backend never grants that token to a sandboxed agent, so this is the only way for a session to use `kubectl` as the pod's ServiceAccount. In `apps/ai-server` only the `homelab` session is trusted; `nested-operator` and `kubeopencode` stay sandboxed. Worker job sandboxing is unaffected.
+
 A test-only launch seam that skips the `sandbox-exec` wrapper for fake-`agy` unit tests (so they run on a platform that cannot isolate) exists only in builds compiled with the `test-hooks` cargo feature and is absent from production builds.
 
 ### Policy Format

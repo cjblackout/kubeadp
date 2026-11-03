@@ -11,8 +11,17 @@ pub struct Pty {
     pub slave: RawFd,
 }
 
+/// Test-only: `Pty::open` holds this for reading, and the fd-leak test holds it
+/// for writing while it checks that a dropped pty's fd numbers are closed.
+/// Without it, another test thread opening a pty in that window is handed the
+/// just-freed fd number and the check mistakes it for a leak.
+#[cfg(test)]
+pub(crate) static OPEN_GUARD: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 impl Pty {
     pub fn open() -> io::Result<Self> {
+        #[cfg(test)]
+        let _open_guard = OPEN_GUARD.read().unwrap_or_else(|e| e.into_inner());
         let mut master: c_int = -1;
         let mut slave: c_int = -1;
         let ret = unsafe {
@@ -441,6 +450,9 @@ mod tests {
         assert!(s_flags >= 0 && (s_flags & libc::FD_CLOEXEC) != 0);
 
         pty.set_master_nonblocking().expect("Set non-blocking");
+        // Keep other threads from opening a pty (and reusing these fd numbers)
+        // between the drop and the checks below.
+        let _no_concurrent_open = OPEN_GUARD.write().unwrap_or_else(|e| e.into_inner());
         let master_fd = pty.master;
         let slave_fd = pty.slave;
         drop(pty);
