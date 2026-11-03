@@ -377,6 +377,7 @@ mod tests {
             max_runtime: Some(chrono::Duration::seconds(30)),
             started_at: Some(Utc::now() - chrono::Duration::seconds(120)),
             hindsight_query: None,
+            sandbox_info: None,
         };
         meta.save(state_root).unwrap();
     }

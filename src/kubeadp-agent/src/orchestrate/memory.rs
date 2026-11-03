@@ -1,6 +1,5 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Outcome of a memory-file injection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,7 +14,7 @@ pub enum InjectOutcome {
 /// `Ok(None)` when git reports it is not inside a work tree, and `Err` on any
 /// other failure (git missing, workdir unreadable, etc.).
 fn git_in_workdir(workdir: &Path, args: &[&str]) -> Result<Option<String>, String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::core::git::hardened_git();
     cmd.arg("-C").arg(workdir);
     cmd.args(args);
     cmd.stdout(std::process::Stdio::piped());
@@ -159,6 +158,7 @@ pub fn inject_memory_file(workdir: &Path, src: &Path) -> Result<InjectOutcome, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

@@ -164,12 +164,97 @@ pub fn build_command_and_args(
 }
 
 /// Builds the `std::process::Command` according to configuration and job metadata.
-pub fn build_command(config: &Config, meta: &JobMetadata, mode: &InvocationMode) -> Command {
+///
+/// Every job (and every retry attempt, which goes through the same function)
+/// is launched through `sandbox-exec` with a freshly written policy file in
+/// the job's log directory. The sandbox isolation is ALWAYS applied and the
+/// runtime is auto-detected inside the pod (`sandbox-exec` -- Contract v1.3):
+/// there is no `--runtime` flag and no user-facing runtime override. A policy
+/// file that cannot be written makes the launch fail here -- the command must
+/// never run without isolation.
+///
+/// On success the returned `Command` wraps `sandbox-exec ... -- <agy> ...`;
+/// the policy file path is also reported back in `policy_path` so callers can
+/// surface it in job status/info output.
+pub fn build_command(
+    config: &Config,
+    meta: &JobMetadata,
+    mode: &InvocationMode,
+) -> Result<(Command, std::path::PathBuf), anyhow::Error> {
     let (prog, args) = build_command_and_args(config, meta, mode);
-    let mut cmd = Command::new(prog);
-    cmd.args(args);
+
+    // Write policy file to state dir
+    let policy = crate::sandbox::SandboxPolicy::for_job(
+        &meta.job_id,
+        &meta.worktree_path,
+        None,
+        Some(&config.agy_path),
+        Some(vec![config.sandbox_home.clone()]),
+    );
+    let policy_path =
+        JobMetadata::log_dir(&config.state_root).join(format!("{}.policy.json", meta.job_id));
+    if let Err(e) = std::fs::create_dir_all(JobMetadata::log_dir(&config.state_root)) {
+        bail!(
+            "failed to create job log directory for sandbox policy '{}': {e}",
+            JobMetadata::log_dir(&config.state_root).display()
+        );
+    }
+    crate::sandbox::SandboxPolicy::write_policy_file(&policy, &policy_path)
+        .map_err(|e| anyhow::anyhow!("job '{}' cannot be launched sandboxed: {e}", meta.job_id))?;
+
+    // Test-only seam (absent from production builds): when the `test-hooks`
+    // feature is enabled, the process-global passthrough switch (default on)
+    // lets the launcher return the plain agy command so the fake-agy unit
+    // tests run on a platform that cannot isolate. Production builds always
+    // wrap. The policy file is written and reported either way (same form).
+    let passthrough = {
+        #[cfg(feature = "test-hooks")]
+        {
+            crate::sandbox::testhook::sandbox_passthrough()
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        {
+            false
+        }
+    };
+    let argv = launch_argv(&prog, &args, &policy_path, passthrough);
+    let mut cmd = Command::new(argv[0].clone());
+    cmd.args(&argv[1..]);
+
     crate::core::proxy::apply_proxy(&mut cmd, Some(config), meta.proxy.as_deref());
-    cmd
+    Ok((cmd, policy_path))
+}
+
+/// Assembles the process `argv` for a launch. Pure (no process spawn) so the
+/// always-on `sandbox-exec` wrapping can be asserted directly.
+///
+/// `passthrough == false` (production, always; or a test that opted back in):
+/// the agy command is wrapped in `kubeadp-agent sandbox-exec --policy <file>
+/// -- <agy> ...`. `passthrough == true` (only reachable under the `test-hooks`
+/// feature, default on there): the plain agy argv, so fake-agy unit tests run
+/// without a working sandbox runtime.
+fn launch_argv(
+    prog: &std::path::Path,
+    args: &[String],
+    policy_path: &std::path::Path,
+    passthrough: bool,
+) -> Vec<String> {
+    if passthrough {
+        let mut v = vec![prog.to_string_lossy().to_string()];
+        v.extend_from_slice(args);
+        v
+    } else {
+        let mut v = vec![crate::sandbox::find_launcher_exe()
+            .to_string_lossy()
+            .to_string()];
+        v.push("sandbox-exec".to_string());
+        v.push("--policy".to_string());
+        v.push(policy_path.to_string_lossy().to_string());
+        v.push("--".to_string());
+        v.push(prog.to_string_lossy().to_string());
+        v.extend_from_slice(args);
+        v
+    }
 }
 
 /// Upper bound for prompt text passed as a single argv element.
@@ -214,13 +299,40 @@ pub fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
     }
 }
 
-/// Validates that configured binary paths exist if they are absolute paths.
+/// Validates that configured binary paths exist and are executable when they
+/// are absolute paths.
+///
+/// The existence check catches a missing binary. The executability check
+/// catches one that exists but cannot be run: every job is launched through
+/// the `sandbox-exec` wrapper (see [`build_command`]), which always spawns
+/// successfully, so an unrunnable agy no longer surfaces as a `spawn()` EACCES
+/// in the monitor (it would only show up later as the wrapper's exit code
+/// 126, with the wrapper's PID already confirmed as a "successful" launch).
+/// Failing fast here keeps an unrunnable agy from ever being reported as a
+/// started job, so the caller can bail and tear down the worktree/branch it
+/// just created. `access(X_OK)` mirrors exactly what the sandbox's `execvpe`
+/// will enforce for the (same-uid) agent.
 pub fn validate_executable_paths(config: &Config) -> Result<()> {
-    if config.agy_path.is_absolute() && !config.agy_path.exists() {
-        bail!(
-            "Configured agy binary does not exist at '{}'",
-            config.agy_path.display()
-        );
+    if config.agy_path.is_absolute() {
+        if !config.agy_path.exists() {
+            bail!(
+                "Configured agy binary does not exist at '{}'",
+                config.agy_path.display()
+            );
+        }
+        let Ok(c_path) = std::ffi::CString::new(config.agy_path.as_os_str().as_encoded_bytes())
+        else {
+            bail!(
+                "Configured agy binary path '{}' contains an interior NUL byte",
+                config.agy_path.display()
+            );
+        };
+        if unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } != 0 {
+            bail!(
+                "Configured agy binary is not executable at '{}'",
+                config.agy_path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -608,7 +720,25 @@ pub fn run_internal_runner(
         }
     };
 
-    let cmd = build_command(config, &meta, &mode);
+    let (cmd, policy_path) = build_command(config, &meta, &mode).with_context(|| {
+        format!(
+            "Failed to build sandboxed command for job '{}'",
+            meta.job_id
+        )
+    })?;
+
+    // Every launch (and every retry, which runs through this same path) fills
+    // the row's `sandbox` object with the backend the pod will auto-select,
+    // the runtime label and the policy file actually given to `sandbox-exec`.
+    // Status/info then print it without re-reading the policy file.
+    let sandbox = crate::sandbox::SandboxInfo::detected(&policy_path);
+    if let Err(e) = crate::core::job::set_job_sandbox(&config.state_root, &meta.job_id, &sandbox) {
+        eprintln!(
+            "agent-run: job '{}': failed to record sandbox info: {}",
+            meta.job_id, e
+        );
+    }
+    meta.sandbox_info = Some(sandbox);
 
     let log_path = JobMetadata::log_path(&config.state_root, &meta.job_id);
     let log_file = OpenOptions::new()
@@ -1083,6 +1213,7 @@ mod tests {
             max_runtime: None,
             started_at: None,
             hindsight_query: None,
+            sandbox_info: None,
         }
     }
 
@@ -1551,7 +1682,12 @@ mod tests {
         fs::create_dir_all(&state_root).unwrap();
         fs::create_dir_all(&workspace_root).unwrap();
 
-        // agy path exists but is not executable -> spawn fails in the monitor.
+        // agy path exists but is not executable -> the launcher refuses it.
+        // Every job now goes through the `sandbox-exec` wrapper, which always
+        // spawns successfully, so an unrunnable agy would otherwise surface
+        // only as the wrapper's exit code (126) with the wrapper's PID already
+        // confirmed as a "successful" launch. The launcher therefore rejects
+        // the binary up front, before any job row, worktree or process exists.
         let agy = tmp.path().join("fake-agy");
         fs::write(&agy, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&agy, fs::Permissions::from_mode(0o644)).unwrap();
@@ -1577,15 +1713,20 @@ mod tests {
             Duration::from_millis(25),
         )
         .expect_err("unspawnable agy must make the launch bail");
-        assert!(err.to_string().contains("did not confirm a PID"));
-
-        // The monitor must have recorded the spawn failure in the job log so
-        // status classification lands on Failed instead of silent SelfTerminated.
-        let log_path = JobMetadata::log_path(&state_root, &job_id);
-        let log = fs::read_to_string(&log_path).unwrap_or_default();
         assert!(
-            log.contains("Failed to spawn agy"),
-            "job log should carry the spawn-failure diagnostic: {log}"
+            err.to_string().contains("not executable"),
+            "the unrunnable agy must be refused by the launcher: {err}"
+        );
+
+        // The bail is pre-launch: no job row, no confirmed PID and no process
+        // may have been left behind.
+        assert!(
+            JobMetadata::load(&state_root, &job_id).is_err(),
+            "no job record may be written when the agy binary is not executable"
+        );
+        assert!(
+            meta.pid.is_none(),
+            "no PID may be confirmed for an unrunnable agy"
         );
     }
 
@@ -2007,18 +2148,28 @@ mod tests {
             .trim()
             .parse()
             .expect("fake agy PID file must contain a number");
-
-        // The monitor's post-spawn CAS failed (launcher set CANCELLED).
-        // Monitor must have killed agy's process group with SIGKILL and reaped the child.
         assert!(
-            wait_until(std::time::Instant::now() + Duration::from_secs(5), || {
-                !crate::core::job::is_pid_alive(agy_pid)
-            }),
-            "the cancelled agy process must be killed"
+            agy_pid > 1,
+            "fake agy must have recorded a real PID, got {agy_pid}"
         );
-        assert_eq!(
-            count_processes_with_cmdline(&agy.to_string_lossy()),
-            0,
+
+        // The monitor's post-spawn CAS failed (launcher set CANCELLED), so it
+        // must have killed the wrapper's process group with SIGKILL and reaped
+        // the child. The kill lands on the group the `sandbox-exec` wrapper led
+        // (it is a setsid session/process-group leader), so the whole tree --
+        // wrapper, its init-shim and the agy it forked/exec'd -- goes down
+        // together. We therefore assert the invariant directly: NO process
+        // still carrying the agy path in its cmdline remains. The monitor
+        // parks in the post-spawn hook above before it reaches the kill, so
+        // the teardown is not instantaneous; poll for it instead of assuming
+        // it already happened. (The recorded `agy_pid` is the agy's
+        // inner-PID-namespace PID, which has no `/proc/<pid>` entry in the
+        // outer namespace, so a raw `is_pid_alive(agy_pid)` check is a no-op
+        // under the wrapper and cannot serve as the "already killed" barrier.)
+        assert!(
+            wait_until(std::time::Instant::now() + Duration::from_secs(10), || {
+                count_processes_with_cmdline(&agy.to_string_lossy()) == 0
+            }),
             "no agy process may remain after the post-spawn cancellation"
         );
 
@@ -2289,5 +2440,162 @@ mod tests {
         );
 
         clear_test_hooks(&job_id);
+    }
+
+    /// Pure-function check of the always-on `sandbox-exec` wrapping (no
+    /// process spawn): with passthrough OFF, `build_command`'s argv must be
+    /// exactly `[<kubeadp-agent exe>, sandbox-exec, --policy, <file>, --,
+    /// <agy>, <agy args...>]`. This covers the wrapping invariant in every
+    /// feature set, including production builds where isolation is always on.
+    #[test]
+    fn test_launch_argv_passthrough_off_is_sandboxed_wrapping() {
+        let prog = PathBuf::from("/usr/local/bin/agy");
+        let args = vec![
+            "--dangerously-skip-permissions".to_string(),
+            "--mode".to_string(),
+            "accept-edits".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "-p".to_string(),
+            "hello".to_string(),
+            "--add-dir".to_string(),
+            "/workspace/homelab/.agent-jobs/test1234".to_string(),
+        ];
+        let policy_path = PathBuf::from("/tmp/state/jobs/test1234.policy.json");
+
+        let argv = launch_argv(&prog, &args, &policy_path, false);
+
+        let launcher = crate::sandbox::find_launcher_exe();
+        assert_eq!(argv[0], launcher.to_string_lossy().to_string());
+        assert_eq!(argv[1], "sandbox-exec");
+        assert_eq!(argv[2], "--policy");
+        assert_eq!(argv[3], policy_path.to_string_lossy().to_string());
+        assert_eq!(argv[4], "--");
+        assert_eq!(argv[5], prog.to_string_lossy().to_string());
+        assert_eq!(&argv[6..], &args);
+        assert_eq!(argv.len(), 6 + args.len());
+    }
+
+    /// End-to-end: a fake `agy` runs to completion through the REAL launcher.
+    /// `build_command` (the production launch path) is exercised with the
+    /// test-hooks seam OFF, so it returns the real
+    /// `kubeadp-agent sandbox-exec --policy <file> -- <agy> ...` command, which
+    /// is spawned and waited on here -- exercising the actual sandbox backend.
+    ///
+    /// It probes first with the exact `sandbox-probe` library code
+    /// `sandbox-exec` uses to pick a backend; when this platform cannot isolate
+    /// (a plain Docker build container: no user namespaces / Landlock) it
+    /// reports a clear skip and returns, so it runs on gVisor/Kata pods and is
+    /// skipped in Docker CI. The seam default stays ON, so the other
+    /// fake-agy launcher tests are never affected.
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_fake_agy_runs_through_real_sandbox_wrapper() {
+        // Probe with the same code `sandbox-exec` uses to decide a backend; if
+        // no mechanism is available here, isolation cannot run and the test is
+        // meaningless (and the wrapper would fail closed with exit 125).
+        let runtime = crate::sandbox::detect_runtime();
+        let probe = crate::sandbox::probe_environment(None);
+        if let Err(reason) = crate::sandbox::cli::validate_backend_probe(runtime, &probe) {
+            eprintln!(
+                "skipped: sandbox isolation unavailable on this platform ({reason}); \
+                 the test-hooks passthrough seam keeps the launcher unit tests runnable here"
+            );
+            return;
+        }
+
+        let tmp = tempdir().unwrap();
+        let state_root = tmp.path().join("state");
+        let workspace_root = tmp.path().join("ws");
+        fs::create_dir_all(&state_root).unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        let wt = tmp.path().join("wt");
+        fs::create_dir_all(&wt).unwrap();
+
+        // Fake agy records its argv in the (sandbox-writable) worktree and
+        // emits a structured SUCCESS line on stdout.
+        let agy = tmp.path().join("fake-agy");
+        fs::write(
+            &agy,
+            format!(
+                "#!/bin/sh\n{{ printf '%s\\n' \"$@\" > {argv}; echo '{{\"status\":\"SUCCESS\",\"response\":\"real-sbx-ok\",\"conversation_id\":\"conv-real-sbx\"}}'\n}}\n",
+                argv = wt.join("argv.txt").display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&agy, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = Config {
+            workspace_root,
+            state_root,
+            agy_path: agy,
+            // Point the policy's writable shared path (the agent's home) at a
+            // temp dir the sandbox backend can actually create; the production
+            // default `/home/agent` is not creatable on this (or a CI) host.
+            sandbox_home: tmp.path().join("sbx-home"),
+            ..Default::default()
+        };
+
+        let mut meta = test_meta_overrides();
+        meta.job_id = format!("sbxe2e{}", std::process::id());
+        meta.worktree_path = wt.clone();
+        let mode = InvocationMode::Start {
+            resolved_prompt: "e2e sandbox probe".to_string(),
+        };
+
+        // Build the REAL wrapped command via the production `build_command`,
+        // with the seam turned off just for this call. The flag is restored to
+        // its default (on) immediately after, so the window during which any
+        // other launcher test could observe the wrapped form is only this
+        // synchronous build (and on an isolating platform such a concurrent
+        // wrap is a working sandbox, not a failure).
+        let (mut cmd, policy_path) = {
+            crate::sandbox::testhook::set_sandbox_passthrough(false);
+            let built = build_command(&config, &meta, &mode);
+            crate::sandbox::testhook::set_sandbox_passthrough(true);
+            built.expect("build_command must succeed with the seam off")
+        };
+        // Sanity: the production wrapper form is what we are about to run.
+        let argv = launch_argv(
+            &config.agy_path,
+            &build_command_and_args(&config, &meta, &mode).1,
+            &policy_path,
+            false,
+        );
+        assert_eq!(argv[1], "sandbox-exec");
+        assert_eq!(argv[3], policy_path.to_string_lossy().to_string());
+
+        // Run the wrapper (the real `kubeadp-agent sandbox-exec ... -- agy`),
+        // with the child's cwd at the worktree, capturing agy's stdout.
+        let out_path = tmp.path().join("sbx-out.txt");
+        let err_path = tmp.path().join("sbx-err.txt");
+        let out_file = fs::File::create(&out_path).unwrap();
+        let err_file = fs::File::create(&err_path).unwrap();
+        let status = cmd
+            .current_dir(&wt)
+            .stdout(out_file)
+            .stderr(err_file)
+            .spawn()
+            .expect("the sandbox wrapper must spawn")
+            .wait()
+            .expect("waiting on the sandbox wrapper must succeed");
+        assert!(
+            status.success(),
+            "the sandboxed fake agy must exit 0; wrapper exit: {status}; stderr: {}",
+            fs::read_to_string(&err_path).unwrap_or_default()
+        );
+
+        // The fake agy really ran inside the sandbox: its structured line is on
+        // stdout and its argv was recorded in the sandbox-writable worktree.
+        let out = fs::read_to_string(&out_path).unwrap();
+        assert!(
+            out.contains("conv-real-sbx") && out.contains("real-sbx-ok"),
+            "the sandboxed agy's final line must reach stdout: {out}"
+        );
+        let argv_text = fs::read_to_string(wt.join("argv.txt")).unwrap();
+        assert!(
+            argv_text.contains("--output-format"),
+            "the sandboxed agy must have executed its body: {argv_text}"
+        );
     }
 }

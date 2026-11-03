@@ -176,9 +176,12 @@ impl SessionMessageSink {
 }
 
 impl crate::core::a2a::MessageSink for SessionMessageSink {
-    fn deliver(&self, task_id: &str, text: &str) -> Result<(), a2a::A2AError> {
+    fn deliver(&self, task_id: &str, sender: &str, text: &str) -> Result<(), a2a::A2AError> {
         use a2a::A2AError;
-        match sessions_api::deliver_message(&self.state, task_id, text) {
+        // Runs on the tokio blocking pool (the handler wraps the call in
+        // spawn_blocking), so the deadline-bounded PTY write never occupies a
+        // worker thread. Shares the same state/rate limiter as the REST path.
+        match sessions_api::deliver_message(&self.state, task_id, sender, text) {
             sessions_api::DeliverOutcome::Accepted { .. } => Ok(()),
             sessions_api::DeliverOutcome::NotFound => Err(A2AError::task_not_found(task_id)),
             sessions_api::DeliverOutcome::Empty => {
@@ -198,9 +201,15 @@ impl crate::core::a2a::MessageSink for SessionMessageSink {
 }
 
 /// Builds the A2A router for agent-orchestrate.
+///
+/// `api_state` is the SAME [`sessions_api::SessionsApiState`] the REST
+/// `/api/v1/sessions` router uses: the A2A `SendMessage` sink and the REST
+/// `POST .../message` handler therefore share ONE rate limiter (the claimed
+/// "shared budget" is real), rather than the A2A router building a second one.
 pub fn a2a_router(
     state: Arc<std::sync::Mutex<SupervisorState>>,
     controls: SessionControlRegistry,
+    api_state: Arc<sessions_api::SessionsApiState>,
     auth: Option<AuthVerifier>,
 ) -> Router {
     let session_names = {
@@ -218,14 +227,7 @@ pub fn a2a_router(
         json_rpc_url: "/rpc".to_string(),
     };
 
-    let sink = Arc::new(SessionMessageSink::new(
-        sessions_api::SessionsApiState::new(
-            state.clone(),
-            controls.clone(),
-            Arc::new(crate::orchestrate::session_log::SessionLogs::from_env()),
-        ),
-    ));
-
+    let sink = Arc::new(SessionMessageSink::new(api_state));
     let backend = Arc::new(SupervisorTaskBackend::new(state, controls));
     crate::core::a2a::a2a_router(model, backend, Some(sink), auth)
 }
@@ -395,9 +397,15 @@ mod tests {
         use tower::ServiceExt;
 
         let (backend, _, _) = make_test_backend();
+        let api_state = sessions_api::SessionsApiState::new(
+            backend.supervisor_state.clone(),
+            backend.controls.clone(),
+            Arc::new(crate::orchestrate::session_log::SessionLogs::from_env()),
+        );
         let app = a2a_router(
             backend.supervisor_state.clone(),
             backend.controls.clone(),
+            api_state,
             None,
         );
 
@@ -481,9 +489,15 @@ mod tests {
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v == "Bearer test-secret")
         });
+        let api_state = sessions_api::SessionsApiState::new(
+            backend.supervisor_state.clone(),
+            backend.controls.clone(),
+            Arc::new(crate::orchestrate::session_log::SessionLogs::from_env()),
+        );
         let app = a2a_router(
             backend.supervisor_state.clone(),
             backend.controls.clone(),
+            api_state,
             Some(auth_verifier),
         );
 
@@ -514,5 +528,86 @@ mod tests {
             .unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_a2a_router_shares_rest_rate_limiter() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let (_, st, controls) = make_test_backend();
+        // The SAME SessionsApiState the REST /api/v1/sessions router would
+        // use: the A2A router must build no second rate limiter of its own.
+        let logs = Arc::new(crate::orchestrate::session_log::SessionLogs::from_env());
+        let api_state = sessions_api::SessionsApiState::new(st.clone(), controls.clone(), logs);
+
+        // Give sess-1 a live PTY so delivery actually succeeds (not NotRunning).
+        let pty = crate::orchestrate::pty::Pty::open().expect("pty");
+        controls
+            .get("sess-1")
+            .unwrap()
+            .pty_input
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(pty.master);
+
+        let app = a2a_router(st.clone(), controls.clone(), api_state.clone(), None);
+
+        let send = |id: u32| -> String {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"SendMessage","params":{{"message":{{"messageId":"m{id}","taskId":"sess-1","role":"ROLE_USER","parts":[{{"text":"hello"}}],"metadata":{{"a2a.sender":"noisy","a2a.hop":1}}}}}}}}"#
+            )
+        };
+        let rpc = |app: Router, body: String| async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/rpc")
+                .header("a2a-version", "1.0")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        // First message from "noisy" is accepted...
+        let resp = rpc(app.clone(), send(1)).await;
+        assert!(
+            resp.get("result").is_some(),
+            "first A2A message should be accepted: {resp}"
+        );
+        // ...and it charged the SHARED limiter (the api_state the REST router
+        // also uses) under the claimed sender -- not a second A2A-only one.
+        {
+            let lim = api_state.message_limits.lock().unwrap();
+            assert_eq!(
+                lim.uses("sess-1", "noisy"),
+                1,
+                "A2A send must land in the shared per-(session, sender) budget"
+            );
+        }
+
+        // Exhaust the shared (sess-1, "noisy") budget: the very same limiter
+        // the REST handler uses must now reject the A2A path.
+        {
+            let mut lim = api_state.message_limits.lock().unwrap();
+            let now = std::time::Instant::now();
+            while lim.uses("sess-1", "noisy") < sessions_api::MESSAGE_RATE_MAX {
+                lim.record("sess-1", "noisy", now);
+            }
+        }
+        let resp2 = rpc(app.clone(), send(2)).await;
+        assert!(
+            resp2.get("error").is_some(),
+            "budget-exhausted A2A send must error: {resp2}"
+        );
+        assert!(
+            resp2.to_string().contains("budget exhausted"),
+            "error body: {resp2}"
+        );
     }
 }

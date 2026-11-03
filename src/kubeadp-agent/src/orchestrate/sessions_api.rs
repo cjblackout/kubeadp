@@ -351,22 +351,28 @@ async fn get_session_log(
 // Message injection
 // ---------------------------------------------------------------------------
 
-/// Maximum message size in bytes (after UTF-8 validation and trimming).
-const MESSAGE_MAX_BYTES: usize = 8192;
+/// Maximum message size in bytes (after UTF-8 validation and trimming). This is
+/// the single PTY-delivery cap; the A2A ingress size limit is derived from it
+/// (see [`crate::core::a2a::ingress::MAX_INGRESS_TEXT_BYTES`]).
+pub const MESSAGE_MAX_BYTES: usize = 8192;
 /// Bracketed paste open: the child treats everything until `CSI 201~` as
 /// pasted input, so embedded newlines never submit early.
 const PASTE_START: &[u8] = b"\x1b[200~";
 /// Bracketed paste close.
 const PASTE_END: &[u8] = b"\x1b[201~";
-/// Messages allowed per session per minute.
-const MESSAGE_RATE_MAX: usize = 30;
+/// Messages allowed per (session, sender) per minute.
+pub const MESSAGE_RATE_MAX: usize = 30;
 const MESSAGE_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Sliding-window rate limiter: at most `MESSAGE_RATE_MAX` injected messages
-/// per session within `MESSAGE_RATE_WINDOW`, with `Retry-After` on the burst.
+/// per (session, sender) within `MESSAGE_RATE_WINDOW`, with `Retry-After` on
+/// the burst. The budget is keyed by the *sender* so one noisy sender cannot
+/// exhaust a session's budget and starve the legitimate peers of the same
+/// session (the REST path uses the "rest" sender, the A2A path uses the
+/// claimed `a2a.sender`).
 #[derive(Default)]
 pub struct MessageRateLimiter {
-    per_session: HashMap<String, Vec<Instant>>,
+    per_sender: HashMap<String, Vec<Instant>>,
 }
 
 impl MessageRateLimiter {
@@ -374,11 +380,13 @@ impl MessageRateLimiter {
         Self::default()
     }
 
-    /// Records one accepted message and returns `Some(retry_after_secs)` when
-    /// the session exceeds the window budget, in which case nothing is added.
-    pub fn record(&mut self, session: &str, now: Instant) -> Option<u64> {
+    /// Records one accepted message from `sender` into `session` and returns
+    /// `Some(retry_after_secs)` when that (session, sender) pair exceeds the
+    /// window budget, in which case nothing is added.
+    pub fn record(&mut self, session: &str, sender: &str, now: Instant) -> Option<u64> {
         self.cleanup(now);
-        let window = self.per_session.entry(session.to_string()).or_default();
+        let key = format!("{session}\x1f{sender}");
+        let window = self.per_sender.entry(key).or_default();
         if window.len() >= MESSAGE_RATE_MAX {
             let oldest = window[0];
             let elapsed = now.duration_since(oldest);
@@ -393,12 +401,25 @@ impl MessageRateLimiter {
     }
 
     fn cleanup(&mut self, now: Instant) {
-        self.per_session.retain(|_, ts| {
+        self.per_sender.retain(|_, ts| {
             ts.retain(|&t| now.duration_since(t) < MESSAGE_RATE_WINDOW);
             !ts.is_empty()
         });
     }
+
+    /// How many accepted messages the (session, sender) pair currently has in
+    /// its sliding window (test/introspection hook).
+    pub fn uses(&self, session: &str, sender: &str) -> usize {
+        self.per_sender
+            .get(&format!("{session}\x1f{sender}"))
+            .map(|ts| ts.len())
+            .unwrap_or(0)
+    }
 }
+
+/// The synthetic sender identity for messages injected over the REST API
+/// (which has no A2A claimed sender). Distinct from any A2A `a2a.sender`.
+pub const REST_SENDER: &str = "\x00rest";
 
 /// `POST /api/v1/sessions/{name}/message` body.
 #[derive(Deserialize)]
@@ -475,7 +496,17 @@ async fn inject_message(
     crate::core::server::reject::ApiJson(req): crate::core::server::reject::ApiJson<MessageRequest>,
 ) -> Response {
     let MessageRequest { text } = req;
-    match deliver_message(&state, &name, &text) {
+    // deliver_message does a (deadline-bounded) blocking PTY write and takes
+    // the pty_input mutex; run it off the tokio worker threads so a stuck
+    // child cannot hold a worker thread (and the mutex) and starve /healthz.
+    let state = Arc::clone(&state);
+    let closure_name = name.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        deliver_message(&state, &closure_name, REST_SENDER, &text)
+    })
+    .await
+    .expect("spawn_blocking task panicked or runtime shut down");
+    match outcome {
         DeliverOutcome::Accepted { bytes } => (
             StatusCode::ACCEPTED,
             Json(json!({ "session": name, "accepted": true, "bytes": bytes })),
@@ -532,9 +563,17 @@ pub enum DeliverOutcome {
 
 /// Shared message-delivery core behind both `POST /api/v1/sessions/{name}/message`
 /// and the A2A `SendMessage` sink: validates the session and text, sanitizes
-/// the payload, respects the shared per-session rate budget and writes a
-/// bracketed-paste payload (never a raw command line) into the session PTY.
-pub fn deliver_message(state: &SessionsApiState, name: &str, text: &str) -> DeliverOutcome {
+/// the payload, respects the shared per-(session, sender) rate budget and
+/// writes a bracketed-paste payload (never a raw command line) into the
+/// session PTY. `sender` identifies who is injecting (the REST caller for the
+/// REST path, the claimed `a2a.sender` for the A2A path) so one noisy sender
+/// cannot exhaust the session's budget.
+pub fn deliver_message(
+    state: &SessionsApiState,
+    name: &str,
+    sender: &str,
+    text: &str,
+) -> DeliverOutcome {
     // 404/not_found for an unknown session.
     let Some(control) = state.controls.get(name) else {
         return DeliverOutcome::NotFound;
@@ -561,16 +600,20 @@ pub fn deliver_message(state: &SessionsApiState, name: &str, text: &str) -> Deli
                 .message_limits
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(retry_after) = limits.record(name, Instant::now()) {
+            if let Some(retry_after) = limits.record(name, sender, Instant::now()) {
                 return DeliverOutcome::RateLimited {
                     retry_after_secs: retry_after,
                 };
             }
+            // The PTY write is bounded by a deadline (see PtyInput::write_all):
+            // a stuck child that never drains its input queue turns into a
+            // timeout instead of wedging the tokio worker / session thread.
+            let deadline = Instant::now() + crate::orchestrate::pty::PTY_WRITE_TOTAL_DEADLINE;
             let written = slot
-                .write_all(PASTE_START)
-                .and_then(|_| slot.write_all(&payload))
-                .and_then(|_| slot.write_all(PASTE_END))
-                .and_then(|_| slot.write_all(b"\r"));
+                .write_all(PASTE_START, deadline)
+                .and_then(|_| slot.write_all(&payload, deadline))
+                .and_then(|_| slot.write_all(PASTE_END, deadline))
+                .and_then(|_| slot.write_all(b"\r", deadline));
             written.is_ok()
         }
     };
@@ -1168,12 +1211,29 @@ mod tests {
         let mut lim = MessageRateLimiter::new();
         let now = Instant::now();
         for _ in 0..MESSAGE_RATE_MAX {
-            assert!(lim.record("s", now).is_none());
+            assert!(lim.record("s", REST_SENDER, now).is_none());
         }
-        let retry = lim.record("s", now);
+        let retry = lim.record("s", REST_SENDER, now);
         assert!(retry.is_some());
         // Other sessions are unaffected.
-        assert!(lim.record("other", now).is_none());
+        assert!(lim.record("other", REST_SENDER, now).is_none());
+    }
+
+    #[test]
+    fn test_message_rate_limiter_per_sender_budget() {
+        // One sender exhausting a session's budget must NOT starve another
+        // sender of the same session: the budget is per (session, sender).
+        let mut lim = MessageRateLimiter::new();
+        let now = Instant::now();
+        for _ in 0..MESSAGE_RATE_MAX {
+            assert!(lim.record("s", "noisy", now).is_none());
+        }
+        // "noisy" is now at its limit...
+        assert!(lim.record("s", "noisy", now).is_some());
+        // ...but a legitimate peer of the same session still has a full budget.
+        assert!(lim.record("s", "peer", now).is_none());
+        // And "rest" (the REST caller) has its own budget too.
+        assert!(lim.record("s", REST_SENDER, now).is_none());
     }
 
     #[test]
@@ -1181,11 +1241,11 @@ mod tests {
         let mut lim = MessageRateLimiter::new();
         let now = Instant::now();
         for _ in 0..MESSAGE_RATE_MAX {
-            lim.record("s", now);
+            lim.record("s", REST_SENDER, now);
         }
         // Once the oldest request falls out of the window the budget is free.
         let later = now + MESSAGE_RATE_WINDOW + Duration::from_secs(1);
-        assert!(lim.record("s", later).is_none());
+        assert!(lim.record("s", REST_SENDER, later).is_none());
     }
 
     #[tokio::test]
@@ -1383,12 +1443,12 @@ mod tests {
         let st = seeded_registry_state();
         let pty = crate::orchestrate::pty::Pty::open().expect("pty");
         seed_pty_input(&st.controls.get("sess-a").unwrap(), &pty);
-        // Pre-fill the limiter to the ceiling for this session.
+        // Pre-fill the limiter to the ceiling for this session's REST sender.
         {
             let mut lim = st.message_limits.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
             for _ in 0..MESSAGE_RATE_MAX {
-                lim.record("sess-a", now);
+                lim.record("sess-a", REST_SENDER, now);
             }
         }
         let app = router(st.clone());

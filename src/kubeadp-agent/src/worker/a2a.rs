@@ -71,8 +71,23 @@ impl JobTaskBackend {
             error = Some(format!("Job ended with status: {status}"));
         }
 
-        // 2. Git diff artifact if worktree exists and cheap to compute
-        if meta.worktree_path.exists() {
+        // 2. Git diff artifact if worktree exists and cheap to compute.
+        // Refuse to compute a diff from a worktree agent-run owns whose .git
+        // pointer does not resolve inside the project's repos root / workspace
+        // checkout (a tampered/stale pointer could redirect the diff into an
+        // attacker-controlled repo); on refusal the task is returned without
+        // the diff artifact rather than failing. External (--from-worktree)
+        // worktrees are user-supplied and are not validated against our roots.
+        let pointer_ok = if meta.external_worktree {
+            true
+        } else {
+            crate::core::git::worktree_gitdir_in_expected_roots(
+                &meta.worktree_path,
+                &crate::core::git::expected_worktree_roots(&self.config, &meta.project),
+            )
+            .is_ok()
+        };
+        if meta.worktree_path.exists() && pointer_ok {
             if let Ok((diff_text, _)) = commands::diff::job_diff_text(meta) {
                 if !diff_text.is_empty() {
                     artifacts_vec.push(Artifact {
@@ -215,6 +230,7 @@ mod tests {
             max_runtime: None,
             started_at: None,
             hindsight_query: None,
+            sandbox_info: None,
         };
         meta.save(&config.state_root).unwrap();
 

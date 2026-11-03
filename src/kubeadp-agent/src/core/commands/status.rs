@@ -98,6 +98,12 @@ pub fn run(config: &Config, args: &JobIdArg) -> Result<CommandOutput> {
     if let Some(query) = &meta.hindsight_query {
         output.push_out(format!("Hindsight query:  {}", query));
     }
+    if let Some(sbx) = &meta.sandbox_info {
+        output.push_out(format!(
+            "Sandbox:      backend {} runtime {} policy {}",
+            sbx.backend, sbx.runtime, sbx.policy_path
+        ));
+    }
     output.push_out(format!("Prompt:       {}", meta.prompt));
 
     Ok(output)
@@ -263,6 +269,7 @@ mod tests {
             max_runtime: None,
             started_at: None,
             hindsight_query: None,
+            sandbox_info: None,
         };
         meta.save(state_root).unwrap();
     }
@@ -450,6 +457,65 @@ mod tests {
                 .any(|l| l.starts_with("Hindsight query")),
             "no Hindsight query line for a job without one: {:?}",
             out.stdout_lines
+        );
+    }
+
+    #[test]
+    fn test_status_sandbox_line_and_json_object() {
+        let temp = tempdir().unwrap();
+        let config = Config {
+            state_root: temp.path().join("state"),
+            ..Default::default()
+        };
+
+        // Without persisted sandbox info: no Sandbox line and no job.sandbox_info JSON key.
+        save_job(&config.state_root, "sbx00");
+        let out = run(
+            &config,
+            &JobIdArg {
+                job_id: "sbx00".to_string(),
+            },
+        )
+        .expect("status should succeed");
+        assert!(
+            !out.stdout_lines.iter().any(|l| l.starts_with("Sandbox:")),
+            "no Sandbox line without sandbox info: {:?}",
+            out.stdout_lines
+        );
+        assert!(out.data["job"].get("sandbox_info").is_none());
+
+        // With persisted sandbox info (a launched job): the line + the JSON object.
+        save_job(&config.state_root, "sbx01");
+        let mut meta = JobMetadata::load(&config.state_root, "sbx01").unwrap();
+        meta.sandbox_info = Some(crate::sandbox::SandboxInfo {
+            backend: "gvisor".to_string(),
+            runtime: "gvisor".to_string(),
+            policy_path: "/state/sbx01.policy.json".to_string(),
+        });
+        meta.save(&config.state_root).unwrap();
+        let out = run(
+            &config,
+            &JobIdArg {
+                job_id: "sbx01".to_string(),
+            },
+        )
+        .expect("status should succeed");
+        let sandbox_line = out
+            .stdout_lines
+            .iter()
+            .find(|l| l.starts_with("Sandbox:"))
+            .expect("Sandbox line present");
+        assert!(
+            sandbox_line.contains("backend gvisor runtime gvisor policy /state/sbx01.policy.json"),
+            "Sandbox line content: {sandbox_line}"
+        );
+        assert_eq!(
+            out.data["job"]["sandbox_info"],
+            json!({
+                "backend": "gvisor",
+                "runtime": "gvisor",
+                "policy_path": "/state/sbx01.policy.json",
+            })
         );
     }
 }

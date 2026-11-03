@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -158,7 +157,7 @@ pub fn check_discardable(worktree: &Path, path: &str) -> Result<PathBuf> {
             )
         })?;
     let tracked_out = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = crate::core::git::hardened_git();
         c.args([
             "-C",
             &worktree.to_string_lossy(),
@@ -305,6 +304,7 @@ pub fn run(config: &Config, args: &DiscardArgs) -> Result<CommandOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::tempdir;
 
     fn git(dir: &Path, args: &[&str]) -> String {
@@ -372,6 +372,7 @@ mod tests {
             max_runtime: None,
             started_at: None,
             hindsight_query: None,
+            sandbox_info: None,
         };
         meta.save(&state_dir).unwrap();
         (state_dir, wt)

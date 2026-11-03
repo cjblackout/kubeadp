@@ -55,7 +55,7 @@ pub fn build_router(
     let base = router_with_rc(Arc::new(core_config), auth, rc_state);
 
     let api_state = SessionsApiState::new(state.clone(), controls.clone(), session_logs);
-    let sessions = sessions_router(api_state);
+    let sessions = sessions_router(api_state.clone());
 
     let auth_token = bearer_token_from_env();
     let auth_state = match &auth_token {
@@ -79,7 +79,11 @@ pub fn build_router(
     });
 
     #[cfg(feature = "a2a")]
-    let a2a_routes = crate::orchestrate::a2a::a2a_router(state.clone(), controls.clone(), a2a_auth);
+    // The A2A router shares the SAME SessionsApiState (and thus the same
+    // message rate limiter) as the REST /api/v1/sessions router above, so the
+    // REST and A2A message paths compete for one budget per (session, sender).
+    let a2a_routes =
+        crate::orchestrate::a2a::a2a_router(state.clone(), controls.clone(), api_state, a2a_auth);
 
     let ready = {
         let state = Arc::clone(&state);

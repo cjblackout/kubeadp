@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -40,7 +40,7 @@ const SHALLOW_NOTE: &str =
 /// failure, timeout, or non-zero exit -- the caller reports `unknown` for
 /// the affected field and never fails the whole command.
 fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
-    let mut child = Command::new("git")
+    let mut child = crate::core::git::hardened_git()
         .current_dir(dir)
         .args(args)
         .stdout(Stdio::piped())
@@ -280,6 +280,7 @@ mod tests {
     use super::*;
     use crate::core::job::{ensure_state_store, JobMetadata};
     use std::path::PathBuf;
+    use std::process::Command;
 
     /// Initializes an empty git repo with one initial commit (same
     /// convention as `init_fixture_repo` in start.rs).
@@ -334,6 +335,7 @@ mod tests {
             max_runtime: None,
             started_at: None,
             hindsight_query: None,
+            sandbox_info: None,
         };
         meta.save(state_root).unwrap();
     }

@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use serde_json::json;
-use std::process::Command;
 
 use crate::core::args::CommitArgs;
 use crate::core::config::Config;
@@ -70,9 +69,21 @@ pub fn run(config: &Config, args: &CommitArgs) -> Result<CommandOutput> {
     // any git operation (silent no-op when healthy).
     crate::core::repos::auto_repair_worktree(config, &meta);
 
+    // Never run git in a worktree agent-run owns whose .git pointer does not
+    // resolve inside the project's repos root / workspace checkout (a
+    // tampered/stale pointer could redirect the commit into an
+    // attacker-controlled repo). External (--from-worktree) worktrees are
+    // user-supplied and are not validated against our roots.
+    if !meta.external_worktree {
+        crate::core::git::worktree_gitdir_in_expected_roots(
+            &meta.worktree_path,
+            &crate::core::git::expected_worktree_roots(config, &meta.project),
+        )?;
+    }
+
     // Fast path: nothing to commit.
     let status_out = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = crate::core::git::hardened_git();
         c.args([
             "-C",
             &meta.worktree_path.to_string_lossy(),
@@ -172,6 +183,7 @@ pub fn run(config: &Config, args: &CommitArgs) -> Result<CommandOutput> {
 mod tests {
     use super::*;
     use crate::core::job::JobStatus;
+    use std::process::Command;
     use tempfile::tempdir;
 
     fn git(repo_dir: &std::path::Path, args: &[&str]) -> String {
@@ -247,6 +259,7 @@ mod tests {
             max_runtime: None,
             started_at: None,
             hindsight_query: None,
+            sandbox_info: None,
         };
         meta.save(&state_dir).unwrap();
 
@@ -314,6 +327,7 @@ mod tests {
             max_runtime: None,
             started_at: None,
             hindsight_query: None,
+            sandbox_info: None,
         };
         meta.save(state_dir).unwrap();
         meta.job_id

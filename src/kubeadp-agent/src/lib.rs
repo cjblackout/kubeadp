@@ -30,5 +30,6 @@ pub mod core;
 pub mod mcp_a2a;
 #[cfg(feature = "server")]
 pub mod orchestrate;
+pub mod sandbox;
 #[cfg(feature = "server")]
 pub mod worker;

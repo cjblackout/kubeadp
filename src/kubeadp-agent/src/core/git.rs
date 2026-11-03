@@ -4,6 +4,257 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Applies the hardened git configuration to `cmd`: the per-invocation `-c`
+/// overrides that neutralise the code-execution vectors an agent can plant in
+/// a repository's own config or hooks, plus an environment that strips the
+/// ambient `GIT_*` variables a caller might carry. Every production git
+/// invocation in the worker goes through this (or [`hardened_git`] /
+/// [`diff_hardened`]) so the hardening cannot be forgotten at a call site.
+///
+/// The overrides:
+/// - `core.fsmonitor=false` -- a repo (or the user/system config) could set
+///   `core.fsmonitor` to a shell script that git runs to refresh the index;
+///   disabling it stops that vector.
+/// - `core.hooksPath=/dev/null` -- the repo's `.git/hooks` (or a configured
+///   hooks path) could hold a `pre-commit`/`post-checkout` script that runs on
+///   `git commit`/`checkout`; pointing the hooks dir at a non-directory
+///   disables every hook.
+/// - `protocol.ext.allow=never` -- refuses the `ext::` transport, which runs
+///   an arbitrary command as part of a fetch/clone.
+/// - `core.pager=cat` -- never pipes diff/log/show output through a pager
+///   that could be a user/system `PAGER`.
+///
+/// The `diff.external` driver (a command the repo config could point at) is
+/// neutralised separately, at the diff-family call sites, with `--no-ext-diff`
+/// (see [`diff_hardened`] / [`diff_subcommand_index`]): an empty `-c
+/// diff.external=` is NOT usable because git would try to *run* the empty
+/// string as the external diff program and abort every diff.
+///
+/// Environment: the ambient `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/
+/// `GIT_OBJECT_DIRECTORY`/`GIT_ALTERNATE_OBJECT_DIRECTORIES`/`GIT_COMMON_DIR`/
+/// `GIT_CEILING_DIRECTORIES` are removed (they could redirect git at a
+/// different repository than the `-C` path names), `GIT_CONFIG_GLOBAL` and
+/// `GIT_CONFIG_SYSTEM` are pointed at `/dev/null` so the invoking user's and
+/// the system's config cannot re-enable any of the vectors, and
+/// `GIT_TERMINAL_PROMPT=0` stops a hung credential/SSH prompt.
+fn harden_git(cmd: &mut Command) -> &mut Command {
+    cmd.arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg("protocol.ext.allow=never")
+        .arg("-c")
+        .arg("core.pager=cat");
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CEILING_DIRECTORIES",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    cmd
+}
+
+/// Builds a hardened `git` command (see [`harden_git`]). Callers append
+/// `-C <dir>` and the subcommand/arguments.
+pub fn hardened_git() -> Command {
+    let mut cmd = Command::new("git");
+    harden_git(&mut cmd);
+    cmd
+}
+
+/// Completes a `git diff` command so the diff is computed by git's built-in
+/// diff: it appends the ref, the `--no-ext-diff --no-textconv` flags (so no
+/// `diff.external` driver or `textconv` filter -- both of which the repo could
+/// define in its config -- is ever invoked), and then the pathspec separator
+/// and pathspecs.
+///
+/// The command must already carry `git diff` (built by the caller, which also
+/// adds `-C <worktree>` and any other leading `diff` options). The two flags
+/// are `diff` subcommand options and must come BEFORE the `--` separator:
+/// anything after `--` is a pathspec, so a flag placed there would be read as
+/// a (nonexistent) path and silently empty the diff. `pathspecs` may be empty
+/// (no `--` separator is emitted).
+pub fn diff_hardened<'c>(
+    cmd: &'c mut Command,
+    ref_arg: Option<&str>,
+    pathspecs: &[String],
+) -> &'c mut Command {
+    if let Some(r) = ref_arg {
+        cmd.arg(r);
+    }
+    cmd.arg("--no-ext-diff").arg("--no-textconv");
+    if !pathspecs.is_empty() {
+        cmd.arg("--").args(pathspecs);
+    }
+    cmd
+}
+
+/// Reads the `gitdir:` target of a worktree's `.git` file when it is a file
+/// (a linked worktree) whose first line has the expected shape. Returns
+/// `None` for a directory `.git`, a missing/malformed file, or a line that is
+/// not a `gitdir:` pointer.
+pub fn worktree_gitdir_target(worktree_path: &Path) -> Option<String> {
+    let dotgit = worktree_path.join(".git");
+    if !dotgit.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&dotgit).ok()?;
+    content
+        .lines()
+        .next()?
+        .trim()
+        .strip_prefix("gitdir:")
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+/// Refuses a worktree whose `.git` file points OUTSIDE the repositories
+/// agent-run manages for the project.
+///
+/// A job worktree is a linked worktree of the project's private bare
+/// repository under `repos_root`; its `.git` file is
+/// `gitdir: <repos_root>/<project>.git/worktrees/<...>`. Before any git
+/// operation runs inside the worktree we verify that pointer resolves to a
+/// location inside one of the allowed roots, so a tampered or stale `.git`
+/// file cannot redirect our git calls at an arbitrary attacker-controlled
+/// repository (whose config/hooks could then run code despite
+/// [`harden_git`]).
+///
+/// A worktree with a directory `.git` is self-contained (its own repository
+/// root, no `gitdir:` pointer); its executable config is neutralised by
+/// [`harden_git`], so it is always accepted. A worktree with a `.git` FILE is a
+/// linked worktree and its `gitdir:` target must canonicalize inside one of
+/// `allowed_roots`.
+///
+/// `allowed_roots` are the repository locations agent-run uses for a project
+/// (see [`crate::core::repos::project_git_repo`]): the private bare-repo root
+/// (`config.repos_root`) for the current layout, plus the project's
+/// workspace checkout (`config.workspace_root/<project>`) for legacy worktrees
+/// still attached to the git-sync checkout. A pointer anywhere else is an
+/// attacker-tampered link and is refused. Returns `Ok(())` in the accepted
+/// cases and when the worktree is absent; a missing `gitdir:` line, a pointer
+/// that does not resolve, or a target outside every allowed root is a hard
+/// error.
+pub fn worktree_gitdir_in_expected_roots(
+    worktree_path: &Path,
+    allowed_roots: &[PathBuf],
+) -> Result<()> {
+    if !worktree_path.exists() {
+        return Ok(());
+    }
+    let dotgit = worktree_path.join(".git");
+    if dotgit.is_dir() {
+        // A directory .git means the worktree is its own repository root
+        // (self-contained, not a linked worktree): it carries no `gitdir:`
+        // pointer, and any executable config it holds (fsmonitor, hooks,
+        // external diff) is neutralised by `harden_git`. There is no pointer
+        // to validate.
+        return Ok(());
+    }
+    if !dotgit.is_file() {
+        // No .git entry at all: a broken/dangling worktree. Let the git call
+        // itself fail with its own message rather than guessing.
+        return Ok(());
+    }
+    let Some(target) = worktree_gitdir_target(worktree_path) else {
+        return Err(crate::core::error::AgentRunError::invalid(
+            "worktree_gitdir_outside_repos",
+            format!(
+                "Refusing to run git in worktree {}: its .git file has no readable 'gitdir:' pointer",
+                worktree_path.display()
+            ),
+        )
+        .into());
+    };
+    // Resolve the pointer to an absolute path WITHOUT following symlinks. A
+    // lexical (component-wise) containment test needs no target to exist, so
+    // a dangling worktree -- whose `.git` points at an admin directory that is
+    // (re)created on repair -- is not rejected here; a tampered pointer at an
+    // unrelated location is. `..` segments are folded lexically (via
+    // `components`), so `../../elsewhere` cannot smuggle a target back out of
+    // an allowed root.
+    let raw = Path::new(&target);
+    let resolved = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        worktree_path.join(raw)
+    };
+    let resolved = resolved.components().fold(PathBuf::new(), |mut acc, c| {
+        acc.push(c);
+        acc
+    });
+
+    // Each allowed root contributes its raw path and, when it exists, its
+    // symlink-resolved (canonical) path.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for root in allowed_roots {
+        roots.push(root.to_path_buf());
+        if let Ok(c) = root.canonicalize() {
+            roots.push(c);
+        }
+    }
+
+    // Lexical containment: the raw pointer must point inside an allowed root.
+    if roots.iter().any(|r| resolved.starts_with(r.as_path())) {
+        // If the target exists, also confirm that symlinks do not resolve it
+        // back OUT of every allowed root (a symlink planted at a path that is
+        // lexically inside a root but points elsewhere would otherwise be
+        // followed by git).
+        if resolved.exists() {
+            if let Ok(canonical) = resolved.canonicalize() {
+                if roots.iter().any(|r| canonical.starts_with(r.as_path())) {
+                    return Ok(());
+                }
+                return Err(crate::core::error::AgentRunError::invalid(
+                    "worktree_gitdir_outside_repos",
+                    format!(
+                        "Refusing to run git in worktree {}: its .git points at {}, which resolves outside the repositories agent-run manages for this project",
+                        worktree_path.display(),
+                        canonical.display()
+                    ),
+                )
+                .into());
+            }
+        }
+        return Ok(());
+    }
+
+    Err(crate::core::error::AgentRunError::invalid(
+        "worktree_gitdir_outside_repos",
+        format!(
+            "Refusing to run git in worktree {}: its .git points at {}, outside the repositories agent-run manages for this project",
+            worktree_path.display(),
+            resolved.display()
+        ),
+    )
+    .into())
+}
+
+/// The roots a worktree's `.git` pointer is allowed to resolve inside for a
+/// project (see [`worktree_gitdir_in_expected_roots`]): the private
+/// bare-repo root and, for legacy worktrees still attached to the git-sync
+/// checkout, the project's workspace checkout.
+pub fn expected_worktree_roots(
+    config: &crate::core::config::Config,
+    project: &str,
+) -> Vec<PathBuf> {
+    let mut roots = vec![config.repos_root.clone()];
+    let checkout = config.workspace_root.join(project);
+    if checkout != config.repos_root {
+        roots.push(checkout);
+    }
+    roots
+}
+
 /// Validates that `<workspace_root>/<project>` exists and is a valid git repository.
 pub fn validate_project_repo(workspace_root: &Path, project: &str) -> Result<PathBuf> {
     let project_dir = workspace_root.join(project);
@@ -27,7 +278,7 @@ pub fn validate_project_repo(workspace_root: &Path, project: &str) -> Result<Pat
 
     // Verify it is a git repo using `git rev-parse --is-inside-work-tree`
     let output = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = hardened_git();
         c.args([
             "-C",
             &project_dir.to_string_lossy(),
@@ -73,7 +324,7 @@ pub fn validate_external_worktree(project_dir: &Path, worktree_path: &Path) -> R
     // The git common dir (real .git of the main worktree) uniquely identifies a
     // repository across worktrees; both must resolve to the same location.
     let common_dir = |dir: &Path| -> Result<PathBuf> {
-        let out = crate::core::reaper::output_tracked(&mut { let mut c = Command::new("git"); c
+        let out = crate::core::reaper::output_tracked(&mut { let mut c = hardened_git(); c
             .args(["-C", &dir.to_string_lossy(), "rev-parse", "--git-common-dir"])
             ; c })
             .with_context(|| format!("Failed to execute 'git rev-parse --git-common-dir' in {} (ensure git is installed and in PATH)", dir.display()))?;
@@ -129,7 +380,7 @@ pub fn is_lock_contention_error(stderr: &str) -> bool {
 /// Returns true when `ref_name` resolves to a commit in `repo_dir`.
 pub fn git_ref_exists(repo_dir: &Path, ref_name: &str) -> Result<bool> {
     let output = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = hardened_git();
         c.args([
             "-C",
             &repo_dir.to_string_lossy(),
@@ -203,7 +454,7 @@ pub fn create_worktree(
 
     // 4. Resolve the validated ref to its concrete commit SHA.
     let sha_output = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = hardened_git();
         c.args([
             "-C",
             &repo_dir.to_string_lossy(),
@@ -234,7 +485,7 @@ pub fn create_worktree(
     let output = loop {
         attempt += 1;
         let output = crate::core::reaper::output_tracked(&mut {
-            let mut c = Command::new("git");
+            let mut c = hardened_git();
             c.args([
                 "-C",
                 &repo_dir.to_string_lossy(),
@@ -318,7 +569,7 @@ pub fn remove_worktree(repo_dir: &Path, worktree_path: &Path, force: bool) -> Re
     args.push(&worktree_str);
 
     let output = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = hardened_git();
         c.args(&args);
         c
     })
@@ -407,7 +658,7 @@ pub fn worktree_dir_can_be_swept(
 /// Deletes a git branch in the repository.
 pub fn delete_branch(repo_dir: &Path, branch_name: &str) -> Result<()> {
     let output = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = hardened_git();
         c.args([
             "-C",
             &repo_dir.to_string_lossy(),
@@ -435,7 +686,7 @@ pub fn delete_branch(repo_dir: &Path, branch_name: &str) -> Result<()> {
 /// Resolves a branch name to its tip commit SHA.
 pub fn get_branch_tip_sha(repo_dir: &Path, branch_name: &str) -> Result<String> {
     let output = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = hardened_git();
         c.args([
             "-C",
             &repo_dir.to_string_lossy(),
@@ -505,7 +756,7 @@ pub fn count_unmerged_unpushed_commits(repo_dir: &Path, branch: &str, base: &str
     args.push("--count");
 
     let output = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = hardened_git();
         c.args(&args);
         c
     })
@@ -539,7 +790,7 @@ pub fn count_unmerged_unpushed_commits(repo_dir: &Path, branch: &str, base: &str
 /// Checks whether a worktree contains uncommitted modifications or untracked files.
 pub fn is_worktree_dirty(worktree_path: &Path) -> Result<bool> {
     let output = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = hardened_git();
         c.args([
             "-C",
             &worktree_path.to_string_lossy(),
@@ -587,7 +838,7 @@ pub fn prune_stale_worktree_registrations(repo_dir: &Path) {
 /// run/execute split can record them (same pattern as gc's `*_to` variants).
 pub fn prune_stale_worktree_registrations_to(repo_dir: &Path, emit: &mut dyn FnMut(String)) {
     match crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = hardened_git();
         c.args(["-C", &repo_dir.to_string_lossy(), "worktree", "prune"]);
         c
     }) {
@@ -786,14 +1037,14 @@ pub fn run_diff(
     let pathspecs = build_diff_pathspecs(only, exclude)?;
     let has_selection = !pathspecs.is_empty();
 
-    let mut cmd = Command::new("git");
+    let mut cmd = hardened_git();
     cmd.args(["-C", &worktree_str, "diff"]);
     match base_ref {
         // Uncommitted mode: everything that differs from HEAD (staged +
         // unstaged + intent-to-add untracked).
         None => {
             if !has_selection {
-                let ita = crate::core::reaper::output_tracked(&mut { let mut c = Command::new("git"); c
+                let ita = crate::core::reaper::output_tracked(&mut { let mut c = hardened_git(); c
                     .args(["-C", &worktree_str, "add", "-N", "-A"])
                     ; c })
                     .with_context(|| {
@@ -832,7 +1083,7 @@ pub fn run_diff(
                         })
                         .collect();
                 if !marked.is_empty() {
-                    let mut add_cmd = Command::new("git");
+                    let mut add_cmd = hardened_git();
                     add_cmd.args(["-C", &worktree_str, "add", "-N", "--"]);
                     for p in &marked {
                         add_cmd.arg(p);
@@ -852,14 +1103,11 @@ pub fn run_diff(
                     }
                 }
             }
-            cmd.arg("HEAD");
+            diff_hardened(&mut cmd, Some("HEAD"), &pathspecs);
         }
         Some(r) => {
-            cmd.arg(r);
+            diff_hardened(&mut cmd, Some(r), &pathspecs);
         }
-    }
-    if has_selection {
-        cmd.arg("--").args(&pathspecs);
     }
 
     let output = crate::core::reaper::output_tracked(&mut cmd).with_context(|| {
@@ -889,7 +1137,7 @@ pub fn commit_uncommitted_changes(
     prompt_summary: &str,
 ) -> Result<bool> {
     let status = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = hardened_git();
         c.args([
             "-C",
             &worktree_path.to_string_lossy(),
@@ -919,7 +1167,7 @@ pub fn commit_uncommitted_changes(
 
     // Stage all changes
     let add_out = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = hardened_git();
         c.args(["-C", &worktree_path.to_string_lossy(), "add", "-A"]);
         c
     })
@@ -940,7 +1188,7 @@ pub fn commit_uncommitted_changes(
     // Commit
     let commit_msg = format!("agent-run({}): {}", job_id, prompt_summary);
     let commit_out = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = hardened_git();
         c.args([
             "-C",
             &worktree_path.to_string_lossy(),
@@ -1033,7 +1281,7 @@ pub fn worktree_status(
 ) -> Result<Vec<WorktreeFileStatus>> {
     let pathspecs = build_diff_pathspecs(only, exclude)?;
 
-    let mut cmd = Command::new("git");
+    let mut cmd = hardened_git();
     cmd.args([
         "-C",
         &worktree_path.to_string_lossy(),
@@ -1136,19 +1384,12 @@ pub fn worktree_status_vs_base(
     let pathspecs = build_diff_pathspecs(only, exclude)?;
     let wt = worktree_path.to_string_lossy().to_string();
 
-    let mut cmd = Command::new("git");
-    cmd.args([
-        "-C",
-        &wt,
-        "diff",
-        "--name-status",
-        "-z",
-        "--find-renames",
-        base_ref,
-    ]);
-    if !pathspecs.is_empty() {
-        cmd.arg("--").args(&pathspecs);
-    }
+    let mut cmd = hardened_git();
+    cmd.args(["-C", &wt, "diff", "--name-status", "-z", "--find-renames"]);
+    // The ref, the `--no-ext-diff --no-textconv` flags, and the pathspec
+    // separator are added by `diff_hardened` in the safe order (flags before
+    // `--`).
+    diff_hardened(&mut cmd, Some(base_ref), &pathspecs);
     let out = crate::core::reaper::output_tracked(&mut cmd).with_context(|| {
         format!(
             "Failed to execute 'git diff' in {} (ensure git is installed and in PATH)",
@@ -1218,7 +1459,7 @@ pub fn worktree_status_vs_base(
 
     // Untracked files: the diff above never lists them (they are not in the
     // index), so they come from a worktree listing of the SAME selection.
-    let mut untracked_cmd = Command::new("git");
+    let mut untracked_cmd = hardened_git();
     untracked_cmd.args([
         "-C",
         &wt,
@@ -1466,7 +1707,7 @@ pub fn commit_selected(
     // NUL-separated RAW bytes, and returns success even when a pathspec matches
     // nothing), so the comparison is byte-exact for every name.
     let ls_out = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = hardened_git();
         c.args([
             "-C",
             &worktree_path.to_string_lossy(),
@@ -1509,7 +1750,7 @@ pub fn commit_selected(
                 std::ffi::OsString::from_vec(s)
             })
             .collect();
-        let mut add = Command::new("git");
+        let mut add = hardened_git();
         add.args(["-C", &worktree_path.to_string_lossy(), "add", "-A", "--"])
             .args(&stage_os);
         let add_out = crate::core::reaper::output_tracked(&mut add).with_context(|| {
@@ -1529,7 +1770,7 @@ pub fn commit_selected(
 
     let commit_msg = format!("agent-run({}): {}", job_id, message);
     let commit_out = crate::core::reaper::output_tracked(&mut {
-        let mut c = Command::new("git");
+        let mut c = hardened_git();
         c.args([
             "-C",
             &worktree_path.to_string_lossy(),
@@ -3068,5 +3309,328 @@ mod tests {
         // A deletion on either side reads as deleted (D takes precedence).
         assert_eq!(porcelain_status_letter(" D"), "D");
         assert_eq!(porcelain_status_letter("D "), "D");
+    }
+
+    // ------------------------------------------------------------------
+    // H2: hardened git -- the code-execution vectors an agent can plant in a
+    // repository's own config or hooks must never run through our invocations.
+    // Each test plants a marker-producing payload in the repo config and proves
+    // the hardened path does NOT trigger it, while the same unhardened git call
+    // DOES (the control arm proves the payload is live, not inert).
+    // ------------------------------------------------------------------
+
+    /// Builds a linked worktree of a private bare repo laid out exactly as the
+    /// production job worktrees are: `<root>/<project>.git` (bare) plus the
+    /// linked worktree at `<root>/<project>.git/worktrees/<id>` via its `.git`
+    /// file. Returns `(bare_repo, worktree_path, root)`.
+    fn linked_worktree_under_root(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        // A real (non-bare) seed repo to create the bare from.
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        let g = |args: &[&str], dir: &Path| {
+            let st = Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .status()
+                .expect("execute git");
+            assert!(st.success(), "git {args:?} in {} failed", dir.display());
+        };
+        g(&["init", "-b", "main"], &seed);
+        g(&["config", "user.name", "T"], &seed);
+        g(&["config", "user.email", "t@t.t"], &seed);
+        std::fs::write(seed.join("f.txt"), "base\n").unwrap();
+        g(&["add", "f.txt"], &seed);
+        g(&["commit", "-m", "i"], &seed);
+
+        let bare = root.join("proj.git");
+        g(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            root,
+        );
+
+        // A linked worktree of the bare repo.
+        let wt = root.join("wt");
+        g(
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "agent-run/x",
+            ],
+            &bare,
+        );
+        // A linked worktree has its own git-dir config that does NOT inherit
+        // the seed repo's identity, so give it one: commits (the hooks test's
+        // control arm) would otherwise fail with "Author identity unknown"
+        // before any hook runs.
+        g(&["config", "user.name", "T"], &wt);
+        g(&["config", "user.email", "t@t.t"], &wt);
+        let _ = std::fs::remove_dir_all(&seed);
+        (bare, wt, root.to_path_buf())
+    }
+
+    /// Writes `body` to `path` and marks it executable. Git runs planted
+    /// `core.fsmonitor` / `diff.external` / hook scripts as *programs*, so a
+    /// non-executable file is silently ignored and the control arm of a
+    /// hardening test would be inert.
+    fn write_exec(path: &Path, body: &str) {
+        use std::fs::{OpenOptions, Permissions};
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        use std::io::Write as _;
+        f.write_all(body.as_bytes()).unwrap();
+        std::fs::set_permissions(path, Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The index file of a worktree (in its git-dir), used to force a "cold"
+    /// index so git re-stats the worktree -- the only situation where a planted
+    /// `core.fsmonitor` is actually invoked.
+    fn worktree_index(worktree: &Path) -> PathBuf {
+        let out = Command::new("git")
+            .current_dir(worktree)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .expect("rev-parse --git-dir");
+        assert!(out.status.success());
+        let git_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let git_dir = Path::new(&git_dir);
+        if git_dir.is_relative() {
+            worktree.join(git_dir).join("index")
+        } else {
+            git_dir.join("index")
+        }
+    }
+
+    #[test]
+    fn test_harden_git_neutralises_fsmonitor() {
+        let temp = tempdir().unwrap();
+        let (_bare, wt, _root) = linked_worktree_under_root(temp.path());
+        let marker = temp.path().join("m_fsmonitor");
+        let fs = temp.path().join("fsmonitor.sh");
+        write_exec(&fs, &format!("#!/bin/sh\ntouch \"{}\"\n", marker.display()));
+        // Plant the fsmonitor in the worktree's own repo config.
+        let cfg = |args: &[&str]| {
+            let st = Command::new("git")
+                .current_dir(&wt)
+                .args(args)
+                .status()
+                .expect("git config");
+            assert!(st.success());
+        };
+        cfg(&["config", "core.fsmonitor", fs.to_str().unwrap()]);
+        std::fs::write(wt.join("f.txt"), "base\nchange\n").unwrap();
+
+        // Control: a PLAIN `git add -N -A` on a COLD index runs the planted
+        // fsmonitor (git re-stats the worktree and invokes the script).
+        let idx = worktree_index(&wt);
+        if idx.exists() {
+            std::fs::remove_file(&idx).unwrap();
+        }
+        let _ = Command::new("git")
+            .current_dir(&wt)
+            .args(["add", "-N", "-A"])
+            .output()
+            .expect("plain add -N -A");
+        assert!(
+            marker.exists(),
+            "control: the planted fsmonitor must be live for the test to mean anything"
+        );
+
+        // Hardened: `run_diff` (which runs `git add -N -A` then `git diff`) on
+        // a COLD index must NOT run it.
+        std::fs::remove_file(&marker).unwrap();
+        if idx.exists() {
+            std::fs::remove_file(&idx).unwrap();
+        }
+        let _ = run_diff(&wt, None, &[], &[]).expect("run_diff");
+        assert!(
+            !marker.exists(),
+            "hardened git ran a planted fsmonitor script (code execution)"
+        );
+    }
+
+    #[test]
+    fn test_harden_git_neutralises_external_diff() {
+        let temp = tempdir().unwrap();
+        let (_bare, wt, _root) = linked_worktree_under_root(temp.path());
+        let marker = temp.path().join("m_extdiff");
+        let ext = temp.path().join("extdiff.sh");
+        write_exec(
+            &ext,
+            &format!("#!/bin/sh\ntouch \"{}\"\n", marker.display()),
+        );
+        let cfg = |args: &[&str]| {
+            let st = Command::new("git")
+                .current_dir(&wt)
+                .args(args)
+                .status()
+                .expect("git config");
+            assert!(st.success());
+        };
+        cfg(&["config", "diff.external", ext.to_str().unwrap()]);
+        std::fs::write(wt.join("f.txt"), "base\nchange\n").unwrap();
+
+        // Control: a plain `git diff --ext-diff HEAD` runs the planted driver.
+        let _ = Command::new("git")
+            .current_dir(&wt)
+            .args(["diff", "--ext-diff", "HEAD"])
+            .output()
+            .expect("plain diff");
+        assert!(
+            marker.exists(),
+            "control: the planted diff.external driver must be live"
+        );
+
+        // Hardened: `run_diff` must NOT run it (--no-ext-diff).
+        std::fs::remove_file(&marker).unwrap();
+        let _ = run_diff(&wt, None, &[], &[]).expect("run_diff");
+        assert!(
+            !marker.exists(),
+            "hardened git ran a planted diff.external driver (code execution)"
+        );
+    }
+
+    #[test]
+    fn test_harden_git_neutralises_hooks() {
+        let temp = tempdir().unwrap();
+        let (_bare, wt, _root) = linked_worktree_under_root(temp.path());
+        let marker = temp.path().join("m_hook");
+        let hooks_dir = temp.path().join("attacker-hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        for h in ["pre-commit", "post-commit"] {
+            write_exec(
+                &hooks_dir.join(h),
+                &format!("#!/bin/sh\ntouch \"{}\"\n", marker.display()),
+            );
+        }
+        let cfg = |args: &[&str]| {
+            let st = Command::new("git")
+                .current_dir(&wt)
+                .args(args)
+                .status()
+                .expect("git config");
+            assert!(st.success());
+        };
+        // Point the worktree's hooks at the planted directory.
+        cfg(&["config", "core.hooksPath", hooks_dir.to_str().unwrap()]);
+        std::fs::write(wt.join("f.txt"), "base\nchange\n").unwrap();
+        let _ = Command::new("git")
+            .current_dir(&wt)
+            .args(["add", "f.txt"])
+            .status()
+            .expect("add");
+
+        // Control: a PLAIN commit runs the planted hooks.
+        let _ = Command::new("git")
+            .current_dir(&wt)
+            .args(["commit", "-m", "ctrl"])
+            .output()
+            .expect("plain commit");
+        assert!(
+            marker.exists(),
+            "control: the planted hooks must be live for the test to mean anything"
+        );
+        // Reset the index state for the hardened commit.
+        let _ = std::fs::write(wt.join("f.txt"), "base\nchange\nhardened\n");
+        let _ = Command::new("git")
+            .current_dir(&wt)
+            .args(["add", "f.txt"])
+            .status()
+            .expect("add");
+
+        // Hardened: `commit_uncommitted_changes` must NOT run them.
+        std::fs::remove_file(&marker).unwrap();
+        let committed = commit_uncommitted_changes(&wt, "job1", "hardened").expect("commit");
+        assert!(committed, "the hardened commit should have made a commit");
+        assert!(
+            !marker.exists(),
+            "hardened git ran planted hooks (code execution)"
+        );
+    }
+
+    #[test]
+    fn test_worktree_gitdir_pointer_outside_root_refused() {
+        // Two independent roots: the legitimate one (under the repos root) and
+        // a genuinely unrelated directory the attacker would point at.
+        let root_temp = tempdir().unwrap();
+        let outside_temp = tempdir().unwrap();
+        let (bare, wt, root) = linked_worktree_under_root(root_temp.path());
+        let _ = bare;
+        // A healthy pointer is accepted.
+        worktree_gitdir_in_expected_roots(&wt, std::slice::from_ref(&root))
+            .expect("healthy pointer accepted");
+
+        // A pointer smuggled OUTSIDE the root must be refused.
+        let outside = outside_temp.path().to_path_buf();
+        let dotgit = wt.join(".git");
+        let original = std::fs::read_to_string(&dotgit).unwrap();
+        std::fs::write(&dotgit, format!("gitdir: {}\n", outside.display())).unwrap();
+        let err = worktree_gitdir_in_expected_roots(&wt, std::slice::from_ref(&root)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("outside the repositories agent-run manages for this project"),
+            "expected an outside-root refusal, got: {}",
+            err
+        );
+        // A garbage pointer (no gitdir line) is refused.
+        std::fs::write(&dotgit, "not a git pointer\n").unwrap();
+        assert!(worktree_gitdir_in_expected_roots(&wt, std::slice::from_ref(&root)).is_err());
+        // Restore for cleanup.
+        std::fs::write(&dotgit, &original).unwrap();
+    }
+
+    #[test]
+    fn test_worktree_gitdir_directory_is_self_contained() {
+        // A worktree that is its own repo root (directory .git) has no pointer
+        // to validate and is always accepted.
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |args: &[&str]| {
+            let st = Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("git");
+            assert!(st.success());
+        };
+        g(&["init", "-b", "main"]);
+        let unrelated_root = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&unrelated_root).unwrap();
+        worktree_gitdir_in_expected_roots(&repo, std::slice::from_ref(&unrelated_root))
+            .expect("a self-contained (directory .git) worktree is accepted");
+    }
+
+    #[test]
+    fn test_worktree_gitdir_target_parses() {
+        let temp = tempdir().unwrap();
+        let (_bare, wt, _root) = linked_worktree_under_root(temp.path());
+        let Some(target) = worktree_gitdir_target(&wt) else {
+            panic!("expected a gitdir: target in the worktree .git file");
+        };
+        assert!(target.contains(".git/worktrees/"), "got: {target}");
+        // A self-contained repo has no .git file, so no target.
+        let selfc = temp.path().join("selfc");
+        std::fs::create_dir_all(&selfc).unwrap();
+        let st = Command::new("git")
+            .current_dir(&selfc)
+            .args(["init", "-b", "main"])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        assert!(worktree_gitdir_target(&selfc).is_none());
     }
 }

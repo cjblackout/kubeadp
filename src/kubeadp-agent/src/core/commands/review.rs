@@ -45,6 +45,18 @@ pub fn run(config: &Config, args: &ReviewArgs) -> Result<CommandOutput> {
     // the diff is computed (silent no-op when healthy).
     crate::core::repos::auto_repair_worktree(config, &target);
 
+    // Never compute the diff from a worktree agent-run owns whose .git pointer
+    // does not resolve inside the project's repos root / workspace checkout (a
+    // tampered/stale pointer could redirect the diff into an
+    // attacker-controlled repo). Worktrees of external (--from-worktree) jobs
+    // are user-supplied and are not validated against our roots.
+    if !target.external_worktree {
+        crate::core::git::worktree_gitdir_in_expected_roots(
+            &target.worktree_path,
+            &crate::core::git::expected_worktree_roots(config, &target.project),
+        )?;
+    }
+
     let (diff_text, _fell_back) = crate::core::commands::diff::job_diff_text(&target)
         .context("Failed to compute diff for review")?;
     if diff_text.trim().is_empty() {
@@ -134,6 +146,7 @@ Be specific: cite file and line. If the diff is fine, say so.\n\n\
         max_runtime: None,
         started_at: None,
         hindsight_query: None,
+        sandbox_info: None,
     };
 
     // Enforce the same max-parallel limit `start` applies before

@@ -649,4 +649,19 @@ gc_max_age_days = 14
             }
         }
     }
+
+    #[test]
+    fn test_removed_sandbox_keys_rejected() {
+        // [common] sandbox and sandbox_runtime were removed in contract v1.2/v1.3
+        let toml = "[common]\nsandbox = \"auto\"\n";
+        let err = parse_config_toml("test.toml", toml).unwrap_err();
+        assert!(err.contains("unknown key 'common.sandbox'"), "{err}");
+
+        let toml2 = "[common]\nsandbox_runtime = \"auto\"\n";
+        let err2 = parse_config_toml("test.toml", toml2).unwrap_err();
+        assert!(
+            err2.contains("unknown key 'common.sandbox_runtime'"),
+            "{err2}"
+        );
+    }
 }

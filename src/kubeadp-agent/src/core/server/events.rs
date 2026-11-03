@@ -534,6 +534,7 @@ mod tests {
             max_runtime: None,
             started_at: None,
             hindsight_query: None,
+            sandbox_info: None,
         };
         meta.insert_new(&state_root).unwrap();
         (config, meta)

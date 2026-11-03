@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::core::args::ExportArgs;
 use crate::core::commands::commit::derive_commit_summary;
@@ -69,10 +69,22 @@ pub struct ExportData {
 /// (small metadata commands, or `--allow-large` exports).
 fn git_args(worktree: &Path, args: &[String], max: Option<u64>) -> Result<Vec<u8>> {
     let joined = args.join(" ");
-    let mut child = Command::new("git")
+    // Neutralise the diff drivers on the diff-family calls routed through here
+    // (`diff --shortstat`, `--name-only`, `--name-status`). The two flags are
+    // `diff` subcommand options, so they are spliced in right after the `diff`
+    // subcommand (the first `args` entry that is not a `-c`/config argument).
+    let effective: Vec<String> = if let Some(diff_pos) = diff_subcommand_index(args) {
+        let mut v = args.to_vec();
+        v.insert(diff_pos + 1, "--no-ext-diff".to_string());
+        v.insert(diff_pos + 2, "--no-textconv".to_string());
+        v
+    } else {
+        args.to_vec()
+    };
+    let mut child = crate::core::git::hardened_git()
         .arg("-C")
         .arg(worktree)
-        .args(args)
+        .args(&effective)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -158,6 +170,31 @@ fn with_selection(mut base: Vec<String>, pathspecs: &[String]) -> Vec<String> {
     base
 }
 
+/// The index of the `diff` subcommand in a git argument list, if present.
+///
+/// The export calls build their arg list as an optional leading
+/// `-c <key>=<value>` config pair followed by the subcommand and its options
+/// (see the `git_args` call sites), so the subcommand is the first entry that
+/// is not the `-c` flag and not the value of a preceding `-c`. Returns the
+/// position of `diff` so the caller can splice the diff-only hardening flags
+/// (`--no-ext-diff --no-textconv`) in right after it.
+fn diff_subcommand_index(args: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-c" {
+            // Skip the flag and its value.
+            i += 2;
+            continue;
+        }
+        if args[i] == "diff" {
+            return Some(i);
+        }
+        // Any other non-config token means the subcommand is not `diff`.
+        return None;
+    }
+    None
+}
+
 /// Parses a `git diff --shortstat` line into `(files, insertions, deletions)`.
 /// An empty/blank shortstat (no changes) yields `(0, 0, 0)`.
 fn parse_shortstat(stats: &str) -> (u64, u64, u64) {
@@ -216,12 +253,24 @@ pub fn run(config: &Config, args: &ExportArgs) -> Result<ExportData> {
         return Err(crate::core::error::AgentRunError::invalid(
             "worktree_not_found",
             format!(
-                "Worktree directory for job '{}' does not exist at {} (it may have been deleted or cleaned)",
-                args.job_id,
+                "Worktree directory for job '{}' does not exist at {} (it may have been deleted outside agent-run or cleaned)",
+                meta.job_id,
                 meta.worktree_path.display()
             ),
         )
         .into());
+    }
+
+    // Never run git in a worktree agent-run owns whose .git pointer does not
+    // resolve inside the project's repos root / workspace checkout (a
+    // tampered/stale pointer could redirect the export into an
+    // attacker-controlled repo). External (--from-worktree) worktrees are
+    // user-supplied and are not validated against our roots.
+    if !meta.external_worktree {
+        crate::core::git::worktree_gitdir_in_expected_roots(
+            &meta.worktree_path,
+            &crate::core::git::expected_worktree_roots(config, &meta.project),
+        )?;
     }
 
     // The shared `:(literal)`/`:(exclude,glob)` pathspecs restrict every git
@@ -554,6 +603,7 @@ fn octal(field: &mut [u8], value: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn shortstat_multi() {
@@ -773,6 +823,7 @@ mod tests {
             max_runtime: None,
             started_at: None,
             hindsight_query: None,
+            sandbox_info: None,
         };
         meta.save(&state_root).unwrap();
 

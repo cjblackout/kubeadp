@@ -116,6 +116,11 @@ pub struct Config {
     /// the home directory at use time; set in tests to point conversation-id
     /// recovery at a temp dir without touching the process environment.
     pub agy_home: Option<PathBuf>,
+    /// Path granted rw to the sandboxed agent (the policy's `shared_rw`
+    /// entry, default `/home/agent`). The default is the production layout.
+    /// Overridable so tests can point it at a creatable temp dir when the
+    /// sandbox backend fail-closes on a writable path it cannot create.
+    pub sandbox_home: PathBuf,
     pub gc_max_age_days: u64,
     pub max_parallel: u32,
     pub shutdown_grace_secs: u64,
@@ -170,6 +175,7 @@ impl Default for Config {
             state_root,
             repos_root: expand_path(DEFAULT_REPOS_ROOT_TEMPLATE, &workspace_root),
             agy_home: None,
+            sandbox_home: PathBuf::from("/home/agent"),
             gc_max_age_days: DEFAULT_GC_MAX_AGE_DAYS,
             max_parallel: DEFAULT_MAX_PARALLEL,
             shutdown_grace_secs: DEFAULT_SHUTDOWN_GRACE_SECS,
@@ -643,6 +649,7 @@ impl Config {
             // resolves the home directory at use time (dirs::home_dir), so
             // the override stays None outside of tests.
             agy_home: None,
+            sandbox_home: PathBuf::from("/home/agent"),
             gc_max_age_days,
             max_parallel,
             shutdown_grace_secs,

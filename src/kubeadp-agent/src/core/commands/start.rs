@@ -563,6 +563,7 @@ pub fn run(config: &Config, args: &StartArgs) -> Result<CommandOutput> {
         max_runtime,
         started_at: Some(Utc::now()),
         hindsight_query,
+        sandbox_info: None,
     };
 
     // 9a. Create the job row with a plain INSERT that hard-fails on an id
@@ -801,6 +802,7 @@ mod tests {
                 max_runtime: None,
                 started_at: None,
                 hindsight_query: None,
+                sandbox_info: None,
             };
             meta.save(&state_dir).unwrap();
         }
@@ -1314,6 +1316,7 @@ mod tests {
             max_runtime: None,
             started_at: None,
             hindsight_query: None,
+            sandbox_info: None,
         };
 
         // A failed insert of a worktree this start created must tear the
@@ -1399,9 +1402,12 @@ mod tests {
         let project_dir = workspace_root.join("test-repo");
         init_fixture_repo(&project_dir);
 
-        // Non-executable fake agy: launch passes path validation but the
-        // monitor cannot spawn it, so the PID poll times out and start bails
-        // after the worktree has been created (the leak scenario).
+        // Non-executable fake agy: the launcher refuses the binary up front
+        // (every job now goes through the `sandbox-exec` wrapper, which always
+        // spawns, so an unrunnable agy would otherwise confirm the wrapper's
+        // PID and be reported as a started job). The launch still bails after
+        // the worktree and the job row have been created -- the leak scenario
+        // this test guards against.
         let agy = temp_dir.path().join("fake-agy");
         fs::write(&agy, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&agy, fs::Permissions::from_mode(0o644)).unwrap();
@@ -1421,11 +1427,7 @@ mod tests {
         };
 
         let err = run(&config, &args).unwrap_err();
-        assert!(
-            err.to_string().contains("did not confirm a PID"),
-            "got: {}",
-            err
-        );
+        assert!(err.to_string().contains("not executable"), "got: {}", err);
 
         // The worktree and the agent-run/* branch must be torn down on the
         // error path, exactly like the --from-patch failure tests assert.

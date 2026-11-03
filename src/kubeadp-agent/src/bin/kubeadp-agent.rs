@@ -30,11 +30,23 @@ fn apply_config_for(role: &str) {
 }
 
 fn main() {
-    // The `mcp-a2a` subcommand is handled before the role dispatch: it is an
-    // explicit, self-describing entry that needs no KUBEADP_ROLE.
-    if std::env::args().nth(1).as_deref() == Some("mcp-a2a") {
-        run_mcp_a2a();
-        return;
+    let first_arg = std::env::args().nth(1);
+    match first_arg.as_deref() {
+        Some("sandbox-exec") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            kubeadp_agent::sandbox::cli::run_sandbox_exec(&args);
+            return;
+        }
+        Some("sandbox-probe") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            kubeadp_agent::sandbox::cli::run_sandbox_probe(&args);
+            return;
+        }
+        Some("mcp-a2a") => {
+            run_mcp_a2a();
+            return;
+        }
+        _ => {}
     }
 
     match std::env::var("KUBEADP_ROLE").as_deref() {

@@ -142,6 +142,13 @@ pub struct JobMetadata {
     /// Explicit Hindsight recall query for this job (trimmed). Replaces the
     /// prompt as the recall query and is persisted so `retry` reuses it.
     pub hindsight_query: Option<String>,
+    /// Sandbox attribution ({backend, runtime, policy_path}) recorded at every
+    /// launch -- start and each retry, which goes through the same
+    /// `build_command` path. `None` only for rows never launched (or written
+    /// before the field existed). Serialized in every JSON output so status
+    /// and info can print it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_info: Option<crate::sandbox::SandboxInfo>,
 }
 
 /// Serde hook for [`JobMetadata::proxy`]: every JSON rendering carries the
@@ -190,7 +197,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     proxy TEXT,
     max_runtime INTEGER,
     started_at INTEGER,
-    hindsight_query TEXT
+    hindsight_query TEXT,
+    sandbox_info TEXT
 )
 ";
 
@@ -335,6 +343,18 @@ pub fn open_state_db(state_root: &Path) -> Result<Connection> {
             }
         }
     }
+    if !columns.iter().any(|c| c == "sandbox_info") {
+        if let Err(e) = conn.execute_batch("ALTER TABLE jobs ADD COLUMN sandbox_info TEXT;") {
+            if !e.to_string().contains("duplicate column") {
+                return Err(e).with_context(|| {
+                    format!(
+                        "Failed to migrate state database at {} (missing column 'sandbox_info')",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
     Ok(conn)
 }
 
@@ -399,6 +419,9 @@ fn row_to_job(row: &Row<'_>) -> rusqlite::Result<JobMetadata> {
             )
         }),
         hindsight_query: row.get(30)?,
+        sandbox_info: row
+            .get::<_, Option<String>>(31)?
+            .and_then(|s| serde_json::from_str::<crate::sandbox::SandboxInfo>(&s).ok()),
     })
 }
 
@@ -422,9 +445,9 @@ impl JobMetadata {
                 conversation_id, retry_count, pid, exit_code, status, hindsight,
                 auto_recall, auto_retain, retry_prompt, read_only, external_worktree,
                 pid_start_time, hindsight_bank, proxy, max_runtime, started_at,
-                hindsight_query
+                hindsight_query, sandbox_info
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32
             )
             ON CONFLICT(job_id) DO UPDATE SET
                 project = excluded.project,
@@ -456,7 +479,8 @@ impl JobMetadata {
                 proxy = excluded.proxy,
                 max_runtime = excluded.max_runtime,
                 started_at = excluded.started_at,
-                hindsight_query = excluded.hindsight_query",
+                hindsight_query = excluded.hindsight_query,
+                sandbox_info = excluded.sandbox_info",
             params![
                 self.job_id,
                 self.project,
@@ -489,6 +513,9 @@ impl JobMetadata {
                 self.max_runtime.and_then(|d: chrono::Duration| d.num_nanoseconds()),
                 self.started_at.and_then(|t| t.timestamp_nanos_opt()),
                 self.hindsight_query,
+                self.sandbox_info
+                    .as_ref()
+                    .and_then(|s| serde_json::to_string(s).ok()),
             ],
         )
         .with_context(|| {
@@ -520,9 +547,9 @@ impl JobMetadata {
                 conversation_id, retry_count, pid, exit_code, status, hindsight,
                 auto_recall, auto_retain, retry_prompt, read_only, external_worktree,
                 pid_start_time, hindsight_bank, proxy, max_runtime, started_at,
-                hindsight_query
+                hindsight_query, sandbox_info
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32
             )",
             params![
                 self.job_id,
@@ -556,6 +583,9 @@ impl JobMetadata {
                 self.max_runtime.and_then(|d: chrono::Duration| d.num_nanoseconds()),
                 self.started_at.and_then(|t| t.timestamp_nanos_opt()),
                 self.hindsight_query,
+                self.sandbox_info
+                    .as_ref()
+                    .and_then(|s| serde_json::to_string(s).ok()),
             ],
         )
         .map_err(|e| -> anyhow::Error {
@@ -588,7 +618,7 @@ impl JobMetadata {
     pub fn load(state_root: &Path, job_id: &str) -> Result<Self> {
         let conn = open_state_db(state_root)?;
         let mut stmt = conn
-            .prepare("SELECT job_id, project, prompt, resolved_prompt, model, effort, sandbox, mode, add_dirs, print_timeout, created_at, worktree_path, branch, base_ref, conversation_id, retry_count, pid, exit_code, status, hindsight, auto_recall, auto_retain, retry_prompt, read_only, external_worktree, pid_start_time, hindsight_bank, proxy, max_runtime, started_at, hindsight_query FROM jobs WHERE job_id = ?1")
+            .prepare("SELECT job_id, project, prompt, resolved_prompt, model, effort, sandbox, mode, add_dirs, print_timeout, created_at, worktree_path, branch, base_ref, conversation_id, retry_count, pid, exit_code, status, hindsight, auto_recall, auto_retain, retry_prompt, read_only, external_worktree, pid_start_time, hindsight_bank, proxy, max_runtime, started_at, hindsight_query, sandbox_info FROM jobs WHERE job_id = ?1")
             .with_context(|| format!("Failed to read job metadata for '{}' from {}", job_id, state_db_path(state_root).display()))?;
         let mut rows = stmt
             .query_map(params![job_id], row_to_job)
@@ -681,6 +711,32 @@ impl JobMetadata {
             })?;
         Ok(())
     }
+}
+
+/// Persists the sandbox attribution of the current launch attempt onto a job
+/// row without touching any other column. Called by the runner after every
+/// `build_command` (a retry goes through the same path), so status/info can
+/// print the active backend/runtime/policy file.
+pub fn set_job_sandbox(
+    state_root: &Path,
+    job_id: &str,
+    sandbox: &crate::sandbox::SandboxInfo,
+) -> Result<()> {
+    let conn = open_state_db(state_root)?;
+    let json =
+        serde_json::to_string(sandbox).context("Failed to serialize sandbox info to JSON")?;
+    conn.execute(
+        "UPDATE jobs SET sandbox_info = ?2 WHERE job_id = ?1",
+        params![job_id, json],
+    )
+    .with_context(|| {
+        format!(
+            "Failed to update sandbox info for job '{}' in {}",
+            job_id,
+            state_db_path(state_root).display()
+        )
+    })?;
+    Ok(())
 }
 
 /// Atomically writes a job's final status, exit code, and conversation ID,
@@ -1562,7 +1618,7 @@ pub fn list_jobs(state_root: &Path, project_filter: Option<&str>) -> Result<Vec<
     let conn = open_state_db(state_root)?;
     let mut stmt = conn
         .prepare(
-            "SELECT job_id, project, prompt, resolved_prompt, model, effort, sandbox, mode, add_dirs, print_timeout, created_at, worktree_path, branch, base_ref, conversation_id, retry_count, pid, exit_code, status, hindsight, auto_recall, auto_retain, retry_prompt, read_only, external_worktree, pid_start_time, hindsight_bank, proxy, max_runtime, started_at, hindsight_query \
+            "SELECT job_id, project, prompt, resolved_prompt, model, effort, sandbox, mode, add_dirs, print_timeout, created_at, worktree_path, branch, base_ref, conversation_id, retry_count, pid, exit_code, status, hindsight, auto_recall, auto_retain, retry_prompt, read_only, external_worktree, pid_start_time, hindsight_bank, proxy, max_runtime, started_at, hindsight_query, sandbox_info \
               FROM jobs WHERE ?1 IS NULL OR project = ?1 ORDER BY created_at DESC, job_id DESC",
         )
         .with_context(|| format!("Failed to prepare job list query in {}", state_db_path(state_root).display()))?;
@@ -2358,6 +2414,11 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
             max_runtime: None,
             started_at: None,
             hindsight_query: Some("remember the migration".to_string()),
+            sandbox_info: Some(crate::sandbox::SandboxInfo {
+                backend: "gvisor".to_string(),
+                runtime: "gvisor".to_string(),
+                policy_path: "/tmp/roundtrip.policy.json".to_string(),
+            }),
         };
 
         meta.save(temp_dir.path()).unwrap();
@@ -2379,6 +2440,42 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
         assert_eq!(reloaded.job_id, "roundtrip");
         // Still exactly one row.
         assert_eq!(list_jobs(temp_dir.path(), None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_set_job_sandbox_updates_row_and_persists() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let meta = make_test_metadata("sandbox01", "p", 0);
+        meta.save(temp_dir.path()).unwrap();
+        assert_eq!(
+            JobMetadata::load(temp_dir.path(), "sandbox01")
+                .unwrap()
+                .sandbox_info,
+            None
+        );
+
+        let info = crate::sandbox::SandboxInfo {
+            backend: "gvisor".to_string(),
+            runtime: "gvisor".to_string(),
+            policy_path: "/tmp/sandbox01.policy.json".to_string(),
+        };
+        set_job_sandbox(temp_dir.path(), "sandbox01", &info).unwrap();
+
+        let loaded = JobMetadata::load(temp_dir.path(), "sandbox01").unwrap();
+        assert_eq!(loaded.sandbox_info, Some(info.clone()));
+
+        // Re-writing on a retry replaces the record, it does not append or error.
+        let retry_info = crate::sandbox::SandboxInfo {
+            backend: "gvisor".to_string(),
+            runtime: "gvisor".to_string(),
+            policy_path: "/tmp/sandbox01-retry.policy.json".to_string(),
+        };
+        set_job_sandbox(temp_dir.path(), "sandbox01", &retry_info).unwrap();
+        let reloaded = JobMetadata::load(temp_dir.path(), "sandbox01").unwrap();
+        assert_eq!(reloaded.sandbox_info, Some(retry_info));
+
+        // A missing job id is not an error (mirrors `save`'s upsert semantics).
+        set_job_sandbox(temp_dir.path(), "missing-job", &info).unwrap();
     }
 
     #[test]
@@ -2664,6 +2761,7 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
             max_runtime: None,
             started_at: None,
             hindsight_query: None,
+            sandbox_info: None,
         }
     }
 
@@ -2704,6 +2802,7 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
         assert!(!meta.external_worktree);
         assert_eq!(meta.pid_start_time, None);
         assert_eq!(meta.hindsight_query, None);
+        assert_eq!(meta.sandbox_info, None);
 
         // The migrated row can also be round-tripped through save().
         let mut meta = meta;
@@ -2711,12 +2810,25 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
         meta.external_worktree = true;
         meta.pid_start_time = Some(987654);
         meta.hindsight_query = Some("stored query".to_string());
+        meta.sandbox_info = Some(crate::sandbox::SandboxInfo {
+            backend: "runc".to_string(),
+            runtime: "runc".to_string(),
+            policy_path: "/tmp/migrated.policy.json".to_string(),
+        });
         meta.save(temp_dir.path()).unwrap();
         let reloaded = JobMetadata::load(temp_dir.path(), "oldjob01").unwrap();
         assert!(reloaded.read_only);
         assert!(reloaded.external_worktree);
         assert_eq!(reloaded.pid_start_time, Some(987654));
         assert_eq!(reloaded.hindsight_query, Some("stored query".to_string()));
+        assert_eq!(
+            reloaded.sandbox_info,
+            Some(crate::sandbox::SandboxInfo {
+                backend: "runc".to_string(),
+                runtime: "runc".to_string(),
+                policy_path: "/tmp/migrated.policy.json".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -2780,6 +2892,7 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
             max_runtime: None,
             started_at: None,
             hindsight_query: None,
+            sandbox_info: None,
         };
 
         let status = compute_status(&meta, temp_dir.path());

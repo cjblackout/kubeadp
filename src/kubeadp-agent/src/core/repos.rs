@@ -13,7 +13,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
@@ -92,7 +91,7 @@ impl Drop for RepoLock {
 /// Runs git in `repo_dir` with `args`, mapping failure to a context-
 /// carrying error. `quiet` suppresses stdout (stderr is always captured).
 fn git_run(repo_dir: &Path, args: &[&str], quiet: bool) -> Result<()> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::core::git::hardened_git();
     cmd.args(["-C", &repo_dir.to_string_lossy()]);
     for a in args {
         cmd.arg(a);
@@ -122,7 +121,7 @@ fn git_run(repo_dir: &Path, args: &[&str], quiet: bool) -> Result<()> {
 /// Captures the trimmed stdout of a git call; `None` on failure or empty
 /// output.
 fn git_stdout(repo_dir: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::core::git::hardened_git();
     cmd.args(["-C", &repo_dir.to_string_lossy()]).args(args);
     let out = crate::core::reaper::output_tracked(&mut cmd).ok()?;
     if !out.status.success() {
@@ -370,18 +369,7 @@ pub fn ensure_private_repo(
 /// Reads the `gitdir:` target of a worktree's `.git` file, if it is a file
 /// whose first line has the expected shape.
 fn gitdir_target(worktree_path: &Path) -> Option<String> {
-    let dotgit = worktree_path.join(".git");
-    if !dotgit.is_file() {
-        return None;
-    }
-    let content = fs::read_to_string(&dotgit).ok()?;
-    content
-        .lines()
-        .next()?
-        .trim()
-        .strip_prefix("gitdir:")
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
+    crate::core::git::worktree_gitdir_target(worktree_path)
 }
 
 /// Whether the worktree's link to its git admin data is dangling: the `.git`
@@ -404,7 +392,7 @@ pub fn worktree_gitdir_dangling(worktree_path: &Path) -> bool {
         return true;
     }
     // The gitdir exists but the pair may be inconsistent: probe it.
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::core::git::hardened_git();
     cmd.args([
         "-C",
         &worktree_path.to_string_lossy(),
@@ -763,6 +751,7 @@ mod tests {
             max_runtime: None,
             started_at: None,
             hindsight_query: None,
+            sandbox_info: None,
         }
     }
 

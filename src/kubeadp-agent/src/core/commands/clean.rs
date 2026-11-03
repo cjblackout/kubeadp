@@ -57,6 +57,18 @@ pub fn run(config: &Config, args: &CleanArgs) -> Result<CommandOutput> {
     // below operate on a consistent pair (no-op when healthy).
     crate::core::repos::auto_repair_worktree(config, &meta);
 
+    // Never run git in a worktree agent-run owns whose .git pointer does not
+    // resolve inside the project's repos root / workspace checkout (a
+    // tampered/stale pointer could redirect the dirty check / worktree removal
+    // into an attacker-controlled repo). External (--from-worktree) worktrees
+    // are user-supplied and are not validated against our roots.
+    if !meta.external_worktree {
+        crate::core::git::worktree_gitdir_in_expected_roots(
+            &meta.worktree_path,
+            &crate::core::git::expected_worktree_roots(config, &meta.project),
+        )?;
+    }
+
     // Re-read the row right before destroying anything: a concurrent `retry`
     // (which reuses this row, bumps retry_count and relaunches an agy in the
     // same worktree) can land between the load at the top of this function and
@@ -352,6 +364,7 @@ mod tests {
             max_runtime: None,
             started_at: None,
             hindsight_query: None,
+            sandbox_info: None,
         };
         meta.save(state_root).unwrap();
     }

@@ -43,6 +43,7 @@ pub fn run(config: &Config, _args: &InfoArgs) -> Result<CommandOutput> {
     let (disk_data, disk_lines, disk_warns) = disk_section(config);
     let (auth_data, auth_lines) = auth_section(config);
     let (tool_data, tool_lines) = toolchains_section();
+    let (sandbox_data, sandbox_lines) = sandbox_section(config);
 
     let mut output = CommandOutput::new(json!({
         "server": server_data,
@@ -51,6 +52,7 @@ pub fn run(config: &Config, _args: &InfoArgs) -> Result<CommandOutput> {
         "disk": disk_data,
         "auth": auth_data,
         "toolchains": tool_data,
+        "sandbox": sandbox_data,
     }));
 
     for lines in [
@@ -60,6 +62,7 @@ pub fn run(config: &Config, _args: &InfoArgs) -> Result<CommandOutput> {
         disk_lines,
         auth_lines,
         tool_lines,
+        sandbox_lines,
     ] {
         for line in lines {
             output.push_out(line);
@@ -400,6 +403,64 @@ fn fmt_bytes(bytes: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// sandbox
+// ---------------------------------------------------------------------------
+
+/// Server-level sandbox section: the runtime/backend this pod auto-detected
+/// (the same `sandbox-exec` will use for every job/session launch, since
+/// there is no override in Contract v1.3), plus one entry per job that has
+/// already launched -- each with its recorded `{backend, runtime, policy_path}`.
+/// All values degrade to "unknown"/empty instead of failing `info`.
+fn sandbox_section(config: &Config) -> (Value, Vec<String>) {
+    let probe = crate::sandbox::detect::probe_environment(None);
+    let runtime = probe.runtime.to_string();
+    let backend = probe.chosen_backend.clone();
+
+    let mut lines = vec!["sandbox".to_string()];
+    lines.push(format!(
+        "  runtime: {} / backend: {}",
+        runtime,
+        if backend.is_empty() {
+            "unknown".to_string()
+        } else {
+            backend.clone()
+        }
+    ));
+
+    let mut jobs_by_runtime: BTreeMap<String, u32> = BTreeMap::new();
+    let mut jobs: Vec<Value> = Vec::new();
+    for job in list_jobs(&config.state_root, None).unwrap_or_default() {
+        let Some(sbx) = &job.sandbox_info else {
+            continue;
+        };
+        *jobs_by_runtime.entry(sbx.runtime.clone()).or_insert(0) += 1;
+        jobs.push(json!({
+            "job_id": job.job_id,
+            "backend": sbx.backend,
+            "runtime": sbx.runtime,
+            "policy_path": sbx.policy_path,
+        }));
+    }
+
+    if jobs.is_empty() {
+        lines.push("  launched jobs: none".to_string());
+    } else {
+        for (rt, count) in &jobs_by_runtime {
+            lines.push(format!("  launched jobs ({}): {}", rt, count));
+        }
+    }
+
+    (
+        json!({
+            "runtime": runtime,
+            "backend": backend,
+            "jobs": jobs,
+        }),
+        lines,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // auth
 // ---------------------------------------------------------------------------
 
@@ -654,7 +715,15 @@ mod tests {
         };
 
         let out = run(&config, &InfoArgs {}).expect("info must never fail");
-        for key in ["server", "config", "capacity", "disk", "auth", "toolchains"] {
+        for key in [
+            "server",
+            "config",
+            "capacity",
+            "disk",
+            "auth",
+            "toolchains",
+            "sandbox",
+        ] {
             assert!(out.data.get(key).is_some(), "missing data section {key}");
         }
         assert!(out.stdout_lines.iter().any(|l| l == "server"));

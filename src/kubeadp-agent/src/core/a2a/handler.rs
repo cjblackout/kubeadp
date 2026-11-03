@@ -65,12 +65,16 @@ fn to_sdk_error(e: CrateError) -> A2AError {
 /// The orchestrator delivers into the live session PTY (bracketed paste);
 /// the worker has no interactive input channel for a running `agy` process
 /// and installs no sink, so its `SendMessage` answers `UNSUPPORTED_OPERATION`.
+/// The handler runs `deliver` on the tokio blocking pool (the PTY write is
+/// deadline-bounded but still blocking), so it never occupies a worker thread.
 pub trait MessageSink: Send + Sync {
-    /// Deliver `text` to the task (session) identified by `task_id`.
+    /// Deliver `text` to the task (session) identified by `task_id`, charged
+    /// to the `sender` (the claimed `a2a.sender`) for the per-(session, sender)
+    /// message budget.
     ///
     /// Returning `Err` means the text was NOT delivered (e.g. the session has
-    /// no live PTY or the message budget is exhausted).
-    fn deliver(&self, task_id: &str, text: &str) -> Result<(), A2AError>;
+    /// no live PTY or the sender's budget is exhausted).
+    fn deliver(&self, task_id: &str, sender: &str, text: &str) -> Result<(), A2AError>;
 }
 /// A2A request handler directly over a [`TaskBackend`] and an optional
 /// [`MessageSink`].
@@ -155,23 +159,36 @@ impl RequestHandler for ServerRequestHandler {
         // job answers TaskNotFound, never a deliverer-specific error.
         let task = task_from_backend(&self.backend, task_id)?;
 
-        let text = req.message.text().map(str::trim).unwrap_or("").to_string();
-        if text.is_empty() {
-            return Err(A2AError::invalid_params("message text must not be empty"));
-        }
-
         #[cfg(feature = "a2a")]
-        let text_to_deliver = {
-            let ingress = process_ingress(&text, req.message.metadata.as_ref())?;
-            ingress.framed_text
+        let (sender, text_to_deliver) = {
+            // Validates the WHOLE message (all parts: empty, size and hop) and
+            // frames it with a per-message nonce delimiter.
+            let ingress = process_ingress(&req.message.parts, req.message.metadata.as_ref())?;
+            (ingress.claimed_sender, ingress.framed_text)
         };
         #[cfg(not(feature = "a2a"))]
-        let text_to_deliver = text;
+        let (sender, text_to_deliver) = {
+            let text = req.message.text().map(str::trim).unwrap_or("").to_string();
+            if text.is_empty() {
+                return Err(A2AError::invalid_params("message text must not be empty"));
+            }
+            // No ingress in the non-a2a build, so there is no claimed sender:
+            // deliver under the same "unknown" identity ingress would use.
+            (String::from("unknown"), text)
+        };
 
-        self.sink
-            .as_ref()
-            .expect("checked above")
-            .deliver(task_id, &text_to_deliver)?;
+        // The sink does a (deadline-bounded) blocking PTY write; run it on the
+        // tokio blocking pool so a stuck child cannot hold a worker thread (and
+        // the pty_input mutex) and starve /healthz.
+        let sink = self.sink.as_ref().expect("checked above").clone();
+        let delivery_task = task_id.to_string();
+        let delivery_sender = sender.clone();
+        let delivery_text = text_to_deliver.clone();
+        tokio::task::spawn_blocking(move || {
+            sink.deliver(&delivery_task, &delivery_sender, &delivery_text)
+        })
+        .await
+        .expect("spawn_blocking task panicked or runtime shut down")?;
 
         // Non-streaming delivery per A2A §7.4.2: return the (long-lived) task
         // in its current state; the session keeps running. The client then

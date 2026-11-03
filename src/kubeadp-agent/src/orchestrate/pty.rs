@@ -140,6 +140,17 @@ pub fn spawn_in_pty(mut cmd: Command, pty: &Pty) -> io::Result<Child> {
 
 /// A session-wide reference to the live child PTY master, shared so the REST
 /// API can type text into the session without owning the supervision thread.
+/// Per-attempt cap on the `poll(POLLOUT)` wait inside [`PtyInput::write_all`]:
+/// the total write is also capped by its `deadline`, so a stuck child is
+/// bounded in both dimensions.
+pub const PTY_WRITE_POLL_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// Total budget for one bracketed-paste injection (all its write segments share
+/// one `deadline` set to `now + PTY_WRITE_TOTAL_DEADLINE`). Generous enough for
+/// a healthy child, bounded so a stuck child that never drains its input queue
+/// cannot wedge the caller (and the `pty_input` mutex) indefinitely.
+pub const PTY_WRITE_TOTAL_DEADLINE: Duration = Duration::from_secs(2);
+
 pub struct PtyInput {
     master: RawFd,
 }
@@ -167,12 +178,28 @@ impl PtyInput {
         }
     }
 
-    /// Writes every byte of `buf` to the PTY master, retrying on EINTR and
-    /// EAGAIN, until an error or EOF. A closed master only surfaces on the
-    /// first write, so an idling slot used to be undetectable until now.
-    pub fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+    /// Writes every byte of `buf` to the PTY master, bounded by `deadline`.
+    ///
+    /// The master is non-blocking, so a full slave input queue makes `write`
+    /// return `EAGAIN` instead of blocking. Rather than spin on `EAGAIN` (which
+    /// used to wedge the caller -- and the `pty_input` mutex it held -- for as
+    /// long as a stuck child refused to drain), we wait for space with
+    /// `poll(POLLOUT)`, capped per attempt by [`PTY_WRITE_POLL_TIMEOUT`] and in
+    /// total by `deadline`. Reaching the deadline returns a clear
+    /// [`io::ErrorKind::TimedOut`] error so the caller can release the lock and
+    /// the session thread can proceed.
+    pub fn write_all(&mut self, buf: &[u8], deadline: Instant) -> io::Result<()> {
         let mut written: usize = 0;
         while written < buf.len() {
+            if deadline <= Instant::now() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "pty write timed out: {written} of {} bytes written",
+                        buf.len()
+                    ),
+                ));
+            }
             let n = unsafe {
                 libc::write(
                     self.master,
@@ -185,14 +212,42 @@ impl PtyInput {
                 continue;
             }
             let err = io::Error::last_os_error();
-            if n < 0 && matches!(err.raw_os_error(), Some(libc::EINTR | libc::EAGAIN)) {
-                continue;
+            match err.raw_os_error() {
+                // Interrupted: re-check the deadline and retry.
+                Some(libc::EINTR) => continue,
+                // Slave input queue full: wait (bounded) for space, then retry.
+                // (On Linux EWOULDBLOCK == EAGAIN.)
+                Some(libc::EAGAIN) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let wait_ms = remaining.min(PTY_WRITE_POLL_TIMEOUT).as_millis().max(1) as c_int;
+                    let mut pfd = libc::pollfd {
+                        fd: self.master,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    let ret = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
+                    if ret < 0 {
+                        let perr = io::Error::last_os_error();
+                        if perr.kind() != io::ErrorKind::Interrupted {
+                            return Err(perr);
+                        }
+                        continue;
+                    }
+                    if (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+                        // Slave side gone: let the next write report the real error.
+                        continue;
+                    }
+                    // Poll timed out (ret == 0) or is writable: loop; the
+                    // deadline check at the top turns a stuck child into an error.
+                }
+                Some(_) => return Err(err),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "pty write returned 0",
+                    ))
+                }
             }
-            return Err(if n < 0 {
-                err
-            } else {
-                io::Error::new(io::ErrorKind::WriteZero, "pty write returned 0")
-            });
         }
         Ok(())
     }
@@ -425,6 +480,51 @@ mod tests {
         let mut child = spawn_in_pty(cmd, &pty).expect("spawn");
         let status = child.wait().expect("wait");
         assert!(status.success(), "child asserted pdeathsig == 15");
+    }
+
+    #[test]
+    fn test_write_all_times_out_on_undrained_pipe() {
+        use std::sync::{Arc, Mutex};
+
+        // A pipe whose read end is kept open but never drained: the 64 KiB
+        // pipe buffer fills, the non-blocking write then returns EAGAIN and
+        // poll(POLLOUT) never reports space. write_all must give up at the
+        // deadline (not spin) and leave the pty_input mutex free.
+        let mut fds = [0 as libc::c_int; 2];
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) };
+        assert_eq!(rc, 0, "pipe2");
+        // pipe2: fds[0] = read end, fds[1] = write end. The write end is fed to
+        // PtyInput; the read end stays open and is never drained, so the 64 KiB
+        // pipe buffer fills and the non-blocking write returns EAGAIN.
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+
+        let input = Arc::new(Mutex::new(PtyInput::new(write_fd)));
+        input.lock().unwrap().put(write_fd);
+
+        let big = vec![b'a'; 1024 * 1024];
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let start = Instant::now();
+        let result = input.lock().unwrap().write_all(&big, deadline);
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "undrained pipe write should time out, got {result:?}"
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        // Bounded by the deadline (it waited, but did not spin forever).
+        assert!(
+            elapsed >= Duration::from_millis(150) && elapsed < Duration::from_millis(1200),
+            "elapsed {elapsed:?} should track the ~200ms deadline"
+        );
+        // The caller's pty_input mutex is released once the write bails out.
+        assert!(input.try_lock().is_ok(), "pty_input mutex must be free");
+
+        unsafe {
+            libc::close(write_fd);
+            libc::close(read_fd);
+        }
     }
 
     #[test]
