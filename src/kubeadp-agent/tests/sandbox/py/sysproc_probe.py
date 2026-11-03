@@ -42,10 +42,24 @@ def main():
         want_hash = os.environ.get("KUBEADP_TEST_SECRET_HASH", "")
     pids = list_proc_pids()
     mypid = os.getpid()
+    # Own ancestor chain (the case shell, the sandbox init shim): in a fresh pid
+    # namespace these are the sandbox's own processes, not another agent's.
+    own = {mypid}
+    cur = mypid
+    for _ in range(64):
+        try:
+            with open("/proc/%d/stat" % cur) as f:
+                cur = int(f.read().rsplit(")", 1)[1].split()[1])
+        except Exception:
+            break
+        if cur <= 0 or cur in own:
+            break
+        own.add(cur)
+    fresh_pidns = os.environ.get("KUBEADP_TEST_PIDNS", "") == "1"
     leaked = []
     visible_others = 0
     for pid in pids:
-        if pid == mypid:
+        if pid in own or (fresh_pidns and pid == 1):
             continue
         # don't scan our own shell/self (self-control noise)
         try:

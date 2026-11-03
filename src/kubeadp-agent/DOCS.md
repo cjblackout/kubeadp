@@ -2,6 +2,42 @@
 
 The `agent-run-cli` crate provides the `agent-run` command-line HTTP client shim for the `agent-run-api` daemon. It parses user arguments, dispatches requests over HTTP, and formats execution outputs. Build the binary with `cargo build --release --manifest-path src/agent-run-cli/Cargo.toml` and run tests with `cargo test --manifest-path src/agent-run-cli/Cargo.toml`. Complete command documentation, syntax, and options are specified in [docs/agent-run/cli-reference.md](../../docs/agent-run/cli-reference.md).
 
+## `repo-sync` subcommand (internal git-sync replacement)
+
+`kubeadp-agent repo-sync [--once|--loop]` is the in-process replacement for the git-sync sidecar containers: one process syncs ALL configured repositories (instead of one sidecar per repo), fetching each `ref` shallowly into its own `<root>` (the git repository itself) and exposing a complete, read-only checkout of a single commit through an atomically-flipped symlink `link` → the worktree. The module is **not wired into any pod yet** (step 4: wiring, test pod first, is a separate task).
+
+### Configuration
+
+`[repo_sync]` is configured in its own file (`KUBEADP_REPO_SYNC_CONFIG`, default `/etc/kubeadp-agent/repo-sync.toml` used only if it exists; an absent file is env-only config). It is NOT part of the `KUBEADP_CONFIG_FILE` file; putting a `[repo_sync]` section there is an error. Keys:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `repos` (array of tables) | required (non-empty) | one entry per repository |
+| `token_env` | none | name of an environment variable holding the token |
+| `token_file` | none | path of a file whose trimmed content is the token |
+
+Per repo (array entry): `name` (unique), `url` (required; embedded userinfo is stripped), `ref` (default `main`), `root` (default `/workspace/.roots/<name>`, `~`, `{name}`, `{workspace_root}` expanded), `link` (required absolute path of the symlink the pod exposes, e.g. `/workspace/<name>`), `period_secs` (default 300, minimum 30), `depth` (default 0 = full history; a positive value makes the fetch shallow and an automatic `--unshallow` restores full history when depth drops back to 0).
+
+Unknown keys are a hard error. Environment overrides (environment always wins): `KUBEADP_REPO_SYNC_TOKEN_ENV`, `KUBEADP_REPO_SYNC_TOKEN_FILE`, `KUBEADP_REPO_SYNC_PERIOD_SECS`, `KUBEADP_REPO_SYNC_FETCH_TIMEOUT_SECS`.
+
+Secrets are never inline: the token comes only from `token_env` (a referenced variable) or `token_file` (re-read every cycle for rotation), is never printed, never placed in `argv`, and git credentials are fed to `git credential approve` on stdin (`GIT_TERMINAL_PROMPT=0`, private per-process gitconfig with git-sync's defaults). Repo URLs are stored without userinfo.
+
+### Algorithm
+
+Per cycle, under a per-root file lock (`<root>/.repo-sync.lock`, flock; a second process on the same root exits cleanly with a clear message) and after refreshing+storing the credential (`git credential approve`):
+
+1. ensure `<root>` is a usable git repository (`git init -b git-sync`, `origin` get-url/add/set-url, wiping an unusable root);
+2. read the currently linked worktree (from `link`), then fetch `ref` from the origin (`git fetch <repo> <ref> --verbose --no-progress --prune --no-auto-gc`, with `--depth N` or an automatic `--unshallow`, with a timeout) and resolve the commit;
+3. if it equals the currently-linked commit, do nothing;
+4. otherwise ensure a read-only checkout `<root>/.worktrees/<sha>` exists (a real `git worktree add --force --detach <root>/.worktrees/<sha> <sha> --no-checkout`, configured by rewriting the `.git` dir to a relative path and `reset --hard <sha> --`, then stripped of all write bits) and atomically flip the symlink to a **relative** target (temp symlink + rename);
+5. prune old worktrees, keeping the current one plus the previous 2 revisions as a grace period (`git worktree prune --verbose`).
+
+A crash or failure at any point leaves `link` pointing at a complete previous checkout.
+
+### Failure behaviour
+
+Network/authentication failures are retried at the next period with capped exponential backoff, are logged without secrets, and never delete the current checkout. `--once` runs one cycle over every repo and exits non-zero on any failure; `--loop` (default) runs per-repo periodic sync. Each cycle prints one status line on stderr: `repo-sync <name>: <old sha> -> <new sha> (<ms>)`.
+
 ## `mcp-a2a` subcommand (A2A sending side, feature `a2a`)
 
 `kubeadp-agent mcp-a2a` runs a stdio MCP server (no `KUBEADP_ROLE`) exposing `list_agents`, `send_message` and `get_task` for talking to peer A2A agents. Discovery is by Kubernetes Services labelled `a2a.homelab/agent=true` (own namespace + `A2A_NAMESPACES`), authenticated with the in-cluster service account; `A2A_KUBE_API` overrides the API base and `A2A_URL_OVERRIDES` redirects connections for tests/development. Messages are tagged `a2a.sender` (`A2A_SELF_NAME`) and `a2a.hop` (max 4). See `README.md`, section "`mcp-a2a` subcommand".

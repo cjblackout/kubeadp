@@ -32,6 +32,7 @@ pub mod output;
 pub mod proxy;
 pub mod reaper;
 pub mod repos;
+pub mod reposync;
 pub mod runner;
 
 #[cfg(feature = "server")]

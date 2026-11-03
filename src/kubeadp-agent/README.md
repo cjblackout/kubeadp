@@ -17,6 +17,10 @@ One cargo package for the whole agent stack. It consolidates the former crates `
 - `agent-run`: the remote CLI, flags and behaviour unchanged (see [DOCS.md](DOCS.md)).
 - `agent-orchestrate` and `agent-run-api`: thin wrappers running one role directly, kept for the existing images and manifests.
 
+## `repo-sync` subcommand (internal git-sync replacement)
+
+`kubeadp-agent repo-sync [--once|--loop]` syncs every configured repository into the pod atomically (one process for all repos instead of one git-sync sidecar per repo): fetch into each repo's own `<root>` (the git repository itself), read-only per-commit worktrees under `<root>/.worktrees/<sha>` (`git worktree add` + `reset --hard`, git-sync layout), and an atomically-flipped symlink `link` → the worktree (relative target) the pod reads through. Read-only checkouts; a crash never leaves the link dangling; old worktrees are pruned keeping the current one plus a grace period. Configured via `[repo_sync]` in its own file (`KUBEADP_REPO_SYNC_CONFIG`, see [DOCS.md](DOCS.md) section "`repo-sync` subcommand"). Tokens are never inline: `token_env`/`token_file`, fed to git through `git credential approve` on stdin (with `GIT_TERMINAL_PROMPT=0`), never in argv or logs. **Not wired into any pod yet.**
+
 ## Features
 
 `default = ["cli","server"]`, `cli`, `server`, `a2a` (implies `server`), `test-hooks` (implies `server`).
@@ -91,6 +95,7 @@ Secrets are never inline. Only the `_FILE` form is accepted:
 
 - `[orchestrator] token_file` -> `AGENT_ORCHESTRATE_TOKEN_FILE` (the bearer token; the inline `AGENT_ORCHESTRATE_TOKEN` variable has no TOML key).
 - The worker's Hindsight API key has no file key: set `AGENT_RUN_HINDSIGHT_API_KEY` in the environment from a Secret.
+- The `repo-sync` subcommand has its own file (`KUBEADP_REPO_SYNC_CONFIG`, see the "repo-sync subcommand" section above): a `[repo_sync]` section in THIS file is rejected, and its token is never inline (`token_env`/`token_file` only).
 
 A key that would put either secret inline is rejected with a message pointing at the `_FILE` form.
 

@@ -120,8 +120,8 @@ except Exception: print("")' 2>/dev/null)"
     fake)   KUBEADP_TEST_RUNTIME="fake";   KUBEADP_TEST_PIDNS="0" ;;
     runc)
       case "$cb" in
-        *"namespaces"*) KUBEADP_TEST_RUNTIME="runc-ns";       KUBEADP_TEST_PIDNS="1" ;;
         *"Landlock"*)   KUBEADP_TEST_RUNTIME="runc-landlock"; KUBEADP_TEST_PIDNS="0" ;;
+        *"namespaces"*) KUBEADP_TEST_RUNTIME="runc-ns";       KUBEADP_TEST_PIDNS="1" ;;
         *)              KUBEADP_TEST_RUNTIME="runc";          KUBEADP_TEST_PIDNS="" ;;
       esac
       ;;

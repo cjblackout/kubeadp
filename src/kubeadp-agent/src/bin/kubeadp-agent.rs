@@ -7,6 +7,10 @@
 //! The `mcp-a2a` subcommand (first argument) runs the A2A **sending** side as
 //! a stdio MCP server (feature `a2a`) and does not require `KUBEADP_ROLE`.
 //!
+//! The `repo-sync` subcommand (first argument) runs the internal git-sync
+//! replacement ([`kubeadp_agent::core::reposync`]) for all configured
+//! repositories; it does not require `KUBEADP_ROLE`.
+//!
 //! `KUBEADP_ROLE` unset or set to any other value exits with code 2 and a
 //! clear message. Each role runs exactly the code that the corresponding old
 //! crate's `main()` ran, honouring the same env vars and CLI.
@@ -30,6 +34,8 @@ fn apply_config_for(role: &str) {
 }
 
 fn main() {
+    // Subcommands handled before the role dispatch: explicit, self-describing
+    // entries that need no KUBEADP_ROLE.
     let first_arg = std::env::args().nth(1);
     match first_arg.as_deref() {
         Some("sandbox-exec") => {
@@ -46,6 +52,13 @@ fn main() {
             run_mcp_a2a();
             return;
         }
+        Some("repo-sync") => match run_repo_sync() {
+            Ok(code) => exit(code),
+            Err(e) => {
+                eprintln!("kubeadp-agent (repo-sync): {e:#}");
+                exit(1);
+            }
+        },
         _ => {}
     }
 
@@ -108,4 +121,30 @@ fn run_mcp_a2a() {
 fn run_mcp_a2a() {
     eprintln!("kubeadp-agent: the 'mcp-a2a' subcommand requires the 'a2a' cargo feature");
     exit(2);
+}
+
+/// Runs the `repo-sync` subcommand (the internal git-sync replacement, see
+/// [`kubeadp_agent::core::reposync`]). Arguments: `--once` runs one cycle
+/// over every configured repo (exits 1 on failure); `--loop` (the default)
+/// runs the periodic loop. Exits 0 on success.
+fn run_repo_sync() -> Result<i32, anyhow::Error> {
+    use kubeadp_agent::core::reposync;
+    let mut once = false;
+    for arg in std::env::args().skip(2) {
+        match arg.as_str() {
+            "--once" => once = true,
+            "--loop" => once = false,
+            other => {
+                anyhow::bail!("unknown repo-sync argument '{other}' (expected --once or --loop)")
+            }
+        }
+    }
+    let cfg = reposync::load_config()?;
+    if once {
+        reposync::run_once(&cfg)?;
+        Ok(0)
+    } else {
+        reposync::run_loop(&cfg)?;
+        Ok(0)
+    }
 }

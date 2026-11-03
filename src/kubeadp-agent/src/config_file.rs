@@ -153,6 +153,17 @@ pub fn parse_config_toml(path: &str, content: &str) -> Result<HashMap<String, St
         let table = value.as_table().ok_or_else(|| {
             format!("Invalid configuration file '{path}': section '{section}' must be a table")
         })?;
+        // The `repo-sync` subcommand has its own dedicated configuration file
+        // (KUBEADP_REPO_SYNC_CONFIG, see `core::reposync`); there are no env
+        // variables here for this file to set, so a `[repo_sync]` section
+        // must ERROR like any unknown key instead of being silently dropped.
+        let section = if section == "repo_sync" {
+            return Err(format!(
+                "Invalid configuration file '{path}': section '[repo_sync]' is not supported here; configure the repo-sync subcommand in its own file (KUBEADP_REPO_SYNC_CONFIG)"
+            ));
+        } else {
+            section
+        };
         for (key, value) in table {
             if key.to_ascii_lowercase() != key.as_str() {
                 return Err(format!(
@@ -485,6 +496,16 @@ gc_max_age_days = 14
     fn test_unknown_section_is_error() {
         let err = parse_config_toml("test.toml", "[bogus]\nx = 1\n").unwrap_err();
         assert!(err.contains("unknown key 'bogus.x'"), "{err}");
+    }
+
+    #[test]
+    fn test_repo_sync_section_is_not_supported_here() {
+        // The `repo-sync` subcommand configures through its own file
+        // (KUBEADP_REPO_SYNC_CONFIG); a `[repo_sync]` section in this config
+        // file must be a hard error, not silently dropped.
+        let err = parse_config_toml("test.toml", "[repo_sync]\nrepos = []\n").unwrap_err();
+        assert!(err.contains("repo_sync"), "{err}");
+        assert!(err.contains("KUBEADP_REPO_SYNC_CONFIG"), "{err}");
     }
 
     #[test]
