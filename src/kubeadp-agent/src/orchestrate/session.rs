@@ -618,41 +618,45 @@ fn run_session_iteration(
 
     cmd.args(&args);
 
-    let policy = crate::sandbox::SandboxPolicy::for_session(&session.session_id, &session.workdir);
-    let policy_path =
-        std::env::temp_dir().join(format!("session-policy-{}.json", session.session_id));
-    if let Err(e) = crate::sandbox::SandboxPolicy::write_policy_file(&policy, &policy_path) {
-        // A session whose policy file cannot be written must not start
-        // unsandboxed: fail the launch with a clear reason like every other
-        // pre-exec failure below.
-        log_event(
-            &session.name,
-            &format!(
-                "failed to write session sandbox policy '{}': {}",
-                policy_path.display(),
-                e
-            ),
-        );
-        handle_spawn_error(
-            &ctx,
-            swb,
-            crash_tracker,
-            restart_count,
-            format!("sandbox-policy-error: {}", e),
-        );
-        return true;
+    // A trusted session (`sandbox: false`) runs `claude` directly, unwrapped.
+    if session.sandbox {
+        let policy =
+            crate::sandbox::SandboxPolicy::for_session(&session.session_id, &session.workdir);
+        let policy_path =
+            std::env::temp_dir().join(format!("session-policy-{}.json", session.session_id));
+        if let Err(e) = crate::sandbox::SandboxPolicy::write_policy_file(&policy, &policy_path) {
+            // A session whose policy file cannot be written must not start
+            // unsandboxed: fail the launch with a clear reason like every other
+            // pre-exec failure below.
+            log_event(
+                &session.name,
+                &format!(
+                    "failed to write session sandbox policy '{}': {}",
+                    policy_path.display(),
+                    e
+                ),
+            );
+            handle_spawn_error(
+                &ctx,
+                swb,
+                crash_tracker,
+                restart_count,
+                format!("sandbox-policy-error: {}", e),
+            );
+            return true;
+        }
+        let launcher = crate::sandbox::find_launcher_exe();
+        let mut sandboxed_cmd = Command::new(launcher);
+        sandboxed_cmd.current_dir(&session.workdir);
+        sandboxed_cmd.envs(&session.env);
+        sandboxed_cmd.arg("sandbox-exec");
+        sandboxed_cmd.arg("--policy");
+        sandboxed_cmd.arg(policy_path.to_string_lossy().to_string());
+        sandboxed_cmd.arg("--");
+        sandboxed_cmd.arg(&session.claude_binary);
+        sandboxed_cmd.args(&args);
+        cmd = sandboxed_cmd;
     }
-    let launcher = crate::sandbox::find_launcher_exe();
-    let mut sandboxed_cmd = Command::new(launcher);
-    sandboxed_cmd.current_dir(&session.workdir);
-    sandboxed_cmd.envs(&session.env);
-    sandboxed_cmd.arg("sandbox-exec");
-    sandboxed_cmd.arg("--policy");
-    sandboxed_cmd.arg(policy_path.to_string_lossy().to_string());
-    sandboxed_cmd.arg("--");
-    sandboxed_cmd.arg(&session.claude_binary);
-    sandboxed_cmd.args(&args);
-    cmd = sandboxed_cmd;
 
     // 5. Open PTY
     let mut pty = match Pty::open() {
@@ -1382,6 +1386,7 @@ mod tests {
             kill_grace_secs: 5.0,
             pty_eof_grace_secs: 10.0,
             kill_wait_secs: 15.0,
+            sandbox: true,
             base_backoff_secs: 2.0,
             max_backoff_secs: 60.0,
             healthy_run_secs: 30.0,
