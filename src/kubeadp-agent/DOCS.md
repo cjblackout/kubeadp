@@ -4,7 +4,7 @@ The `agent-run-cli` crate provides the `agent-run` command-line HTTP client shim
 
 ## `repo-sync` subcommand (internal git-sync replacement)
 
-`kubeadp-agent repo-sync [--once|--loop]` is the in-process replacement for the git-sync sidecar containers: one process syncs ALL configured repositories (instead of one sidecar per repo), fetching each `ref` shallowly into its own `<root>` (the git repository itself) and exposing a complete, read-only checkout of a single commit through an atomically-flipped symlink `link` → the worktree. The module is **not wired into any pod yet** (step 4: wiring, test pod first, is a separate task).
+`kubeadp-agent repo-sync [--once|--loop]` is the in-process replacement for the git-sync sidecar containers: one process syncs ALL configured repositories (instead of one sidecar per repo), fetching each `ref` shallowly into its own `<root>` (the git repository itself) and exposing a complete, read-only checkout of a single commit through an atomically-flipped symlink `link` → the worktree. Wired into the `ai-server` (orchestrator) and `kubeadp-agent-worker` pods as a `repo-sync` sidecar container.
 
 ### Configuration
 
