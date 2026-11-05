@@ -626,8 +626,20 @@ impl JobsetRegistry {
 /// previous one (tests run multithreaded, so each gets its own).
 static GLOBAL_REGISTRY: std::sync::Mutex<Option<Arc<JobsetRegistry>>> = std::sync::Mutex::new(None);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LOCAL_REGISTRY: std::cell::RefCell<Option<Arc<JobsetRegistry>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The process-wide registry (an owned `Arc` clone), created on first use.
 pub fn global_registry() -> Arc<JobsetRegistry> {
+    // Tests: a thread inside `with_isolated_registry` sees its own registry, so
+    // concurrently running tests on other threads never write into it.
+    #[cfg(test)]
+    if let Some(local) = TEST_LOCAL_REGISTRY.with(|c| c.borrow().clone()) {
+        return local;
+    }
     let mut slot = GLOBAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if slot.is_none() {
         *slot = Some(Arc::new(JobsetRegistry::new()));
@@ -1113,24 +1125,44 @@ pub fn with_isolated_registry<R>(f: impl FnOnce() -> R) -> R {
 /// drop (RAII). See [`with_isolated_registry`].
 #[cfg(test)]
 struct JobsetScope {
+    #[cfg(not(test))]
     previous: Option<Arc<JobsetRegistry>>,
+    #[cfg(test)]
+    previous_local: Option<Arc<JobsetRegistry>>,
 }
 
 #[cfg(test)]
 impl JobsetScope {
     fn new() -> Self {
-        let mut slot = GLOBAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let previous = slot.take();
-        *slot = Some(Arc::new(JobsetRegistry::new()));
-        Self { previous }
+        let fresh = Arc::new(JobsetRegistry::new());
+        // Tests: only the calling thread sees the fresh registry (other
+        // threads keep the shared one), so concurrent tests cannot write
+        // into it.
+        #[cfg(test)]
+        {
+            let previous_local = TEST_LOCAL_REGISTRY.with(|c| c.borrow_mut().replace(fresh));
+            Self { previous_local }
+        }
+        #[cfg(not(test))]
+        {
+            let mut slot = GLOBAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = slot.take();
+            *slot = Some(fresh);
+            Self { previous }
+        }
     }
 }
 
 #[cfg(test)]
 impl Drop for JobsetScope {
     fn drop(&mut self) {
-        let mut slot = GLOBAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        *slot = self.previous.take();
+        #[cfg(test)]
+        TEST_LOCAL_REGISTRY.with(|c| *c.borrow_mut() = self.previous_local.take());
+        #[cfg(not(test))]
+        {
+            let mut slot = GLOBAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = self.previous.take();
+        }
     }
 }
 

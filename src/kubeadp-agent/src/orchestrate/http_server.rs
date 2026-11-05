@@ -119,15 +119,16 @@ pub fn build_router(
     };
 
     let app = base.merge(sessions);
+    // The operator bearer layer guards `/api/v1` (and `/metrics`) only. The A2A
+    // routes carry their own authentication layer (operator bearer OR a
+    // jobset credential, plus the public agent card), so they are merged
+    // AFTER the bearer layer: wrapping them in it would reject every jobset
+    // member and hide the agent card.
+    let app = crate::core::server::obs::add_observability(app, auth_state, ready, state_metrics);
     #[cfg(feature = "a2a")]
     let app = app.merge(a2a_routes);
 
-    Ok(crate::core::server::obs::add_observability(
-        app,
-        auth_state,
-        ready,
-        state_metrics,
-    ))
+    Ok(app)
 }
 
 /// Resolves the operator-token auth state for the supervisor's HTTP API.
