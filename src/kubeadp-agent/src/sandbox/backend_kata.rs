@@ -292,8 +292,15 @@ pub fn is_denied_path(path: &Path, hide: &[PathBuf], allow_serviceaccount: bool)
     if !allow_serviceaccount && is_k8s_serviceaccount_token_path(path) {
         return true;
     }
-    hide.iter()
-        .any(|h| (path == h || path.starts_with(h) || h.starts_with(path)) && is_git_repository(h))
+    // A `hide` entry that does not exist hides nothing, so it cannot be reached
+    // through a sibling or parent grant either. Without this check the walk up
+    // in `is_git_repository` finds a `.git` in an ancestor (e.g. `/workspace/.git`)
+    // and refuses to grant `/workspace` because of a missing `/workspace/.agent-jobs`.
+    hide.iter().any(|h| {
+        (path == h || path.starts_with(h) || h.starts_with(path))
+            && h.exists()
+            && is_git_repository(h)
+    })
 }
 
 /// Executes a command in the Kata sandbox backend.
@@ -789,6 +796,26 @@ fn execute_target(cmd: &str, args: &[String], env: &[(String, String)]) -> ! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_hide_entry_under_a_git_root_does_not_deny_the_parent_grant() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let missing = root.path().join(".agent-jobs");
+        // `.agent-jobs` is absent: nothing to hide, so granting the parent is fine.
+        assert!(!is_denied_path(
+            root.path(),
+            std::slice::from_ref(&missing),
+            false
+        ));
+        // Once it exists inside the repository it is hidden and the parent is refused.
+        std::fs::create_dir(&missing).unwrap();
+        assert!(is_denied_path(
+            root.path(),
+            std::slice::from_ref(&missing),
+            false
+        ));
+    }
+
     use super::*;
     use crate::sandbox::policy::SecretConfig;
 
