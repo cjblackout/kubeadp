@@ -154,6 +154,7 @@ else
   ara_work=$(mktemp -d)
   ara_state=$(mktemp -d)
   ara_port=$($TCMD python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()' 2>/dev/null || echo $((20000 + RANDOM % 10000)))
+  KUBEADP_API_ALLOW_UNAUTHENTICATED=1 \
   AGENT_RUN_API_LISTEN="127.0.0.1:$ara_port" \
   AGENT_RUN_WORKSPACE_ROOT="$ara_work" \
   AGENT_RUN_STATE_ROOT="$ara_state" \
