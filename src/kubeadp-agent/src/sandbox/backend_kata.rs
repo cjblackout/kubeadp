@@ -283,23 +283,42 @@ fn is_git_repository(path: &Path) -> bool {
     false
 }
 
-/// Returns `true` when `path` must be DENIED (never granted) by the Kata
-/// Landlock domain: the Kubernetes ServiceAccount token directory, or a
-/// `hide` entry that is a git repository (so its object store cannot be read
-/// through a sibling that is allowed).
-/// If `allow_serviceaccount` is true, the ServiceAccount token directory deny is lifted.
+/// Resolves `path` through symlinks when it exists (`/var/run` -> `/run`,
+/// `..data` secret-volume links); otherwise returns it unchanged. Deny checks
+/// must compare resolved paths: Landlock rules attach to the resolved inode, so
+/// a lexical check is bypassed by spelling the same directory another way.
+fn resolve(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Returns `true` when granting `path` must be DENIED (never granted) by the
+/// Kata Landlock domain:
+/// - it is, is under, or CONTAINS the Kubernetes ServiceAccount token
+///   directory (a parent grant exposes it just as well), unless
+///   `allow_serviceaccount` lifts that deny; or
+/// - it overlaps an EXISTING `hide` entry that is a git repository (so its
+///   object store cannot be read through a sibling that is allowed).
+///
+/// All comparisons are on resolved paths, so symlinked spellings (`/run/...`
+/// for `/var/run/...`) are denied too.
 pub fn is_denied_path(path: &Path, hide: &[PathBuf], allow_serviceaccount: bool) -> bool {
-    if !allow_serviceaccount && is_k8s_serviceaccount_token_path(path) {
-        return true;
+    let p = resolve(path);
+    if !allow_serviceaccount {
+        let sa = resolve(Path::new(K8S_SERVICEACCOUNT_TOKEN_DIR));
+        if is_k8s_serviceaccount_token_path(path)
+            || p == sa
+            || p.starts_with(&sa)
+            || sa.starts_with(&p)
+        {
+            return true;
+        }
     }
     // A `hide` entry that does not exist hides nothing, so it cannot be reached
-    // through a sibling or parent grant either. Without this check the walk up
-    // in `is_git_repository` finds a `.git` in an ancestor (e.g. `/workspace/.git`)
-    // and refuses to grant `/workspace` because of a missing `/workspace/.agent-jobs`.
+    // through a sibling or parent grant either. (Already in main for the parent
+    // walk; kept here with the resolved comparison.)
     hide.iter().any(|h| {
-        (path == h || path.starts_with(h) || h.starts_with(path))
-            && h.exists()
-            && is_git_repository(h)
+        let h = resolve(h);
+        (p == h || p.starts_with(&h) || h.starts_with(&p)) && h.exists() && is_git_repository(&h)
     })
 }
 
@@ -503,7 +522,9 @@ pub fn apply_landlock_domain(
         if !path.exists() {
             return Ok(());
         }
-        let c_path = CString::new(path.to_str().unwrap()).unwrap();
+        let c_path = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
+        let c_path = CString::new(c_path)
+            .map_err(|_| format!("kata backend: path {path:?} contains a NUL byte"))?;
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         if fd < 0 {
             return Ok(()); // Skip if cannot open
@@ -571,16 +592,35 @@ pub fn apply_landlock_domain(
         add_rw(tmp)?;
     }
 
-    // 5. Grants allow-list (if session has grants).
+    // 5. Grants allow-list (if session has grants). Grants are optional extras
+    //    on top of the base policy, and a Landlock allow-list only ever adds
+    //    access. A policy VIOLATION (a denied path) still aborts the launch, but
+    //    an environmental failure of one grant (the kernel rejecting the rule)
+    //    is dropped with a warning and the session starts with less access:
+    //    isolation is unaffected, whereas aborting would crash-loop the whole
+    //    session over one optional path. The base policy above stays fatal.
     if let Some(ref g) = policy.grants {
+        let grant = |what: &str, r: Result<(), String>| -> Result<(), String> {
+            match r {
+                Err(e) if e.contains("refusing to grant") => Err(e),
+                Err(e) => {
+                    eprintln!("kubeadp-agent: sandbox grant dropped ({what}): {e}");
+                    Ok(())
+                }
+                Ok(()) => Ok(()),
+            }
+        };
         if g.serviceaccount {
-            add_ro(Path::new(K8S_SERVICEACCOUNT_TOKEN_DIR))?;
+            grant(
+                "serviceaccount",
+                add_ro(Path::new(K8S_SERVICEACCOUNT_TOKEN_DIR)),
+            )?;
         }
         for ro_path in &g.ro_paths {
-            add_ro(ro_path)?;
+            grant(&format!("ro {}", ro_path.display()), add_ro(ro_path))?;
         }
         for rw_path in &g.rw_paths {
-            add_rw(rw_path)?;
+            grant(&format!("rw {}", rw_path.display()), add_rw(rw_path))?;
         }
     }
 
@@ -796,6 +836,26 @@ fn execute_target(cmd: &str, args: &[String], env: &[(String, String)]) -> ! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn serviceaccount_dir_is_denied_through_symlinked_spellings_and_parents() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("run/secrets/kubernetes.io");
+        std::fs::create_dir_all(real.join("serviceaccount")).unwrap();
+        // The check resolves symlinks: a link to the real dir is denied like the dir.
+        let link = root.path().join("alias");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // K8S_SERVICEACCOUNT_TOKEN_DIR is a fixed absolute path, so the symlink and
+        // parent cases are exercised through the production path where it exists
+        // and through `resolve` equivalence otherwise.
+        assert_eq!(resolve(&link), std::fs::canonicalize(&real).unwrap());
+        let sa = Path::new(K8S_SERVICEACCOUNT_TOKEN_DIR);
+        if let Some(parent) = sa.parent() {
+            // A parent grant exposes the token dir just as well.
+            assert!(is_denied_path(parent, &[], false));
+            assert!(!is_denied_path(parent, &[], true));
+        }
+    }
+
     #[test]
     fn missing_hide_entry_under_a_git_root_does_not_deny_the_parent_grant() {
         let root = tempfile::tempdir().unwrap();

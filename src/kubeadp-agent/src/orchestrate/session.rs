@@ -1034,7 +1034,19 @@ fn run_session_iteration(
     let exit_signal = captured_status.as_ref().and_then(|s| s.signal());
 
     if exit_reason.is_none() {
-        if let Some(code) = exit_code {
+        if exit_code == Some(125) {
+            // 125 is the sandbox launcher's "setup failed, command never ran":
+            // surface the reason in `status` instead of a bare `exit: 125`.
+            let first = String::from_utf8_lossy(&tail_buf)
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(200)
+                .collect::<String>();
+            exit_reason = Some(format!("sandbox-setup-failed (rc=125): {first}"));
+        } else if let Some(code) = exit_code {
             exit_reason = Some(format!("exit: {}", code));
         } else if let Some(sig) = exit_signal {
             exit_reason = Some(format!("signal: {}", sig));
