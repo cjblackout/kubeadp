@@ -219,7 +219,7 @@ Base configuration is resolved in the following priority order:
 > If an explicit path is provided via `--config` or the config environment variable and fails to load, the supervisor exits with code 1 immediately.
 
 > [!WARNING]
-> **Workdir Symlink Limitation**: Claude Code derives transcript paths using the canonical (symlink-resolved) real path of its working directory. If a session's `workdir` is a symlink whose target changes (such as git-sync checkout directories), the conversation transcript path will change and previous conversation history will be lost on retarget. Workspace sessions should point at stable real directories, not git-sync symlinks. (The default `/home/coder` session is a stable real directory and unaffected).
+> **Workdir Symlink Limitation**: Claude Code derives transcript paths using the canonical (symlink-resolved) real path of its working directory. If a session's `workdir` is a symlink whose target changes (such as repo-sync checkout directories), the conversation transcript path will change and previous conversation history will be lost on retarget. Workspace sessions should point at stable real directories, not repo-sync symlinks. (The default `/home/coder` session is a stable real directory and unaffected).
 
 Example configuration JSON:
 
