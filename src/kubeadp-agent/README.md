@@ -1,439 +1,190 @@
 # kubeadp-agent
 
-One cargo package for the whole agent stack. It consolidates the former crates `agent-core`, `agent-orchestrate`, `agent-run-api` and `agent-run-cli`; behaviour is unchanged.
+Unified agent execution stack. It provides a process supervisor and REST API (`orchestrator`), a background job execution daemon (`worker`), a remote command-line interface (`agent-run`), an execution engine abstraction layer, and container-level process sandboxing.
 
-## Layout
+## Module Layout
 
-| Module | Former crate | Feature |
+| Module | Purpose | Cargo Feature |
 |---|---|---|
-| `core` | agent-core (job engine, git worktrees, shared axum server, A2A) | `server` for `core::server`, `a2a` for `core::a2a` |
-| `orchestrate` | agent-orchestrate (Claude Code session supervisor and REST API) | `server` |
-| `worker` | agent-run-api (agy job API daemon) | `server` |
-| `cli` | agent-run-cli (remote client) | `cli` |
-| `engine` | — (pluggable engine layer: `Engine` trait, capability table, registry, 501 `unsupported` mapping; the E1 foundation, nothing routes through it yet) | `engine` |
+| `core` | Execution engine, Git worktree isolation, SQLite persistence, shared axum HTTP server, and A2A protocol support | `server` for `core::server`, `a2a` for `core::a2a` |
+| `orchestrate` | Interactive session supervisor and REST management API | `server` |
+| `worker` | Background job execution API daemon | `server` |
+| `cli` | Remote HTTP command-line client (`agent-run`) | `cli` |
+| `engine` | Pluggable engine layer (`Engine` trait, capability registry, emulation layer, and run-control routes) | `engine` (implies `server`) |
+| `sandbox` | Container-level process isolation (`sandbox-exec`, `sandbox-probe`, `relay-inner`, `relay-connect`) | Built unconditionally |
 
-## Binaries
+## Binaries and Roles
 
-- `kubeadp-agent`: role chosen by env `KUBEADP_ROLE=orchestrator|worker` (unset or any other value exits with code 2).
-- `agent-run`: the remote CLI, flags and behaviour unchanged (see [DOCS.md](DOCS.md)).
-- `agent-orchestrate` and `agent-run-api`: thin wrappers running one role directly, kept for the existing images and manifests.
+The package provides the following binaries:
 
-## `repo-sync` subcommand (internal git-sync replacement)
+- `kubeadp-agent`: Dispatcher binary. When invoked without subcommands, it reads the `KUBEADP_ROLE` environment variable:
+  - `KUBEADP_ROLE=orchestrator`: Runs the session supervisor and management API.
+  - `KUBEADP_ROLE=worker`: Runs the background job API daemon.
+  - An unset or invalid `KUBEADP_ROLE` exits with code 2.
+- `agent-run`: Remote CLI client communicating with the API daemon over HTTP.
+- `agent-orchestrate`: Direct binary entry point for the orchestrator role.
+- `agent-run-api`: Direct binary entry point for the worker role.
 
-`kubeadp-agent repo-sync [--once|--loop]` syncs every configured repository into the pod atomically (one process for all repos instead of one git-sync sidecar per repo): fetch into each repo's own `<root>` (the git repository itself), read-only per-commit worktrees under `<root>/.worktrees/<sha>` (`git worktree add` + `reset --hard`, git-sync layout), and an atomically-flipped symlink `link` → the worktree (relative target) the pod reads through. Read-only checkouts; a crash never leaves the link dangling; old worktrees are pruned keeping the current one plus a grace period. Configured via `[repo_sync]` in its own file (`KUBEADP_REPO_SYNC_CONFIG`, see [DOCS.md](DOCS.md) section "`repo-sync` subcommand"). Tokens are never inline: `token_env`/`token_file`, fed to git through `git credential approve` on stdin (with `GIT_TERMINAL_PROMPT=0`), never in argv or logs. Wired into `ai-server` and `kubeadp-agent-worker` pods as a `repo-sync` sidecar.
+### Subcommands
 
-## Features
+The `kubeadp-agent` binary supports subcommands that run directly without requiring `KUBEADP_ROLE`:
 
-`default = ["cli","server","engine"]`, `cli`, `server`, `a2a` (implies `server`), `test-hooks` (implies `server`), `engine` (implies `server`).
+- `kubeadp-agent mcp-a2a`: Standard I/O Model Context Protocol (MCP) server providing client tools for talking to peer A2A agents (`list_agents`, `send_message`, `reply`, `get_task`).
+- `kubeadp-agent repo-sync [--once|--loop]`: Synchronizes Git repositories into local checkouts using atomic worktrees and symlinks.
+- `kubeadp-agent sandbox-exec --policy <file|-> -- <cmd> [args...]`: Executes `<cmd>` inside a sandboxed environment according to the specified policy.
+- `kubeadp-agent sandbox-probe [--json]`: Detects container runtime capabilities and reports supported sandbox backends.
+- `kubeadp-agent relay-inner <socket-path>`: Internal loopback TCP-to-Unix proxy for sandboxed network relay mode.
+- `kubeadp-agent relay-connect <host> <port>`: Internal `ProxyCommand` helper for SSH egress through the relay proxy.
 
-## Tests
+## Cargo Features
 
-`cargo test --features a2a,test-hooks`, `bash tests/orchestrate/run-tests.sh` (supervisor black-box suite), `bash tests/cli/run-all.sh` (CLI suite, never touches the real server; see tests/cli/README.md).
+| Feature | Description |
+|---|---|
+| `default` | Includes `["cli", "server", "engine"]`. |
+| `cli` | Builds client library and remote CLI dispatching logic. |
+| `server` | Builds shared axum HTTP server routes, authentication, and supervisor/worker services. |
+| `engine` | Enables pluggable `Engine` trait, run-control routes, and capability tables (implies `server`). |
+| `a2a` | Enables A2A protocol server routes and the `mcp-a2a` tool suite (implies `server`). |
+| `test-hooks` | Exposes internal test hooks and defaults `api_allow_unauthenticated` to true for harnesses (implies `server`). |
 
-## Configuration file
+## Configuration File
 
-Both long-lived roles of the `kubeadp-agent` binary (`KUBEADP_ROLE=orchestrator|worker`) and the thin `agent-orchestrate` / `agent-run-api` wrappers can be configured from a single TOML file that maps 1:1 onto the environment variables the code already reads. The pattern mirrors `info-hub-mcp`'s `src/config.rs`.
+The long-lived roles of `kubeadp-agent` (`orchestrator` and `worker`), as well as `agent-orchestrate` and `agent-run-api`, can be configured via a TOML file.
 
 File resolution:
+1. `KUBEADP_CONFIG_FILE` environment variable specifies an explicit path. An empty string is an error.
+2. If unset, `/etc/kubeadp-agent/config.toml` is loaded if it exists.
+3. If absent, configuration is read exclusively from environment variables.
 
-- `KUBEADP_CONFIG_FILE` selects the file; an empty value is an error.
-- When unset, `/etc/kubeadp-agent/config.toml` is used **only if it exists**.
-- An absent file means environment-only configuration (behaviour unchanged).
+Environment variables take precedence over settings in the configuration file.
 
-Sections: `[common]`, `[orchestrator]`, `[worker]`. Keys are lower-case; a key in the wrong section, an unknown key, a duplicate key or a non-scalar value is a hard error naming `section.key`. Booleans are written `true`/`false`, numbers as decimal strings.
+The file contains three sections: `[common]`, `[orchestrator]`, and `[worker]`. Unknown, misplaced, or duplicate keys produce a configuration error and exit code 1.
 
-**Precedence: the environment always wins.** The role applies `[common]` plus its own section; the other role's section is parsed and validated but its values are not applied, so one ConfigMap can serve both roles.
+### Configuration Keys
 
-### Key table
+| Section | Key | Environment Variable | Default / Notes |
+|---|---|---|---|
+| `[common]` | `http_proxy` | `AGENT_RUN_HTTP_PROXY` | Proxy URL for HTTP traffic |
+| `[common]` | `https_proxy` | `AGENT_RUN_HTTPS_PROXY` | Proxy URL for HTTPS traffic |
+| `[common]` | `no_proxy` | `AGENT_RUN_NO_PROXY` | Comma-separated bypass host list |
+| `[common]` | `api_token_file` | `KUBEADP_API_TOKEN_FILE` | Path to bearer token guarding `/api/v1` and A2A routes |
+| `[common]` | `api_allow_unauthenticated` | `KUBEADP_API_ALLOW_UNAUTHENTICATED` | Boolean; permits starting without a token if `true` |
+| `[common]` | `jobset_root_key_file` | `KUBEADP_JOBSET_ROOT_KEY_FILE` | Path to root HMAC key deriving per-jobset secrets |
+| `[orchestrator]` | `listen` | `AGENT_ORCHESTRATE_LISTEN` | Listen address (default: `127.0.0.1:8002`) |
+| `[orchestrator]` | `token_file` | `AGENT_ORCHESTRATE_TOKEN_FILE` | Path to orchestrator token file (fallback if `api_token_file` unset) |
+| `[orchestrator]` | `session_log_ring_bytes` | `AGENT_ORCHESTRATE_SESSION_LOG_RING_BYTES` | Buffer size for session logs (default: 500,000 bytes) |
+| `[orchestrator]` | `config` | `AGENT_ORCHESTRATE_CONFIG` | Path to session definition file (`.json` or `.toml`) |
+| `[orchestrator]` | `workspaces` | `CLAUDE_WORKSPACES` | Comma/whitespace list of workspace names, or `auto` |
+| `[orchestrator]` | `workspace_root` | `CLAUDE_WORKSPACE_ROOT` | Base directory for workspaces (default: `/workspace`) |
+| `[orchestrator]` | `remote_prefix` | `CLAUDE_REMOTE_PREFIX` | Prefix for session remote names (default: `ai-server`) |
+| `[orchestrator]` | `default_session` | `CLAUDE_DEFAULT_SESSION` | Boolean; controls auto-inclusion of default session |
+| `[orchestrator]` | `default_session_id` | `CLAUDE_DEFAULT_SESSION_ID` | UUID for default session |
+| `[orchestrator]` | `session_args` | `CLAUDE_SESSION_ARGS` | Extra CLI arguments appended to session processes |
+| `[orchestrator]` | `claude_max_crashes` | `CLAUDE_MAX_CRASHES` | Maximum crashes within window before failing (default: 0 = unlimited) |
+| `[orchestrator]` | `default_session_engine` | `AGENT_ORCHESTRATE_DEFAULT_SESSION_ENGINE` | Default engine for sessions (default: `claude`) |
+| `[worker]` | `api_listen` | `AGENT_RUN_API_LISTEN` | Listen address (default: `0.0.0.0:8002`) |
+| `[worker]` | `workspace_root` | `AGENT_RUN_WORKSPACE_ROOT` | Base directory for workspace operations |
+| `[worker]` | `jobs_dir_name` | `AGENT_RUN_JOBS_DIR_NAME` | Subdirectory name for job worktrees |
+| `[worker]` | `agy_path` | `AGENT_RUN_AGY_PATH` | Path to `agy` executable |
+| `[worker]` | `default_model` | `AGENT_RUN_DEFAULT_MODEL` | Default model string passed to agent jobs |
+| `[worker]` | `default_effort` | `AGENT_RUN_DEFAULT_EFFORT` | Default reasoning effort setting |
+| `[worker]` | `default_base_branch` | `AGENT_RUN_DEFAULT_BASE_BRANCH` | Default base branch for repository checkouts |
+| `[worker]` | `default_engine` | `AGENT_RUN_DEFAULT_ENGINE` | Default engine for jobs (default: `agy`) |
+| `[worker]` | `state_root` | `AGENT_RUN_STATE_ROOT` | Path to persistent SQLite and runtime state |
+| `[worker]` | `repos_root` | `AGENT_RUN_REPOS_ROOT` | Base path for bare Git cache repositories |
+| `[worker]` | `gc_max_age_days` | `AGENT_RUN_GC_MAX_AGE_DAYS` | Threshold for automatic job garbage collection |
+| `[worker]` | `max_parallel` | `AGENT_RUN_MAX_PARALLEL` | Concurrent job execution limit |
+| `[worker]` | `shutdown_grace_secs` | `AGENT_RUN_SHUTDOWN_GRACE` | Grace period in seconds for termination |
+| `[worker]` | `launch_timeout_secs` | `AGENT_RUN_LAUNCH_TIMEOUT_SECS` | Maximum seconds allowed for job launch |
+| `[worker]` | `stall_minutes` | `AGENT_RUN_STALL_MINUTES` | Inactivity threshold before flagging stalled jobs |
+| `[worker]` | `max_runtime` | `AGENT_RUN_MAX_RUNTIME` | Hard wall-clock limit for job execution |
+| `[worker]` | `hindsight_enabled` | `AGENT_RUN_HINDSIGHT_ENABLED` | Boolean; enables Hindsight memory engine integration |
+| `[worker]` | `hindsight_bank` | `AGENT_RUN_HINDSIGHT_BANK` | Bank identifier for Hindsight |
+| `[worker]` | `hindsight_tag` | `AGENT_RUN_HINDSIGHT_TAG` | Project tag for memory indexing |
+| `[worker]` | `hindsight_path` | `AGENT_RUN_HINDSIGHT_PATH` | Path to hindsight CLI binary |
+| `[worker]` | `hindsight_auto_recall` | `AGENT_RUN_HINDSIGHT_AUTO_RECALL` | Boolean; automatically recall context for prompts |
+| `[worker]` | `hindsight_auto_retain` | `AGENT_RUN_HINDSIGHT_AUTO_RETAIN` | Boolean; retain execution summary into memory |
+| `[worker]` | `hindsight_url` | `AGENT_RUN_HINDSIGHT_URL` | Base URL for remote Hindsight API |
+| `[worker]` | `hindsight_profile` | `AGENT_RUN_HINDSIGHT_PROFILE` | Profile name for Hindsight CLI calls |
+| `[worker]` | `remote_control` | `AGENT_RUN_REMOTE_CONTROL` | Boolean; enables remote control supervisor |
+| `[worker]` | `remote_control_autostart` | `AGENT_RUN_REMOTE_CONTROL_AUTOSTART` | Boolean; automatically starts remote control |
+| `[worker]` | `remote_control_check_secs` | `AGENT_RUN_REMOTE_CONTROL_CHECK_SECS` | Health check interval for remote control |
+| `[worker]` | `agy_mcp_source` | `AGENT_RUN_AGY_MCP_SOURCE` | Path to template MCP configuration file |
+| `[worker]` | `a2a_interrupt_min_secs` | `AGENT_RUN_A2A_INTERRUPT_MIN_SECS` | Minimum seconds between incoming A2A job interrupts (default: 20) |
+| `[worker]` | `a2a_mcp_enabled` | `AGENT_RUN_A2A_MCP_ENABLED` | Boolean; injects `mcp-a2a` server into job configuration (default: false) |
 
-| Section | Key | Environment variable |
-|---|---|---|
-| `[common]` | `http_proxy` | `AGENT_RUN_HTTP_PROXY` |
-| `[common]` | `https_proxy` | `AGENT_RUN_HTTPS_PROXY` |
-| `[common]` | `no_proxy` | `AGENT_RUN_NO_PROXY` |
-| `[common]` | `api_token_file` | `KUBEADP_API_TOKEN_FILE` |
-| `[common]` | `api_allow_unauthenticated` | `KUBEADP_API_ALLOW_UNAUTHENTICATED` |
-| `[orchestrator]` | `listen` | `AGENT_ORCHESTRATE_LISTEN` |
-| `[orchestrator]` | `token_file` | `AGENT_ORCHESTRATE_TOKEN_FILE` |
-| `[orchestrator]` | `session_log_ring_bytes` | `AGENT_ORCHESTRATE_SESSION_LOG_RING_BYTES` |
-| `[orchestrator]` | `config` | `AGENT_ORCHESTRATE_CONFIG` |
-| `[orchestrator]` | `workspaces` | `CLAUDE_WORKSPACES` |
-| `[orchestrator]` | `workspace_root` | `CLAUDE_WORKSPACE_ROOT` |
-| `[orchestrator]` | `remote_prefix` | `CLAUDE_REMOTE_PREFIX` |
-| `[orchestrator]` | `default_session` | `CLAUDE_DEFAULT_SESSION` |
-| `[orchestrator]` | `default_session_id` | `CLAUDE_DEFAULT_SESSION_ID` |
-| `[orchestrator]` | `session_args` | `CLAUDE_SESSION_ARGS` |
-| `[orchestrator]` | `claude_max_crashes` | `CLAUDE_MAX_CRASHES` |
-| `[worker]` | `workspace_root` | `AGENT_RUN_WORKSPACE_ROOT` |
-| `[worker]` | `jobs_dir_name` | `AGENT_RUN_JOBS_DIR_NAME` |
-| `[worker]` | `agy_path` | `AGENT_RUN_AGY_PATH` |
-| `[worker]` | `default_model` | `AGENT_RUN_DEFAULT_MODEL` |
-| `[worker]` | `default_effort` | `AGENT_RUN_DEFAULT_EFFORT` |
-| `[worker]` | `default_base_branch` | `AGENT_RUN_DEFAULT_BASE_BRANCH` |
-| `[worker]` | `state_root` | `AGENT_RUN_STATE_ROOT` |
-| `[worker]` | `repos_root` | `AGENT_RUN_REPOS_ROOT` |
-| `[worker]` | `gc_max_age_days` | `AGENT_RUN_GC_MAX_AGE_DAYS` |
-| `[worker]` | `max_parallel` | `AGENT_RUN_MAX_PARALLEL` |
-| `[worker]` | `shutdown_grace_secs` | `AGENT_RUN_SHUTDOWN_GRACE` |
-| `[worker]` | `launch_timeout_secs` | `AGENT_RUN_LAUNCH_TIMEOUT_SECS` |
-| `[worker]` | `stall_minutes` | `AGENT_RUN_STALL_MINUTES` |
-| `[worker]` | `max_runtime` | `AGENT_RUN_MAX_RUNTIME` |
-| `[worker]` | `hindsight_enabled` | `AGENT_RUN_HINDSIGHT_ENABLED` |
-| `[worker]` | `hindsight_bank` | `AGENT_RUN_HINDSIGHT_BANK` |
-| `[worker]` | `hindsight_tag` | `AGENT_RUN_HINDSIGHT_TAG` |
-| `[worker]` | `hindsight_path` | `AGENT_RUN_HINDSIGHT_PATH` |
-| `[worker]` | `hindsight_auto_recall` | `AGENT_RUN_HINDSIGHT_AUTO_RECALL` |
-| `[worker]` | `hindsight_auto_retain` | `AGENT_RUN_HINDSIGHT_AUTO_RETAIN` |
-| `[worker]` | `hindsight_url` | `AGENT_RUN_HINDSIGHT_URL` |
-| `[worker]` | `hindsight_profile` | `AGENT_RUN_HINDSIGHT_PROFILE` |
-| `[worker]` | `remote_control` | `AGENT_RUN_REMOTE_CONTROL` |
-| `[worker]` | `remote_control_autostart` | `AGENT_RUN_REMOTE_CONTROL_AUTOSTART` |
-| `[worker]` | `remote_control_check_secs` | `AGENT_RUN_REMOTE_CONTROL_CHECK_SECS` |
- | `[worker]` | `api_listen` | `AGENT_RUN_API_LISTEN` |
- | `[worker]` | `agy_mcp_source` | `AGENT_RUN_AGY_MCP_SOURCE` |
- | `[worker]` | `a2a_interrupt_min_secs` | `AGENT_RUN_A2A_INTERRUPT_MIN_SECS` |
+### Secret Management Rules
 
-### Secrets
+Secrets are never configured inline in the TOML file:
+- Bearer tokens must use `api_token_file` or `token_file`. Inline `token` keys are rejected.
+- Jobset root keys must use `jobset_root_key_file`. Inline `jobset_root_key` is rejected.
+- The worker's Hindsight API key must be supplied via the `AGENT_RUN_HINDSIGHT_API_KEY` environment variable.
 
-Secrets are never inline. Only the `_FILE` form is accepted:
+If no token is supplied, the server refuses to bind unless `api_allow_unauthenticated = true` is set. Raw secret values are hashed to SHA-256 upon reading and are never logged.
 
-- `[common] api_token_file` -> `KUBEADP_API_TOKEN_FILE`: the operator bearer
-  token guarding the WHOLE `/api/v1` and A2A surface of BOTH roles (worker
-  agent-run-api and orchestrator alike); an inline `[common] token` is
-  rejected.
-- `[orchestrator] token_file` -> `AGENT_ORCHESTRATE_TOKEN_FILE` (the legacy
-  orchestrator bearer token; the inline `AGENT_ORCHESTRATE_TOKEN` variable has
-  no TOML key). Honoured as a fallback when no `[common] api_token_file` is
-  set, so existing deployments keep working unchanged.
-- The worker's Hindsight API key has no file key: set `AGENT_RUN_HINDSIGHT_API_KEY` in the environment from a Secret.
-- The `repo-sync` subcommand has its own file (`KUBEADP_REPO_SYNC_CONFIG`, see the "repo-sync subcommand" section above): a `[repo_sync]` section in THIS file is rejected, and its token is never inline (`token_env`/`token_file` only).
-
-A key that would put either secret inline is rejected with a message pointing at the `_FILE` form.
-
-Without a token (shared or legacy) a role refuses to start its API server
-unless `api_allow_unauthenticated` (`KUBEADP_API_ALLOW_UNAUTHENTICATED`) is
-set; the token value is hashed to a SHA-256 digest at startup and never
-appears in logs.
-
-The `agent-run` CLI (client side) reads the same variable: when
-`KUBEADP_API_TOKEN_FILE` is set, the file's trimmed contents are presented as
-`Authorization: Bearer <token>` on every request the CLI makes (via a ureq
-middleware in `src/cli/client.rs`). Unset means no header. A configured but
-unreadable or empty file aborts the CLI with a clear error naming only the
-path — the token value is never printed or logged.
-
-Example (one ConfigMap for both roles):
+### Configuration Example
 
 ```toml
 [common]
-http_proxy = "http://proxy.example:3128"
+http_proxy = "http://proxy.example.internal:3128"
 api_token_file = "/run/secrets/api-token"
+jobset_root_key_file = "/run/secrets/jobset-root-key"
 
 [orchestrator]
 listen = "0.0.0.0:8002"
-claude_max_crashes = 7
+claude_max_crashes = 5
+default_session_engine = "claude"
 
 [worker]
 max_parallel = 4
-hindsight_url = "https://hindsight.example"
+default_engine = "agy"
+a2a_mcp_enabled = true
 ```
 
-### Orchestrator session configuration as TOML
+## Quick Usage
 
-The orchestrator's JSON session configuration (`AGENT_ORCHESTRATE_CONFIG`, default `/etc/agent-orchestrate/config.json`) is also accepted as TOML, chosen by file extension (`.toml` vs `.json`) and deserialized through the same serde structs: the top-level fields (`state_file`, `heartbeat_interval_secs`, `stale_heartbeat_secs`, `shutdown_grace_secs`, `claude_config_dir`) plus an array of tables for `sessions` with the same field names as the JSON form. Sessions are not embedded in the main configuration file.
+### Starting Services
 
-# Module notes: core
-## agent-core
-
-The `agent-core` crate is the shared execution engine and library backing `agent-run-cli`, `agent-run-api` and `agent-orchestrate`. It implements Git worktree isolation, SQLite job metadata persistence, process lifecycle management, activity monitoring, Hindsight memory integration, and (behind the `server` cargo feature) the axum-based HTTP API server module (`kubeadp_agent::core::server`) that both `agent-run-api` and `agent-orchestrate` re-export. The `server` module carries the shared `/api/v1` route group plus the observability/auth/error layers both servers build on: `server::obs::add_observability` wraps the authenticated sub-router in one bearer-auth layer and appends the never-auth `GET /healthz` and `GET /readyz` probes and the auth-gated `GET /metrics`; `server::reject` provides `ApiJson`/`ApiQuery`/`ApiPath` extractors whose rejections render as the standard `{"error","code"}` JSON shape (400/413/415/422). Build the library with `cargo build --manifest-path src/kubeadp-agent/Cargo.toml [--features server]` and run tests with `cargo test --manifest-path src/kubeadp-agent/Cargo.toml`. Architectural specifications and subsystem designs are detailed in [docs/agent-run/architecture.md](../../docs/agent-run/architecture.md).
-
-The `agent-core` crate is the shared execution engine and library backing `agent-run-cli`, `agent-run-api` and `agent-orchestrate`. It implements Git worktree isolation, SQLite job metadata persistence, process lifecycle management, activity monitoring, Hindsight memory integration, and (behind the `server` cargo feature) the axum-based HTTP API server module (`kubeadp_agent::core::server`) that both `agent-run-api` and `agent-orchestrate` re-export. Build the library with `cargo build --manifest-path src/kubeadp-agent/Cargo.toml [--features server]` and run tests with `cargo test --manifest-path src/kubeadp-agent/Cargo.toml`. Architectural specifications and subsystem designs are detailed in [docs/agent-run/architecture.md](../../docs/agent-run/architecture.md).
-
-### A2A agent protocol surface (feature `a2a`)
-
-Behind the `a2a` cargo feature (which depends on `server`), `kubeadp_agent::core::a2a` serves the A2A v1 agent protocol through the official SDK (`a2aproject/a2a-rs`, Apache-2.0, pinned exactly: `a2a-lf` types, `a2a-server-lf` routers, `a2a-client-lf` for clients and tests): the public agent card at `/.well-known/agent-card.json` (name/description/version from a caller-supplied `A2aModel`; skills = a caller-passed list of project/agent names; bearer security scheme) and HTTP+JSON (REST) bindings (`/message:send`, `/tasks`, `/tasks/{id}`, `/tasks/{id}:cancel`) for `GetTask`, `ListTasks`, `CancelTask` over the `TaskBackend` trait and `SendMessage` over the `MessageSink` trait. `SendStreamingMessage`, `SubscribeToTask`, push-notification config and `GetExtendedAgentCard` answer the A2A error codes (`UNSUPPORTED_OPERATION`, `PUSH_NOTIFICATION_NOT_SUPPORTED`, ...).
-
-The server implements `a2a_server::RequestHandler` by hand (`core::a2a::handler`), not `DefaultRequestHandler`: sessions and jobs already own their task ids and never reach a terminal state on `SendMessage`, so the handler returns the current task and the session keeps running (progress through `GetTask`). Errors, status codes and media types are the SDK's (REST errors are `application/problem+json` with the A2A reason in `error.details[0].reason`; unsupported operations are HTTP 400). `agent-orchestrate` passes a `SessionMessageSink` that delivers into the live session through the same path as `POST /api/v1/sessions/{name}/message` (sanitising, size limit, rate limit); `agent-run-api` passes a `JobMessageSink` that resumes the addressed job's conversation with the message as the next turn (interrupt-and-resume): a running job's `agy` attempt is stopped cleanly (SIGTERM group, grace, SIGKILL — the same mechanism as `kill`, but never marked user-killed/failed) and the same conversation is continued through the retry follow-up path; a finished job is resumed directly. An operator-killed job is never woken (clear error); unknown/cleaned/discarded jobs answer `TASK_NOT_FOUND`. At most one resume is in flight per job (per-job gate); concurrent messages coalesce in memory into the next turn (bounded 8 msgs / 8 KB, oldest dropped with a note, no persistent inbox). A per-job minimum interval (`a2a_interrupt_min_secs`, default 20 s, `0` = off) plus the existing per-jobset hop-token budget rate-limit message storms (a throttled delivery is rejected with a rate-limit error); a repeated A2A message id is applied at most once (idempotency).
-
-Router construction: `a2a_router(model, backend, sink, auth)` returns a standalone `axum::Router` (card and REST routes); the wrappers (`agent-orchestrate`, `agent-run-api`) merge it into their own routers. All non-card routes require a bearer token supplied by the caller as an optional `AuthVerifier` (`Arc<dyn Fn(&HeaderMap) -> bool>`); the card is always public. `map_job_status` converts `kubeadp_agent::core::job::JobStatus` into A2A `TaskState` (`Running`→`working`, `Done`→`completed`, `Failed`/`Incomplete`/`QuotaExhausted`→`failed`, `SelfTerminated`/`Killed`→`canceled`).
-
-Feature-gated integration tests live in `tests/a2a.rs` (wire format) and `tests/a2a_client.rs` (the official client against an in-process server); run them with `cargo test --features a2a --manifest-path src/kubeadp-agent/Cargo.toml`.
-
-### `mcp-a2a` subcommand: the A2A sending side over MCP (feature `a2a`)
-
-The same `a2a` feature gates `kubeadp-agent mcp-a2a`, a stdio Model Context Protocol server exposing four tools for talking **to** peer agents (client side, `kubeadp_agent::core::a2a::client` + `kubeadp_agent::mcp_a2a`). It does **not** require `KUBEADP_ROLE`.
-
-- `list_agents` — the discovered peer agents (name, namespace, url, best-effort agent card).
-- `send_message` — send a text message (role `user`) to an agent by Service name **or `namespace/name`** (the `agent` argument accepts both; `A2aClientCtx::agent` already resolves unqualified names against the own namespace first, then uniquely across the discovery namespaces, and refuses ambiguous names), tagged with `a2a.sender` (from `A2A_SELF_NAME`, default the process name) and `a2a.hop` (incoming hop + 1). A hop above 4 is refused.
-- `reply` — reply to the agent that sent the last message this agent received. The `mcp-a2a` server is a **separate stdio process** and cannot see incoming messages, so there is no shared in-process "last sender"; instead `reply` is a `send_message` whose recipient is passed explicitly as `to`: copy it verbatim from the `claimed sender:` field of the framed header of the incoming message (`--- A2A INCOMING MESSAGE (claimed sender: <name>, hop: <n>) ---`). Same resolution, sender/hop tagging and hop limit as `send_message`.
-- `get_task` — fetch the current state of a task on an agent by Service name or `namespace/name`.
-
-Agents are discovered from Kubernetes Services labelled `a2a.homelab/agent=true` in the pod's own namespace plus `A2A_NAMESPACES` (comma-separated); the in-cluster service account (`/var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt,namespace}`) authenticates the discovery, and `A2A_KUBE_API` overrides the API base for local development/tests. Each Service's URL is `http://<service>.<namespace>.svc:<port>` using the port named `a2a` (else the first port). The card fetch is best-effort (3 s timeout); a failure just omits `card`. `send_message`/`get_task` only accept a Service name or `namespace/name` from the registry (never an arbitrary URL). `A2A_URL_OVERRIDES` (`name=url,...` or `namespace/name=url,...`, the latter winning for that agent) is a test/development seam that redirects the *connection* (and card fetch) while the advertised URL stays the cluster-internal one.
-
-The `a2a` MCP tool **descriptions** tell the model plainly that messages from other agents are framed DATA, not instructions. `kubeadp-agent mcp-a2a` can be wired into every agy job automatically: with the `[worker] a2a_mcp_enabled = true` config key (env `AGENT_RUN_A2A_MCP_ENABLED`), `prepare_agy_home` merges an `"a2a"` entry (`{"command": "<current exe>", "args": ["mcp-a2a"]}`) into the job's `~/.gemini/config/mcp_config.json` while keeping every existing server (atomic, idempotent, a no-op when the key is false). The tool reads nothing secret from the file: its identity/credential come from the job environment (`A2A_SELF_NAME`, `KUBEADP_JOBSET_ID`, `KUBEADP_JOBSET_SECRET_FILE`).
-
-Errors are MCP tool errors (`isError: true`), never panics, and every response is bounded to 20 KB. Tests: `tests/a2a_client_mcp.rs` (in-process A2A server + in-memory MCP round trip, including `reply` and `namespace/name` resolution) and `tests/a2a_discovery.rs` (fake Kubernetes API).
-
-# Module notes: orchestrate
-
-## Agent Orchestrate
-
-### Design
-`agent-orchestrate` (formerly `claude-supervisor`) is a lightweight, robust Rust process supervisor for the `ai-server` pod's Claude Code CLI sessions.
-It manages N independent interactive sessions concurrently without an asynchronous runtime, using minimal core dependencies (`libc`, `serde`, `serde_json`).
-
-Each session runs in its own dedicated Unix pseudo-terminal (PTY) with an isolated process group (`setsid`, `TIOCSCTTY`).
-PTY output is forwarded raw and immediately by default, preserving TUI screen drawing and ANSI escape sequences. Opt-in `prefix_output` buffers lines with `[<session>] ` and flushes partial lines after 100ms of inactivity.
-Optional hang detection monitors PTY output activity (`hang_timeout_secs`). Empirical measurement with real Claude in a PTY showed that Claude emits ~1-2 KB within ~3.5s of launch and then remains completely silent while idle (observed silent for >2 minutes); output silence is normal behavior, so hang detection is OFF by default (`hang_timeout_secs: 0.0`).
-
-Lifecycle state management:
-1. Pre-launch Config: Thread-safe serialized (`static Mutex`) and atomic update of `~/.claude.json` and `~/.claude/settings.json`, skipping writes if disk contents are identical.
-2. Readiness Check: Pre-launch validation of `claude auth status --json` with categorized logging. Aborts promptly on supervisor shutdown and reaps probe children. Non-zero exit code is recorded as `status-failed (rc=..)`, while `not-logged-in` is recorded only when rc == 0 and `loggedIn` is false.
-3. Transcript Policy: Validates transcript files; a transcript is considered usable if at least one line parses as JSON (allowing Claude Code to resume successfully even if the last line is truncated or a middle line is corrupted). If a file exists but contains zero parseable JSON lines (empty, whitespace, or binary garbage), it is unusable and quarantined to `.corrupt.<unix-millis>.bak` to trigger a clean start with `--session-id`. Furthermore, if `--resume` exits non-zero within `resume_fail_uptime_secs` with `No conversation found with session ID` for `resume_fail_quarantine_after` consecutive launches with the same transcript size and mtime, it is quarantined to `.corrupt.<unix-millis>.bak` and starts fresh with `--session-id` (transient errors like network or API outages neither count toward quarantine nor reset an existing streak). Missing files start fresh without quarantine.
-4. Launch Arguments: Dynamically selects `--resume <id>` if a usable transcript exists, or `--session-id <id>` for fresh starts.
-5. Backoff Window & Cooldown: Crashes and caught panics increment restart counters. Restart delays are computed using a sliding window of all restarts within `backoff_window_secs` (`delay = min(base * 2^n, max_backoff)` with n = restarts already in the window, with +0..+25% jitter; the first crash gets `base`). If a session exceeds `max_crashes` within `crash_window_secs`, it enters `failed` state for `failed_cooldown_secs` (probes exit 2). Once the cooldown expires, the crash tracker is cleared and supervision automatically resumes.
-6. Atomic State & Health Probing: State transitions and periodic heartbeats are committed via atomic tempfile rename with unique per-call names and dedicated write mutex serialization. State lock is released before disk writes. The `status` command serves as a Kubernetes probe (exit 1 if heartbeat is stale, exit 2 if any session failed or a thread died, exit 0 if healthy).
-7. Bounded Shutdown, Reaping & Unkillable Handling: On SIGTERM, SIGINT, or SIGHUP, threads and child processes are stopped gracefully within `shutdown_grace_secs`. Reaps only tracked supervisor child PIDs/process groups (never `waitpid(-1)`). After SIGKILL escalation, child process wait is bounded by `kill_wait_secs` using a non-blocking poll. If a child process cannot be reaped (e.g. stuck in uninterruptible D-state I/O), the supervisor logs `child pid N unkillable (uninterruptible)`, does not block indefinitely, and marks the session as `failed` with last exit reason `unkillable` (causing `status` to exit 2). Once the stuck PID disappears, supervision resumes via the failed-cooldown path.
-8. Orphan Prevention: Sets `PR_SET_PDEATHSIG(SIGTERM)` in child `pre_exec` (with `getppid()` race guard) when spawning from the long-lived session thread. If the supervisor terminates abruptly (SIGKILL/crash), child processes receive SIGTERM and exit instead of becoming orphaned.
-9. Configuration Validation: All `f64` duration fields are validated at load time (must be finite, >= 0.0, <= 30 days, with `failed_cooldown_secs` >= 1.0). Invalid values exit 1 naming the offending field and session.
-10. Session Precedence: File-configured sessions always take precedence over environment-generated sessions (default or `CLAUDE_WORKSPACES`). Conflicting generated sessions are skipped with a warning. Duplicates within the same source exit with code 1.
-
-### CLI Commands
-- `agent-orchestrate run [--config <path>]`: Run the supervisor. Resolves configuration (from `--config`, `AGENT_ORCHESTRATE_CONFIG` (legacy `CLAUDE_SUPERVISOR_CONFIG` still accepted), or `/etc/agent-orchestrate/config.json`) and environment variables (`CLAUDE_WORKSPACES`, etc.) and supervises all sessions.
-- `agent-orchestrate status [--config <path>] [--state-file <path>]`: Probe supervisor health:
-  - Exit `0`: All sessions healthy, heartbeat active.
-  - Exit `1`: Heartbeat stale (> threshold).
-  - Exit `2`: One or more sessions failed or a session thread terminated unexpectedly (triggers Kubernetes pod restart).
-  - Exit `3`: State file could not be read or parsed.
-  - Exit `4`: Supervisor is stopped or one or more sessions are in `stopped` status.
-- `agent-orchestrate print-config [--config <path>]`: Resolve and print the active supervisor configuration as JSON to stdout without starting sessions or mutating files. Exits 1 on invalid duplicate names or session IDs.
-
-### Configuration Reference
-Base configuration is resolved in the following priority order:
-1. `--config <path>` (CLI argument)
-2. `AGENT_ORCHESTRATE_CONFIG` (environment variable path; legacy `CLAUDE_SUPERVISOR_CONFIG` still accepted)
-3. `/etc/agent-orchestrate/config.json` (only if the file exists on disk)
-4. Built-in defaults
-
-> [!NOTE]
-> Cwd-relative default config search (`agent-orchestrate.json` or `config.json` in the working directory) has been removed to avoid accidentally loading unrelated files in `/home/coder`.
-> If an explicit path is provided via `--config` or the config environment variable and fails to load, the supervisor exits with code 1 immediately.
-
-> [!WARNING]
-> **Workdir Symlink Limitation**: Claude Code derives transcript paths using the canonical (symlink-resolved) real path of its working directory. If a session's `workdir` is a symlink whose target changes (such as repo-sync checkout directories), the conversation transcript path will change and previous conversation history will be lost on retarget. Workspace sessions should point at stable real directories, not repo-sync symlinks. (The default `/home/coder` session is a stable real directory and unaffected).
-
-Example configuration JSON:
-
-```json
-{
-  "state_file": "/tmp/claude-supervisor-state.json",
-  "heartbeat_interval_secs": 2.0,
-  "stale_heartbeat_secs": 15.0,
-  "shutdown_grace_secs": 5.0,
-  "claude_config_dir": null,
-  "sessions": [
-    {
-      "name": "default",
-      "workdir": "/home/coder",
-      "session_id": "10000000-0000-4000-8000-000000000001",
-      "claude_binary": "claude",
-      "claude_args": [
-        "--dangerously-skip-permissions",
-        "--remote-control",
-        "ai-server"
-      ],
-      "env": {},
-      "session_file": null,
-      "transcript_path": null,
-      "readiness_poll_secs": 30.0,
-      "hang_timeout_secs": 0.0,
-      "kill_grace_secs": 5.0,
-      "pty_eof_grace_secs": 10.0,
-      "kill_wait_secs": 15.0,
-      "base_backoff_secs": 2.0,
-      "max_backoff_secs": 60.0,
-      "healthy_run_secs": 30.0,
-      "max_crashes": 0,
-      "crash_window_secs": 60.0,
-      "failed_cooldown_secs": 300.0,
-      "backoff_window_secs": 600.0,
-      "resume_fail_quarantine_after": 5,
-      "resume_fail_uptime_secs": 5.0,
-      "prefix_output": false
-    }
-  ]
-}
-```
-
-#### Environment Variables for Workspace Auto-Generation
-When running or inspecting config, environment variables dynamically inject sessions alongside any file-defined sessions. Empty or whitespace-only variables are treated as unset:
-- `AGENT_ORCHESTRATE_CONFIG`: Path to base JSON configuration file (used if `--config` is not specified); legacy `CLAUDE_SUPERVISOR_CONFIG` is still accepted.
-- `CLAUDE_WORKSPACES`: Comma and/or whitespace separated workspace names (e.g. `homelab,nested-operator`), or `auto`. In `auto` mode, scans `CLAUDE_WORKSPACE_ROOT` for non-hidden directories (or symlinks to directories) containing `.git` (file or directory) and sorts them alphabetically. Names must match `[a-z0-9][a-z0-9._-]*`.
-- `CLAUDE_WORKSPACE_ROOT`: Base directory for relative workspace paths and `auto` scan (default: `/workspace`).
-- `CLAUDE_REMOTE_PREFIX`: Remote-control name prefix for generated sessions (default: `ai-server`). Remote name is `<prefix>-<name>`.
-- `CLAUDE_DEFAULT_SESSION`: Controls whether the legacy default session is included (`1`/`true`/`on` default; `0`/`false`/`no`/`off` disables).
-- `CLAUDE_DEFAULT_SESSION_ID`: Session UUID for default session (default: `10000000-0000-4000-8000-000000000001`).
-- `CLAUDE_SESSION_ARGS`: Optional whitespace-separated arguments appended to all generated sessions (e.g. `--model haiku`).
-- `CLAUDE_MAX_CRASHES`: Optional integer override for maximum crashes within window for env-generated sessions. Defaults to `0` (unlimited retries, never mark failed).
-- `HOME`: User home directory (if unset or empty, falls back to `/home/coder`).
-
-Workspace session IDs are derived via deterministic UUIDv5 from `ai-server-<name>` within a fixed namespace UUID (`a689b7b9-3b60-449a-8b17-0d5b7a14e911`), ensuring transcript continuity even if `CLAUDE_REMOTE_PREFIX` changes.
-
-#### Global Options
-- `state_file`: Path to write the atomic JSON state (default: `/tmp/claude-supervisor-state.json`).
-- `heartbeat_interval_secs`: Frequency of supervisor heartbeat timestamp updates (default: `2.0`).
-- `stale_heartbeat_secs`: Threshold after which heartbeat is considered stale by probe (default: `15.0`).
-- `shutdown_grace_secs`: Grace period before sending SIGKILL to remaining child processes on supervisor shutdown (default: `5.0`).
-- `claude_config_dir`: Base Claude directory override (default: `$HOME/.claude`).
-
-#### Session Options
-- `name`: Unique name identifier for the session.
-- `workdir`: Working directory path for the session child process.
-- `session_id`: Unique Claude Code session UUID.
-- `claude_binary`: Path or binary name for Claude executable (default: `"claude"`). If no path separator is present, searched in session `env.PATH` then system `PATH`.
-- `claude_args`: Command-line arguments. `--resume` or `--session-id` is inserted appropriately.
-- `env`: Key-value environment variables passed to the session.
-- `session_file`: Legacy transcript file override.
-- `transcript_path`: Explicit transcript file path override (takes precedence over derived `~/.claude/projects/<slug>/<session_id>.jsonl`).
-- `readiness_poll_secs`: Interval between auth readiness checks (default: `30.0` for env-generated sessions, `5.0` for file-config sessions).
-- `hang_timeout_secs`: Seconds of silent PTY inactivity before triggering kill & restart (default: `0.0` = disabled).
-- `kill_grace_secs`: Grace period between SIGTERM and SIGKILL escalation (default: `5.0`).
-- `pty_eof_grace_secs`: Grace period in seconds to wait for child to exit after PTY EOF/error before SIGTERM/SIGKILL escalation and restarting as normal exit (default: `10.0`).
-- `kill_wait_secs`: Maximum duration in seconds to wait for child process reaping via non-blocking poll after SIGKILL before declaring the child unkillable (default: `15.0`).
-- `base_backoff_secs`: Initial restart backoff duration in seconds (default: `2.0`).
-- `max_backoff_secs`: Maximum exponential backoff cap (default: `60.0`).
-- `healthy_run_secs`: Uptime threshold in seconds for a run to be considered healthy (default: `30.0`).
-- `max_crashes`: Max allowed crashes within sliding crash window before marking session failed (default: `0` for env-generated sessions = unlimited retries; `5` for file-config sessions).
-- `crash_window_secs`: Sliding window duration for crash threshold accounting (default: `60.0`).
-- `failed_cooldown_secs`: Cooldown duration in seconds to keep a session in `failed` status before resetting the crash tracker and retrying (default: `300.0`, min: `1.0`).
-- `backoff_window_secs`: Sliding window duration in seconds for exponential backoff accounting across all restarts (default: `600.0`).
-- `resume_fail_quarantine_after`: Number of consecutive fast `--resume` failures printing `No conversation found with session ID` with identical transcript size and mtime before quarantining the file to start fresh with `--session-id` (default: `5`).
-- `resume_fail_uptime_secs`: Maximum uptime in seconds to consider a failed `--resume` launch as a fast resume failure (default: `5.0`).
-- `prefix_output`: When true, prefixes forwarded PTY output with `[<name>] ` and flushes partial lines after 100ms (default: `false`, raw immediate forwarding).
-
-### REST API
-
-The supervisor runs an HTTP server on its own tokio runtime in a background
-thread, serving the REST API of the `worker` module (identical `/api/v1/...`
-routes, request/response schemas, error format and SSE events, so the
-`agent-run` CLI works against it unchanged) plus a supervisor-specific
-`/api/v1/sessions` group for the sessions it manages (LIST, GET,
-START / STOP / RESTART, redacted LOG tail, message injection). No endpoint
-writes to a session's PTY except `message`, which is deliberately modelled on
-what a user types into a terminal and never submits text as a command.
-
-- Listen address: `AGENT_ORCHESTRATE_LISTEN`, default `127.0.0.1:8002`
-  (reachable only from inside the cluster).
-- Required bearer token for the WHOLE `/api/v1` group (the shared agent-run
-  routes and the `/api/v1/sessions` group alike) and, under `a2a`, the A2A
-  routes: `KUBEADP_API_TOKEN_FILE` (config `[common] api_token_file`, both
-  roles share it), with the legacy `AGENT_ORCHESTRATE_TOKEN_FILE` /
-  `AGENT_ORCHESTRATE_TOKEN` honoured as a fallback. Without any token the
-  server refuses to start unless `KUBEADP_API_ALLOW_UNAUTHENTICATED=true`
-  (config `api_allow_unauthenticated`). The token is enforced once by a single
-  router layer, compared in constant time on its SHA-256 digest (the raw value
-  is hashed at startup and never logged), and failed attempts are throttled
-  per peer IP (429 after 10 failures within 60 s, with `Retry-After`).
-  `/healthz` and `/readyz` are the only never-gated routes; `/metrics`
-  requires the token like `/api/v1`; auth failures answer
-  `application/problem+json`.
-- `GET /readyz`: unauthenticated readiness probe, `{"status": "ready"}` when
-  the state store / sessions registry is readable, `503 {"error","code":
-  "not_ready"}` otherwise.
-- `GET /metrics`: Prometheus text format (`agent_process_uptime_seconds`,
-  `agent_state{status="..."}` session counts by state,
-  `agent_requests_total{class="..."}`), gated by the bearer token like
-  `/api/v1`.
-- Per-session log ring buffer: `AGENT_ORCHESTRATE_SESSION_LOG_RING_BYTES`
-  (default 500000). `GET /api/v1/sessions/{name}/log?tail=N` serves the last
-  `N` lines (default 5000) of the ring, with credential-looking values
-  (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`/`glpat-`/`Bearer
-  `...`/`AGE-SECRET-KEY-`...) redacted before they reach a client.
-- `POST /api/v1/sessions/{name}/message` injects one message into a running
-  session. Body: `{"text": "<message>"}` (JSON). The text is trimmed and must
-  be between 1 and 8192 bytes of valid UTF-8; control characters and escape
-  sequences are stripped (a newline is kept and delivered inside the paste).
-  The message is written to the session's PTY as a bracketed paste
-  (`ESC[200~ ... ESC[201~`) followed by a single Enter, so pasted newlines
-  never submit early and the text cannot run as a command; Claude Code queues
-  text typed during a turn, so in-flight work is not interrupted.
-  - `400 invalid_body`: body is not JSON, has no `text`, or the text is empty
-    after trimming.
-  - `413 too_large`: trimmed text exceeds 8192 bytes.
-  - `404`: unknown session.
-  - `409 not_running`: session is stopped/paused or has no live PTY.
-  - `429 rate_limited` (with `Retry-After`): more than 30 messages per minute
-    for one session (sliding window).
-  - `202`: `{"session": "<name>", "accepted": true, "bytes": <n>}` where `n`
-    is the number of sanitised text bytes pasted.
-  Each accepted message writes exactly one line to the supervisor log with the
-  session name, the byte count and a short hash prefix of the text (FNV-1a) —
-  never the text itself — and the session log ring is never touched, so the
-  log redaction of `session_log.rs` is not bypassed.
-
-#### A2A Protocol Support (`--features a2a`)
-When compiled with `--features a2a`, `agent-orchestrate` exposes the A2A v1 agent protocol surface powered by `agent-core::a2a`:
-- Public Agent Card: `GET /.well-known/agent-card.json` serves the agent card (unauthenticated, public).
-- Sessions as A2A Tasks:
-  - Task ID = session name
-  - Context ID = session name
-  - State mapping: `Running` / `Starting` / `Backoff` -> `working`, `Stopped` -> `completed` (or `canceled` if paused), `Failed` -> `failed`.
-- Endpoints:
-  - REST: `GET /tasks`, `GET /tasks/{id}`, `POST /tasks/{id}:cancel` (or legacy `POST /tasks/{id}/cancel`), and `POST /message:send`.
-  - Unsupported operations (streaming, subscriptions, push configs) return standard 400 responses.
-- Authentication: Protected A2A routes are guarded by the same bearer token
-  mechanism as `/api/v1` routes (`KUBEADP_API_TOKEN_FILE`, legacy
-  `AGENT_ORCHESTRATE_TOKEN_FILE` / `AGENT_ORCHESTRATE_TOKEN`), compared in
-  constant time on the SHA-256 digest. The A2A surface is extra: a per-jobset
-  credential can be layered on top of the operator token as an alternative
-  (see `core::server::auth::auth_verifier_from_state`).
-
-### How to Run Tests
-
-#### 1. Cargo Unit Tests
-Executes unit tests covering backoff math, jitter, sliding crash windows, configuration parsing, session file validation, corrupted file quarantine, concurrent config updates, UTF-8 safe tail formatting, atomic state serialization, UUIDv5 derivation, duration validation, and workspace discovery:
+Start the supervisor:
 ```bash
-cargo test --locked
+export KUBEADP_ROLE=orchestrator
+kubeadp-agent
 ```
 
-#### 2. Clippy & Linter
+Start the worker daemon:
 ```bash
-cargo clippy --all-targets --locked -- -D warnings
+export KUBEADP_ROLE=worker
+kubeadp-agent
 ```
 
-#### 3. Formatting Check
+### Running the Client
+
+Start a background job via the remote CLI:
 ```bash
-cargo fmt --check
+agent-run --remote http://agent-run-api:8002 start homelab "Update documentation"
 ```
 
-#### 4. Black-Box Integration Suite
-Executes the integration suite against `fake-claude.sh` in temporary, isolated directories (unsetting ambient supervisor environment variables to ensure hermetic runs):
+Select an explicit execution engine:
 ```bash
-tests/orchestrate/run-tests.sh
+agent-run --remote http://agent-run-api:8002 start --engine agy homelab "Run test suite"
 ```
 
-### Behavioral Notes
+Monitor job status:
+```bash
+agent-run --remote http://agent-run-api:8002 status <job-id>
+```
 
-1. Crash Loop Protection & Failed State Cooldown: sliding crash window (`max_crashes` in `crash_window_secs`); once exceeded, the session enters `failed` status for `failed_cooldown_secs` (causing `status` to exit 2) while siblings keep running, then supervision resumes automatically.
-2. Bounded Shutdown: each session runs in its own process group (`setsid`); the whole group is signaled with strict `shutdown_grace_secs` deadlines and SIGKILL escalation; only tracked supervisor children are reaped.
-3. Orphan Prevention: child processes get `PR_SET_PDEATHSIG(SIGTERM)`, so they terminate if the supervisor dies abruptly.
-4. Config is purely JSON (TOML support can be added if desired).
+Tail job execution logs:
+```bash
+agent-run --remote http://agent-run-api:8002 tail <job-id>
+```
 
-### Status
+Inspect sandbox status on a host:
+```bash
+kubeadp-agent sandbox-probe --json
+```
 
-- Wired in as the default supervisor for the `ai-server` pod; see [apps/ai-server/DOCS.md](../../apps/ai-server/DOCS.md) for rollout status and configuration details.
-
-# Module notes: worker
-
-## agent-run-api
-
-The `agent-run-api` crate provides the HTTP API daemon and job execution engine for `agent-run`. It manages background `agy` agent execution in Git worktrees, state persistence in SQLite, process supervision, and Server-Sent Events. Build the binary with `cargo build --release --manifest-path src/kubeadp-agent/Cargo.toml` and run tests with `cargo test --manifest-path src/kubeadp-agent/Cargo.toml`. Complete endpoint specifications, wire schemas, and error codes are documented in [docs/agent-run/api-reference.md](../../docs/agent-run/api-reference.md).
-
-### A2A Protocol Surface
-
-When built with the `a2a` feature (`--features a2a`), the daemon serves the Agent-to-Agent (A2A v1) protocol:
-- `GET /.well-known/agent-card.json` -- public agent card describing the agent's capabilities and supported interfaces.
-- `GET /tasks`, `GET /tasks/{id}`, `POST /tasks/{id}:cancel` -- REST bindings for tasks.
-- A2A tasks correspond directly to `agent-run` jobs (`task.id` = `job_id`, `task.context_id` = `job_id`), mapping job statuses (`running` -> `working`, `done` -> `completed`, `failed` -> `failed`, `killed` -> `canceled`) and exposing the final response and worktree diff as task artifacts.
-- Methods not currently supported (such as `SendMessage`, `SubscribeToTask`, or push notifications) return HTTP 400 (`UNSUPPORTED_OPERATION`).
-
+Execute a sandboxed command directly:
+```bash
+kubeadp-agent sandbox-exec --policy /path/to/policy.json -- /usr/bin/git status
+```
