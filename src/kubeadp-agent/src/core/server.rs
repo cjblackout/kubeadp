@@ -3411,21 +3411,34 @@ mod tests {
 
     /// `POST /api/v1/jobsets/{id}/end` on a KNOWN jobset answers 200 with the
     /// new (bumped) epoch and marks it ended (verify now rejects).
-    #[tokio::test]
-    async fn test_end_jobset_route_ends_known_jobset() {
-        // The route drives the process-wide registry (like production). Use a
-        // unique agent id so this test never collides with other tests.
-        std::env::remove_var(crate::core::jobset::ROOT_KEY_FILE_ENV);
-        let cred = crate::core::jobset::register_agent(&format!("job-end-{}", std::process::id()));
-        let app = test_router();
-        let uri = format!("/api/v1/jobsets/{}/end", cred.jobset_id);
-        let res = app.oneshot(post_json_request(&uri, "{}")).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK, "known jobset ends with 200");
-        let value: Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-        assert_eq!(value["ended"], true);
-        assert!(value["epoch"].as_u64().unwrap() > cred.epoch);
-        // Ended in the registry -> verification now rejects.
-        assert!(crate::core::jobset::global_registry().is_ended(&cred.jobset_id));
-        crate::core::jobset::drop_agent(&format!("job-end-{}", std::process::id()));
+    #[test]
+    fn test_end_jobset_route_ends_known_jobset() {
+        // The route drives the process-wide registry (like production): run
+        // under the isolation lock so a concurrent test asserting an empty
+        // registry never sees this agent.
+        crate::core::jobset::with_isolated_registry(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    std::env::remove_var(crate::core::jobset::ROOT_KEY_FILE_ENV);
+                    let cred = crate::core::jobset::register_agent(&format!(
+                        "job-end-{}",
+                        std::process::id()
+                    ));
+                    let app = test_router();
+                    let uri = format!("/api/v1/jobsets/{}/end", cred.jobset_id);
+                    let res = app.oneshot(post_json_request(&uri, "{}")).await.unwrap();
+                    assert_eq!(res.status(), StatusCode::OK, "known jobset ends with 200");
+                    let value: Value =
+                        serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+                    assert_eq!(value["ended"], true);
+                    assert!(value["epoch"].as_u64().unwrap() > cred.epoch);
+                    // Ended in the registry -> verification now rejects.
+                    assert!(crate::core::jobset::global_registry().is_ended(&cred.jobset_id));
+                    crate::core::jobset::drop_agent(&format!("job-end-{}", std::process::id()));
+                });
+        });
     }
 }
