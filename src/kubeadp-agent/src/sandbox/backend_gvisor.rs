@@ -260,9 +260,14 @@ pub enum MountOp {
     /// Bind-mount the real `src` into a staging mountpoint `stage` (used to
     /// preserve an `rw` path that lives inside a hidden directory).
     PreserveBind { src: PathBuf, stage: PathBuf },
-    /// Mount an empty tmpfs over `target` to hide its real contents, then for
-    /// each preserved entry recreate `hide/rel` and bind the staging mount
-    /// back so the agent keeps access to its own paths.
+    /// Hide `target`'s real contents from the agent. When `target` is a
+    /// directory (or does not exist yet) an empty tmpfs is mounted over it,
+    /// then for each preserved entry `hide/rel` is recreated and the staging
+    /// mount bound back so the agent keeps access to its own paths. When
+    /// `target` is a regular file (e.g. the operator token file) the empty
+    /// tmpfs cannot be mounted over it (a mountpoint must be a directory), so
+    /// `/dev/null` is bind-mounted over the file instead; a file target must
+    /// then carry no `preserved` entries (fail closed).
     Hide {
         target: PathBuf,
         preserved: Vec<Preserved>,
@@ -518,6 +523,22 @@ fn cstr(p: &Path) -> Result<CString, String> {
     .map_err(|e| format!("NUL byte in path {:?}: {e}", p))
 }
 
+/// Decides, at apply time, how a `hide` target is to be hidden. Returns
+/// `true` when `target` exists on the current mount tree and is NOT a
+/// directory (a regular file, the case of the operator token file behind
+/// `KUBEADP_API_TOKEN_FILE`): a mountpoint must be a directory, so such a
+/// target cannot be overmounted with an empty tmpfs and is instead hidden by
+/// bind-mounting `/dev/null` over it. `false` for a directory or a target that
+/// does not exist (the current empty-tmpfs behaviour applies). Uses
+/// `symlink_metadata` so a symlinked dir is treated as a directory, never
+/// followed.
+fn hide_is_file(target: &Path) -> bool {
+    match std::fs::symlink_metadata(target) {
+        Ok(m) => !m.is_dir(),
+        Err(_) => false,
+    }
+}
+
 /// Applies the mount plan in order. Returns `Err` on the first failure so the
 /// caller aborts the launch (exit 125) instead of running with a weaker-than-
 /// policy mount set.
@@ -652,6 +673,38 @@ fn apply_mount_op(op: &MountOp) -> Result<(), String> {
             }
         }
         MountOp::Hide { target, preserved } => {
+            // A hide target that exists as a regular file (the operator token
+            // file behind KUBEADP_API_TOKEN_FILE) cannot be overmounted with
+            // an empty tmpfs: a mountpoint must be a directory, and
+            // `fs::create_dir_all` on an existing file fails with EEXIST.
+            // Hide it instead by bind-mounting /dev/null over it, which makes
+            // any read of the file return EOF. Fail closed: the bind must
+            // succeed or the launch is refused.
+            if hide_is_file(target) {
+                if !preserved.is_empty() {
+                    return Err(format!(
+                        "hide target {target:?} is a file but the plan preserves {preserved:?} \
+                         sub-paths; a file cannot preserve children (fail closed)"
+                    ));
+                }
+                let target_c = cstr(target)?;
+                unsafe {
+                    if libc::mount(
+                        c"/dev/null".as_ptr(),
+                        target_c.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND,
+                        std::ptr::null(),
+                    ) != 0
+                    {
+                        return Err(format!(
+                            "hide file {target:?}: bind /dev/null over it failed: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                }
+                return Ok(());
+            }
             let target_c = cstr(target)?;
             // Mount an empty tmpfs over the hidden dir, hiding its real
             // contents. (If the hide dir does not exist, `fs::create_dir_all`
@@ -764,7 +817,8 @@ mod tests {
     use super::super::init_shim::status_to_exit_code;
     use super::super::policy::SandboxPolicy;
     use super::{
-        build_agent_env, plan_mounts, MountOp, MountSpec, AGENT_TMP_OPTS, SHM_PRIVATE_OPTS,
+        build_agent_env, hide_is_file, plan_mounts, MountOp, MountSpec, AGENT_TMP_OPTS,
+        SHM_PRIVATE_OPTS,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -1254,6 +1308,62 @@ mod tests {
         assert!(
             hide_targets(&plan).contains(&PathBuf::from("/no/such/dir/anywhere")),
             "a missing hide dir must still be hidden, not skipped: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn test_plan_file_hide_target_produces_hide_op() {
+        // The operator token file (KUBEADP_API_TOKEN_FILE) is a regular FILE
+        // on the hide list. `plan_mounts` is pure and must not assume the hide
+        // target is a directory: a file target still yields a Hide op, and no
+        // path under it can be preserved (a file has no children), so the
+        // op carries an empty `preserved` list. Without this, apply_mount_op
+        // fails with EEXIST (create_dir_all on a file) and every agent-run
+        // job dies.
+        let token = PathBuf::from("/var/run/kubeadp/api-token");
+        let policy = SandboxPolicy {
+            hide: vec![token.clone()],
+            ..Default::default()
+        };
+        let (plan, _) = plan_mounts(&spec(policy));
+        let hides = hide_targets(&plan);
+        assert!(
+            hides.contains(&token),
+            "a file hide target must still produce a Hide op (never skipped): {plan:?}"
+        );
+        let op = plan
+            .iter()
+            .find_map(|op| match op {
+                MountOp::Hide { target, preserved } if target == &token => Some(preserved),
+                _ => None,
+            })
+            .expect("Hide op for the token file");
+        assert!(
+            op.is_empty(),
+            "a file hide target cannot have preserved sub-paths: {op:?}"
+        );
+    }
+
+    #[test]
+    fn test_hide_is_file_classifier() {
+        // The apply path branches on `hide_is_file`: true for a regular file
+        // (the /dev/null bind), false for a directory and for a missing target
+        // (the empty-tmpfs path). Hermetic, no mount involved.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("token");
+        fs::write(&f, b"secret").expect("write token file");
+        assert!(
+            hide_is_file(&f),
+            "a regular file must be classified as a file target"
+        );
+        assert!(
+            !hide_is_file(dir.path()),
+            "a directory must not be classified as a file target"
+        );
+        let missing = dir.path().join("does-not-exist");
+        assert!(
+            !hide_is_file(&missing),
+            "a missing target must take the directory (tmpfs) path"
         );
     }
 
