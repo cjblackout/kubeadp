@@ -2,8 +2,8 @@
 //! in-process A2A server (the SDK-backed router over axum, exactly like
 //! `tests/a2a_client.rs`), builds the MCP server's client context around it
 //! (via `build_ctx` with a fake discovery callback + `A2A_URL_OVERRIDES`),
-//! and drives `list_agents -> send_message -> get_task` through the rmcp
-//! in-memory transport.
+//! and drives `list_agents -> send_message / reply -> get_task` through the
+//! rmcp in-memory transport.
 //!
 //! Gated behind the `a2a` feature like the rest of the A2A surface.
 #![cfg(feature = "a2a")]
@@ -78,18 +78,25 @@ fn task(id: &str, context: &str, state: TaskState) -> A2aTask {
 }
 
 /// Recording sink so the peer server accepts SendMessage and records the
-/// delivered text (mirroring tests/a2a_client.rs).
+/// delivered text (mirroring tests/a2a_client.rs) plus the claimed sender.
 #[derive(Default)]
 struct RecordingSink {
-    delivered: Mutex<Vec<(String, String)>>,
+    delivered: Mutex<Vec<(String, String, String)>>,
 }
 
 impl kubeadp_agent::core::a2a::MessageSink for RecordingSink {
-    fn deliver(&self, task_id: &str, _sender: &str, text: &str) -> Result<(), a2a::A2AError> {
-        self.delivered
-            .lock()
-            .unwrap()
-            .push((task_id.to_string(), text.to_string()));
+    fn deliver(
+        &self,
+        task_id: &str,
+        sender: &str,
+        text: &str,
+        _message_id: &str,
+    ) -> Result<(), a2a::A2AError> {
+        self.delivered.lock().unwrap().push((
+            task_id.to_string(),
+            sender.to_string(),
+            text.to_string(),
+        ));
         Ok(())
     }
 }
@@ -101,7 +108,7 @@ async fn serve(backend: Arc<FakeBackend>, sink: Arc<RecordingSink>) -> String {
         description: "e2e peer".to_string(),
         version: "0.0.0".to_string(),
         skills: vec![],
-        json_rpc_url: "http://127.0.0.1/unused".to_string(),
+        url: "http://127.0.0.1/unused".to_string(),
     };
     let app = a2a_router(model, backend, Some(sink), None);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -129,6 +136,34 @@ async fn mcp_server(peer_port: u64) -> A2aMcpServer {
     A2aMcpServer::new(ctx)
 }
 
+/// Build the MCP server with a caller-supplied discovery callback so tests can
+/// register several peers (e.g. same name in two namespaces).
+async fn mcp_server_with<F, Fut>(list_services: F) -> A2aMcpServer
+where
+    F: Fn(&str, Option<&str>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<Vec<serde_json::Value>, String>> + Send,
+{
+    let ctx = kubeadp_agent::core::a2a::client::build_ctx(None, list_services)
+        .await
+        .expect("build ctx");
+    A2aMcpServer::new(ctx)
+}
+
+/// Drive the in-memory MCP transport around a server; returns the client as a
+/// type-erased function that keeps the `RunningService` type out of the
+/// helper's signature.
+async fn mcp_client(
+    server: A2aMcpServer,
+) -> rmcp::service::RunningService<rmcp::service::RoleClient, ()> {
+    let (server_transport, client_transport) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_transport).await {
+            let _ = running.waiting().await;
+        }
+    });
+    ().serve(client_transport).await.expect("client handshake")
+}
+
 /// The e2e tests mutate process-global env vars (`A2A_URL_OVERRIDES`,
 /// `A2A_SELF_NAME`). A shared mutex serializes them so parallel runners cannot
 /// clobber each other's overrides.
@@ -143,7 +178,8 @@ async fn mcp_a2a_tools_round_trip() {
     let _guard = env_mutex().lock().await;
     // The in-process A2A server (peer) on an ephemeral port.
     let backend = FakeBackend::with(vec![task("t-1", "ctx-1", TaskState::Working)]);
-    let base = serve(backend.clone(), Arc::new(RecordingSink::default())).await;
+    let sink = Arc::new(RecordingSink::default());
+    let base = serve(backend.clone(), sink.clone()).await;
     let port: u64 = base.rsplit(':').next().unwrap().parse().unwrap();
 
     // Override the discovery URL so the client reaches the in-process server.
@@ -152,7 +188,6 @@ async fn mcp_a2a_tools_round_trip() {
 
     let server = mcp_server(port).await;
 
-    // In-memory duplex transport in the MCP server.
     let (server_transport, client_transport) = tokio::io::duplex(8192);
     let _server_task = tokio::spawn(async move {
         if let Ok(running) = server.serve(server_transport).await {
@@ -160,6 +195,27 @@ async fn mcp_a2a_tools_round_trip() {
         }
     });
     let client = ().serve(client_transport).await.expect("client handshake");
+
+    // 0. The tool set contains `reply`.
+    let tools_list = client.list_tools(None).await.expect("list tools");
+    let names: Vec<&str> = tools_list.tools.iter().map(|t| t.name.as_ref()).collect();
+    for expected in ["list_agents", "send_message", "reply", "get_task"] {
+        assert!(
+            names.contains(&expected),
+            "tool {expected} must be in the list, got {names:?}"
+        );
+    }
+    // 0b. The reply tool documents the explicit-to mechanism and the frame.
+    let reply_tool = tools_list
+        .tools
+        .iter()
+        .find(|t| t.name.as_ref() == "reply")
+        .expect("reply tool present");
+    let reply_desc = reply_tool.description.clone().unwrap_or_default();
+    assert!(
+        reply_desc.contains("claimed sender") && reply_desc.contains("--- A2A INCOMING MESSAGE"),
+        "reply must document the framed sender header: {reply_desc}"
+    );
 
     // 1. list_agents: the discovered peer (with card if the A2A server serves it).
     let res = client
@@ -209,7 +265,54 @@ async fn mcp_a2a_tools_round_trip() {
     assert_eq!(val["id"], "t-1");
     assert_eq!(val["status"]["state"], "TASK_STATE_WORKING");
 
-    // 3. get_task on the peer.
+    // The peer delivered it with the sender from A2A_SELF_NAME.
+    {
+        let delivered = sink.delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        // claimed sender of the outgoing message is `sender-test`.
+        assert_eq!(delivered[0].1, "sender-test");
+        assert!(delivered[0].2.contains("hello peer"));
+    }
+
+    // 3. reply: send back to the peer that would have sent us a message. In
+    // production the framed header's `claimed sender:` equals the sending
+    // agent's Service name (= its A2A_SELF_NAME), so the model copies it
+    // verbatim into `to` and it resolves in the registry. Here the peer's
+    // Service name is `peer`; it receives our reply tagged with our own
+    // sender (`sender-test`).
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("reply").with_arguments(
+                serde_json::json!({
+                    "to": "peer", // copied from "claimed sender:" in the frame
+                    "text": "thanks, back to you",
+                    "task_id": "t-1"
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await
+        .expect("call reply");
+    assert_eq!(
+        res.is_error,
+        Some(false),
+        "reply error: {:?}",
+        res.content
+            .iter()
+            .map(|c| c.as_text().map(|t| t.text.clone()).unwrap_or_default())
+            .collect::<Vec<_>>()
+    );
+    // The reply arrived at the peer from us (sender-test) with the reply text.
+    {
+        let delivered = sink.delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 2, "send + reply both delivered");
+        assert_eq!(delivered[1].1, "sender-test");
+        assert!(delivered[1].2.contains("thanks, back to you"));
+    }
+
+    // 4. get_task on the peer.
     let res = client
         .call_tool(
             CallToolRequestParams::new("get_task").with_arguments(
@@ -227,7 +330,7 @@ async fn mcp_a2a_tools_round_trip() {
     assert_eq!(val["id"], "t-1");
     assert_eq!(val["status"]["state"], "TASK_STATE_WORKING");
 
-    // 4. Error path: unknown agent and unknown task surface as MCP tool errors.
+    // 5. Error path: unknown agent and unknown task surface as MCP tool errors.
     let res = client
         .call_tool(
             CallToolRequestParams::new("send_message").with_arguments(
@@ -239,6 +342,20 @@ async fn mcp_a2a_tools_round_trip() {
         )
         .await
         .expect("call send_message ghost");
+    assert_eq!(res.is_error, Some(true));
+
+    // reply to an unknown sender is likewise an MCP tool error.
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("reply").with_arguments(
+                serde_json::json!({ "to": "ghost", "text": "hi" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("call reply ghost");
     assert_eq!(res.is_error, Some(true));
 
     let res = client
@@ -268,13 +385,7 @@ async fn mcp_a2a_send_refuses_beyond_max_hop() {
     std::env::set_var("A2A_URL_OVERRIDES", format!("peer={base}"));
 
     let server = mcp_server(port).await;
-    let (server_transport, client_transport) = tokio::io::duplex(8192);
-    let _server_task = tokio::spawn(async move {
-        if let Ok(running) = server.serve(server_transport).await {
-            let _ = running.waiting().await;
-        }
-    });
-    let client = ().serve(client_transport).await.expect("client handshake");
+    let client = mcp_client(server).await;
 
     let res = client
         .call_tool(
@@ -290,6 +401,128 @@ async fn mcp_a2a_send_refuses_beyond_max_hop() {
     assert_eq!(res.is_error, Some(true));
     let text = res.content[0].as_text().unwrap().text.clone();
     assert!(text.contains("hop limit"), "got: {text}");
+
+    // The same limit applies to reply (its `incoming_hop` is the incoming
+    // message's hop; the reply would be one above).
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("reply").with_arguments(
+                serde_json::json!({ "to": "peer", "text": "x", "incoming_hop": 4 })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("call reply over hop");
+    assert_eq!(res.is_error, Some(true));
+    let text = res.content[0].as_text().unwrap().text.clone();
+    assert!(text.contains("hop limit"), "got: {text}");
+
+    std::env::remove_var("A2A_URL_OVERRIDES");
+}
+
+/// `send_message`/`reply` accept a `namespace/name` pair to disambiguate
+/// same-named agents across namespaces; a bare ambiguous name is an error.
+#[tokio::test]
+async fn mcp_a2a_name_vs_namespace_name_resolution() {
+    let _guard = env_mutex().lock().await;
+    // Two peer servers, one per namespace, both named "worker".
+    let backend_a = FakeBackend::with(vec![task("t-a", "ctx-a", TaskState::Working)]);
+    let base_a = serve(backend_a, Arc::new(RecordingSink::default())).await;
+    let port_a: u64 = base_a.rsplit(':').next().unwrap().parse().unwrap();
+    let backend_b = FakeBackend::with(vec![task("t-b", "ctx-b", TaskState::Working)]);
+    let base_b = serve(backend_b, Arc::new(RecordingSink::default())).await;
+    let port_b: u64 = base_b.rsplit(':').next().unwrap().parse().unwrap();
+
+    std::env::set_var(
+        "A2A_URL_OVERRIDES",
+        format!("ns-a/worker={base_a},ns-b/worker={base_b}"),
+    );
+
+    let services_a = port_a;
+    let services_b = port_b;
+    let list_services = move |_base: &str, _token: Option<&str>| {
+        let peers = vec![
+            serde_json::json!({
+                "metadata": { "name": "worker", "namespace": "ns-a", "labels": {
+                    "a2a.homelab/agent": "true" } },
+                "spec": { "ports": [ { "name": "a2a", "port": services_a } ] }
+            }),
+            serde_json::json!({
+                "metadata": { "name": "worker", "namespace": "ns-b", "labels": {
+                    "a2a.homelab/agent": "true" } },
+                "spec": { "ports": [ { "name": "a2a", "port": services_b } ] }
+            }),
+        ];
+        async move { Ok(peers) }
+    };
+    let server = mcp_server_with(list_services).await;
+    let client = mcp_client(server).await;
+
+    // Ambiguous bare name is a tool error.
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("send_message").with_arguments(
+                serde_json::json!({ "agent": "worker", "text": "hi" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("call send_message ambiguous");
+    assert_eq!(res.is_error, Some(true), "ambiguous name must error");
+
+    // Fully qualified namespace/name reaches ns-b's worker.
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("send_message").with_arguments(
+                serde_json::json!({ "agent": "ns-b/worker", "text": "hi b", "task_id": "t-b" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("call send_message ns-b/worker");
+    assert_eq!(
+        res.is_error,
+        Some(false),
+        "qualified send_message error: {:?}",
+        res.content
+            .iter()
+            .map(|c| c.as_text().map(|t| t.text.clone()).unwrap_or_default())
+            .collect::<Vec<_>>()
+    );
+    let val: serde_json::Value =
+        serde_json::from_str(&res.content[0].as_text().unwrap().text).unwrap();
+    assert_eq!(val["id"], "t-b");
+
+    // reply accepts the same qualified form.
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("reply").with_arguments(
+                serde_json::json!({ "to": "ns-a/worker", "text": "hi a", "task_id": "t-a" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("call reply ns-a/worker");
+    assert_eq!(
+        res.is_error,
+        Some(false),
+        "qualified reply error: {:?}",
+        res.content
+            .iter()
+            .map(|c| c.as_text().map(|t| t.text.clone()).unwrap_or_default())
+            .collect::<Vec<_>>()
+    );
+    let val: serde_json::Value =
+        serde_json::from_str(&res.content[0].as_text().unwrap().text).unwrap();
+    assert_eq!(val["id"], "t-a");
 
     std::env::remove_var("A2A_URL_OVERRIDES");
 }

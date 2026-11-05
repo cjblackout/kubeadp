@@ -264,6 +264,11 @@ pub fn run(config: &Config, args: &CleanArgs) -> Result<CommandOutput> {
         }
     }
 
+    // Drop the job's jobset-registry entry: a cleaned job must no longer
+    // present a valid jobset credential. Idempotent if the monitor already
+    // dropped it (e.g. the job finished before the clean).
+    crate::core::jobset::drop_agent(&meta.job_id);
+
     // Remove the job record from the state database. A failure here is a
     // returned error, not a warning: the worktree/branch are already gone,
     // but the stale row would keep the job listed (and `retry`-able into a

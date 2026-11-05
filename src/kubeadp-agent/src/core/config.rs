@@ -18,6 +18,11 @@ pub const DEFAULT_MAX_PARALLEL: u32 = 3;
 pub const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 25;
 pub const DEFAULT_LAUNCH_TIMEOUT_SECS: u64 = 20;
 pub const DEFAULT_STALL_MINUTES: u64 = 20;
+/// Minimum interval (seconds) between two A2A `SendMessage` interrupts of the
+/// SAME job: an incoming message that would interrupt a job whose previous
+/// interrupt is younger than this is rejected as rate-limited (in addition to
+/// the per-jobset hop-token budget). `0` disables the interval.
+pub const DEFAULT_A2A_INTERRUPT_MIN_SECS: u64 = 20;
 pub const DEFAULT_HINDSIGHT_PATH: &str = "hindsight";
 pub const DEFAULT_REMOTE_CONTROL_CHECK_SECS: u64 = 60;
 pub const MIN_REMOTE_CONTROL_CHECK_SECS: u64 = 10;
@@ -89,6 +94,14 @@ pub struct ConfigFile {
     pub remote_control_autostart: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_control_check_secs: Option<u64>,
+    /// Default engine id for jobs (read by the worker role).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_engine: Option<String>,
+    /// Default engine id for sessions (read by the orchestrator role).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_session_engine: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a2a_interrupt_min_secs: Option<u64>,
 }
 
 /// Fully resolved, layered runtime configuration for the agent-run engine.
@@ -158,6 +171,14 @@ pub struct Config {
     pub remote_control: bool,
     pub remote_control_autostart: bool,
     pub remote_control_check_secs: u64,
+    /// Default engine id for jobs (engine selection precedence level 3,
+    /// per-role fallback; unused until E3 routes jobs behind the trait).
+    pub default_engine: Option<String>,
+    /// Default engine id for sessions (same precedence; unused until E2/E5).
+    pub default_session_engine: Option<String>,
+    /// Minimum seconds between two A2A `SendMessage` interrupts of the same
+    /// job (see [`DEFAULT_A2A_INTERRUPT_MIN_SECS`]); `0` disables the interval.
+    pub a2a_interrupt_min_secs: u64,
 }
 
 impl Default for Config {
@@ -197,6 +218,9 @@ impl Default for Config {
             remote_control: false,
             remote_control_autostart: false,
             remote_control_check_secs: DEFAULT_REMOTE_CONTROL_CHECK_SECS,
+            default_engine: None,
+            default_session_engine: None,
+            a2a_interrupt_min_secs: DEFAULT_A2A_INTERRUPT_MIN_SECS,
         }
     }
 }
@@ -415,7 +439,34 @@ impl Config {
             file_cfg.stall_minutes.unwrap_or(DEFAULT_STALL_MINUTES)
         };
 
-        // 10e. Resolve max_runtime (the server-wide DEFAULT job runtime).
+        // 10e. Resolve a2a_interrupt_min_secs: the per-job minimum interval
+        // between two A2A `SendMessage` interrupts. `0` (a deliberate
+        // disabling of the interval) is valid; anything unparseable falls back
+        // with a warning, so a mistyped value cannot disable it or make the
+        // worker refuse to start.
+        let a2a_interrupt_min_secs = if let Some(env_val) = env_vars
+            .get("AGENT_RUN_A2A_INTERRUPT_MIN_SECS")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            match env_val.parse::<u64>() {
+                Ok(secs) => secs,
+                _ => {
+                    eprintln!(
+                        "agent-run: ignoring invalid AGENT_RUN_A2A_INTERRUPT_MIN_SECS value {env_val:?}; using the default"
+                    );
+                    file_cfg
+                        .a2a_interrupt_min_secs
+                        .unwrap_or(DEFAULT_A2A_INTERRUPT_MIN_SECS)
+                }
+            }
+        } else {
+            file_cfg
+                .a2a_interrupt_min_secs
+                .unwrap_or(DEFAULT_A2A_INTERRUPT_MIN_SECS)
+        };
+
+        // 10f. Resolve max_runtime (the server-wide DEFAULT job runtime).
         // UNSET BY DEFAULT: absent/empty means no default limit, jobs run
         // unbounded -- unlike the settings above there is NO fallback value,
         // so `None` survives all the way down. An invalid non-empty value is
@@ -631,6 +682,36 @@ impl Config {
                 .max(MIN_REMOTE_CONTROL_CHECK_SECS)
         };
 
+        // 13d. Resolve engine selection defaults (HL-91 E1). These feed the
+        // engine registry selection precedence level 3 (per-role default)
+        // once E3/E5 route jobs/sessions behind the engine trait; until then
+        // they are unused configuration. Empty strings resolve to None.
+        let default_engine = env_vars
+            .get("AGENT_RUN_DEFAULT_ENGINE")
+            .cloned()
+            .or_else(|| file_cfg.default_engine.clone())
+            .and_then(|s| {
+                let trimmed = s.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            });
+
+        let default_session_engine = env_vars
+            .get("AGENT_ORCHESTRATE_DEFAULT_SESSION_ENGINE")
+            .cloned()
+            .or_else(|| file_cfg.default_session_engine.clone())
+            .and_then(|s| {
+                let trimmed = s.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            });
+
         // Ensure the state directory and SQLite state database exist so that any
         // command can auto-create the layout on first use (init is not required).
         crate::core::job::ensure_state_store(&state_root)?;
@@ -671,6 +752,9 @@ impl Config {
             remote_control,
             remote_control_autostart,
             remote_control_check_secs,
+            default_engine,
+            default_session_engine,
+            a2a_interrupt_min_secs,
         })
     }
 }
@@ -1313,5 +1397,67 @@ no_proxy = "file-no-proxy"
         let cfg_file = Config::load_with_env(&env_file).unwrap();
         assert!(cfg_file.remote_control_autostart);
         assert_eq!(cfg_file.remote_control_check_secs, 45);
+    }
+
+    #[test]
+    fn test_engine_defaults_unset_by_default() {
+        // HL-91 E1: the engine selection defaults exist but are None unless
+        // configured -- nothing changes for existing deployments.
+        let temp_dir = tempdir().unwrap();
+        let env = env_with(&[(
+            "AGENT_RUN_STATE_ROOT",
+            temp_dir.path().join("state").to_str().unwrap(),
+        )]);
+        let cfg = Config::load_with_env(&env).unwrap();
+        assert_eq!(cfg.default_engine, None);
+        assert_eq!(cfg.default_session_engine, None);
+    }
+
+    #[test]
+    fn test_engine_defaults_env_and_file_precedence() {
+        let temp_dir = tempdir().unwrap();
+        let config_file_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_file_path,
+            "default_engine = \"file-engine\"\ndefault_session_engine = \"file-session\"\n",
+        )
+        .unwrap();
+
+        // File values are honored.
+        let env_file = env_with(&[
+            ("AGENT_RUN_CONFIG", config_file_path.to_str().unwrap()),
+            (
+                "AGENT_RUN_STATE_ROOT",
+                temp_dir.path().join("state").to_str().unwrap(),
+            ),
+        ]);
+        let cfg = Config::load_with_env(&env_file).unwrap();
+        assert_eq!(cfg.default_engine, Some("file-engine".to_string()));
+        assert_eq!(cfg.default_session_engine, Some("file-session".to_string()));
+
+        // Env beats file, per the global precedence.
+        let env_both = env_with(&[
+            ("AGENT_RUN_CONFIG", config_file_path.to_str().unwrap()),
+            (
+                "AGENT_RUN_STATE_ROOT",
+                temp_dir.path().join("state").to_str().unwrap(),
+            ),
+            ("AGENT_RUN_DEFAULT_ENGINE", "env-engine"),
+            ("AGENT_ORCHESTRATE_DEFAULT_SESSION_ENGINE", "env-session"),
+        ]);
+        let cfg = Config::load_with_env(&env_both).unwrap();
+        assert_eq!(cfg.default_engine, Some("env-engine".to_string()));
+        assert_eq!(cfg.default_session_engine, Some("env-session".to_string()));
+
+        // Whitespace-only values resolve to None.
+        let env_blank = env_with(&[
+            (
+                "AGENT_RUN_STATE_ROOT",
+                temp_dir.path().join("state").to_str().unwrap(),
+            ),
+            ("AGENT_RUN_DEFAULT_ENGINE", "   "),
+        ]);
+        let cfg = Config::load_with_env(&env_blank).unwrap();
+        assert_eq!(cfg.default_engine, None);
     }
 }

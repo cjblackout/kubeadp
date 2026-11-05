@@ -404,7 +404,10 @@ pub fn prune_single_job_opts_to(
         }
     }
 
-    // 4. Delete job record
+    // 4. Delete job record. A GC'd job must no longer present a valid jobset
+    // credential, so its registry entry is dropped first (idempotent if the
+    // monitor already dropped it).
+    crate::core::jobset::drop_agent(&job.job_id);
     match JobMetadata::delete(&config.state_root, &job.job_id) {
         Ok(()) => {
             emit(false, format!("Removed job record for '{}'", job.job_id));

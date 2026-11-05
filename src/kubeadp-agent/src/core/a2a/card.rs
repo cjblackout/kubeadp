@@ -5,7 +5,7 @@ use a2a::agent_card::{
     AgentCapabilities, AgentCard, AgentInterface, AgentSkill, HttpAuthSecurityScheme,
     SecurityScheme,
 };
-use a2a::TRANSPORT_PROTOCOL_JSONRPC;
+use a2a::TRANSPORT_PROTOCOL_HTTP_JSON;
 use std::collections::HashMap;
 
 /// Well-known path for the public agent card (A2A §8.6).
@@ -19,9 +19,9 @@ pub struct A2aModel {
     pub version: String,
     /// `skills` in the card = the project/agent names the caller passes.
     pub skills: Vec<String>,
-    /// The base URL (without the JSON-RPC path) where the JSON-RPC binding
-    /// is served; used as the `supportedInterfaces[].url`.
-    pub json_rpc_url: String,
+    /// The base URL where the HTTP+JSON (REST) binding is served; used as the
+    /// `supportedInterfaces[].url`.
+    pub url: String,
 }
 
 impl A2aModel {
@@ -70,8 +70,8 @@ impl A2aModel {
             description: self.description.clone(),
             version: self.version.clone(),
             supported_interfaces: vec![AgentInterface::new(
-                self.json_rpc_url.clone(),
-                TRANSPORT_PROTOCOL_JSONRPC,
+                self.url.clone(),
+                TRANSPORT_PROTOCOL_HTTP_JSON,
             )],
             capabilities,
             default_input_modes: vec!["text/plain".to_string()],

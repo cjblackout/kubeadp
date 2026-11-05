@@ -4,7 +4,7 @@
 use a2a::{A2AError, Message, Part, Role, SendMessageRequest, TaskState};
 use a2a_client::auth::AuthInterceptor;
 use a2a_client::client::A2AClient;
-use a2a_client::jsonrpc::JsonRpcTransport;
+use a2a_client::rest::RestTransport;
 use kubeadp_agent::core::a2a::client::{MAX_HOP, META_HOP, META_SENDER};
 use kubeadp_agent::core::a2a::ingress::MAX_INGRESS_TEXT_BYTES;
 use kubeadp_agent::core::a2a::{
@@ -57,7 +57,13 @@ struct CountingSink {
 }
 
 impl MessageSink for CountingSink {
-    fn deliver(&self, task_id: &str, _sender: &str, text: &str) -> Result<(), A2AError> {
+    fn deliver(
+        &self,
+        task_id: &str,
+        _sender: &str,
+        text: &str,
+        _message_id: &str,
+    ) -> Result<(), A2AError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         self.delivered
             .lock()
@@ -93,7 +99,7 @@ async fn serve(
         version: "0.0.0".to_string(),
         description: "test".to_string(),
         skills: vec![],
-        json_rpc_url: "http://127.0.0.1/unused".to_string(),
+        url: "http://127.0.0.1/unused".to_string(),
     };
     let app = a2a_router(model, backend, Some(sink), Some(test_verifier()));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -104,9 +110,9 @@ async fn serve(
     (format!("http://{addr}"), handle)
 }
 
-fn client(endpoint: &str) -> A2AClient<JsonRpcTransport> {
+fn client(endpoint: &str) -> A2AClient<RestTransport> {
     let http = reqwest::Client::new();
-    let transport = JsonRpcTransport::new(http, format!("{endpoint}/rpc"));
+    let transport = RestTransport::new(http, endpoint.trim_end_matches('/').to_string());
     A2AClient::new(transport)
         .with_interceptors(vec![Arc::new(AuthInterceptor::bearer(test_secret()))])
 }

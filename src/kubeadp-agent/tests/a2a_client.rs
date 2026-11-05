@@ -9,7 +9,7 @@ use a2a::{
 };
 use a2a_client::auth::AuthInterceptor;
 use a2a_client::client::A2AClient;
-use a2a_client::jsonrpc::JsonRpcTransport;
+use a2a_client::rest::RestTransport;
 use kubeadp_agent::core::a2a::{
     a2a_router, constant_time_eq, A2aModel, A2aTask, AuthVerifier, TaskBackend,
     WELL_KNOWN_AGENT_CARD_PATH,
@@ -80,7 +80,13 @@ struct RecordingSink {
 }
 
 impl kubeadp_agent::core::a2a::MessageSink for RecordingSink {
-    fn deliver(&self, task_id: &str, _sender: &str, text: &str) -> Result<(), A2AError> {
+    fn deliver(
+        &self,
+        task_id: &str,
+        _sender: &str,
+        text: &str,
+        _message_id: &str,
+    ) -> Result<(), A2AError> {
         self.delivered
             .lock()
             .unwrap()
@@ -106,7 +112,7 @@ fn verifier_good() -> AuthVerifier {
     })
 }
 
-/// Start the SDK A2A server on an ephemeral port; return the JSON-RPC base URL.
+/// Start the SDK A2A server on an ephemeral port; return the REST base URL.
 async fn serve(
     backend: Arc<FakeBackend>,
     sink: Arc<RecordingSink>,
@@ -117,9 +123,7 @@ async fn serve(
         description: "HL-78 client test".to_string(),
         version: "0.0.0".to_string(),
         skills: vec!["proj-a".to_string()],
-        // The model JSON-RPC URL is the agent card's advertised interface URL;
-        // the client POSTs there.
-        json_rpc_url: "http://127.0.0.1/unused".to_string(),
+        url: "http://127.0.0.1/unused".to_string(),
     };
     let app = a2a_router(model, backend, Some(sink), auth);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -130,10 +134,10 @@ async fn serve(
     (format!("http://{addr}"), handle)
 }
 
-/// Build an authenticated SDK client bound to the server's JSON-RPC endpoint.
-fn client(endpoint: &str) -> A2AClient<JsonRpcTransport> {
+/// Build an authenticated SDK client bound to the server's REST endpoint.
+fn client(endpoint: &str) -> A2AClient<RestTransport> {
     let http = reqwest::Client::new();
-    let transport = JsonRpcTransport::new(http, format!("{endpoint}/rpc"));
+    let transport = RestTransport::new(http, endpoint.trim_end_matches('/').to_string());
     A2AClient::new(transport)
         .with_interceptors(vec![Arc::new(AuthInterceptor::bearer(good_secret()))])
 }
@@ -305,7 +309,7 @@ async fn sdk_client_unauthenticated_is_rejected() {
 
     // No auth interceptor.
     let http = reqwest::Client::new();
-    let transport = JsonRpcTransport::new(http, format!("{base}/rpc"));
+    let transport = RestTransport::new(http, base.trim_end_matches('/').to_string());
     let cli = A2AClient::new(transport);
 
     let err = cli
@@ -316,7 +320,7 @@ async fn sdk_client_unauthenticated_is_rejected() {
         })
         .await
         .unwrap_err();
-    // The server authorizer answers INVALID_REQUEST; the SDK maps the JSON-RPC
+    // The server authorizer answers INVALID_REQUEST; the SDK maps the REST
     // error envelope to an A2AError with code -32600.
     assert_eq!(err.code, -32600); // INVALID_REQUEST
 

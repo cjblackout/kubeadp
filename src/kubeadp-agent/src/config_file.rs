@@ -29,6 +29,9 @@
 //!   no_proxy                -> AGENT_RUN_NO_PROXY
 //!   http_proxy              -> AGENT_RUN_HTTP_PROXY
 //!   https_proxy             -> AGENT_RUN_HTTPS_PROXY
+//!   api_token_file          -> KUBEADP_API_TOKEN_FILE
+//!   api_allow_unauthenticated -> KUBEADP_API_ALLOW_UNAUTHENTICATED
+//!   jobset_root_key_file    -> KUBEADP_JOBSET_ROOT_KEY_FILE
 //!
 //! [orchestrator]
 //!   listen                  -> AGENT_ORCHESTRATE_LISTEN
@@ -69,10 +72,21 @@
 //!   remote_control          -> AGENT_RUN_REMOTE_CONTROL
 //!   remote_control_autostart -> AGENT_RUN_REMOTE_CONTROL_AUTOSTART
 //!   remote_control_check_secs -> AGENT_RUN_REMOTE_CONTROL_CHECK_SECS
+//!   default_engine          -> AGENT_RUN_DEFAULT_ENGINE
 //!   api_listen              -> AGENT_RUN_API_LISTEN
 //!   agy_mcp_source          -> AGENT_RUN_AGY_MCP_SOURCE
+//!   a2a_interrupt_min_secs  -> AGENT_RUN_A2A_INTERRUPT_MIN_SECS
+//!   a2a_mcp_enabled         -> AGENT_RUN_A2A_MCP_ENABLED
 //!   hindsight_api_key       -> (rejected: secret, set AGENT_RUN_HINDSIGHT_API_KEY from a Secret)
 //! ```
+//!
+//! ## Engine selection defaults (HL-91 E1)
+//!
+//! The engine registry's per-role default (selection precedence level 3) is
+//! configured with `[worker] default_engine` (jobs) and
+//! `[orchestrator] default_session_engine` (sessions). Like every other key
+//! these are lower-case scalars mapping 1:1 to environment variables; they
+//! are unused until E3/E5 route jobs/sessions behind the engine trait.
 //!
 //! ## Secrets
 //!
@@ -84,6 +98,12 @@
 //! - The worker's Hindsight API key has no TOML key at all: the worker reads
 //!   it from the environment variable `AGENT_RUN_HINDSIGHT_API_KEY`, which must
 //!   come from a Secret, never from the ConfigMap.
+//! - The shared operator API token (`[common] api_token_file` ->
+//!   `KUBEADP_API_TOKEN_FILE`) likewise accepts only the `_FILE` form; an
+//!   inline `[common] token` is rejected.
+//! - The jobset root key (`[common] jobset_root_key_file` ->
+//!   `KUBEADP_JOBSET_ROOT_KEY_FILE`) likewise accepts only the `_FILE` form;
+//!   an inline `[common] jobset_root_key` is rejected.
 //!
 //! A key that would put one of these secrets inline is rejected with a message
 //! saying how to supply it.
@@ -206,6 +226,15 @@ pub fn parse_config_toml(path: &str, content: &str) -> Result<HashMap<String, St
 fn secret_inline_for_section_key(section: &str, key: &str) -> Option<&'static str> {
     match (section, key) {
         ("orchestrator", "token") => Some("AGENT_ORCHESTRATE_TOKEN"),
+        // The operator token has no inline-TMPL key in either section: the
+        // only spellings are the shared `[common] api_token_file`
+        // (KUBEADP_API_TOKEN_FILE) and, for the orchestrator's legacy
+        // `[orchestrator] token_file`. An inline `token` under either role
+        // is rejected.
+        ("common", "token") => Some("KUBEADP_API_TOKEN_FILE"),
+        // The jobset root key likewise has no inline spelling: only the
+        // shared `[common] jobset_root_key_file` (KUBEADP_JOBSET_ROOT_KEY_FILE).
+        ("common", "jobset_root_key") => Some("KUBEADP_JOBSET_ROOT_KEY_FILE"),
         ("worker", "hindsight_api_key") => Some("AGENT_RUN_HINDSIGHT_API_KEY"),
         _ => None,
     }
@@ -221,6 +250,17 @@ fn var_for_section_key(section: &str, key: &str) -> Option<String> {
         ("common", "no_proxy") => Some("AGENT_RUN_NO_PROXY".to_string()),
         ("common", "http_proxy") => Some("AGENT_RUN_HTTP_PROXY".to_string()),
         ("common", "https_proxy") => Some("AGENT_RUN_HTTPS_PROXY".to_string()),
+        // The operator bearer token protecting the whole `/api/v1` and A2A
+        // surface. It is a secret, supplied through a file (see
+        // secret_inline_for_section_key); both roles read the same variable.
+        ("common", "api_token_file") => Some("KUBEADP_API_TOKEN_FILE".to_string()),
+        ("common", "api_allow_unauthenticated") => {
+            Some("KUBEADP_API_ALLOW_UNAUTHENTICATED".to_string())
+        }
+        // The jobset root key: the file whose content is trimmed to become the
+        // HMAC key deriving per-jobset secrets. Shared by both roles, a secret
+        // supplied through a file only (see secret_inline_for_section_key).
+        ("common", "jobset_root_key_file") => Some("KUBEADP_JOBSET_ROOT_KEY_FILE".to_string()),
 
         // --- [orchestrator]: the agent-orchestrate session supervisor ---
         ("orchestrator", "listen") => Some("AGENT_ORCHESTRATE_LISTEN".to_string()),
@@ -236,6 +276,9 @@ fn var_for_section_key(section: &str, key: &str) -> Option<String> {
         ("orchestrator", "default_session_id") => Some("CLAUDE_DEFAULT_SESSION_ID".to_string()),
         ("orchestrator", "session_args") => Some("CLAUDE_SESSION_ARGS".to_string()),
         ("orchestrator", "claude_max_crashes") => Some("CLAUDE_MAX_CRASHES".to_string()),
+        ("orchestrator", "default_session_engine") => {
+            Some("AGENT_ORCHESTRATE_DEFAULT_SESSION_ENGINE".to_string())
+        }
 
         // --- [worker]: the agent-run API daemon ---
         ("worker", "workspace_root") => Some("AGENT_RUN_WORKSPACE_ROOT".to_string()),
@@ -267,8 +310,13 @@ fn var_for_section_key(section: &str, key: &str) -> Option<String> {
         ("worker", "remote_control_check_secs") => {
             Some("AGENT_RUN_REMOTE_CONTROL_CHECK_SECS".to_string())
         }
+        ("worker", "default_engine") => Some("AGENT_RUN_DEFAULT_ENGINE".to_string()),
         ("worker", "api_listen") => Some("AGENT_RUN_API_LISTEN".to_string()),
         ("worker", "agy_mcp_source") => Some("AGENT_RUN_AGY_MCP_SOURCE".to_string()),
+        ("worker", "a2a_interrupt_min_secs") => {
+            Some("AGENT_RUN_A2A_INTERRUPT_MIN_SECS".to_string())
+        }
+        ("worker", "a2a_mcp_enabled") => Some("AGENT_RUN_A2A_MCP_ENABLED".to_string()),
 
         _ => None,
     }
@@ -335,7 +383,14 @@ fn section_and_key_for_var(var: &str) -> Option<(&'static str, String)> {
 /// All valid TOML keys of one section (used by the inverse mapping).
 fn section_keys(section: &str) -> Vec<&'static str> {
     match section {
-        "common" => vec!["no_proxy", "http_proxy", "https_proxy"],
+        "common" => vec![
+            "no_proxy",
+            "http_proxy",
+            "https_proxy",
+            "api_token_file",
+            "api_allow_unauthenticated",
+            "jobset_root_key_file",
+        ],
         "orchestrator" => vec![
             "listen",
             "token_file",
@@ -348,6 +403,7 @@ fn section_keys(section: &str) -> Vec<&'static str> {
             "default_session_id",
             "session_args",
             "claude_max_crashes",
+            "default_session_engine",
         ],
         "worker" => vec![
             "workspace_root",
@@ -377,6 +433,9 @@ fn section_keys(section: &str) -> Vec<&'static str> {
             "remote_control_check_secs",
             "api_listen",
             "agy_mcp_source",
+            "default_engine",
+            "a2a_interrupt_min_secs",
+            "a2a_mcp_enabled",
         ],
         _ => Vec::new(),
     }
@@ -409,7 +468,7 @@ max_parallel = 4
 hindsight_url = "https://hindsight.example"
 
 [orchestrator]
-listen = "0.0.0.0:8003"
+listen = "0.0.0.0:8002"
 claude_max_crashes = 7
 "#
     }
@@ -435,7 +494,7 @@ claude_max_crashes = 7
         );
         assert_eq!(
             vars.get("AGENT_ORCHESTRATE_LISTEN").map(|s| s.as_str()),
-            Some("0.0.0.0:8003")
+            Some("0.0.0.0:8002")
         );
         assert_eq!(
             vars.get("CLAUDE_MAX_CRASHES").map(|s| s.as_str()),
@@ -468,6 +527,27 @@ gc_max_age_days = 14
         assert_eq!(
             vars.get("AGENT_RUN_GC_MAX_AGE_DAYS").map(|s| s.as_str()),
             Some("14")
+        );
+    }
+
+    #[test]
+    fn test_a2a_mcp_enabled_maps_to_env() {
+        let toml = r#"
+[worker]
+a2a_mcp_enabled = true
+"#;
+        let vars = parse(toml);
+        assert_eq!(
+            vars.get("AGENT_RUN_A2A_MCP_ENABLED").map(|s| s.as_str()),
+            Some("true")
+        );
+        // Inverse mapping recovers it too (sound and complete over the table).
+        let (section, key) = section_and_key_for_var("AGENT_RUN_A2A_MCP_ENABLED").unwrap();
+        assert_eq!(section, "worker");
+        assert_eq!(key, "a2a_mcp_enabled");
+        assert_eq!(
+            var_for_section_key("worker", "a2a_mcp_enabled").as_deref(),
+            Some("AGENT_RUN_A2A_MCP_ENABLED")
         );
     }
 
@@ -563,6 +643,47 @@ gc_max_age_days = 14
     }
 
     #[test]
+    fn test_common_api_token_keys_accepted_and_inlined_rejected() {
+        // api_token_file + api_allow_unauthenticated are [common] keys mapped
+        // to their KUBEADP_* variables (applied for both roles).
+        let vars = parse(
+            "[common]\napi_token_file = \"/run/secrets/api-token\"\n\
+             api_allow_unauthenticated = \"true\"\n\
+             jobset_root_key_file = \"/run/secrets/jobset-root-key\"\n",
+        );
+        assert_eq!(
+            vars.get("KUBEADP_API_TOKEN_FILE").map(|s| s.as_str()),
+            Some("/run/secrets/api-token")
+        );
+        assert_eq!(
+            vars.get("KUBEADP_API_ALLOW_UNAUTHENTICATED")
+                .map(|s| s.as_str()),
+            Some("true")
+        );
+        assert_eq!(
+            vars.get("KUBEADP_JOBSET_ROOT_KEY_FILE").map(|s| s.as_str()),
+            Some("/run/secrets/jobset-root-key")
+        );
+        // An inline token value is rejected like every other secret.
+        let err = parse_config_toml("test.toml", "[common]\ntoken = \"abc\"\n").unwrap_err();
+        assert!(err.contains("must not be set inline"), "{err}");
+        assert!(err.contains("KUBEADP_API_TOKEN_FILE"), "{err}");
+        // An inline jobset root key value is likewise rejected.
+        let err =
+            parse_config_toml("test.toml", "[common]\njobset_root_key = \"abc\"\n").unwrap_err();
+        assert!(err.contains("must not be set inline"), "{err}");
+        assert!(err.contains("KUBEADP_JOBSET_ROOT_KEY_FILE"), "{err}");
+        // api_token_file is a scalar (a path); a non-scalar is rejected.
+        let err =
+            parse_config_toml("test.toml", "[common]\napi_token_file = [\"/a\"]\n").unwrap_err();
+        assert!(err.contains("must be a scalar"), "{err}");
+        // jobset_root_key_file is likewise a scalar path.
+        let err = parse_config_toml("test.toml", "[common]\njobset_root_key_file = [\"/a\"]\n")
+            .unwrap_err();
+        assert!(err.contains("must be a scalar"), "{err}");
+    }
+
+    #[test]
     fn test_non_scalar_value_is_error() {
         let err = parse_config_toml("test.toml", "[worker]\nmax_parallel = [1, 2]\n").unwrap_err();
         assert!(err.contains("must be a scalar"), "{err}");
@@ -629,7 +750,7 @@ gc_max_age_days = 14
         let applied2 = apply_to_env(&vars, &["orchestrator"]);
         assert_eq!(
             std::env::var("AGENT_ORCHESTRATE_LISTEN").unwrap(),
-            "0.0.0.0:8003"
+            "0.0.0.0:8002"
         );
         assert_eq!(std::env::var("CLAUDE_MAX_CRASHES").unwrap(), "7");
         assert_eq!(applied2, 2);
@@ -683,6 +804,24 @@ gc_max_age_days = 14
         assert!(
             err2.contains("unknown key 'common.sandbox_runtime'"),
             "{err2}"
+        );
+    }
+
+    #[test]
+    fn test_engine_default_keys_map_to_env() {
+        // HL-91 E1: per-role engine selection defaults (precedence level 3).
+        let vars = parse(
+            "[worker]\ndefault_engine = \"claude\"\n\
+             [orchestrator]\ndefault_session_engine = \"agy\"\n",
+        );
+        assert_eq!(
+            vars.get("AGENT_RUN_DEFAULT_ENGINE").map(|s| s.as_str()),
+            Some("claude")
+        );
+        assert_eq!(
+            vars.get("AGENT_ORCHESTRATE_DEFAULT_SESSION_ENGINE")
+                .map(|s| s.as_str()),
+            Some("agy")
         );
     }
 }

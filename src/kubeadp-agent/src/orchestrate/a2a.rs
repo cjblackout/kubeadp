@@ -176,11 +176,19 @@ impl SessionMessageSink {
 }
 
 impl crate::core::a2a::MessageSink for SessionMessageSink {
-    fn deliver(&self, task_id: &str, sender: &str, text: &str) -> Result<(), a2a::A2AError> {
+    fn deliver(
+        &self,
+        task_id: &str,
+        sender: &str,
+        text: &str,
+        _message_id: &str,
+    ) -> Result<(), a2a::A2AError> {
         use a2a::A2AError;
         // Runs on the tokio blocking pool (the handler wraps the call in
         // spawn_blocking), so the deadline-bounded PTY write never occupies a
         // worker thread. Shares the same state/rate limiter as the REST path.
+        // The session path deduplicates on (session, sender) budget, not on the
+        // A2A message id, so `message_id` is not used here.
         match sessions_api::deliver_message(&self.state, task_id, sender, text) {
             sessions_api::DeliverOutcome::Accepted { .. } => Ok(()),
             sessions_api::DeliverOutcome::NotFound => Err(A2AError::task_not_found(task_id)),
@@ -211,6 +219,7 @@ pub fn a2a_router(
     controls: SessionControlRegistry,
     api_state: Arc<sessions_api::SessionsApiState>,
     auth: Option<AuthVerifier>,
+    jobset: Option<crate::core::a2a::JobsetCred>,
 ) -> Router {
     let session_names = {
         let st = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -224,12 +233,12 @@ pub fn a2a_router(
         description: "Process supervisor for Claude Code agent sessions".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         skills: session_names,
-        json_rpc_url: "/rpc".to_string(),
+        url: String::new(),
     };
 
     let sink = Arc::new(SessionMessageSink::new(api_state));
     let backend = Arc::new(SupervisorTaskBackend::new(state, controls));
-    crate::core::a2a::a2a_router(model, backend, Some(sink), auth)
+    crate::core::a2a::a2a_router_with_jobset(model, backend, Some(sink), auth, jobset)
 }
 
 #[cfg(test)]
@@ -274,6 +283,7 @@ mod tests {
                 pty_eof_grace_secs: 1.0,
                 kill_wait_secs: 2.0,
                 sandbox: true,
+                grants: None,
                 base_backoff_secs: 1.0,
                 max_backoff_secs: 10.0,
                 healthy_run_secs: 30.0,
@@ -408,6 +418,7 @@ mod tests {
             backend.controls.clone(),
             api_state,
             None,
+            None,
         );
 
         // Public agent card at /.well-known/agent-card.json
@@ -444,37 +455,18 @@ mod tests {
         assert_eq!(task_val["id"], "sess-1");
         assert_eq!(task_val["status"]["state"], "TASK_STATE_WORKING");
 
-        // JSON-RPC GetTask
+        // REST POST /tasks/sess-1:cancel
         let req = Request::builder()
             .method("POST")
-            .uri("/rpc")
-            .header("a2a-version", "1.0")
+            .uri("/tasks/sess-1:cancel")
             .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"sess-1"}}"#,
-            ))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let bytes = res.into_body().collect().await.unwrap().to_bytes();
-        let rpc_val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(rpc_val["result"]["id"], "sess-1");
-
-        // JSON-RPC CancelTask
-        let req = Request::builder()
-            .method("POST")
-            .uri("/rpc")
-            .header("a2a-version", "1.0")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"jsonrpc":"2.0","id":2,"method":"CancelTask","params":{"id":"sess-1"}}"#,
-            ))
+            .body(Body::from("{}"))
             .unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
-        let rpc_val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(rpc_val["result"]["status"]["state"], "TASK_STATE_CANCELED");
+        let cancel_val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(cancel_val["status"]["state"], "TASK_STATE_CANCELED");
     }
 
     #[tokio::test]
@@ -500,6 +492,7 @@ mod tests {
             backend.controls.clone(),
             api_state,
             Some(auth_verifier),
+            None,
         );
 
         // Agent card is public even with auth configured
@@ -554,33 +547,26 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .put(pty.master);
 
-        let app = a2a_router(st.clone(), controls.clone(), api_state.clone(), None);
+        let app = a2a_router(st.clone(), controls.clone(), api_state.clone(), None, None);
 
         let send = |id: u32| -> String {
             format!(
-                r#"{{"jsonrpc":"2.0","id":{id},"method":"SendMessage","params":{{"message":{{"messageId":"m{id}","taskId":"sess-1","role":"ROLE_USER","parts":[{{"text":"hello"}}],"metadata":{{"a2a.sender":"noisy","a2a.hop":1}}}}}}}}"#
+                r#"{{"message":{{"messageId":"m{id}","taskId":"sess-1","role":"ROLE_USER","parts":[{{"text":"hello"}}],"metadata":{{"a2a.sender":"noisy","a2a.hop":1}}}}}}"#
             )
         };
-        let rpc = |app: Router, body: String| async move {
+        let send_req = |app: Router, body: String| async move {
             let req = Request::builder()
                 .method("POST")
-                .uri("/rpc")
-                .header("a2a-version", "1.0")
+                .uri("/message:send")
                 .header("content-type", "application/json")
                 .body(Body::from(body))
                 .unwrap();
-            let res = app.oneshot(req).await.unwrap();
-            assert_eq!(res.status(), StatusCode::OK);
-            let bytes = res.into_body().collect().await.unwrap().to_bytes();
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            app.oneshot(req).await.unwrap()
         };
 
         // First message from "noisy" is accepted...
-        let resp = rpc(app.clone(), send(1)).await;
-        assert!(
-            resp.get("result").is_some(),
-            "first A2A message should be accepted: {resp}"
-        );
+        let res = send_req(app.clone(), send(1)).await;
+        assert_eq!(res.status(), StatusCode::OK);
         // ...and it charged the SHARED limiter (the api_state the REST router
         // also uses) under the claimed sender -- not a second A2A-only one.
         {
@@ -601,14 +587,13 @@ mod tests {
                 lim.record("sess-1", "noisy", now);
             }
         }
-        let resp2 = rpc(app.clone(), send(2)).await;
+        let res2 = send_req(app.clone(), send(2)).await;
+        assert_eq!(res2.status(), StatusCode::BAD_REQUEST);
+        let bytes = res2.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8_lossy(&bytes);
         assert!(
-            resp2.get("error").is_some(),
-            "budget-exhausted A2A send must error: {resp2}"
-        );
-        assert!(
-            resp2.to_string().contains("budget exhausted"),
-            "error body: {resp2}"
+            body_str.contains("budget exhausted"),
+            "error body: {body_str}"
         );
     }
 }

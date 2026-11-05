@@ -50,6 +50,8 @@ Sections: `[common]`, `[orchestrator]`, `[worker]`. Keys are lower-case; a key i
 | `[common]` | `http_proxy` | `AGENT_RUN_HTTP_PROXY` |
 | `[common]` | `https_proxy` | `AGENT_RUN_HTTPS_PROXY` |
 | `[common]` | `no_proxy` | `AGENT_RUN_NO_PROXY` |
+| `[common]` | `api_token_file` | `KUBEADP_API_TOKEN_FILE` |
+| `[common]` | `api_allow_unauthenticated` | `KUBEADP_API_ALLOW_UNAUTHENTICATED` |
 | `[orchestrator]` | `listen` | `AGENT_ORCHESTRATE_LISTEN` |
 | `[orchestrator]` | `token_file` | `AGENT_ORCHESTRATE_TOKEN_FILE` |
 | `[orchestrator]` | `session_log_ring_bytes` | `AGENT_ORCHESTRATE_SESSION_LOG_RING_BYTES` |
@@ -86,28 +88,48 @@ Sections: `[common]`, `[orchestrator]`, `[worker]`. Keys are lower-case; a key i
 | `[worker]` | `remote_control` | `AGENT_RUN_REMOTE_CONTROL` |
 | `[worker]` | `remote_control_autostart` | `AGENT_RUN_REMOTE_CONTROL_AUTOSTART` |
 | `[worker]` | `remote_control_check_secs` | `AGENT_RUN_REMOTE_CONTROL_CHECK_SECS` |
-| `[worker]` | `api_listen` | `AGENT_RUN_API_LISTEN` |
-| `[worker]` | `agy_mcp_source` | `AGENT_RUN_AGY_MCP_SOURCE` |
+ | `[worker]` | `api_listen` | `AGENT_RUN_API_LISTEN` |
+ | `[worker]` | `agy_mcp_source` | `AGENT_RUN_AGY_MCP_SOURCE` |
+ | `[worker]` | `a2a_interrupt_min_secs` | `AGENT_RUN_A2A_INTERRUPT_MIN_SECS` |
 
 ### Secrets
 
 Secrets are never inline. Only the `_FILE` form is accepted:
 
-- `[orchestrator] token_file` -> `AGENT_ORCHESTRATE_TOKEN_FILE` (the bearer token; the inline `AGENT_ORCHESTRATE_TOKEN` variable has no TOML key).
+- `[common] api_token_file` -> `KUBEADP_API_TOKEN_FILE`: the operator bearer
+  token guarding the WHOLE `/api/v1` and A2A surface of BOTH roles (worker
+  agent-run-api and orchestrator alike); an inline `[common] token` is
+  rejected.
+- `[orchestrator] token_file` -> `AGENT_ORCHESTRATE_TOKEN_FILE` (the legacy
+  orchestrator bearer token; the inline `AGENT_ORCHESTRATE_TOKEN` variable has
+  no TOML key). Honoured as a fallback when no `[common] api_token_file` is
+  set, so existing deployments keep working unchanged.
 - The worker's Hindsight API key has no file key: set `AGENT_RUN_HINDSIGHT_API_KEY` in the environment from a Secret.
 - The `repo-sync` subcommand has its own file (`KUBEADP_REPO_SYNC_CONFIG`, see the "repo-sync subcommand" section above): a `[repo_sync]` section in THIS file is rejected, and its token is never inline (`token_env`/`token_file` only).
 
 A key that would put either secret inline is rejected with a message pointing at the `_FILE` form.
+
+Without a token (shared or legacy) a role refuses to start its API server
+unless `api_allow_unauthenticated` (`KUBEADP_API_ALLOW_UNAUTHENTICATED`) is
+set; the token value is hashed to a SHA-256 digest at startup and never
+appears in logs.
+
+The `agent-run` CLI (client side) reads the same variable: when
+`KUBEADP_API_TOKEN_FILE` is set, the file's trimmed contents are presented as
+`Authorization: Bearer <token>` on every request the CLI makes (via a ureq
+middleware in `src/cli/client.rs`). Unset means no header. A configured but
+unreadable or empty file aborts the CLI with a clear error naming only the
+path — the token value is never printed or logged.
 
 Example (one ConfigMap for both roles):
 
 ```toml
 [common]
 http_proxy = "http://proxy.example:3128"
+api_token_file = "/run/secrets/api-token"
 
 [orchestrator]
-listen = "0.0.0.0:8003"
-token_file = "/run/secrets/agent-token"
+listen = "0.0.0.0:8002"
 claude_max_crashes = 7
 
 [worker]
@@ -128,25 +150,28 @@ The `agent-core` crate is the shared execution engine and library backing `agent
 
 ### A2A agent protocol surface (feature `a2a`)
 
-Behind the `a2a` cargo feature (which depends on `server`), `kubeadp_agent::core::a2a` serves the A2A v1 agent protocol through the official SDK (`a2aproject/a2a-rs`, Apache-2.0, pinned exactly: `a2a-lf` types, `a2a-server-lf` routers, `a2a-client-lf` for clients and tests): the public agent card at `/.well-known/agent-card.json` (name/description/version from a caller-supplied `A2aModel`; skills = a caller-passed list of project/agent names; bearer security scheme), JSON-RPC (`POST /rpc`, needs the `A2A-Version: 1.0` header) and HTTP+JSON (REST) bindings for `GetTask`, `ListTasks`, `CancelTask` over the `TaskBackend` trait and `SendMessage` over the `MessageSink` trait. `SendStreamingMessage`, `SubscribeToTask`, push-notification config and `GetExtendedAgentCard` answer the A2A error codes (`UNSUPPORTED_OPERATION`, `PUSH_NOTIFICATION_NOT_SUPPORTED`, ...).
+Behind the `a2a` cargo feature (which depends on `server`), `kubeadp_agent::core::a2a` serves the A2A v1 agent protocol through the official SDK (`a2aproject/a2a-rs`, Apache-2.0, pinned exactly: `a2a-lf` types, `a2a-server-lf` routers, `a2a-client-lf` for clients and tests): the public agent card at `/.well-known/agent-card.json` (name/description/version from a caller-supplied `A2aModel`; skills = a caller-passed list of project/agent names; bearer security scheme) and HTTP+JSON (REST) bindings (`/message:send`, `/tasks`, `/tasks/{id}`, `/tasks/{id}:cancel`) for `GetTask`, `ListTasks`, `CancelTask` over the `TaskBackend` trait and `SendMessage` over the `MessageSink` trait. `SendStreamingMessage`, `SubscribeToTask`, push-notification config and `GetExtendedAgentCard` answer the A2A error codes (`UNSUPPORTED_OPERATION`, `PUSH_NOTIFICATION_NOT_SUPPORTED`, ...).
 
-The server implements `a2a_server::RequestHandler` by hand (`core::a2a::handler`), not `DefaultRequestHandler`: sessions and jobs already own their task ids and never reach a terminal state on `SendMessage`, so the handler returns the current task and the session keeps running (progress through `GetTask`). Errors, status codes and media types are the SDK's (REST errors are `application/problem+json` with the A2A reason in `error.details[0].reason`; unsupported operations are HTTP 400, authentication failures HTTP 400 / JSON-RPC -32600). `agent-orchestrate` passes a `SessionMessageSink` that delivers into the session through the same path as `POST /api/v1/sessions/{name}/message` (sanitising, size limit, rate limit); `agent-run-api` passes no sink (jobs have no interactive input), so `SendMessage` answers `UNSUPPORTED_OPERATION` there.
+The server implements `a2a_server::RequestHandler` by hand (`core::a2a::handler`), not `DefaultRequestHandler`: sessions and jobs already own their task ids and never reach a terminal state on `SendMessage`, so the handler returns the current task and the session keeps running (progress through `GetTask`). Errors, status codes and media types are the SDK's (REST errors are `application/problem+json` with the A2A reason in `error.details[0].reason`; unsupported operations are HTTP 400). `agent-orchestrate` passes a `SessionMessageSink` that delivers into the live session through the same path as `POST /api/v1/sessions/{name}/message` (sanitising, size limit, rate limit); `agent-run-api` passes a `JobMessageSink` that resumes the addressed job's conversation with the message as the next turn (interrupt-and-resume): a running job's `agy` attempt is stopped cleanly (SIGTERM group, grace, SIGKILL — the same mechanism as `kill`, but never marked user-killed/failed) and the same conversation is continued through the retry follow-up path; a finished job is resumed directly. An operator-killed job is never woken (clear error); unknown/cleaned/discarded jobs answer `TASK_NOT_FOUND`. At most one resume is in flight per job (per-job gate); concurrent messages coalesce in memory into the next turn (bounded 8 msgs / 8 KB, oldest dropped with a note, no persistent inbox). A per-job minimum interval (`a2a_interrupt_min_secs`, default 20 s, `0` = off) plus the existing per-jobset hop-token budget rate-limit message storms (a throttled delivery is rejected with a rate-limit error); a repeated A2A message id is applied at most once (idempotency).
 
-Router construction: `a2a_router(model, backend, sink, auth)` returns a standalone `axum::Router` (card, `/rpc` and REST routes); the wrappers (`agent-orchestrate`, `agent-run-api`) merge it into their own routers. All non-card routes require a bearer token supplied by the caller as an optional `AuthVerifier` (`Arc<dyn Fn(&HeaderMap) -> bool>`); the card is always public. `map_job_status` converts `kubeadp_agent::core::job::JobStatus` into A2A `TaskState` (`Running`→`working`, `Done`→`completed`, `Failed`/`Incomplete`/`QuotaExhausted`→`failed`, `SelfTerminated`/`Killed`→`canceled`).
+Router construction: `a2a_router(model, backend, sink, auth)` returns a standalone `axum::Router` (card and REST routes); the wrappers (`agent-orchestrate`, `agent-run-api`) merge it into their own routers. All non-card routes require a bearer token supplied by the caller as an optional `AuthVerifier` (`Arc<dyn Fn(&HeaderMap) -> bool>`); the card is always public. `map_job_status` converts `kubeadp_agent::core::job::JobStatus` into A2A `TaskState` (`Running`→`working`, `Done`→`completed`, `Failed`/`Incomplete`/`QuotaExhausted`→`failed`, `SelfTerminated`/`Killed`→`canceled`).
 
 Feature-gated integration tests live in `tests/a2a.rs` (wire format) and `tests/a2a_client.rs` (the official client against an in-process server); run them with `cargo test --features a2a --manifest-path src/kubeadp-agent/Cargo.toml`.
 
 ### `mcp-a2a` subcommand: the A2A sending side over MCP (feature `a2a`)
 
-The same `a2a` feature gates `kubeadp-agent mcp-a2a`, a stdio Model Context Protocol server exposing three tools for talking **to** peer agents (client side, `kubeadp_agent::core::a2a::client` + `kubeadp_agent::mcp_a2a`). It does **not** require `KUBEADP_ROLE`.
+The same `a2a` feature gates `kubeadp-agent mcp-a2a`, a stdio Model Context Protocol server exposing four tools for talking **to** peer agents (client side, `kubeadp_agent::core::a2a::client` + `kubeadp_agent::mcp_a2a`). It does **not** require `KUBEADP_ROLE`.
 
 - `list_agents` — the discovered peer agents (name, namespace, url, best-effort agent card).
-- `send_message` — send a text message (role `user`) to an agent by Service name, tagged with `a2a.sender` (from `A2A_SELF_NAME`, default the process name) and `a2a.hop` (incoming hop + 1). A hop above 4 is refused.
-- `get_task` — fetch the current state of a task on an agent by Service name.
+- `send_message` — send a text message (role `user`) to an agent by Service name **or `namespace/name`** (the `agent` argument accepts both; `A2aClientCtx::agent` already resolves unqualified names against the own namespace first, then uniquely across the discovery namespaces, and refuses ambiguous names), tagged with `a2a.sender` (from `A2A_SELF_NAME`, default the process name) and `a2a.hop` (incoming hop + 1). A hop above 4 is refused.
+- `reply` — reply to the agent that sent the last message this agent received. The `mcp-a2a` server is a **separate stdio process** and cannot see incoming messages, so there is no shared in-process "last sender"; instead `reply` is a `send_message` whose recipient is passed explicitly as `to`: copy it verbatim from the `claimed sender:` field of the framed header of the incoming message (`--- A2A INCOMING MESSAGE (claimed sender: <name>, hop: <n>) ---`). Same resolution, sender/hop tagging and hop limit as `send_message`.
+- `get_task` — fetch the current state of a task on an agent by Service name or `namespace/name`.
 
-Agents are discovered from Kubernetes Services labelled `a2a.homelab/agent=true` in the pod's own namespace plus `A2A_NAMESPACES` (comma-separated); the in-cluster service account (`/var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt,namespace}`) authenticates the discovery, and `A2A_KUBE_API` overrides the API base for local development/tests. Each Service's URL is `http://<service>.<namespace>.svc:<port>` using the port named `a2a` (else the first port). The card fetch is best-effort (3 s timeout); a failure just omits `card`. `send_message`/`get_task` only accept a Service name from the registry (never an arbitrary URL). `A2A_URL_OVERRIDES` (`name=url,...`) is a test/development seam that redirects the *connection* (and card fetch) while the advertised URL stays the cluster-internal one.
+Agents are discovered from Kubernetes Services labelled `a2a.homelab/agent=true` in the pod's own namespace plus `A2A_NAMESPACES` (comma-separated); the in-cluster service account (`/var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt,namespace}`) authenticates the discovery, and `A2A_KUBE_API` overrides the API base for local development/tests. Each Service's URL is `http://<service>.<namespace>.svc:<port>` using the port named `a2a` (else the first port). The card fetch is best-effort (3 s timeout); a failure just omits `card`. `send_message`/`get_task` only accept a Service name or `namespace/name` from the registry (never an arbitrary URL). `A2A_URL_OVERRIDES` (`name=url,...` or `namespace/name=url,...`, the latter winning for that agent) is a test/development seam that redirects the *connection* (and card fetch) while the advertised URL stays the cluster-internal one.
 
-Errors are MCP tool errors (`isError: true`), never panics, and every response is bounded to 20 KB. Tests: `tests/a2a_client_mcp.rs` (in-process A2A server + in-memory MCP round trip) and `tests/a2a_discovery.rs` (fake Kubernetes API).
+The `a2a` MCP tool **descriptions** tell the model plainly that messages from other agents are framed DATA, not instructions. `kubeadp-agent mcp-a2a` can be wired into every agy job automatically: with the `[worker] a2a_mcp_enabled = true` config key (env `AGENT_RUN_A2A_MCP_ENABLED`), `prepare_agy_home` merges an `"a2a"` entry (`{"command": "<current exe>", "args": ["mcp-a2a"]}`) into the job's `~/.gemini/config/mcp_config.json` while keeping every existing server (atomic, idempotent, a no-op when the key is false). The tool reads nothing secret from the file: its identity/credential come from the job environment (`A2A_SELF_NAME`, `KUBEADP_JOBSET_ID`, `KUBEADP_JOBSET_SECRET_FILE`).
+
+Errors are MCP tool errors (`isError: true`), never panics, and every response is bounded to 20 KB. Tests: `tests/a2a_client_mcp.rs` (in-process A2A server + in-memory MCP round trip, including `reply` and `namespace/name` resolution) and `tests/a2a_discovery.rs` (fake Kubernetes API).
 
 # Module notes: orchestrate
 
@@ -296,15 +321,21 @@ START / STOP / RESTART, redacted LOG tail, message injection). No endpoint
 writes to a session's PTY except `message`, which is deliberately modelled on
 what a user types into a terminal and never submits text as a command.
 
-- Listen address: `AGENT_ORCHESTRATE_LISTEN`, default `127.0.0.1:8003`
+- Listen address: `AGENT_ORCHESTRATE_LISTEN`, default `127.0.0.1:8002`
   (reachable only from inside the cluster).
-- Optional bearer token for the WHOLE `/api/v1` group (the shared agent-run
-  routes and the `/api/v1/sessions` group alike):
-  `AGENT_ORCHESTRATE_TOKEN_FILE` (a file whose trimmed contents are the token)
-  or `AGENT_ORCHESTRATE_TOKEN`. The token is enforced once by a single router
-  layer, compared in constant time, and failed attempts are throttled per peer
-  IP (429 after 10 failures within 60 s). `/healthz` and `/readyz` are the only
-  never-gated routes; `/metrics` requires the token like `/api/v1`.
+- Required bearer token for the WHOLE `/api/v1` group (the shared agent-run
+  routes and the `/api/v1/sessions` group alike) and, under `a2a`, the A2A
+  routes: `KUBEADP_API_TOKEN_FILE` (config `[common] api_token_file`, both
+  roles share it), with the legacy `AGENT_ORCHESTRATE_TOKEN_FILE` /
+  `AGENT_ORCHESTRATE_TOKEN` honoured as a fallback. Without any token the
+  server refuses to start unless `KUBEADP_API_ALLOW_UNAUTHENTICATED=true`
+  (config `api_allow_unauthenticated`). The token is enforced once by a single
+  router layer, compared in constant time on its SHA-256 digest (the raw value
+  is hashed at startup and never logged), and failed attempts are throttled
+  per peer IP (429 after 10 failures within 60 s, with `Retry-After`).
+  `/healthz` and `/readyz` are the only never-gated routes; `/metrics`
+  requires the token like `/api/v1`; auth failures answer
+  `application/problem+json`.
 - `GET /readyz`: unauthenticated readiness probe, `{"status": "ready"}` when
   the state store / sessions registry is readable, `503 {"error","code":
   "not_ready"}` otherwise.
@@ -347,10 +378,14 @@ When compiled with `--features a2a`, `agent-orchestrate` exposes the A2A v1 agen
   - Context ID = session name
   - State mapping: `Running` / `Starting` / `Backoff` -> `working`, `Stopped` -> `completed` (or `canceled` if paused), `Failed` -> `failed`.
 - Endpoints:
-  - JSON-RPC: `POST /rpc` supporting `GetTask`, `ListTasks`, and `CancelTask`.
-  - REST: `GET /tasks`, `GET /tasks/{id}`, and `POST /tasks/{id}:cancel` (or legacy `POST /tasks/{id}/cancel`).
-  - Unsupported operations (`SendMessage`, streaming, subscriptions, push configs) return standard 501 / `unsupported` responses.
-- Authentication: Protected A2A routes are guarded by the same bearer token mechanism as `/api/v1` routes (`AGENT_ORCHESTRATE_TOKEN_FILE` or `AGENT_ORCHESTRATE_TOKEN`).
+  - REST: `GET /tasks`, `GET /tasks/{id}`, `POST /tasks/{id}:cancel` (or legacy `POST /tasks/{id}/cancel`), and `POST /message:send`.
+  - Unsupported operations (streaming, subscriptions, push configs) return standard 400 responses.
+- Authentication: Protected A2A routes are guarded by the same bearer token
+  mechanism as `/api/v1` routes (`KUBEADP_API_TOKEN_FILE`, legacy
+  `AGENT_ORCHESTRATE_TOKEN_FILE` / `AGENT_ORCHESTRATE_TOKEN`), compared in
+  constant time on the SHA-256 digest. The A2A surface is extra: a per-jobset
+  credential can be layered on top of the operator token as an alternative
+  (see `core::server::auth::auth_verifier_from_state`).
 
 ### How to Run Tests
 
@@ -397,8 +432,7 @@ The `agent-run-api` crate provides the HTTP API daemon and job execution engine 
 
 When built with the `a2a` feature (`--features a2a`), the daemon serves the Agent-to-Agent (A2A v1) protocol:
 - `GET /.well-known/agent-card.json` -- public agent card describing the agent's capabilities and supported interfaces.
-- `POST /rpc` -- JSON-RPC 2.0 interface supporting `GetTask`, `ListTasks`, and `CancelTask`.
 - `GET /tasks`, `GET /tasks/{id}`, `POST /tasks/{id}:cancel` -- REST bindings for tasks.
 - A2A tasks correspond directly to `agent-run` jobs (`task.id` = `job_id`, `task.context_id` = `job_id`), mapping job statuses (`running` -> `working`, `done` -> `completed`, `failed` -> `failed`, `killed` -> `canceled`) and exposing the final response and worktree diff as task artifacts.
-- Methods not currently supported (such as `SendMessage`, `SubscribeToTask`, or push notifications) return HTTP 501 / JSON-RPC `UNSUPPORTED_OPERATION` (`code: "unsupported"`).
+- Methods not currently supported (such as `SendMessage`, `SubscribeToTask`, or push notifications) return HTTP 400 (`UNSUPPORTED_OPERATION`).
 

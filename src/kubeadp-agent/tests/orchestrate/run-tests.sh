@@ -3220,7 +3220,7 @@ EOF
 # T53: REST API /healthz is reachable and reports ok while supervising
 # ==============================================================================
 # The supervisor serves the copied agent-run REST API and its own
-# /api/v1/sessions group on AGENT_ORCHESTRATE_LISTEN (default 127.0.0.1:8003).
+# /api/v1/sessions group on AGENT_ORCHESTRATE_LISTEN (default 127.0.0.1:8002).
 # /healthz is exempt from the optional bearer token.
 # ==============================================================================
 test_t53() {
@@ -4385,6 +4385,84 @@ EOF
     fi
 }
 
+# ==============================================================================
+# T69: Session grants (env passthrough, grants parsing in supervisor config)
+# ==============================================================================
+test_t69() {
+    local tdir="${TEST_TMP}/t69"
+    mkdir -p "$tdir/home" "$tdir/work" "$tdir/ro_granted" "$tdir/rw_granted"
+    echo "ro-content" > "$tdir/ro_granted/data.txt"
+    local log_file="$tdir/fake-claude.log"
+    local state_file="$tdir/state.json"
+    local cfg_file="$tdir/config.json"
+    local sup_log="$tdir/supervisor.log"
+    local probe_script="$tdir/probe.sh"
+
+    # Script that inspects its environment and writes to probe.log
+    cat <<'EOF' > "$probe_script"
+#!/usr/bin/env bash
+echo "PROBE_START" >> "$FAKE_CLAUDE_LOG"
+echo "VIKUNJA_URL=${VIKUNJA_URL:-unset}" >> "$FAKE_CLAUDE_LOG"
+echo "VIKUNJA_TOKEN=${VIKUNJA_API_TOKEN:-unset}" >> "$FAKE_CLAUDE_LOG"
+echo "UNGRANTED_VAR=${SOME_UNGRANTED_VAR:-unset}" >> "$FAKE_CLAUDE_LOG"
+while true; do
+    echo "fake-claude: heartbeat $(date +%s)"
+    sleep 0.2
+done
+EOF
+    chmod +x "$probe_script"
+
+    cat <<EOF > "$cfg_file"
+{
+    "state_file": "$state_file",
+    "sessions": [
+        {
+            "name": "sess69",
+            "workdir": "$tdir/work",
+            "session_id": "test-session-069",
+            "claude_binary": "$probe_script",
+            "readiness_poll_secs": 0.2,
+            "sandbox": false,
+            "grants": {
+                "serviceaccount": false,
+                "ro_paths": ["$tdir/ro_granted"],
+                "rw_paths": ["$tdir/rw_granted"],
+                "env": ["VIKUNJA_*"]
+            },
+            "env": {
+                "FAKE_CLAUDE_LOG": "$log_file"
+            }
+        }
+    ]
+}
+EOF
+
+    HOME="$tdir/home" \
+    VIKUNJA_URL="http://vikunja.local:3456" \
+    VIKUNJA_API_TOKEN="secret-vik-tok" \
+    SOME_UNGRANTED_VAR="secret-ungranted" \
+        "$BIN" run --config "$cfg_file" > "$sup_log" 2>&1 &
+    local spid=$!
+    ACTIVE_PIDS+=("$spid")
+
+    local ok=0
+    for _ in $(seq 1 100); do
+        if grep -q "VIKUNJA_TOKEN=secret-vik-tok" "$log_file" 2>/dev/null; then
+            ok=1
+            break
+        fi
+        sleep 0.05
+    done
+
+    stop_supervisor "$spid"
+
+    if [ "$ok" -eq 1 ]; then
+        rec "T69" "PASS" "session with grants passes through env matching wildcard from supervisor environment"
+    else
+        rec "T69" "FAIL" "session grants env passthrough failed (log: $(cat "$log_file" 2>/dev/null))"
+    fi
+}
+
 TESTS_TO_RUN=()
 if [ -n "${ONLY:-}" ]; then
     for t in $ONLY; do
@@ -4471,6 +4549,7 @@ else
     test_t66
     test_t67
     test_t68
+    test_t69
 fi
 
 echo "============================================================"

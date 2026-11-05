@@ -107,8 +107,17 @@ fn run_mcp_a2a() {
         .build()
         .expect("failed to build tokio runtime");
     if let Err(e) = rt.block_on(async {
-        let server =
-            kubeadp_agent::mcp_a2a::build_server(std::env::var("A2A_KUBE_API").ok()).await?;
+        let kube_api = {
+            #[cfg(feature = "test-hooks")]
+            {
+                std::env::var("A2A_KUBE_API").ok()
+            }
+            #[cfg(not(feature = "test-hooks"))]
+            {
+                None
+            }
+        };
+        let server = kubeadp_agent::mcp_a2a::build_server(kube_api).await?;
         kubeadp_agent::mcp_a2a::run_stdio(server).await
     }) {
         eprintln!("kubeadp-agent (mcp-a2a): {e:#}");

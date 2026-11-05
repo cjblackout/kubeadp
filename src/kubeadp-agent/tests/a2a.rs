@@ -74,7 +74,7 @@ fn test_model() -> A2aModel {
         description: "A test agent".to_string(),
         version: "1.0.0".to_string(),
         skills: vec!["proj-a".to_string(), "proj-b".to_string()],
-        json_rpc_url: "http://localhost:8080".to_string(),
+        url: "http://localhost:8080".to_string(),
     }
 }
 
@@ -162,15 +162,16 @@ async fn card_is_served_without_auth_and_has_expected_content() {
         value["securitySchemes"]["bearer"]["httpAuthSecurityScheme"]["scheme"],
         "bearer"
     );
-    // supportedInterfaces advertises the JSON-RPC binding
+    // supportedInterfaces advertises the HTTP+JSON (REST) binding
     assert_eq!(
         value["supportedInterfaces"][0]["url"],
         "http://localhost:8080"
     );
     assert_eq!(
         value["supportedInterfaces"][0]["protocolBinding"],
-        "JSONRPC"
+        "HTTP+JSON"
     );
+    assert_eq!(value["supportedInterfaces"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -198,22 +199,17 @@ async fn protected_routes_require_bearer_token() {
     let backend: Arc<dyn TaskBackend> = FakeBackend::with(vec![task]);
     let app = test_router(backend, Some(verifier_ok()));
 
-    // No auth header on the JSON-RPC binding -> 401 JSON.
+    // JSON-RPC /rpc is not mounted -> 404
     let req = Request::builder()
         .method("POST")
         .uri("/rpc")
-        .header("a2a-version", "1.0")
         .header("content-type", "application/json")
         .body(Body::from(
             r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"t1"}}"#.to_string(),
         ))
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
-    // JSON-RPC keeps HTTP 200 and reports auth failure in the envelope.
-    assert_eq!(res.status(), StatusCode::OK);
-    let value: serde_json::Value =
-        serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    assert_eq!(value["error"]["code"], -32600); // INVALID_REQUEST
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
     // No auth header on a REST route -> the SDK maps the authorizer's
     // INVALID_REQUEST to HTTP 400 (A2A problem+json envelope).
@@ -238,11 +234,11 @@ async fn protected_routes_require_bearer_token() {
 }
 
 // ---------------------------------------------------------------------------
-// GetTask / ListTasks / CancelTask through BOTH bindings
+// GetTask / ListTasks / CancelTask through REST binding
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn get_task_through_rest_and_jsonrpc() {
+async fn get_task_through_rest() {
     let task = A2aTask {
         id: "t1".to_string(),
         context_id: Some("c1".to_string()),
@@ -261,20 +257,10 @@ async fn get_task_through_rest_and_jsonrpc() {
     assert_eq!(v["id"], "t1");
     assert_eq!(v["contextId"], "c1");
     assert_eq!(v["status"]["state"], "TASK_STATE_COMPLETED");
-
-    // JSON-RPC GetTask
-    let body = r#"{"jsonrpc":"2.0","id":"req-1","method":"GetTask","params":{"id":"t1"}}"#;
-    let res = app.clone().oneshot(post_auth("/rpc", body)).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    assert_eq!(v["jsonrpc"], "2.0");
-    assert_eq!(v["id"], "req-1");
-    assert_eq!(v["result"]["id"], "t1");
-    assert_eq!(v["result"]["status"]["state"], "TASK_STATE_COMPLETED");
 }
 
 #[tokio::test]
-async fn list_tasks_through_rest_and_jsonrpc_with_filters() {
+async fn list_tasks_through_rest_with_filters() {
     let tasks = vec![
         A2aTask {
             id: "t1".to_string(),
@@ -320,18 +306,79 @@ async fn list_tasks_through_rest_and_jsonrpc_with_filters() {
     let list = v["tasks"].as_array().unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0]["id"], "t2");
-
-    // JSON-RPC ListTasks filters by contextId
-    let body = r#"{"jsonrpc":"2.0","id":2,"method":"ListTasks","params":{"contextId":"c1"}}"#;
-    let res = app.clone().oneshot(post_auth("/rpc", body)).await.unwrap();
-    let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    let list = v["result"]["tasks"].as_array().unwrap();
-    assert_eq!(list.len(), 1);
-    assert_eq!(list[0]["id"], "t1");
 }
 
 #[tokio::test]
-async fn cancel_task_through_rest_and_jsonrpc() {
+async fn list_tasks_pagination_and_stable_ordering() {
+    let tasks: Vec<A2aTask> = (0..15)
+        .rev()
+        .map(|i| A2aTask {
+            id: format!("task-{:02}", i),
+            context_id: Some("ctx".to_string()),
+            state: TaskState::Working,
+            status_message: None,
+            error: None,
+            artifacts: None,
+        })
+        .collect();
+    let backend: Arc<dyn TaskBackend> = FakeBackend::with(tasks);
+    let app = test_router(backend, Some(verifier_ok()));
+
+    // Page 1: pageSize=5
+    let res = app
+        .clone()
+        .oneshot(get_auth("/tasks?pageSize=5"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+    let list = v["tasks"].as_array().unwrap();
+    assert_eq!(list.len(), 5);
+    // Stable sorted order by id: task-00 .. task-04
+    assert_eq!(list[0]["id"], "task-00");
+    assert_eq!(list[4]["id"], "task-04");
+    assert_eq!(v["nextPageToken"], "5");
+    assert_eq!(v["totalSize"], 15);
+
+    // Page 2: with pageToken=5
+    let res = app
+        .clone()
+        .oneshot(get_auth("/tasks?pageSize=5&pageToken=5"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+    let list = v["tasks"].as_array().unwrap();
+    assert_eq!(list.len(), 5);
+    assert_eq!(list[0]["id"], "task-05");
+    assert_eq!(list[4]["id"], "task-09");
+    assert_eq!(v["nextPageToken"], "10");
+
+    // Page 3: with pageToken=10
+    let res = app
+        .clone()
+        .oneshot(get_auth("/tasks?pageSize=5&pageToken=10"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+    let list = v["tasks"].as_array().unwrap();
+    assert_eq!(list.len(), 5);
+    assert_eq!(list[0]["id"], "task-10");
+    assert_eq!(list[4]["id"], "task-14");
+    assert_eq!(v["nextPageToken"], "");
+
+    // Invalid pageToken offset out of bounds -> error
+    let res = app
+        .clone()
+        .oneshot(get_auth("/tasks?pageSize=5&pageToken=99"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn cancel_task_through_rest() {
     let tasks = vec![
         A2aTask {
             id: "t1".to_string(),
@@ -383,12 +430,15 @@ async fn cancel_task_through_rest_and_jsonrpc() {
     let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
     assert_eq!(v["error"]["details"][0]["reason"], "TASK_NOT_CANCELABLE");
 
-    // JSON-RPC CancelTask on a completed task -> TaskNotCancelable error
-    let body = r#"{"jsonrpc":"2.0","id":3,"method":"CancelTask","params":{"id":"t2"}}"#;
-    let res = app.clone().oneshot(post_auth("/rpc", body)).await.unwrap();
+    // REST cancel on a completed task -> TaskNotCancelable error
+    let res = app
+        .clone()
+        .oneshot(post_auth("/tasks/t2:cancel", ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    assert!(v["error"].is_object());
-    assert_eq!(v["error"]["code"], -32002); // TASK_NOT_CANCELABLE
+    assert_eq!(v["error"]["details"][0]["reason"], "TASK_NOT_CANCELABLE");
 }
 
 // ---------------------------------------------------------------------------
@@ -407,12 +457,6 @@ async fn unknown_task_returns_task_not_found() {
     // SDK REST envelope: error.details[0].reason is the A2A error code.
     assert_eq!(v["error"]["details"][0]["reason"], "TASK_NOT_FOUND");
     assert_eq!(v["error"]["status"], "NOT_FOUND");
-
-    // JSON-RPC: TASK_NOT_FOUND (-32001) error object.
-    let body = r#"{"jsonrpc":"2.0","id":4,"method":"GetTask","params":{"id":"nope"}}"#;
-    let res = app.clone().oneshot(post_auth("/rpc", body)).await.unwrap();
-    let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    assert_eq!(v["error"]["code"], -32001);
 }
 
 // ---------------------------------------------------------------------------
@@ -423,15 +467,6 @@ async fn unknown_task_returns_task_not_found() {
 async fn send_message_rest_is_unsupported_when_no_sink() {
     let backend: Arc<dyn TaskBackend> = FakeBackend::with(vec![]);
     let app = test_router(backend, Some(verifier_ok()));
-
-    // JSON-RPC method names surface as UNSUPPORTED_OPERATION.
-    let body = r#"{"jsonrpc":"2.0","id":5,"method":"SendMessage","params":{}}"#;
-    let res = app.clone().oneshot(post_auth("/rpc", body)).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    assert_eq!(v["error"]["code"], -32004); // UNSUPPORTED_OPERATION
-    let reason = v["error"]["data"][0]["reason"].as_str().unwrap_or("");
-    assert_eq!(reason, "UNSUPPORTED_OPERATION");
 
     // REST -> the SDK maps UNSUPPORTED_OPERATION to HTTP 400 with the A2A
     // problem+json envelope.
@@ -501,54 +536,6 @@ async fn subscribe_streaming_push_and_extended_card_answer_sdk_codes() {
         let got = v["error"]["details"][0]["reason"].as_str().unwrap_or("");
         assert_eq!(got, reason, "path {path}");
     }
-
-    // JSON-RPC: known method names answer their A2A error codes.
-    let rpc_cases: Vec<(&str, i64)> = vec![
-        ("SendStreamingMessage", -32004), // UNSUPPORTED_OPERATION
-        ("SubscribeToTask", -32004),
-        ("CreateTaskPushNotificationConfig", -32003), // PUSH_NOTIFICATION_NOT_SUPPORTED
-        ("GetTaskPushNotificationConfig", -32003),
-        ("ListTaskPushNotificationConfigs", -32003),
-        ("DeleteTaskPushNotificationConfig", -32003),
-        ("GetExtendedAgentCard", -32007), // EXTENDED_CARD_NOT_CONFIGURED
-    ];
-    for (method, code) in rpc_cases {
-        let body = format!(r#"{{"jsonrpc":"2.0","id":6,"method":"{method}","params":{{}}}}"#);
-        let res = app.clone().oneshot(post_auth("/rpc", &body)).await.unwrap();
-        let v: serde_json::Value =
-            serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-        assert_eq!(v["error"]["code"], code, "method {method}");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// JSON-RPC envelope robustness (SDK-compatible wire format)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn jsonrpc_malformed_body_is_parse_error_in_envelope() {
-    let backend: Arc<dyn TaskBackend> = FakeBackend::with(vec![]);
-    let app = test_router(backend, Some(verifier_ok()));
-    let res = app
-        .clone()
-        .oneshot(post_auth("/rpc", "{not json"))
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    assert_eq!(v["jsonrpc"], "2.0");
-    assert_eq!(v["error"]["code"], -32700); // PARSE_ERROR
-}
-
-#[tokio::test]
-async fn jsonrpc_wrong_version_is_invalid_request() {
-    let backend: Arc<dyn TaskBackend> = FakeBackend::with(vec![]);
-    let app = test_router(backend, Some(verifier_ok()));
-    let body = r#"{"jsonrpc":"1.0","id":7,"method":"GetTask","params":{"id":"t1"}}"#;
-    let res = app.oneshot(post_auth("/rpc", body)).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    assert_eq!(v["error"]["code"], -32600); // INVALID_REQUEST
 }
 
 // ---------------------------------------------------------------------------

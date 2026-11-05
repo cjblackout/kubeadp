@@ -38,6 +38,12 @@ pub fn execute_gvisor(
     args: &[String],
     env: &[(String, String)],
 ) -> Result<i32, String> {
+    if policy.grants.is_some() {
+        return Err(
+            "gvisor backend does not support session grants; refusing to run without grant enforcement (fail closed)"
+                .to_string(),
+        );
+    }
     // 1. Prepare secret if configured: read secret bytes before unsharing if fd is inherited
     let mut secret_bytes = if let Some(ref sec) = policy.secret {
         read_secret_fd(sec.fd)?

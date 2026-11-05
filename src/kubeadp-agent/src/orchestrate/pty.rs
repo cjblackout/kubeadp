@@ -1,5 +1,7 @@
 use std::io;
 use std::os::raw::c_int;
+#[cfg(test)]
+use std::os::unix::io::AsRawFd;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -92,7 +94,11 @@ impl Drop for Pty {
 /// IMPORTANT: `spawn_in_pty` must be called from the long-lived session thread,
 /// not from a transient thread, because PR_SET_PDEATHSIG is tied to the
 /// THREAD that performed the fork.
-pub fn spawn_in_pty(mut cmd: Command, pty: &Pty) -> io::Result<Child> {
+pub fn spawn_in_pty(
+    mut cmd: Command,
+    pty: &Pty,
+    secret_fd: Option<std::os::fd::OwnedFd>,
+) -> io::Result<Child> {
     let slave_in = unsafe {
         let dup = libc::fcntl(pty.slave, libc::F_DUPFD_CLOEXEC, 0);
         if dup < 0 {
@@ -121,6 +127,22 @@ pub fn spawn_in_pty(mut cmd: Command, pty: &Pty) -> io::Result<Child> {
 
     unsafe {
         cmd.pre_exec(move || {
+            // Jobset secret: dup the (already-written) memfd onto fd 3 for the
+            // sandbox `secret` channel, then close the child's copy. The
+            // `OwnedFd` is captured by value, so the fd is open in the child
+            // (inherited by fork) when this runs and is closed in the parent
+            // after `spawn()`.
+            if let Some(secret_fd) = secret_fd.as_ref() {
+                let src = std::os::fd::AsRawFd::as_raw_fd(secret_fd);
+                let r = libc::dup2(src, 3);
+                if src != 3 {
+                    let _ = libc::close(src);
+                }
+                if r < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let _ = libc::fcntl(3, libc::F_SETFD, 0);
+            }
             // Fix #8: Set PR_SET_PDEATHSIG so the child receives SIGTERM when
             // this supervisor thread exits (including abnormal death).
             //
@@ -145,6 +167,53 @@ pub fn spawn_in_pty(mut cmd: Command, pty: &Pty) -> io::Result<Child> {
         .stdout(slave_out)
         .stderr(slave_err)
         .spawn()
+}
+
+/// Writes `secret` into an anonymous `memfd` (inaccessible by name) and returns
+/// the owning `OwnedFd`. The caller hands it to [`spawn_in_pty`], which dups it
+/// onto fd 3 in the child's `pre_exec` before exec (the sandbox `secret`
+/// channel). The secret never appears in argv or the environment.
+pub fn secret_memfd(secret: &str) -> std::os::fd::OwnedFd {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    let bytes = secret.as_bytes();
+    let name = CString::new("kubeadp-agent-jobset-secret").expect("static, no NUL");
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        panic!(
+            "jobset secret memfd_create failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                bytes[off..].as_ptr() as *const libc::c_void,
+                bytes.len() - off,
+            )
+        };
+        if n < 0 {
+            let _ = unsafe { libc::close(fd) };
+            panic!(
+                "jobset secret memfd write failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        off += n as usize;
+    }
+    // Rewind the shared file offset: the child reads the secret from fd 3
+    // (a dup of this memfd — dup shares the open file description, including
+    // its offset) via `read_secret_fd`, which reads from the current offset
+    // to EOF. Without the rewind the child sees an empty file.
+    assert_eq!(
+        unsafe { libc::lseek(fd, 0, libc::SEEK_SET) },
+        0,
+        "jobset secret memfd lseek failed: {}",
+        std::io::Error::last_os_error()
+    );
+    unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
 }
 
 /// A session-wide reference to the live child PTY master, shared so the REST
@@ -489,7 +558,7 @@ mod tests {
             "-c",
             "import ctypes; s = ctypes.c_int(); ctypes.CDLL(None).prctl(2, ctypes.byref(s)); assert s.value == 15, f'got {s.value}'",
         ]);
-        let mut child = spawn_in_pty(cmd, &pty).expect("spawn");
+        let mut child = spawn_in_pty(cmd, &pty, None).expect("spawn");
         let status = child.wait().expect("wait");
         assert!(status.success(), "child asserted pdeathsig == 15");
     }
@@ -537,6 +606,23 @@ mod tests {
             libc::close(write_fd);
             libc::close(read_fd);
         }
+    }
+
+    #[test]
+    fn test_secret_memfd_rewinds_offset_for_child_read() {
+        let secret = "jobset-secret-0123456789abcdef";
+        let fd = secret_memfd(secret);
+        let raw = fd.as_raw_fd();
+        assert!(raw >= 0);
+
+        let dup_fd = unsafe { libc::dup(raw) };
+        assert!(dup_fd >= 0, "dup failed");
+        let mut file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+        use std::io::Read;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)
+            .expect("read from dup'd secret memfd");
+        assert_eq!(String::from_utf8_lossy(&data), secret);
     }
 
     #[test]

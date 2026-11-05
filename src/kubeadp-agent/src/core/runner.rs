@@ -180,17 +180,39 @@ pub fn build_command(
     config: &Config,
     meta: &JobMetadata,
     mode: &InvocationMode,
-) -> Result<(Command, std::path::PathBuf), anyhow::Error> {
+) -> Result<(Command, std::path::PathBuf, Option<String>), anyhow::Error> {
     let (prog, args) = build_command_and_args(config, meta, mode);
 
-    // Write policy file to state dir
-    let policy = crate::sandbox::SandboxPolicy::for_job(
+    // Base policy for the job: main's `shared_rw` override (the writable
+    // shared home path, default `/home/agent`) is preserved.
+    let base_policy = crate::sandbox::SandboxPolicy::for_job(
         &meta.job_id,
         &meta.worktree_path,
         None,
         Some(&config.agy_path),
         Some(vec![config.sandbox_home.clone()]),
     );
+    // Jobset wiring: if this job is a jobset member (registered in the
+    // process-wide registry before launch), its jobset secret rides the
+    // sandbox `secret` channel (an inherited fd the sandbox turns into a 0400
+    // file in the agent's private tmp) and only the jobset id + the secret
+    // file's PATH reach the environment. The secret value never touches argv
+    // or env (see the pre_exec that hands it on fd 3 in `run_internal_runner`).
+    // A job that is not a member is launched unchanged.
+    let jobset = crate::core::jobset::agent_jobset(&meta.job_id);
+    let policy = match &jobset {
+        Some(_) => crate::core::jobset::build_jobset_policy(&base_policy),
+        None => base_policy,
+    };
+    // The operator token file (config `api_token_file`) is hidden so a
+    // sandboxed agent can never read the credential that guards the host's
+    // /api/v1 and A2A surface. No-op when the host has no token file.
+    let policy = policy.hide_operator_token_file();
+    // The jobset root key file (config `jobset_root_key_file`) is hidden so a
+    // sandboxed agent can never read the root of trust that derives every
+    // jobset secret (agents see only their derived per-jobset secret through
+    // the `secret` channel). No-op when no root key file is configured.
+    let policy = policy.hide_jobset_root_key_file();
     let policy_path =
         JobMetadata::log_dir(&config.state_root).join(format!("{}.policy.json", meta.job_id));
     if let Err(e) = std::fs::create_dir_all(JobMetadata::log_dir(&config.state_root)) {
@@ -221,8 +243,23 @@ pub fn build_command(
     let mut cmd = Command::new(argv[0].clone());
     cmd.args(&argv[1..]);
 
+    // Hand the jobset to the agent's environment: the jobset id and the PATH
+    // of the 0400 secret file (never the secret value). These vars match the
+    // default `KUBEADP_*` allow pattern, so the sandbox passes them through.
+    // The secret VALUE itself is not set here (it must never touch env): it is
+    // handed on fd 3 by `run_internal_runner` via `attach_session_and_secret`
+    // and written into the private tmp by the sandbox.
+    if let Some(cred) = &jobset {
+        let private_tmp = policy
+            .private_tmp_path()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        for (k, v) in crate::core::jobset::build_jobset_env(cred, &private_tmp) {
+            cmd.env(k, v);
+        }
+    }
+
     crate::core::proxy::apply_proxy(&mut cmd, Some(config), meta.proxy.as_deref());
-    Ok((cmd, policy_path))
+    Ok((cmd, policy_path, jobset.map(|c| c.secret)))
 }
 
 /// Assembles the process `argv` for a launch. Pure (no process spawn) so the
@@ -352,6 +389,99 @@ pub(crate) fn detached_session(cmd: &mut Command) {
         cmd.pre_exec(move || {
             if libc::setsid() == -1 {
                 // EPERM: already a session/process-group leader -- nothing to do.
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EPERM) {
+                    return Ok(());
+                }
+                return Err(err);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Sets the job spawn's `pre_exec` to (a) start a new session / process group
+/// (`setsid`, exactly [`detached_session`]) and (b), when `secret` is `Some`,
+/// hand the jobset secret to the child on file descriptor 3 (the conventional
+/// `secret` channel the sandbox backends read via `read_secret_fd`).
+///
+/// One combined `pre_exec` is required because `Command::pre_exec` can hold
+/// only a single closure. The secret is never in argv or the environment: it is
+/// written into an anonymous `memfd` (inaccessible by name) whose `OwnedFd` is
+/// captured by the closure, so it stays open in the parent until `spawn()` and
+/// is dup'd onto fd 3 in the forked child before exec. The sandbox reads fd 3
+/// and writes it to a 0400 file in the agent's private tmp; the agent reads
+/// only the PATH of that file (`KUBEADP_JOBSET_SECRET_FILE`), never the secret.
+/// A jobset member whose `memfd` cannot be created fails loudly (the launch is
+/// aborted): it must not run without its secret channel.
+fn attach_session_and_secret(cmd: &mut Command, secret: Option<String>) {
+    let secret_fd: Option<std::os::fd::OwnedFd> = secret.as_deref().map(|s| {
+        use std::ffi::CString;
+        use std::os::fd::FromRawFd;
+        let bytes = s.as_bytes();
+        let name = CString::new("kubeadp-agent-jobset-secret").expect("static, no NUL");
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            panic!(
+                "jobset secret memfd_create failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let n = unsafe {
+                libc::write(
+                    fd,
+                    bytes[off..].as_ptr() as *const libc::c_void,
+                    bytes.len() - off,
+                )
+            };
+            if n < 0 {
+                let _ = unsafe { libc::close(fd) };
+                panic!(
+                    "jobset secret memfd write failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            off += n as usize;
+        }
+        // Rewind the shared file offset: the child reads the secret from fd 3
+        // (a dup of this memfd) via `read_secret_fd`, which reads from the
+        // current offset to EOF. Without the rewind the child sees an empty
+        // secret and cannot authenticate as a jobset member.
+        assert_eq!(
+            unsafe { libc::lseek(fd, 0, libc::SEEK_SET) },
+            0,
+            "jobset secret memfd lseek failed: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+    });
+    // SAFETY: the closure runs in the forked child between fork and exec and
+    // only makes async-signal-safe calls (`dup2`/`close`/`fcntl`/`setsid` plus
+    // errno inspection); no allocation, locking, or non-reentrant calls. The
+    // memfd's `OwnedFd` is captured by value, so its fd is open in the child
+    // (inherited by fork) when `dup2` runs; the child's extra copy is closed
+    // right after the dup and, in the parent, is closed when `cmd` (holding the
+    // closure) is dropped after `spawn()`. Only fd 3 (CLOEXEC cleared) survives
+    // the exec into the sandbox.
+    unsafe {
+        cmd.pre_exec(move || {
+            if let Some(secret_fd) = secret_fd.as_ref() {
+                use std::os::fd::AsRawFd;
+                let src = secret_fd.as_raw_fd();
+                let r = libc::dup2(src, 3);
+                if src != 3 {
+                    let _ = libc::close(src);
+                }
+                if r < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // `dup2(src, src)` is a no-op that would leave fd 3's CLOEXEC
+                // set; clear the FD flags so fd 3 survives the exec.
+                let _ = libc::fcntl(3, libc::F_SETFD, 0);
+            }
+            if libc::setsid() == -1 {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EPERM) {
                     return Ok(());
@@ -555,6 +685,16 @@ pub fn launch_background_job_with_timeout(
     // 2. Save initial metadata
     meta.save(&config.state_root)?;
 
+    // 2b. Register the agent in the process-wide jobset registry (idempotent:
+    // a retry reuses the job's jobset; a brand-new job joins the host's jobset
+    // if the host is a member, or gets a fresh random jobset if the host was
+    // started by an operator request). Done just before the monitor thread
+    // spawns so `build_command` can wire the sandbox `secret` channel + jobset
+    // env and the A2A surface can accept the job's credential. The secret
+    // exists in memory only and the entry is dropped on every end path
+    // (monitor completion / kill / clean / gc / a failed start's row delete).
+    crate::core::jobset::register_agent(&meta.job_id);
+
     // 3. Spawn the job monitor on an in-process thread. The handshake is
     // the atomic state machine coordinating launcher and monitor:
     // PENDING -> RUNNING (monitor wins) or PENDING -> CANCELLED (launcher wins).
@@ -693,6 +833,12 @@ pub fn run_internal_runner(
     // reaped here instead of leaking to a non-reaping PID 1.
     mark_child_subreaper();
 
+    // Drop the job's jobset-registry entry when this monitor thread exits,
+    // whatever the reason (completion, failure, kill, cancelled launch, spawn
+    // error). A re-run (retry) re-registers a fresh entry, so the guard only
+    // clears *this* attempt's registration.
+    let _jobset_drop = crate::core::jobset::JobsetDropGuard::new(job_id);
+
     execute_test_pre_spawn_hook(job_id);
 
     let mut meta = JobMetadata::load(&config.state_root, job_id)?;
@@ -720,12 +866,13 @@ pub fn run_internal_runner(
         }
     };
 
-    let (cmd, policy_path) = build_command(config, &meta, &mode).with_context(|| {
-        format!(
-            "Failed to build sandboxed command for job '{}'",
-            meta.job_id
-        )
-    })?;
+    let (cmd, policy_path, jobset_secret) =
+        build_command(config, &meta, &mode).with_context(|| {
+            format!(
+                "Failed to build sandboxed command for job '{}'",
+                meta.job_id
+            )
+        })?;
 
     // Every launch (and every retry, which runs through this same path) fills
     // the row's `sandbox` object with the backend the pod will auto-select,
@@ -753,10 +900,12 @@ pub fn run_internal_runner(
 
     let mut spawn_cmd = cmd;
     spawn_cmd.current_dir(&meta.worktree_path);
-    // Own new session + process group: `agent-run kill` signals the process
-    // group of meta.pid, so this is what makes the group signal (and thus
-    // the job's own child processes) actually reachable.
-    detached_session(&mut spawn_cmd);
+    // Own new session + process group (so `agent-run kill` reaches the whole
+    // process group), and -- for a jobset member -- hand the jobset secret on
+    // fd 3 in the same `pre_exec` (the sandbox writes it into the private tmp
+    // as a 0400 file). `None` secret = a plain job, identical to the old
+    // `detached_session` behavior.
+    attach_session_and_secret(&mut spawn_cmd, jobset_secret);
 
     // Cancellation check, immediately before the spawn: if the launcher
     // already declared this launch failed (PID not confirmed in time), do
@@ -2549,7 +2698,7 @@ mod tests {
         // other launcher test could observe the wrapped form is only this
         // synchronous build (and on an isolating platform such a concurrent
         // wrap is a working sandbox, not a failure).
-        let (mut cmd, policy_path) = {
+        let (mut cmd, policy_path, _jobset_secret) = {
             crate::sandbox::testhook::set_sandbox_passthrough(false);
             let built = build_command(&config, &meta, &mode);
             crate::sandbox::testhook::set_sandbox_passthrough(true);

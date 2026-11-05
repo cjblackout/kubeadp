@@ -131,6 +131,119 @@ pub fn validate_supervisor_duration(field_name: &str, val: f64) -> Result<(), St
     validate_duration_field(field_name, "supervisor", val)
 }
 
+/// Per-session sandbox resource and environment grants (HL-151).
+///
+/// Configured explicitly per session in supervisor configuration files.
+/// Strict validation: unknown fields are rejected, paths must be absolute,
+/// and environment variable names must be non-empty valid identifiers with
+/// an optional trailing wildcard `*` only.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionGrants {
+    /// Grants read-only access to the pod's Kubernetes ServiceAccount token directory.
+    #[serde(default)]
+    pub serviceaccount: bool,
+
+    /// Absolute paths granted read-only.
+    #[serde(default)]
+    pub ro_paths: Vec<PathBuf>,
+
+    /// Absolute paths granted read-write.
+    #[serde(default)]
+    pub rw_paths: Vec<PathBuf>,
+
+    /// Environment variable names passed through from supervisor process environment.
+    /// Trailing wildcard `*` allowed (e.g. `VIKUNJA_*`). Names only, never values.
+    #[serde(default)]
+    pub env: Vec<String>,
+}
+
+impl SessionGrants {
+    /// Validates the grants configuration according to sandbox security constraints.
+    pub fn validate(&self, session_name: &str) -> Result<(), String> {
+        for p in &self.ro_paths {
+            validate_grant_path(p, "ro_paths", session_name)?;
+        }
+        for p in &self.rw_paths {
+            validate_grant_path(p, "rw_paths", session_name)?;
+        }
+        for var in &self.env {
+            validate_grant_env_name(var, session_name)?;
+        }
+        Ok(())
+    }
+}
+
+/// Validates that a granted path is absolute, not root or forbidden system dirs,
+/// and has no path traversal components.
+fn validate_grant_path(path: &Path, field: &str, session_name: &str) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "Configuration error: field 'grants.{}' in session '{}' contains non-absolute path '{}'",
+            field,
+            session_name,
+            path.display()
+        ));
+    }
+    let s = path.to_string_lossy();
+    if s == "/" || s == "/proc" || s.starts_with("/proc/") || s == "/dev" || s.starts_with("/dev/")
+    {
+        return Err(format!(
+            "Configuration error: field 'grants.{}' in session '{}' contains forbidden path '{}'",
+            field,
+            session_name,
+            path.display()
+        ));
+    }
+    // Disallow traversal components (".." or ".")
+    for comp in path.components() {
+        if let std::path::Component::ParentDir = comp {
+            return Err(format!(
+                "Configuration error: field 'grants.{}' in session '{}' contains parent traversal '..' in '{}'",
+                field,
+                session_name,
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates an environment variable name: valid identifier, trailing '*' allowed only.
+fn validate_grant_env_name(name: &str, session_name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(format!(
+            "Configuration error: field 'grants.env' in session '{}' contains empty variable name",
+            session_name
+        ));
+    }
+    let (ident, has_wildcard) = if let Some(stripped) = name.strip_suffix('*') {
+        (stripped, true)
+    } else {
+        (name, false)
+    };
+    if has_wildcard && ident.contains('*') {
+        return Err(format!(
+            "Configuration error: field 'grants.env' in session '{}' has '*' not at the trailing position in '{}'",
+            session_name, name
+        ));
+    }
+    // Identifier must be ASCII alphanumeric or '_'
+    if ident.is_empty() && has_wildcard {
+        return Err(format!(
+            "Configuration error: field 'grants.env' in session '{}' wildcard '*' requires prefix in '{}'",
+            session_name, name
+        ));
+    }
+    if !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(format!(
+            "Configuration error: field 'grants.env' in session '{}' contains invalid characters in '{}'",
+            session_name, name
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionConfig {
     pub name: String,
@@ -176,6 +289,10 @@ pub struct SessionConfig {
     /// it explicitly per session in the supervisor config, never globally.
     #[serde(default = "default_sandbox")]
     pub sandbox: bool,
+
+    /// Explicit sandbox grants for sandboxed sessions (HL-151).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<SessionGrants>,
 
     #[serde(default = "default_base_backoff")]
     pub base_backoff_secs: f64,
@@ -240,6 +357,9 @@ impl SessionConfig {
                     mf.display()
                 ));
             }
+        }
+        if let Some(ref g) = self.grants {
+            g.validate(n)?;
         }
         Ok(())
     }
@@ -735,6 +855,7 @@ session_id = "id-b"
             pty_eof_grace_secs: 10.0,
             kill_wait_secs: 15.0,
             sandbox: true,
+            grants: None,
             base_backoff_secs: 2.0,
             max_backoff_secs: 60.0,
             healthy_run_secs: 30.0,
@@ -778,6 +899,7 @@ session_id = "id-b"
             pty_eof_grace_secs: 10.0,
             kill_wait_secs: 15.0,
             sandbox: true,
+            grants: None,
             base_backoff_secs: 2.0,
             max_backoff_secs: 60.0,
             healthy_run_secs: 30.0,
@@ -943,16 +1065,100 @@ session_id = "id-b"
 
 #[cfg(test)]
 mod sandbox_flag_tests {
-    use super::SessionConfig;
+    use super::*;
 
     #[test]
     fn sandbox_defaults_on_and_can_be_disabled_per_session() {
         let on: SessionConfig =
             serde_json::from_str(r#"{"name":"a","workdir":"/w","session_id":"s"}"#).unwrap();
         assert!(on.sandbox);
+        assert!(on.grants.is_none());
         let off: SessionConfig =
             serde_json::from_str(r#"{"name":"a","workdir":"/w","session_id":"s","sandbox":false}"#)
                 .unwrap();
         assert!(!off.sandbox);
+    }
+
+    #[test]
+    fn test_session_grants_parsing_and_validation() {
+        // Valid grants JSON parses and validates
+        let valid_json = r#"{
+            "name": "sess",
+            "workdir": "/w",
+            "session_id": "s",
+            "grants": {
+                "serviceaccount": true,
+                "ro_paths": ["/opt/tools", "/opt/ssh-home-cloud"],
+                "rw_paths": ["/workspace", "/home/agent"],
+                "env": ["GH_TOKEN", "VIKUNJA_*", "PATH"]
+            }
+        }"#;
+        let s: SessionConfig = serde_json::from_str(valid_json).expect("valid grants must parse");
+        assert!(s.validate_durations().is_ok());
+        let g = s.grants.unwrap();
+        assert!(g.serviceaccount);
+        assert_eq!(g.ro_paths.len(), 2);
+        assert_eq!(g.rw_paths.len(), 2);
+        assert_eq!(g.env.len(), 3);
+
+        // Unknown key in grants rejected (deny_unknown_fields)
+        let unknown_key = r#"{
+            "name": "sess",
+            "workdir": "/w",
+            "session_id": "s",
+            "grants": {
+                "serviceaccount": true,
+                "unknown_key": "bad"
+            }
+        }"#;
+        assert!(serde_json::from_str::<SessionConfig>(unknown_key).is_err());
+
+        // Relative path rejected
+        let rel_path = r#"{
+            "name": "sess",
+            "workdir": "/w",
+            "session_id": "s",
+            "grants": {
+                "ro_paths": ["relative/path"]
+            }
+        }"#;
+        let s: SessionConfig = serde_json::from_str(rel_path).unwrap();
+        let err = s.validate_durations().unwrap_err();
+        assert!(err.contains("non-absolute path"), "err: {err}");
+
+        // Path traversal rejected
+        let traversal = r#"{
+            "name": "sess",
+            "workdir": "/w",
+            "session_id": "s",
+            "grants": {
+                "rw_paths": ["/workspace/../etc"]
+            }
+        }"#;
+        let s: SessionConfig = serde_json::from_str(traversal).unwrap();
+        let err = s.validate_durations().unwrap_err();
+        assert!(err.contains("parent traversal"), "err: {err}");
+
+        // Root or /proc or /dev forbidden
+        for forbidden in ["/", "/proc", "/proc/1", "/dev", "/dev/null"] {
+            let json = format!(
+                r#"{{"name":"sess","workdir":"/w","session_id":"s","grants":{{"ro_paths":["{forbidden}"]}}}}"#
+            );
+            let s: SessionConfig = serde_json::from_str(&json).unwrap();
+            let err = s.validate_durations().unwrap_err();
+            assert!(err.contains("forbidden path"), "err: {err}");
+        }
+
+        // Invalid env names (empty, bad chars, inner wildcard)
+        for bad_env in ["", "BAD*VAR", "BAD-VAR", "*", "FOO**"] {
+            let json = format!(
+                r#"{{"name":"sess","workdir":"/w","session_id":"s","grants":{{"env":["{bad_env}"]}}}}"#
+            );
+            let s: SessionConfig = serde_json::from_str(&json).unwrap();
+            assert!(
+                s.validate_durations().is_err(),
+                "bad env should fail: {bad_env}"
+            );
+        }
     }
 }

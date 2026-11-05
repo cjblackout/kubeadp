@@ -42,6 +42,15 @@ pub fn run_session_loop(
     pty_input: Arc<Mutex<crate::orchestrate::pty::PtyInput>>,
     mut stdout_sender: StdoutSender,
 ) {
+    // Register the session in the process-wide jobset registry (idempotent; a
+    // respawned session reuses its jobset). The entry is dropped when this
+    // thread exits (the drop guard covers Stopped, Failed, and any unexpected
+    // exit), so the A2A surface stops accepting the session's credential the
+    // moment the session ends.
+    crate::core::jobset::register_agent(&session.session_id);
+    let _session_jobset_drop =
+        crate::core::jobset::JobsetDropGuard::new(session.session_id.clone());
+
     // Fix #4: use SlideWindowBackoff for backoff computation.
     let mut swb = SlideWindowBackoff::new(
         session.base_backoff_secs,
@@ -619,9 +628,56 @@ fn run_session_iteration(
     cmd.args(&args);
 
     // A trusted session (`sandbox: false`) runs `claude` directly, unwrapped.
-    if session.sandbox {
-        let policy =
-            crate::sandbox::SandboxPolicy::for_session(&session.session_id, &session.workdir);
+    // A jobset member session is only ever handed its derived secret through
+    // the sandbox `secret` channel inside the sandboxed branch below, so a
+    // trusted session never receives a jobset secret fd.
+    let mut session_secret_fd = None;
+    // Under `test-hooks`, the process-global `sandbox_passthrough` switch also lets
+    // tests run unwrapped on platforms without sandbox support.
+    let wrap_in_sandbox = session.sandbox && {
+        #[cfg(feature = "test-hooks")]
+        {
+            !crate::sandbox::testhook::sandbox_passthrough()
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        {
+            true
+        }
+    };
+    if wrap_in_sandbox {
+        let grants_cfg = session
+            .grants
+            .as_ref()
+            .map(|g| crate::sandbox::policy::GrantsConfig {
+                serviceaccount: g.serviceaccount,
+                ro_paths: g.ro_paths.clone(),
+                rw_paths: g.rw_paths.clone(),
+                env: g.env.clone(),
+            });
+        let base_policy = crate::sandbox::SandboxPolicy::for_session(
+            &session.session_id,
+            &session.workdir,
+            grants_cfg,
+        );
+        // Jobset wiring (same as the job launcher): if this session is a jobset
+        // member (registered in the process-wide registry), its secret rides the
+        // sandbox `secret` channel and only the jobset id + the secret file PATH
+        // reach the environment (never the secret value). A session with no
+        // registered jobset is launched unchanged. The policy's agent id
+        // (`session.session_id`) is the same key the session is registered under,
+        // so the private-tmp (and thus the secret file PATH) matches the sandbox.
+        let session_jobset = crate::core::jobset::agent_jobset(&session.session_id);
+        let policy = match &session_jobset {
+            Some(_) => crate::core::jobset::build_jobset_policy(&base_policy),
+            None => base_policy,
+        };
+        // The operator token file (config `api_token_file`) is hidden so a
+        // sandboxed session can never read the credential that guards the host's
+        // /api/v1 and A2A surface. No-op when the host has no token file.
+        let policy = policy.hide_operator_token_file();
+        // The jobset root key file is hidden too (agents see only their derived
+        // per-jobset secret through the `secret` channel). No-op when unset.
+        let policy = policy.hide_jobset_root_key_file();
         let policy_path =
             std::env::temp_dir().join(format!("session-policy-{}.json", session.session_id));
         if let Err(e) = crate::sandbox::SandboxPolicy::write_policy_file(&policy, &policy_path) {
@@ -649,6 +705,36 @@ fn run_session_iteration(
         let mut sandboxed_cmd = Command::new(launcher);
         sandboxed_cmd.current_dir(&session.workdir);
         sandboxed_cmd.envs(&session.env);
+        // Jobset env (jobset id + secret file PATH, never the secret value), and
+        // the secret itself handed on fd 3 via the memfd below. The `KUBEADP_*`
+        // vars match the default allow pattern so the sandbox passes them through.
+        if let Some(cred) = &session_jobset {
+            let private_tmp = policy
+                .private_tmp_path()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+            for (k, v) in crate::core::jobset::build_jobset_env(cred, &private_tmp) {
+                sandboxed_cmd.env(k, v);
+            }
+            session_secret_fd = Some(crate::orchestrate::pty::secret_memfd(&cred.secret));
+        }
+
+        // Pass through granted environment variables from the supervisor's process environment
+        if let Some(ref g) = session.grants {
+            for (k, v) in std::env::vars() {
+                let allowed = g.env.iter().any(|pattern| {
+                    if pattern.ends_with('*') {
+                        let prefix = &pattern[..pattern.len() - 1];
+                        k.starts_with(prefix)
+                    } else {
+                        &k == pattern
+                    }
+                });
+                if allowed {
+                    sandboxed_cmd.env(k, v);
+                }
+            }
+        }
+
         sandboxed_cmd.arg("sandbox-exec");
         sandboxed_cmd.arg("--policy");
         sandboxed_cmd.arg(policy_path.to_string_lossy().to_string());
@@ -697,7 +783,7 @@ fn run_session_iteration(
         .unwrap_or(0);
     let start_rfc3339 = crate::orchestrate::logging::rfc3339_now();
 
-    let mut child = match spawn_in_pty(cmd, &pty) {
+    let mut child = match spawn_in_pty(cmd, &pty, session_secret_fd) {
         Ok(c) => c,
         Err(e) => {
             log_event(&session.name, &format!("Failed to spawn Claude: {}", e));
@@ -1387,6 +1473,7 @@ mod tests {
             pty_eof_grace_secs: 10.0,
             kill_wait_secs: 15.0,
             sandbox: true,
+            grants: None,
             base_backoff_secs: 2.0,
             max_backoff_secs: 60.0,
             healthy_run_secs: 30.0,

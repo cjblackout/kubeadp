@@ -425,6 +425,18 @@ fn row_to_job(row: &Row<'_>) -> rusqlite::Result<JobMetadata> {
     })
 }
 
+/// Escapes SQLite LIKE special characters (`%`, `_`, and `\`) using `\` as the escape character.
+pub fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '%' || c == '_' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 impl JobMetadata {
     pub fn log_dir(state_root: &Path) -> PathBuf {
         state_root.join("logs")
@@ -659,11 +671,13 @@ impl JobMetadata {
         }
         let conn = open_state_db(state_root)?;
         let mut stmt = conn
-            .prepare("SELECT job_id FROM jobs WHERE job_id LIKE ?1 ORDER BY length(job_id)")
+            .prepare(
+                "SELECT job_id FROM jobs WHERE job_id LIKE ?1 ESCAPE '\\' ORDER BY length(job_id)",
+            )
             .with_context(|| format!("Failed to resolve job prefix '{}'", job_id))?;
-        let prefix = format!("{}%", job_id);
+        let escaped_prefix = format!("{}%", escape_like(job_id));
         let ids: Vec<String> = stmt
-            .query_map(params![prefix], |r| r.get(0))
+            .query_map(params![escaped_prefix], |r| r.get(0))
             .with_context(|| {
                 format!(
                     "Failed to query job prefix '{}' in {}",
@@ -2940,6 +2954,25 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
             "Error was: {}",
             err
         );
+
+        // Escape characters: % and _ and \ in job IDs must not behave as wildcards
+        make_test_metadata("job%1", "p", 0)
+            .save(temp_dir.path())
+            .unwrap();
+        make_test_metadata("job_1", "p", 0)
+            .save(temp_dir.path())
+            .unwrap();
+        make_test_metadata("jobx1", "p", 0)
+            .save(temp_dir.path())
+            .unwrap();
+
+        // Querying "job%" should resolve ONLY "job%1", NOT "job_1" or "jobx1"
+        let m = JobMetadata::resolve(temp_dir.path(), "job%").unwrap();
+        assert_eq!(m.job_id, "job%1");
+
+        // Querying "job_" should resolve ONLY "job_1", NOT "job%1" or "jobx1"
+        let m = JobMetadata::resolve(temp_dir.path(), "job_").unwrap();
+        assert_eq!(m.job_id, "job_1");
     }
 
     #[test]

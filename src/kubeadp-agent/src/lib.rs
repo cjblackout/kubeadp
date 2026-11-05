@@ -21,11 +21,16 @@
 //! - `a2a` (implies `server`) gates the A2A module of `core` and the per-role
 //!   `a2a` integration modules.
 //! - `test-hooks` is used by the orchestrator session loop tests.
+//! - `engine` (implies `server`) gates the pluggable engine layer:
+//!   the [`engine`] module tree (trait, run model, capability table,
+//!   registry, 501 plumbing).
 
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod config_file;
 pub mod core;
+#[cfg(feature = "engine")]
+pub mod engine;
 #[cfg(feature = "a2a")]
 pub mod mcp_a2a;
 #[cfg(feature = "server")]

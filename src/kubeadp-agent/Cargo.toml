@@ -9,7 +9,7 @@ name = "kubeadp_agent"
 path = "src/lib.rs"
 
 [features]
-default = ["cli", "server"]
+default = ["cli", "server", "engine"]
 # The axum-based HTTP stack shared by the core server module (`core::server`),
 # the orchestrator (supervisor HTTP API) and the worker (agent-run API daemon).
 server = [
@@ -34,6 +34,11 @@ a2a = ["server", "dep:a2a", "dep:a2a-server-lf", "dep:async-trait", "dep:futures
 # Implies `server` (the old agent-orchestrate crate always compiled its HTTP
 # stack; the supervisor binary needs it).
 test-hooks = ["server"]
+# The pluggable engine layer (trait, run model, capability table, registry,
+# 501 plumbing -- HL-91 E1). Implies `server`: the engine surface is only
+# reached through HTTP endpoints and the trait uses the axum types for its
+# 501 mapping. Off by default so the pure `cli` build stays untouched.
+engine = ["server", "dep:async-trait"]
 
 [dependencies]
 clap = { version = "=4.5.20", features = ["derive", "env"] }
@@ -48,6 +53,12 @@ humantime = "2.1"
 dirs = "5.0"
 rusqlite = { version = "0.31", features = ["bundled"] }
 libc = "0.2"
+# Shared SHA-256 / HMAC-SHA256 / constant-time comparison primitives (the
+# single crypto provider for the whole crate). Version matches the copy
+# already resolved in Cargo.lock via the a2a rustls tree, so declaring it
+# directly adds no new package; the feature matrix (cli / server / a2a) all
+# reach it, including `--no-default-features --features cli`.
+ring = "=0.17.14"
 axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"], optional = true }
 tokio-stream = { version = "0.1", optional = true }

@@ -12,11 +12,47 @@ pub struct SecretConfig {
     pub dest: String,
 }
 
+/// Execution role for a sandbox policy.
+/// Grants are restricted to `Session` role policies and are rejected for `Worker` role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyRole {
+    #[default]
+    Worker,
+    Session,
+}
+
+/// Per-session grants configuration (passed from trusted supervisor config).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantsConfig {
+    /// Grants read-only access to the Kubernetes ServiceAccount token directory.
+    #[serde(default)]
+    pub serviceaccount: bool,
+
+    /// Absolute paths granted read-only.
+    #[serde(default)]
+    pub ro_paths: Vec<PathBuf>,
+
+    /// Absolute paths granted read-write.
+    #[serde(default)]
+    pub rw_paths: Vec<PathBuf>,
+
+    /// Environment variable names passed through from supervisor process environment.
+    /// Trailing wildcard `*` allowed only.
+    #[serde(default)]
+    pub env: Vec<String>,
+}
+
 /// Sandbox policy matching CONTRACT v1:
 /// Unknown policy keys are an error (`deny_unknown_fields`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxPolicy {
+    #[serde(default)]
+    pub role: PolicyRole,
+    #[serde(default)]
+    pub grants: Option<GrantsConfig>,
     #[serde(default)]
     pub agent_id: Option<String>,
     #[serde(default)]
@@ -64,6 +100,8 @@ fn default_net() -> String {
 impl Default for SandboxPolicy {
     fn default() -> Self {
         Self {
+            role: PolicyRole::Worker,
+            grants: None,
             agent_id: None,
             jobset_id: None,
             rw: Vec::new(),
@@ -99,6 +137,8 @@ impl SandboxPolicy {
         shared_rw: Option<Vec<PathBuf>>,
     ) -> Self {
         let mut policy = Self {
+            role: PolicyRole::Worker,
+            grants: None,
             agent_id: Some(job_id.to_string()),
             rw: vec![worktree_path.to_path_buf()],
             ..Default::default()
@@ -126,13 +166,38 @@ impl SandboxPolicy {
         policy
     }
 
-    /// Builds a default policy for an orchestrator session.
-    pub fn for_session(session_id: &str, workdir: &Path) -> Self {
+    /// Builds a default policy for an orchestrator session with optional grants.
+    pub fn for_session(session_id: &str, workdir: &Path, grants: Option<GrantsConfig>) -> Self {
         Self {
+            role: PolicyRole::Session,
+            grants,
             agent_id: Some(session_id.to_string()),
             rw: vec![workdir.to_path_buf()],
             ..Default::default()
         }
+    }
+
+    /// Validates the policy and its grants.
+    /// Fails closed (returns Err) if:
+    /// - `role` is `Worker` but `grants` is set (worker jobs can never have grants).
+    /// - Any grant path is non-absolute, root `/`, `/proc`, `/dev`, or contains traversal `..`.
+    /// - Any grant env name is invalid.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.role == PolicyRole::Worker && self.grants.is_some() {
+            return Err("Worker job policy must not specify grants (grants are restricted to session policies)".to_string());
+        }
+        if let Some(ref g) = self.grants {
+            for p in &g.ro_paths {
+                validate_policy_grant_path(p, "ro_paths")?;
+            }
+            for p in &g.rw_paths {
+                validate_policy_grant_path(p, "rw_paths")?;
+            }
+            for env in &g.env {
+                validate_policy_grant_env_name(env)?;
+            }
+        }
+        Ok(())
     }
 
     /// Loads a policy from a file path or stdin if path is "-".
@@ -147,7 +212,9 @@ impl SandboxPolicy {
             std::fs::read_to_string(path)
                 .map_err(|e| format!("failed to read policy file '{path}': {e}"))?
         };
-        Self::parse_json(&content)
+        let policy = Self::parse_json(&content)?;
+        policy.validate()?;
+        Ok(policy)
     }
 
     /// Parses policy from JSON string. Unknown keys produce an error.
@@ -169,8 +236,9 @@ impl SandboxPolicy {
         Ok(())
     }
 
-    /// Checks whether an environment variable name matches any pattern in `env_allow`.
-    /// Patterns support simple trailing `*` wildcard (e.g. `A2A_*`).
+    /// Checks whether an environment variable name matches any pattern in `env_allow`
+    /// or in `grants.env` if grants are configured.
+    /// Patterns support simple trailing `*` wildcard (e.g. `A2A_*`, `VIKUNJA_*`).
     pub fn is_env_allowed(&self, var_name: &str) -> bool {
         for pattern in &self.env_allow {
             if pattern.ends_with('*') {
@@ -180,6 +248,18 @@ impl SandboxPolicy {
                 }
             } else if pattern == var_name {
                 return true;
+            }
+        }
+        if let Some(ref g) = self.grants {
+            for pattern in &g.env {
+                if pattern.ends_with('*') {
+                    let prefix = &pattern[..pattern.len() - 1];
+                    if var_name.starts_with(prefix) {
+                        return true;
+                    }
+                } else if pattern == var_name {
+                    return true;
+                }
             }
         }
         false
@@ -265,8 +345,165 @@ impl SandboxPolicy {
                 }
             }
         }
+        if let Some(ref g) = self.grants {
+            for p in &g.rw_paths {
+                std::fs::create_dir_all(p).map_err(|e| {
+                    format!(
+                        "sandbox policy granted rw path {} cannot be created: {e}",
+                        p.display()
+                    )
+                })?;
+                if let Ok(m) = std::fs::metadata(p) {
+                    if !m.is_dir() {
+                        return Err(format!(
+                            "sandbox policy granted rw path {} is not a directory",
+                            p.display()
+                        ));
+                    }
+                }
+            }
+        }
         Ok(())
     }
+
+    /// Adds the configured operator token file (config `api_token_file`, the
+    /// path named by `KUBEADP_API_TOKEN_FILE`) to the policy's `hide` list so a
+    /// sandboxed agent can never read the operator credential. No-op when the
+    /// token file is not configured (there is then nothing to hide).
+    pub fn hide_operator_token_file(self) -> Self {
+        self.with_hidden_path(operator_token_file_path().as_deref())
+    }
+
+    /// Adds the configured jobset root key file (config
+    /// `jobset_root_key_file`, the path named by
+    /// `KUBEADP_JOBSET_ROOT_KEY_FILE`) to the policy's `hide` list so a
+    /// sandboxed agent can never read the root key (agents only ever see
+    /// their DERIVED per-jobset secret through the `secret` channel). No-op
+    /// when the root key file is not configured.
+    pub fn hide_jobset_root_key_file(self) -> Self {
+        self.with_hidden_path(jobset_root_key_file_path().as_deref())
+    }
+
+    /// Adds `path` to the policy's `hide` list so a sandboxed agent can never
+    /// read it. No-op when `path` is `None`. Idempotent: an already-hidden
+    /// path is not duplicated.
+    pub fn with_hidden_path(mut self, path: Option<&Path>) -> Self {
+        if let Some(path) = path {
+            let pb = path.to_path_buf();
+            if !self.hide.iter().any(|h| h == &pb) {
+                self.hide.push(pb);
+            }
+        }
+        self
+    }
+}
+
+/// Environment variable naming the operator token file (config key
+/// `api_token_file`). Mirrors `crate::core::server::token::API_TOKEN_FILE_ENV`;
+/// duplicated here because the sandbox module is compiled without the `server`
+/// feature (a cli-only build) and so cannot reference that module.
+const API_TOKEN_FILE_ENV: &str = "KUBEADP_API_TOKEN_FILE";
+
+/// The absolute path of the operator token file (the file named by
+/// `KUBEADP_API_TOKEN_FILE`, config key `api_token_file`), if configured.
+///
+/// This is the credential that guards the host's `/api/v1` and A2A surface; an
+/// agent must never be able to read it, so every sandbox policy the launcher
+/// builds hides this path. `None` means the host has no operator token file
+/// configured.
+pub fn operator_token_file_path() -> Option<PathBuf> {
+    std::env::var(API_TOKEN_FILE_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Environment variable naming the jobset root key file (config key
+/// `jobset_root_key_file`). Mirrors
+/// `crate::core::jobset::ROOT_KEY_FILE_ENV`; duplicated here because the
+/// sandbox module is compiled without the `server` feature (a cli-only build)
+/// and so cannot reference that module.
+const JOBSET_ROOT_KEY_FILE_ENV: &str = "KUBEADP_JOBSET_ROOT_KEY_FILE";
+
+/// The absolute path of the jobset root key file (the file named by
+/// `KUBEADP_JOBSET_ROOT_KEY_FILE`, config key `jobset_root_key_file`), if
+/// configured.
+///
+/// This is the root of trust that derives every jobset secret; an agent must
+/// never be able to read it, so every sandbox policy the launcher builds hides
+/// this path. `None` means the host has no root key file configured.
+pub fn jobset_root_key_file_path() -> Option<PathBuf> {
+    std::env::var(JOBSET_ROOT_KEY_FILE_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Validates that a granted path in a sandbox policy is absolute, not root or forbidden system dirs,
+/// and has no path traversal components ('..').
+fn validate_policy_grant_path(path: &Path, field: &str) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "Sandbox policy error: field 'grants.{}' contains non-absolute path '{}'",
+            field,
+            path.display()
+        ));
+    }
+    let s = path.to_string_lossy();
+    if s == "/" || s == "/proc" || s.starts_with("/proc/") || s == "/dev" || s.starts_with("/dev/")
+    {
+        return Err(format!(
+            "Sandbox policy error: field 'grants.{}' contains forbidden path '{}'",
+            field,
+            path.display()
+        ));
+    }
+    for comp in path.components() {
+        if let std::path::Component::ParentDir = comp {
+            return Err(format!(
+                "Sandbox policy error: field 'grants.{}' contains parent traversal '..' in '{}'",
+                field,
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates an environment variable name in a sandbox policy grant: valid identifier, trailing '*' allowed only.
+fn validate_policy_grant_env_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(
+            "Sandbox policy error: field 'grants.env' contains empty variable name".to_string(),
+        );
+    }
+    let (ident, has_wildcard) = if let Some(stripped) = name.strip_suffix('*') {
+        (stripped, true)
+    } else {
+        (name, false)
+    };
+    if has_wildcard && ident.contains('*') {
+        return Err(format!(
+            "Sandbox policy error: field 'grants.env' has '*' not at the trailing position in '{}'",
+            name
+        ));
+    }
+    if ident.is_empty() && has_wildcard {
+        return Err(format!(
+            "Sandbox policy error: field 'grants.env' wildcard '*' requires prefix in '{}'",
+            name
+        ));
+    }
+    for c in ident.chars() {
+        if !c.is_ascii_alphanumeric() && c != '_' {
+            return Err(format!(
+                "Sandbox policy error: field 'grants.env' contains invalid identifier character '{c}' in '{name}'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -448,5 +685,199 @@ mod tests {
             private_tmp.unwrap().join("work").is_dir(),
             "relative rw path must be created under the private tmp"
         );
+    }
+
+    #[test]
+    fn test_jobset_policy_secret_channel_and_hide() {
+        // The jobset policy carries the `secret` channel (fd 3 -> the 0400
+        // file name the sandbox writes it to) and only the two jobset env vars
+        // are guaranteed to pass the `env_allow` filter -- the secret value
+        // itself is never an env var, so it cannot reach the agent.
+        let base = SandboxPolicy::for_job(
+            "job-42",
+            Path::new("/workspace/.agent-jobs/homelab/job-42"),
+            None,
+            None,
+            None,
+        );
+        let policy = crate::core::jobset::build_jobset_policy(&base);
+
+        assert_eq!(
+            policy.secret,
+            Some(SecretConfig {
+                fd: 3,
+                dest: crate::core::jobset::JOBSET_SECRET_FILE_NAME.to_string()
+            })
+        );
+        assert!(policy.is_env_allowed(crate::core::jobset::JOBSET_ID_ENV));
+        assert!(policy.is_env_allowed(crate::core::jobset::JOBSET_SECRET_FILE_ENV));
+        assert!(policy.is_env_allowed(crate::core::jobset::JOBSET_EPOCH_ENV));
+        // The secret value is not an environment variable at all: even if it
+        // were (wrongly) set, it would be filtered out (not `KUBEADP_*`-named
+        // here). The point is the launcher never sets it.
+        assert!(!policy.is_env_allowed("JOBSET_SECRET"));
+
+        // The env the launcher sets contains the id, the epoch and the PATH
+        // of the secret file only.
+        let cred = crate::core::jobset::JobsetCredential {
+            jobset_id: "js-1".to_string(),
+            secret: "super-secret-value".to_string(),
+            epoch: crate::core::jobset::EPOCH_ZERO,
+        };
+        let tmp = PathBuf::from("/tmp/agent-sandbox-job-42");
+        let env = crate::core::jobset::build_jobset_env(&cred, &tmp);
+        let env_str: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let joined = env_str.join("\n");
+        // Exactly three vars: the jobset id, the epoch, and the secret file
+        // PATH (never the secret value).
+        assert_eq!(env.len(), 3);
+        assert!(joined.contains(&format!("{}=js-1", crate::core::jobset::JOBSET_ID_ENV)));
+        assert!(joined.contains(&format!(
+            "{}={}/jobset-secret",
+            crate::core::jobset::JOBSET_SECRET_FILE_ENV,
+            tmp.display()
+        )));
+        assert!(joined.contains(&format!("{}=0", crate::core::jobset::JOBSET_EPOCH_ENV)));
+        // The secret value appears NOWHERE in the env (id/epoch/path only).
+        assert!(!joined.contains("super-secret-value"));
+        assert!(!joined.contains("super-secret-value") && !joined.contains("secret-value"));
+    }
+
+    #[test]
+    fn test_jobset_policy_is_noop_for_non_member() {
+        // A job that is not a jobset member is launched unchanged: build_command
+        // does not call build_jobset_policy, so the base policy has no secret
+        // channel and no jobset env vars are added.
+        let policy = SandboxPolicy::for_job(
+            "job-plain",
+            Path::new("/workspace/.agent-jobs/homelab/job-plain"),
+            None,
+            None,
+            None,
+        );
+        assert!(policy.secret.is_none());
+    }
+
+    #[test]
+    fn test_with_hidden_path_adds_and_is_idempotent() {
+        let base = SandboxPolicy::for_job(
+            "job-h",
+            Path::new("/w/.agent-jobs/h/job-h"),
+            None,
+            None,
+            None,
+        );
+        let token = Path::new("/run/secrets/api-token");
+        let p1 = base.clone().with_hidden_path(Some(token));
+        assert!(p1
+            .hide
+            .iter()
+            .any(|h| h.as_path() == Path::new("/run/secrets/api-token")));
+        // Idempotent: a second call does not duplicate the entry.
+        let p2 = p1.with_hidden_path(Some(token));
+        let n = p2
+            .hide
+            .iter()
+            .filter(|h| h.as_path() == Path::new("/run/secrets/api-token"))
+            .count();
+        assert_eq!(n, 1);
+        // None: the policy is unchanged.
+        let unchanged = base.hide.len();
+        let p3 = base.clone().with_hidden_path(None);
+        assert_eq!(p3.hide.len(), unchanged);
+    }
+
+    #[test]
+    fn test_hide_operator_token_file_reads_env() {
+        // `hide_operator_token_file` maps the configured `KUBEADP_API_TOKEN_FILE`
+        // path into the `hide` list. Asserted via the pure `with_hidden_path`
+        // on the same resolved value (avoids mutating the process env, which is
+        // shared with the token tests).
+        let path = std::env::var_os(API_TOKEN_FILE_ENV);
+        let base = SandboxPolicy::for_job(
+            "job-h",
+            Path::new("/w/.agent-jobs/h/job-h"),
+            None,
+            None,
+            None,
+        );
+        match path {
+            Some(raw) => {
+                let p = base.hide_operator_token_file();
+                assert!(p.hide.iter().any(|h| h.as_path() == Path::new(&raw)));
+            }
+            None => {
+                let unchanged = base.hide.len();
+                let p = base.hide_operator_token_file();
+                assert_eq!(p.hide.len(), unchanged);
+            }
+        }
+    }
+
+    #[test]
+    fn test_worker_grants_rejected() {
+        let json = r#"{
+            "role": "worker",
+            "grants": {
+                "serviceaccount": true
+            }
+        }"#;
+        let policy: SandboxPolicy = serde_json::from_str(json).unwrap();
+        let err = policy.validate().unwrap_err();
+        assert!(err.contains("Worker job policy must not specify grants"));
+    }
+
+    #[test]
+    fn test_session_grants_shape_validation() {
+        // Forbidden root /
+        let mut policy = SandboxPolicy::for_session(
+            "s1",
+            Path::new("/tmp"),
+            Some(GrantsConfig {
+                ro_paths: vec![PathBuf::from("/")],
+                ..Default::default()
+            }),
+        );
+        let err = policy.validate().unwrap_err();
+        assert!(err.contains("forbidden path '/'"));
+
+        // Forbidden /proc
+        policy.grants = Some(GrantsConfig {
+            ro_paths: vec![PathBuf::from("/proc/version")],
+            ..Default::default()
+        });
+        let err2 = policy.validate().unwrap_err();
+        assert!(err2.contains("forbidden path '/proc/version'"));
+
+        // Non-absolute path
+        policy.grants = Some(GrantsConfig {
+            rw_paths: vec![PathBuf::from("relative/path")],
+            ..Default::default()
+        });
+        let err3 = policy.validate().unwrap_err();
+        assert!(err3.contains("non-absolute path"));
+
+        // Parent traversal
+        policy.grants = Some(GrantsConfig {
+            rw_paths: vec![PathBuf::from("/workspace/../etc")],
+            ..Default::default()
+        });
+        let err4 = policy.validate().unwrap_err();
+        assert!(err4.contains("parent traversal '..'"));
+
+        // Valid grants
+        policy.grants = Some(GrantsConfig {
+            serviceaccount: true,
+            ro_paths: vec![
+                PathBuf::from("/opt/tools"),
+                PathBuf::from("/opt/ssh-home-cloud"),
+            ],
+            rw_paths: vec![PathBuf::from("/workspace"), PathBuf::from("/home/agent")],
+            env: vec!["VIKUNJA_*".to_string(), "GH_TOKEN".to_string()],
+        });
+        assert!(policy.validate().is_ok());
+        assert!(policy.is_env_allowed("VIKUNJA_API_TOKEN"));
+        assert!(policy.is_env_allowed("GH_TOKEN"));
+        assert!(!policy.is_env_allowed("OTHER_SECRET"));
     }
 }

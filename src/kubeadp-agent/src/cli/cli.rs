@@ -12,8 +12,9 @@ use clap::{Args, Parser, Subcommand};
 
 pub use crate::core::args::{
     CatArgs, CleanArgs, CommitArgs, DiffArgs, DiscardArgs, ExportArgs, FilesArgs, GcArgs, InfoArgs,
-    InitArgs, JobIdArg, ListArgs, ModelsArgs, ProjectsArgs, QuotaArgs, RemoteControlAction,
-    RemoteControlArgs, RepairArgs, ResultArgs, RetryArgs, ReviewArgs, StartArgs, WaitArgs,
+    InitArgs, JobIdArg, JobsetEndArgs, ListArgs, ModelsArgs, ProjectsArgs, QuotaArgs,
+    RemoteControlAction, RemoteControlArgs, RepairArgs, ResultArgs, RetryArgs, ReviewArgs,
+    StartArgs, WaitArgs,
 };
 
 /// agent-run: remote CLI client for the agent-run API server
@@ -130,6 +131,10 @@ pub enum Commands {
 
     /// Manage the agy remote-control daemon on the API server
     RemoteControl(RemoteControlArgs),
+
+    /// End a jobset: bump its epoch and mark it ended (old credentials stop
+    /// verifying). Operator-only.
+    Jobset(JobsetEndArgs),
 }
 
 /// Arguments for `agent-run auth`.

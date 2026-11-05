@@ -13,7 +13,7 @@ use crate::core::auth::AuthManager;
 use crate::core::config::Config;
 use crate::core::runner::mark_child_subreaper;
 
-const DEFAULT_LISTEN: &str = "0.0.0.0:8001";
+const DEFAULT_LISTEN: &str = "0.0.0.0:8002";
 
 /// The former agent-run-api `main`, preserved verbatim as an async
 /// entry function.
@@ -121,14 +121,29 @@ pub async fn run() -> Result<()> {
         }
     );
 
+    let state_root = config.state_root.clone();
     let state = Arc::new(config);
     // One global auth manager (at most one in-progress OAuth flow) for
     // the auth routes.
     let auth = Arc::new(AuthManager::new());
     let rc_state = server::RemoteControlState::default();
-    // agent-run-api has no bearer token by design (its NetworkPolicy is the
-    // access control): the shared auth layer passes requests through
-    // untouched, so all responses are identical to the pre-token server.
+    // The operator bearer token guards the WHOLE /api/v1 surface (agent-run
+    // routes) plus, under `a2a`, the A2A routes. It is resolved once at
+    // startup: the raw value exists only long enough to be hashed into the
+    // AuthState digest, and is never logged. Without a token the server
+    // refuses to start unless api_allow_unauthenticated is set.
+    let auth_state = server::auth::resolve_startup_auth()
+        .with_context(|| "agent-run-api: refusing to start".to_string())?;
+    // Register this worker's own jobset membership (if it is a member) so the
+    // A2A surface can accept a presented jobset credential against itself.
+    // No-op when the worker is not a jobset member (an operator request).
+    crate::core::jobset::register_self();
+    // Jobset robustness startup: resolve + cache the jobset root key, point
+    // the persisted membership store at the worker's state dir, and reload
+    // memberships (a restart then still verifies a retried job's re-derived
+    // secret). A configured-but-broken root key file is a startup error naming
+    // only the path (never its content).
+    crate::core::jobset::init_global_jobsets(&state_root).map_err(|e| anyhow::anyhow!("{e}"))?;
     let ready = {
         let state = Arc::clone(&state);
         Arc::new(move || {
@@ -155,7 +170,7 @@ pub async fn run() -> Result<()> {
     };
     let app = server::obs::add_observability(
         server::router_with_rc(state.clone(), auth, rc_state.clone()),
-        server::auth::AuthState::none(),
+        auth_state.clone(),
         ready,
         state_metrics,
     );
@@ -167,14 +182,31 @@ pub async fn run() -> Result<()> {
             description: "Remote execution daemon for agent-run jobs".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             skills: Vec::new(),
-            json_rpc_url: format!("http://{listen}/rpc"),
+            url: format!("http://{listen}"),
         };
         let a2a_backend = Arc::new(crate::worker::a2a::JobTaskBackend::new(state.clone()));
-        // agent-run-api has no bearer token by default (cluster NetworkPolicy is access control).
-        // Passing None as AuthVerifier allows unauthenticated in-cluster access.
-        // No MessageSink: a running agy job has no interactive stdin channel,
-        // so SendMessage answers UNSUPPORTED_OPERATION for the worker role.
-        let a2a_routes = crate::core::a2a::a2a_router(a2a_model, a2a_backend, None, None);
+        // SendMessage resumes the addressed job's conversation with the framed
+        // message as the next turn (interrupt-and-resume): the sink stops a
+        // running attempt cleanly, then continues the same conversation through
+        // the retry follow-up path.
+        let a2a_sink = Arc::new(crate::worker::a2a::JobMessageSink::new(state.clone()));
+        // The A2A surface sits behind the SAME operator token as /api/v1
+        // (see auth_state above): the verifier hashes the presented bearer
+        // credential and compares digests in constant time, exactly like the
+        // shared layer. When the server started with api_allow_unauthenticated
+        // there is no token and the A2A routes are likewise open.
+        // The operator token gate (same credential as /api/v1) plus, when this
+        // worker is a jobset member, the per-jobset credential as an
+        // independent alternative on the A2A routes (never on /api/v1).
+        let a2a_auth = crate::core::server::auth::auth_verifier_from_state(&auth_state);
+        let a2a_jobset = crate::core::a2a::JobsetCred::from_host();
+        let a2a_routes = crate::core::a2a::a2a_router_with_jobset(
+            a2a_model,
+            a2a_backend,
+            Some(a2a_sink),
+            a2a_auth,
+            a2a_jobset,
+        );
         app.merge(a2a_routes)
     };
     eprintln!("agent-run-api: listening on {listen}");

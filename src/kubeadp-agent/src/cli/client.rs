@@ -129,16 +129,91 @@ fn debug_env_on() -> bool {
         .unwrap_or(false)
 }
 
+/// Env var naming the operator token file (the same `[common] api_token_file`
+/// -> `KUBEADP_API_TOKEN_FILE` mapping the server roles use; the file's
+/// trimmed contents are presented as `Authorization: Bearer <token>` on every
+/// request the CLI makes).
+const API_TOKEN_FILE_ENV: &str = "KUBEADP_API_TOKEN_FILE";
+
+/// Reads the operator token file, trimming surrounding whitespace. The CLI
+/// build (`--no-default-features --features cli`) has no `server` feature, so
+/// it cannot depend on `core::server::token::read_token_file` and keeps its
+/// own tiny reader here. The raw token is never logged or shown anywhere: on
+/// error the message names only the path.
+fn api_token_from_file(env_value: &str) -> Result<String, String> {
+    let path = Path::new(env_value);
+    let bytes = std::fs::read(path).map_err(|e| {
+        format!(
+            "cannot read operator API token from {API_TOKEN_FILE_ENV} '{}': {e}",
+            path.display()
+        )
+    })?;
+    let token = String::from_utf8_lossy(&bytes).trim().to_string();
+    if token.is_empty() {
+        return Err(format!(
+            "operator API token file {API_TOKEN_FILE_ENV} '{}' is empty",
+            path.display()
+        ));
+    }
+    Ok(token)
+}
+
+/// Resolves the operator token the CLI must present: the trimmed contents of
+/// the file named by `KUBEADP_API_TOKEN_FILE` (config `api_token_file`). When
+/// the variable is unset there is no token and no header is added. A
+/// configured but unreadable or empty file is an error naming the path (the
+/// token is never part of any message).
+fn resolve_api_token() -> Result<Option<String>, String> {
+    match std::env::var_os(API_TOKEN_FILE_ENV) {
+        None => Ok(None),
+        Some(value) => {
+            let raw = value
+                .into_string()
+                .map_err(|_| format!("{API_TOKEN_FILE_ENV} is not valid Unicode"));
+            api_token_from_file(&raw?).map(Some)
+        }
+    }
+}
+
+/// ureq middleware that stamps `Authorization: Bearer <token>` on every
+/// request before it is sent. Only installed when a token file is configured
+/// (see [`resolve_api_token`]); when it is set the bearer value must never
+/// appear in debug output or error text, so the token is held in the struct
+/// and the header is set exactly once per request.
+#[allow(clippy::result_large_err)]
+fn bearer_token_middleware(
+    token: String,
+) -> impl Fn(ureq::Request, ureq::MiddlewareNext) -> Result<ureq::Response, ureq::Error> {
+    move |req, next| next.handle(req.set("Authorization", &format!("Bearer {token}")))
+}
+
 /// Build a ureq agent with timeouts appropriate for the given call type.
 ///
 /// `read_timeout` of `None` means "no read timeout" (unbounded); used for
 /// calls that wait on a human (auth flows) and for `wait` when the user
 /// provided no `--timeout` argument.
+///
+/// When `KUBEADP_API_TOKEN_FILE` is set (config `[common] api_token_file`)
+/// the built agent adds a middleware that presents the file's trimmed
+/// contents as `Authorization: Bearer` on every request. A configured but
+/// unreadable or empty file is a clear error (with the path, never the
+/// token); this is the CLI's failure path here because the whole CLI
+/// communicates with the API over `agents` built by this function.
 fn build_agent(read_timeout: Option<Duration>) -> ureq::Agent {
     let ct = connect_timeout();
     let mut builder = ureq::AgentBuilder::new().timeout_connect(ct);
     if let Some(rt) = read_timeout {
         builder = builder.timeout_read(rt).timeout_write(rt);
+    }
+    match resolve_api_token() {
+        Ok(Some(token)) => {
+            builder = builder.middleware(bearer_token_middleware(token));
+        }
+        Ok(None) => {}
+        Err(message) => {
+            eprintln!("Error: {message}");
+            exit(1);
+        }
     }
     builder.build()
 }
@@ -434,6 +509,23 @@ pub fn dispatch(cli: &Cli, base_url: &str) -> ! {
                     &agent,
                     "POST",
                     &job_url(&base, &args.job_id, "/kill"),
+                    None,
+                    json_mode,
+                ),
+                json_mode,
+            )
+        }
+        Commands::Jobset(args) => {
+            // `jobset end <id>` -> POST /api/v1/jobsets/<id>/end (operator
+            // token gate is the same shared bearer layer as every /api/v1
+            // route; the CLI attaches the bearer credential when configured).
+            let encoded = urlencode(&args.jobset_id);
+            let agent = build_agent(Some(ordinary_read_timeout()));
+            exit_output(
+                &call(
+                    &agent,
+                    "POST",
+                    &format!("{base}{API_PREFIX}/jobsets/{encoded}/end"),
                     None,
                     json_mode,
                 ),
@@ -2365,6 +2457,101 @@ mod tests {
     // -- timeout tests (no real network) ----------------------------------
 
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // -- operator-token file: the CLI middleware ----------------------------------
+
+    /// Runs `f` with `KUBEADP_API_TOKEN_FILE` pointing at a fresh temp file
+    /// containing exactly `contents` (a trailing newline is preserved
+    /// verbatim, so callers pass e.g. `"T\n"`).
+    fn with_token_file<R>(contents: &str, f: impl FnOnce() -> R) -> R {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token");
+        std::fs::write(&path, contents).unwrap();
+        std::env::set_var("KUBEADP_API_TOKEN_FILE", &path);
+        let result = f();
+        std::env::remove_var("KUBEADP_API_TOKEN_FILE");
+        result
+    }
+
+    #[test]
+    fn bearer_token_from_file_is_presented_on_requests() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        with_token_file("T\n", || {
+            let (base, requests, handle) = spawn_http_stub(
+                |_line, _rest| (200, r#"{"ok":true}"#.to_string()),
+                "GET /api/v1/info ",
+                1,
+            );
+            let agent = build_agent(Some(ordinary_read_timeout()));
+            let _ = agent.get(&format!("{base}/api/v1/info")).call();
+            let recorded = requests.lock().unwrap().clone();
+            assert!(
+                recorded[0]
+                    .1
+                    .to_lowercase()
+                    .contains("authorization: bearer t"),
+                "no bearer header in {recorded:?}"
+            );
+            drop(recorded);
+            handle.join().expect("stub thread");
+        });
+    }
+
+    #[test]
+    fn no_authorization_header_when_token_file_unset() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("KUBEADP_API_TOKEN_FILE");
+        let (base, requests, handle) = spawn_http_stub(
+            |_line, _rest| (200, r#"{"ok":true}"#.to_string()),
+            "GET /api/v1/info ",
+            1,
+        );
+        let agent = build_agent(Some(ordinary_read_timeout()));
+        let _ = agent.get(&format!("{base}/api/v1/info")).call();
+        let recorded = requests.lock().unwrap().clone();
+        assert!(
+            !recorded[0].1.to_lowercase().contains("authorization:"),
+            "unexpected authorization header in {recorded:?}"
+        );
+        drop(recorded);
+        handle.join().expect("stub thread");
+    }
+
+    #[test]
+    fn unreadable_token_file_is_a_clear_error_without_the_token() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("KUBEADP_API_TOKEN_FILE", "/nonexistent/token-file-xyzzy");
+        let err = resolve_api_token().unwrap_err();
+        std::env::remove_var("KUBEADP_API_TOKEN_FILE");
+        assert!(
+            err.contains("/nonexistent/token-file-xyzzy"),
+            "error should name the path: {err}"
+        );
+        assert!(
+            !err.contains("secret"),
+            "token must never appear in the error: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_token_file_is_a_clear_error_without_the_token() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty-token");
+        std::fs::write(&path, "   \n").unwrap();
+        std::env::set_var("KUBEADP_API_TOKEN_FILE", &path);
+        let err = resolve_api_token().unwrap_err();
+        std::env::remove_var("KUBEADP_API_TOKEN_FILE");
+        assert!(
+            err.contains("empty-token"),
+            "error should name the path: {err}"
+        );
+        assert!(!err.contains("secret"), "token must never appear: {err}");
+        assert!(
+            err.contains("empty"),
+            "should mention the file is empty: {err}"
+        );
+    }
 
     /// Test that read_timeout_env parses positive integers and rejects non-positive or invalid strings.
     #[test]

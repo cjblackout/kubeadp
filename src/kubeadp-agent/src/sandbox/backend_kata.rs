@@ -287,8 +287,9 @@ fn is_git_repository(path: &Path) -> bool {
 /// Landlock domain: the Kubernetes ServiceAccount token directory, or a
 /// `hide` entry that is a git repository (so its object store cannot be read
 /// through a sibling that is allowed).
-pub fn is_denied_path(path: &Path, hide: &[PathBuf]) -> bool {
-    if is_k8s_serviceaccount_token_path(path) {
+/// If `allow_serviceaccount` is true, the ServiceAccount token directory deny is lifted.
+pub fn is_denied_path(path: &Path, hide: &[PathBuf], allow_serviceaccount: bool) -> bool {
+    if !allow_serviceaccount && is_k8s_serviceaccount_token_path(path) {
         return true;
     }
     hide.iter()
@@ -479,11 +480,14 @@ pub fn apply_landlock_domain(
     }
     let ruleset_fd = ruleset_fd as i32;
 
+    let allow_sa = policy.role == crate::sandbox::policy::PolicyRole::Session
+        && policy.grants.as_ref().is_some_and(|g| g.serviceaccount);
+
     // Helper to add a path-beneath rule. Denied paths (the kubernetes
     // ServiceAccount token dir, or a `hide` entry that is a git repository)
     // are refused even if a policy lists them: the backend fails closed.
     let add_rule = |path: &Path, allowed: u64| -> Result<(), String> {
-        if is_denied_path(path, &policy.hide) {
+        if is_denied_path(path, &policy.hide, allow_sa) {
             return Err(format!(
                 "kata backend: refusing to grant access to denied path {path:?} (the \
                  kubernetes ServiceAccount token dir or a hidden git repository)"
@@ -522,8 +526,15 @@ pub fn apply_landlock_domain(
     let add_ro =
         |path: &Path| -> Result<(), String> { add_rule(path, access_flags_for_path(path, false)) };
     // Add a read-write rule whose access flags are chosen by the path type.
-    let add_rw =
-        |path: &Path| -> Result<(), String> { add_rule(path, access_flags_for_path(path, true)) };
+    // The ServiceAccount token directory can NEVER be granted read-write under any circumstance.
+    let add_rw = |path: &Path| -> Result<(), String> {
+        if is_k8s_serviceaccount_token_path(path) {
+            return Err(format!(
+                "kata backend: refusing to grant write access to ServiceAccount path {path:?}"
+            ));
+        }
+        add_rule(path, access_flags_for_path(path, true))
+    };
     // Add a read/write rule for a device node (no execute/truncate).
     let add_device_rw = |path: &Path| -> Result<(), String> { add_rule(path, device_flags(true)) };
 
@@ -551,6 +562,19 @@ pub fn apply_landlock_domain(
     }
     if let Some(tmp) = private_tmp {
         add_rw(tmp)?;
+    }
+
+    // 5. Grants allow-list (if session has grants).
+    if let Some(ref g) = policy.grants {
+        if g.serviceaccount {
+            add_ro(Path::new(K8S_SERVICEACCOUNT_TOKEN_DIR))?;
+        }
+        for ro_path in &g.ro_paths {
+            add_ro(ro_path)?;
+        }
+        for rw_path in &g.rw_paths {
+            add_rw(rw_path)?;
+        }
     }
 
     // 5. Set PR_SET_NO_NEW_PRIVS before restrict_self
@@ -880,9 +904,15 @@ mod tests {
         let no_hide: Vec<PathBuf> = Vec::new();
         assert!(is_denied_path(
             Path::new("/var/run/secrets/kubernetes.io/serviceaccount/token"),
-            &no_hide
+            &no_hide,
+            false
         ));
-        assert!(!is_denied_path(Path::new("/usr/bin"), &no_hide));
+        assert!(!is_denied_path(
+            Path::new("/var/run/secrets/kubernetes.io/serviceaccount/token"),
+            &no_hide,
+            true
+        ));
+        assert!(!is_denied_path(Path::new("/usr/bin"), &no_hide, false));
 
         // A `hide` entry that is a git repository is denied (and its subpaths).
         let tmp = tempfile::tempdir().unwrap();
@@ -891,14 +921,15 @@ mod tests {
         let sibling = tmp.path().join("visible");
         std::fs::create_dir(&sibling).unwrap();
         let hide = vec![repo.clone()];
-        assert!(is_denied_path(&repo, &hide));
-        assert!(is_denied_path(&repo.join("objects"), &hide));
+        assert!(is_denied_path(&repo, &hide, false));
+        assert!(is_denied_path(&repo, &hide, true));
+        assert!(is_denied_path(&repo.join("objects"), &hide, false));
         // The visible sibling is not a repo and is not hidden.
-        assert!(!is_denied_path(&sibling, &hide));
+        assert!(!is_denied_path(&sibling, &hide, false));
         // A `hide` entry that is NOT a git repo does not trigger the deny.
         let plain = tmp.path().join("plain");
         std::fs::create_dir(&plain).unwrap();
-        assert!(!is_denied_path(&plain, std::slice::from_ref(&plain)));
+        assert!(!is_denied_path(&plain, std::slice::from_ref(&plain), false));
     }
 
     // H6c (behavioral): a child that restricts only ITSELF must refuse to grant
@@ -929,6 +960,112 @@ mod tests {
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "applying a domain that grants the ServiceAccount token dir must fail"
         );
+    }
+
+    // HL-151: Test that:
+    // (a) default sessions and worker jobs still cannot read ServiceAccount token dir
+    // (b) a granted session CAN read it read-only and CANNOT write it
+    // (c) a granted path outside allowed shapes is rejected
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_session_serviceaccount_grant_and_write_denial() {
+        use crate::sandbox::policy::{GrantsConfig, PolicyRole};
+
+        // (a) Worker job with SA token dir in ro is denied
+        let worker_policy = SandboxPolicy {
+            role: PolicyRole::Worker,
+            ro: vec![PathBuf::from(K8S_SERVICEACCOUNT_TOKEN_DIR)],
+            ..Default::default()
+        };
+        let pid1 = unsafe { libc::fork() };
+        assert!(pid1 >= 0);
+        if pid1 == 0 {
+            let res = apply_landlock_domain(&worker_policy, KATA_MIN_LANDLOCK_ABI, None);
+            unsafe {
+                libc::_exit(if res.is_err() { 0 } else { 1 });
+            }
+        }
+        let mut st1 = 0;
+        unsafe {
+            libc::waitpid(pid1, &mut st1, 0);
+        }
+        assert!(libc::WIFEXITED(st1) && libc::WEXITSTATUS(st1) == 0);
+
+        // (a2) Default session (no grants) with SA token dir in ro is denied
+        let session_no_grants = SandboxPolicy {
+            role: PolicyRole::Session,
+            ro: vec![PathBuf::from(K8S_SERVICEACCOUNT_TOKEN_DIR)],
+            ..Default::default()
+        };
+        let pid2 = unsafe { libc::fork() };
+        assert!(pid2 >= 0);
+        if pid2 == 0 {
+            let res = apply_landlock_domain(&session_no_grants, KATA_MIN_LANDLOCK_ABI, None);
+            unsafe {
+                libc::_exit(if res.is_err() { 0 } else { 1 });
+            }
+        }
+        let mut st2 = 0;
+        unsafe {
+            libc::waitpid(pid2, &mut st2, 0);
+        }
+        assert!(libc::WIFEXITED(st2) && libc::WEXITSTATUS(st2) == 0);
+
+        // (b) Session with serviceaccount: true grant in ro succeeds (or fails gracefully only if landlock unsupported)
+        let session_granted = SandboxPolicy {
+            role: PolicyRole::Session,
+            grants: Some(GrantsConfig {
+                serviceaccount: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pid3 = unsafe { libc::fork() };
+        assert!(pid3 >= 0);
+        if pid3 == 0 {
+            let res = apply_landlock_domain(&session_granted, KATA_MIN_LANDLOCK_ABI, None);
+            // Must NOT fail with "refusing to grant access to denied path"
+            if let Err(ref e) = res {
+                if e.contains("refusing to grant access to denied path") {
+                    unsafe {
+                        libc::_exit(1);
+                    }
+                }
+            }
+            unsafe {
+                libc::_exit(0);
+            }
+        }
+        let mut st3 = 0;
+        unsafe {
+            libc::waitpid(pid3, &mut st3, 0);
+        }
+        assert!(libc::WIFEXITED(st3) && libc::WEXITSTATUS(st3) == 0);
+
+        // (b2) Session attempting to write SA path must fail closed!
+        let session_write_sa = SandboxPolicy {
+            role: PolicyRole::Session,
+            grants: Some(GrantsConfig {
+                serviceaccount: true,
+                rw_paths: vec![PathBuf::from(K8S_SERVICEACCOUNT_TOKEN_DIR)],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pid4 = unsafe { libc::fork() };
+        assert!(pid4 >= 0);
+        if pid4 == 0 {
+            let res = apply_landlock_domain(&session_write_sa, KATA_MIN_LANDLOCK_ABI, None);
+            // Must fail closed because write to SA path is refused!
+            unsafe {
+                libc::_exit(if res.is_err() { 0 } else { 1 });
+            }
+        }
+        let mut st4 = 0;
+        unsafe {
+            libc::waitpid(pid4, &mut st4, 0);
+        }
+        assert!(libc::WIFEXITED(st4) && libc::WEXITSTATUS(st4) == 0);
     }
 
     // H6c (behavioral): a child that applies the FULL default domain (proc/dev

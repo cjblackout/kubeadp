@@ -585,6 +585,14 @@ pub fn run(config: &Config, args: &StartArgs) -> Result<CommandOutput> {
     )?;
 
     // 10. Launch detached in background
+    // Register the new agent in the process-wide jobset registry before the
+    // launch: the job joins the host's jobset (if the host is a member) or
+    // gets a fresh one (an operator request). The monitor's `build_command`
+    // reads this entry to wire the sandbox `secret` channel + jobset env, and
+    // the A2A surface reads it to accept the job's credential. Dropped on
+    // every end path (see `jobset::drop_agent`).
+    crate::core::jobset::register_agent(&meta.job_id);
+
     let worktree_for_cleanup = worktree_path.clone();
     let branch_for_cleanup = meta.branch.clone();
     let pid = match launch_background_job(config, &mut meta) {
@@ -604,6 +612,10 @@ pub fn run(config: &Config, args: &StartArgs) -> Result<CommandOutput> {
             // survive a failed launch; it is ours in every case (internal or
             // external worktree), unlike the worktree above.
             discard_new_job_row(config, &job_id);
+            // The jobset entry registered just before the launch must not
+            // survive a failed launch either: without a live process/row the
+            // ghost registry entry would linger for the host's lifetime.
+            crate::core::jobset::drop_agent(&meta.job_id);
             return Err(e);
         }
     };
@@ -973,6 +985,58 @@ mod tests {
             list_jobs(&config.state_root, None).unwrap().is_empty(),
             "no job record should be created for a failed start"
         );
+    }
+
+    #[test]
+    fn test_start_failed_launch_drops_jobset_registry_entry() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        crate::core::jobset::with_isolated_registry(|| {
+            let temp_dir = tempdir().unwrap();
+            let workspace_root = temp_dir.path().join("workspace");
+            let project_dir = workspace_root.join("test-repo");
+            init_fixture_repo(&project_dir);
+
+            // A non-executable absolute agy path: `start` registers the job in
+            // the jobset registry just before `launch_background_job`, and the
+            // launch then fails synchronously in `validate_executable_paths`
+            // (step 0). The `Err(e)` branch must `drop_agent`, leaving no
+            // ghost registry entry (F6).
+            let agy = temp_dir.path().join("fake-agy");
+            fs::write(&agy, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&agy, fs::Permissions::from_mode(0o644)).unwrap();
+
+            let config = Config {
+                repos_root: workspace_root.clone().join(".agent-repos"),
+                workspace_root: workspace_root.clone(),
+                state_root: temp_dir.path().join("state"),
+                agy_path: agy,
+                ..Default::default()
+            };
+
+            let args = StartArgs {
+                project: "test-repo".to_string(),
+                prompt: "do something".to_string(),
+                ..Default::default()
+            };
+
+            let err = run(&config, &args).unwrap_err();
+            assert!(
+                err.to_string().contains("not executable"),
+                "expected launch failure, got: {err}"
+            );
+
+            // The job registered by `run` before the launch must be gone
+            // again: no ghost jobset entry (F6).
+            assert_eq!(
+                crate::core::jobset::global_registry().len(),
+                0,
+                "failed start must drop its jobset registry entry"
+            );
+            assert_no_agent_run_branches(&project_dir);
+        });
     }
 
     #[test]

@@ -704,6 +704,7 @@ mod tests {
                 pty_eof_grace_secs: 1.0,
                 kill_wait_secs: 2.0,
                 sandbox: true,
+                grants: None,
                 base_backoff_secs: 1.0,
                 max_backoff_secs: 10.0,
                 healthy_run_secs: 30.0,

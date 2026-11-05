@@ -300,6 +300,16 @@ pub fn terminate_process_to(
 
 pub fn run(config: &Config, args: &JobIdArg) -> Result<CommandOutput> {
     let meta = JobMetadata::resolve(&config.state_root, &args.job_id)?;
+    run_with_meta(config, &args.job_id, meta)
+}
+
+/// Terminates an exact job record (without prefix resolution).
+pub fn run_exact(config: &Config, job_id: &str) -> Result<CommandOutput> {
+    let meta = JobMetadata::load(&config.state_root, job_id)?;
+    run_with_meta(config, job_id, meta)
+}
+
+fn run_with_meta(config: &Config, job_id: &str, meta: JobMetadata) -> Result<CommandOutput> {
     let status = compute_status(&meta, &config.state_root);
 
     let mut output = CommandOutput::new(json!({
@@ -315,7 +325,7 @@ pub fn run(config: &Config, args: &JobIdArg) -> Result<CommandOutput> {
     if status != JobStatus::Running {
         output.push_out(format!(
             "Job '{}' is not currently running (status: {}).",
-            args.job_id, status
+            job_id, status
         ));
         return Ok(output);
     }
@@ -325,7 +335,7 @@ pub fn run(config: &Config, args: &JobIdArg) -> Result<CommandOutput> {
         _ => {
             output.push_out(format!(
                 "Job '{}' is not currently running (status: {}).",
-                args.job_id, status
+                job_id, status
             ));
             return Ok(output);
         }

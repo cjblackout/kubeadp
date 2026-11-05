@@ -597,6 +597,13 @@ pub struct RemoteControlArgs {
     pub action: RemoteControlAction,
 }
 
+/// End a jobset: bump its epoch and mark it ended so its old credentials stop
+/// verifying (operator-only, like every /api/v1 route).
+#[derive(Debug, Args, Clone, serde::Deserialize)]
+pub struct JobsetEndArgs {
+    /// Jobset id (or a unique prefix is not accepted -- jobsets use exact ids).
+    pub jobset_id: String,
+}
 #[derive(Debug, Subcommand, Clone, PartialEq, Eq, serde::Deserialize)]
 pub enum RemoteControlAction {
     /// Enable and start the agy remote-control daemon

@@ -10,9 +10,12 @@
 //! header so the remote client's tail loop can resume.
 
 pub mod auth;
+#[cfg(feature = "engine")]
+pub mod capabilities;
 mod events;
 pub mod obs;
 pub mod reject;
+pub mod token;
 
 pub use reject::{ApiJson, ApiPath, ApiQuery};
 
@@ -26,6 +29,8 @@ use crate::core::commands;
 use crate::core::config::Config;
 use crate::core::job::JobMetadata;
 use crate::core::output::CommandOutput;
+#[cfg(feature = "engine")]
+use crate::engine::EngineRegistry;
 use anyhow::{Context, Result};
 use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
@@ -62,8 +67,8 @@ pub struct RemoteControlState {
 /// The returned router carries the `/api/v1/*` routes plus their state; it
 /// deliberately has NO `/healthz` (that is added by [`obs::add_observability`]
 /// after the auth layer, so a liveness probe never needs a token). When no
-/// bearer token is configured (agent-run-api's network-policy-only model)
-/// the auth layer passes requests through untouched.
+/// bearer token is configured (only the explicit `api_allow_unauthenticated`
+/// path) the auth layer passes requests through untouched.
 #[allow(dead_code)]
 pub fn router(state: AppState, auth: Arc<AuthManager>) -> Router {
     router_with_rc(state, auth, RemoteControlState::default())
@@ -77,13 +82,16 @@ pub fn router(state: AppState, auth: Arc<AuthManager>) -> Router {
 /// is authenticated automatically -- there is no per-handler check to
 /// forget. The router carries NO `/healthz` (added by
 /// [`obs::add_observability`] after the auth layer). With no bearer token
-/// configured (agent-run-api's network-policy-only model) the layer passes
-/// requests through untouched.
+/// configured (only the explicit `api_allow_unauthenticated` path) the layer
+/// passes requests through untouched.
 pub fn router_with_rc(
     state: AppState,
     auth: Arc<AuthManager>,
     rc_state: RemoteControlState,
 ) -> Router {
+    // E1: the engine registry defaults to empty (no engines registered yet);
+    // the role entry points pass their configured registry through
+    // `router_with_engines` in E3/E5.
     let api_v1 = Router::new()
         // start (POST body) / list (GET query)
         .route("/jobs", post(start_job).get(list_jobs))
@@ -109,6 +117,10 @@ pub fn router_with_rc(
         .route("/projects", get(projects_cmd))
         .route("/gc", post(gc_job))
         .route("/init", post(init_job))
+        // Jobset lifecycle: ending a jobset bumps its epoch and marks it ended
+        // (old credentials stop verifying). Same operator-token gate as every
+        // other /api/v1 route (the shared bearer layer around this sub-router).
+        .route("/jobsets/{jobset_id}/end", post(end_jobset_job))
         // auth (agy-owned home credentials; the manager is an extension)
         .route("/auth/status", get(auth_status))
         .route("/info", get(info_cmd))
@@ -124,6 +136,69 @@ pub fn router_with_rc(
         .with_state(state)
         .layer(Extension(auth))
         .layer(Extension(rc_state));
+
+    #[cfg(feature = "engine")]
+    let api_v1 = api_v1
+        .route("/capabilities", get(capabilities::capabilities_handler))
+        .layer(Extension(Arc::new(EngineRegistry::new())));
+
+    Router::new().nest("/api/v1", api_v1)
+}
+
+/// Engine-aware variant of [`router_with_rc`]: the same `/api/v1` routes plus
+/// `GET /api/v1/capabilities` carrying the caller's [`EngineRegistry`] (the
+/// role entry points construct it from config in E3/E5).
+///
+/// When the crate builds without the `engine` feature this is behaviourally
+/// identical to [`router_with_rc`] except for the registry.
+#[cfg(feature = "engine")]
+pub fn router_with_engines(
+    state: AppState,
+    auth: Arc<AuthManager>,
+    rc_state: RemoteControlState,
+    engines: Arc<EngineRegistry>,
+) -> Router {
+    let api_v1 = Router::new()
+        .route("/jobs", post(start_job).get(list_jobs))
+        .route("/jobs/wait", post(wait_jobs))
+        .route("/jobs/repair", post(repair_all))
+        .route("/jobs/{job_id}", get(job_status))
+        .route("/jobs/{job_id}/clean", delete(clean_job))
+        .route("/jobs/{job_id}/kill", post(kill_job))
+        .route("/jobs/{job_id}/retry", post(retry_job))
+        .route("/jobs/{job_id}/repair", post(repair_job))
+        .route("/jobs/{job_id}/commit", post(commit_job))
+        .route("/jobs/{job_id}/discard", post(discard_job))
+        .route("/jobs/{job_id}/export", get(export_job))
+        .route("/jobs/{job_id}/review", post(review_job))
+        .route("/jobs/{job_id}/log", get(log_job))
+        .route("/jobs/{job_id}/diff", get(diff_job))
+        .route("/jobs/{job_id}/files", get(files_job))
+        .route("/jobs/{job_id}/cat", get(cat_job))
+        .route("/jobs/{job_id}/result", get(result_job))
+        .route("/jobs/{job_id}/events", get(events::events_job))
+        .route("/projects", get(projects_cmd))
+        .route("/gc", post(gc_job))
+        .route("/init", post(init_job))
+        // Jobset lifecycle (A2A): same operator-token gate as the other
+        // /api/v1 routes, carried over into the engine-aware router.
+        .route("/jobsets/{jobset_id}/end", post(end_jobset_job))
+        .route("/auth/status", get(auth_status))
+        .route("/info", get(info_cmd))
+        .route("/models", get(models_cmd))
+        .route("/quota", get(quota_cmd))
+        .route("/remote-control/enable", post(remote_control_enable))
+        .route("/remote-control/disable", post(remote_control_disable))
+        .route("/remote-control/status", get(remote_control_status))
+        .route("/auth", post(start_auth))
+        .route("/auth/code", post(submit_auth_code))
+        .route("/auth/cancel", post(cancel_auth))
+        .route("/capabilities", get(capabilities::capabilities_handler))
+        .fallback(api_v1_not_found)
+        .with_state(state)
+        .layer(Extension(auth))
+        .layer(Extension(rc_state))
+        .layer(Extension(engines));
 
     Router::new().nest("/api/v1", api_v1)
 }
@@ -170,6 +245,17 @@ pub(crate) fn error_to_response(err: anyhow::Error) -> Response {
     // causes and paths never reach a client.
     eprintln!("[agent-run-api] error: {err:#}");
     let Some(typed) = typed_error(&err) else {
+        // Engine-layer errors carry their own response mapping (the 501
+        // `{"error", "code":"unsupported", "engine"}` contract body). Nothing
+        // routes through the engine trait in E1, so this arm is reached by
+        // future endpoint code only; it is tested directly.
+        #[cfg(feature = "engine")]
+        if let Some(engine_err) = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<crate::engine::errors::EngineError>())
+        {
+            return crate::engine::errors::to_response(engine_err);
+        }
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": err.to_string(), "code": "internal" })),
@@ -1157,6 +1243,31 @@ async fn init_job(State(config): State<AppState>, ApiJson(args): ApiJson<InitArg
     }
 }
 
+/// `POST /api/v1/jobsets/{id}/end` — end a jobset (operator-only by the shared
+/// bearer gate).
+///
+/// Bumps the jobset's epoch, marks it ended (old credentials stop verifying)
+/// and persists the membership store; answers 200 with the new epoch. An
+/// unknown jobset (no member in this process) answers 404 with the standard
+/// JSON error shape. The body is empty; the request needs no body fields.
+async fn end_jobset_job(ApiPath(jobset_id): ApiPath<String>) -> Response {
+    let id = jobset_id.clone();
+    match run_blocking(move || crate::core::jobset::end_jobset(&id).map_err(anyhow::Error::msg))
+        .await
+    {
+        Ok(Some(epoch)) => {
+            Json(json!({ "jobset_id": jobset_id, "ended": true, "epoch": epoch })).into_response()
+        }
+        Ok(None) => error_to_response(anyhow::Error::new(
+            crate::core::error::AgentRunError::not_found(
+                "jobset_not_found",
+                format!("No such jobset: '{jobset_id}'"),
+            ),
+        )),
+        Err(err) => error_to_response(err),
+    }
+}
+
 /// `GET /api/v1/auth/status` -- whether the server's home already holds
 /// valid agy credentials (no agy spawn).
 async fn auth_status() -> Response {
@@ -1308,6 +1419,17 @@ mod tests {
             .uri(uri)
             .header("Content-Type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
+            .expect("request")
+    }
+
+    /// A POST request carrying the bearer credential (the count for the gated
+    /// /api/v1 group, used to prove a route is behind the token).
+    fn post_request_auth(uri: &str, token: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
             .expect("request")
     }
 
@@ -3094,5 +3216,216 @@ mod tests {
         let q = parse_export_query(Some("format=tar&bogus=1")).unwrap();
         assert_eq!(q.format, "tar");
         assert!(!q.allow_large);
+    }
+
+    // -------------------------------------------------------------------
+    // GET /api/v1/capabilities (HL-91 E1): behind the same bearer layer as
+    // every other /api/v1 route; serves the engine capability tables.
+    // -------------------------------------------------------------------
+
+    /// A capability router with one registered no-op engine ("testcfg") so
+    /// the endpoint reports a real table, not just the empty list.
+    #[cfg(feature = "engine")]
+    fn capabilities_router(engines: std::sync::Arc<crate::engine::EngineRegistry>) -> Router {
+        obs::add_observability(
+            crate::core::server::router_with_engines(
+                Arc::new(Config::default()),
+                Arc::new(AuthManager::new()),
+                RemoteControlState::default(),
+                engines,
+            ),
+            auth::AuthState::none(),
+            Arc::new(|| Ok(())),
+            Arc::new(Vec::new),
+        )
+    }
+
+    #[cfg(feature = "engine")]
+    fn test_noop_engine(id: &'static str) -> std::sync::Arc<dyn crate::engine::Engine> {
+        use crate::engine::capability::CapabilityTable;
+        use crate::engine::{
+            Engine, EngineCtx, EngineError, JobSpec, Run, RunId, SessionSpec, Transport,
+        };
+        struct TestCfgEngine {
+            id: &'static str,
+            capabilities: CapabilityTable,
+        }
+        #[::async_trait::async_trait]
+        impl Engine for TestCfgEngine {
+            fn id(&self) -> String {
+                self.id.to_string()
+            }
+            async fn start_job(
+                &self,
+                _spec: JobSpec,
+                _ctx: &mut dyn EngineCtx,
+            ) -> Result<RunId, EngineError> {
+                Ok("cfg-job".to_string())
+            }
+            async fn resume_job(&self, _run: &Run, _prompt: &str) -> Result<(), EngineError> {
+                Ok(())
+            }
+            async fn job_status(&self, run: &Run) -> Result<crate::engine::RunStatus, EngineError> {
+                Ok(run.status)
+            }
+            async fn start_session(
+                &self,
+                _spec: SessionSpec,
+                _ctx: &mut dyn EngineCtx,
+            ) -> Result<RunId, EngineError> {
+                Ok("cfg-session".to_string())
+            }
+            async fn send_message(&self, _run: &Run, _text: &str) -> Result<(), EngineError> {
+                Ok(())
+            }
+            async fn stop_session(&self, _run: &Run, _restart: bool) -> Result<(), EngineError> {
+                Ok(())
+            }
+            fn capabilities(&self) -> CapabilityTable {
+                self.capabilities.clone()
+            }
+        }
+        let table = if id == "testcfg" {
+            CapabilityTable::builder("testcfg")
+                .transport(Transport::StreamJson)
+                .native(&["job.start", "job.status", "session.start", "session.stop"])
+                .build()
+        } else {
+            CapabilityTable::builder(id).build()
+        };
+        std::sync::Arc::new(TestCfgEngine {
+            id,
+            capabilities: table,
+        }) as std::sync::Arc<dyn Engine>
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "engine")]
+    async fn test_capabilities_returns_200_with_tables() {
+        let mut registry = crate::engine::EngineRegistry::new();
+        registry.register(test_noop_engine("testcfg"));
+        let app = capabilities_router(std::sync::Arc::new(registry));
+        let res = app
+            .oneshot(get_request("/api/v1/capabilities"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+        assert!(value["capabilities"].is_array());
+        let list = value["capabilities"].as_array().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["engine"], "testcfg");
+        assert_eq!(list[0]["transport"], "stream_json");
+        assert_eq!(list[0]["endpoints"]["job.start"], "native");
+        assert_eq!(list[0]["endpoints"]["fork"], "unsupported");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "engine")]
+    async fn test_capabilities_empty_registry_returns_empty_list() {
+        let reg = std::sync::Arc::new(crate::engine::EngineRegistry::new());
+        let app = capabilities_router(reg);
+        let res = app
+            .oneshot(get_request("/api/v1/capabilities"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+        assert_eq!(value["capabilities"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "engine")]
+    async fn test_capabilities_requires_token_when_configured() {
+        // /capabilities is registered inside the /api/v1 sub-router, so it is
+        // behind the same bearer layer as /jobs and /info: 401 without the
+        // token, 200 with it.
+        let reg = std::sync::Arc::new(crate::engine::EngineRegistry::new());
+        let app = obs::add_observability(
+            crate::core::server::router_with_engines(
+                Arc::new(Config::default()),
+                Arc::new(AuthManager::new()),
+                RemoteControlState::default(),
+                reg,
+            ),
+            auth::AuthState::token("sekret-token".to_string()),
+            Arc::new(|| Ok(())),
+            Arc::new(Vec::new),
+        );
+        let res = app
+            .clone()
+            .oneshot(get_request("/api/v1/capabilities"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let res = app
+            .oneshot(get_request_auth("/api/v1/capabilities", "sekret-token"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "engine")]
+    async fn engine_error_unsupported_maps_to_501_body_via_error_to_response() {
+        // The error_to_response 501 arm (HL-91 2.6): an EngineError in the
+        // anyhow chain answers 501 {"error","code":"unsupported","engine"}.
+        let err = anyhow::Error::new(crate::engine::EngineError::unsupported("testcfg", "fork"));
+        let res = super::error_to_response(err);
+        assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+        let value: Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+        assert_eq!(value["code"], "unsupported");
+        assert_eq!(value["engine"], "testcfg");
+        assert!(
+            value["error"].as_str().unwrap().contains("testcfg"),
+            "501 body should name the engine: {value}"
+        );
+    }
+
+    /// `POST /api/v1/jobsets/{id}/end` requires the operator bearer token (it
+    /// is one of the whole /api/v1 group) and 404s on unknown jobset ids.
+    #[tokio::test]
+    async fn test_end_jobset_route_requires_token_and_404s_unknown() {
+        // With a token configured, the route is gated like every /api/v1 route.
+        let app = test_router_authed("sekret-token");
+        let res = app
+            .clone()
+            .oneshot(post_json_request("/api/v1/jobsets/abc/end", "{}"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // With the token, an unknown jobset id 404s with the JSON error shape.
+        let res = app
+            .clone()
+            .oneshot(post_request_auth(
+                "/api/v1/jobsets/ghost/end",
+                "sekret-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let value: Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+        assert_eq!(value["code"], "jobset_not_found");
+    }
+
+    /// `POST /api/v1/jobsets/{id}/end` on a KNOWN jobset answers 200 with the
+    /// new (bumped) epoch and marks it ended (verify now rejects).
+    #[tokio::test]
+    async fn test_end_jobset_route_ends_known_jobset() {
+        // The route drives the process-wide registry (like production). Use a
+        // unique agent id so this test never collides with other tests.
+        std::env::remove_var(crate::core::jobset::ROOT_KEY_FILE_ENV);
+        let cred = crate::core::jobset::register_agent(&format!("job-end-{}", std::process::id()));
+        let app = test_router();
+        let uri = format!("/api/v1/jobsets/{}/end", cred.jobset_id);
+        let res = app.oneshot(post_json_request(&uri, "{}")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "known jobset ends with 200");
+        let value: Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+        assert_eq!(value["ended"], true);
+        assert!(value["epoch"].as_u64().unwrap() > cred.epoch);
+        // Ended in the registry -> verification now rejects.
+        assert!(crate::core::jobset::global_registry().is_ended(&cred.jobset_id));
+        crate::core::jobset::drop_agent(&format!("job-end-{}", std::process::id()));
     }
 }
