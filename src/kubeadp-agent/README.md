@@ -10,6 +10,7 @@ One cargo package for the whole agent stack. It consolidates the former crates `
 | `orchestrate` | agent-orchestrate (Claude Code session supervisor and REST API) | `server` |
 | `worker` | agent-run-api (agy job API daemon) | `server` |
 | `cli` | agent-run-cli (remote client) | `cli` |
+| `engine` | — (pluggable engine layer: `Engine` trait, capability table, registry, 501 `unsupported` mapping; the E1 foundation, nothing routes through it yet) | `engine` |
 
 ## Binaries
 
@@ -23,7 +24,7 @@ One cargo package for the whole agent stack. It consolidates the former crates `
 
 ## Features
 
-`default = ["cli","server"]`, `cli`, `server`, `a2a` (implies `server`), `test-hooks` (implies `server`).
+`default = ["cli","server","engine"]`, `cli`, `server`, `a2a` (implies `server`), `test-hooks` (implies `server`), `engine` (implies `server`).
 
 ## Tests
 
@@ -408,7 +409,7 @@ cargo fmt --check
 #### 4. Black-Box Integration Suite
 Executes the integration suite against `fake-claude.sh` in temporary, isolated directories (unsetting ambient supervisor environment variables to ensure hermetic runs):
 ```bash
-tests/run-tests.sh
+tests/orchestrate/run-tests.sh
 ```
 
 ### Behavioral Notes

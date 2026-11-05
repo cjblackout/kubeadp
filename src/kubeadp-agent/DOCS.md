@@ -164,9 +164,11 @@ Job status (`agent-run status <id>`) and info (`agent-run info`) JSON outputs in
 ```
 `agent-run status` and `agent-run info` print the active sandbox backend, runtime, and policy path.
 
-**Session sandboxing & grants.** Orchestrator sessions can be configured with `"sandbox": true` (the default) or `"sandbox": false` (trusted). Sandboxed sessions run inside `sandbox-exec`. To safely grant specific pod resources to a sandboxed session without running unsandboxed, a session may declare a `grants` object in the supervisor configuration. Grants are strictly restricted to orchestrator sessions configured via trusted configuration files; worker jobs cannot specify grants and fail closed if grants are supplied.
+**Session sandboxing & grants.** Orchestrator sessions can be configured with `"sandbox": true` (the default) or `"sandbox": false` (trusted). Sandboxed sessions run inside `sandbox-exec`. To safely grant specific pod resources to a sandboxed session without running unsandboxed, a session may declare a `grants` object in the supervisor configuration. Grants are strictly restricted to orchestrator sessions configured via trusted configuration files; worker jobs cannot specify grants and fail closed if grants are supplied. When the launcher exits `125` (sandbox setup failed, the command never ran), the supervisor records the session's last exit reason as `sandbox-setup-failed (rc=125): <reason>`, taking the first non-empty line of the launcher output (capped at 200 characters) instead of a bare `exit: 125`.
 
 When `serviceaccount: true` is granted on a session policy, the Kata backend lifts the default deny on the Kubernetes ServiceAccount token directory (`/var/run/secrets/kubernetes.io`) for read-only access (write access to the ServiceAccount directory is always denied and fails closed). Granted paths are strictly validated: non-absolute paths, root `/`, `/proc`, `/dev`, and paths with parent traversal (`..`) are rejected fail-closed. Backends that cannot enforce grants (such as gVisor) fail closed with exit 125 rather than silently ignoring grants.
+
+Every sandboxed agent (worker job and session alike) additionally has two paths hidden by default in its policy: the operator API token file (`api_token_file` / `KUBEADP_API_TOKEN_FILE`) — the credential that guards the host's `/api/v1` and A2A surface — and the jobset root key file (`KUBEADP_JOBSET_ROOT_KEY_FILE`), which agents must never read (they only ever see their derived per-jobset secret on the `secret` channel). Both are no-ops when unset. Each is a single regular file, so a session that needs the operator token can re-grant it as one read-only `ro_paths` entry (as the `homelab` session does).
 
 #### Session Grants Configuration Reference
 
@@ -177,7 +179,7 @@ When `serviceaccount: true` is granted on a session policy, the Kata backend lif
 | `rw_paths` | array of strings | Absolute paths granted read-write to the sandboxed session. Must not be `/`, `/proc`, `/dev`, or contain `..`. |
 | `env` | array of strings | Environment variable names passed through from supervisor process environment. Only exact names or trailing wildcard `*` allowed (e.g. `VIKUNJA_*`). Values are never configured or logged. |
 
-In `apps/ai-server`, `homelab` is configured with `"sandbox": false` by default, but can be switched to sandboxed with full explicit grants. `nested-operator` and `kubeopencode` stay sandboxed by default. Worker job sandboxing is unaffected.
+In `apps/ai-server`, all three sessions are sandboxed: `homelab` runs with explicit `grants` (read-only ServiceAccount token for kubectl, read-only paths for the tools/ssh/config directories and the operator API token file, read-write `/workspace`, `/home/agent`, `/tmp` and `/run/ssh-cert`, and the GitHub/Vikunja/info-hub/Hindsight env), while `nested-operator` and `kubeopencode` run sandboxed with no grants. No session is trusted (`"sandbox": false`) by default. Worker job sandboxing is unaffected.
 
 A test-only launch seam that skips the `sandbox-exec` wrapper for fake-`agy` unit tests (so they run on a platform that cannot isolate) exists only in builds compiled with the `test-hooks` cargo feature and is absent from production builds.
 
