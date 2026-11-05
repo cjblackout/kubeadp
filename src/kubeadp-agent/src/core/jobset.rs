@@ -1723,13 +1723,13 @@ mod tests {
             assert_eq!(key.as_bytes().len(), 32);
             // 31 bytes -> clear error naming only the path.
             let short = dir.path().join("short");
-            std::fs::write(&short, vec![0x01u8; 31]).unwrap();
+            std::fs::write(&short, vec![b'x'; 31]).unwrap();
             std::env::set_var(ROOT_KEY_FILE_ENV, short.to_string_lossy().to_string());
             let err = resolve_root_key().unwrap_err();
             assert!(err.contains("short"), "{err}");
             assert!(err.contains("fewer than"), "{err}");
             // The error must not embed the key material.
-            assert!(!err.contains('\u{1}'), "no key bytes leak: {err}");
+            assert!(!err.contains('x'), "no key bytes leak: {err}");
             clear_root_key_env();
         });
     }
