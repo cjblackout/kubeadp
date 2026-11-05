@@ -64,6 +64,14 @@ marked `[CONTROL]` (expected; excluded from the exit code), while the positive
 cases R5 (own env/dirs), R8 (exit codes) and R10 (network) PASS. The suite
 then exits 0, which is what the header states.
 
+## Known limitation (not tested as a leak)
+
+R10 keeps the shared network namespace, so under the gVisor backend an agent can connect to
+ABSTRACT unix-domain sockets of other processes in the pod (the Kata backend blocks this with
+Landlock `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`). There is no isolation test for it: the
+behaviour is a documented property of the gVisor backend, and the pod must not run abstract
+socket listeners.
+
 ## Exit code semantics
 
 The harness exits 0 iff there are no hard (non-control) FAILs; it exits 1

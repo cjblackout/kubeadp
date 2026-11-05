@@ -4,6 +4,14 @@
 //! - Three runtimes: gvisor, kata, runc (plus native for testing/overrides).
 //! - Policy configuration (rw, ro, shared_rw, hide, tmp, secret, env_allow, net).
 //! - Command execution via `sandbox-exec` and environment/runtime inspection via `sandbox-probe`.
+//!
+//! Known limitation of the contract (R10, shared network): agents keep the pod's network
+//! namespace because they need egress, so ABSTRACT unix-domain sockets of other processes in
+//! the same pod stay reachable. The Kata backend closes this with Landlock
+//! (`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`); the gVisor backend cannot (no Landlock, and a
+//! separate network namespace would remove egress). Path-based sockets are covered by the
+//! filesystem isolation. A pod that runs the gVisor backend must therefore not run processes
+//! that listen on abstract sockets.
 
 pub mod backend_gvisor;
 pub mod backend_kata;

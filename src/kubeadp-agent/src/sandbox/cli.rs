@@ -129,6 +129,7 @@ pub fn run_sandbox_exec(args: &[String]) {
             exit(125);
         }
     };
+    let policy = finish_policy(policy);
 
     // Runtime is ALWAYS auto-detected inside the pod (Contract v1.3)
     let effective_runtime = detect_runtime();
@@ -190,6 +191,18 @@ fn refusal_for_runtime(runtime: SandboxRuntime) -> Option<&'static str> {
             Some("isolation is always applied; refusing to run without a sandbox")
         }
     }
+}
+
+/// Finalizes a hand-run `sandbox-exec` policy the same way the in-process
+/// launchers (the job runner and the orchestrator session supervisor) do: it
+/// hides the operator token file and the jobset root key file so a hand-run
+/// sandbox cannot read either credential. Both builder methods are no-ops when
+/// the corresponding env path (`KUBEADP_API_TOKEN_FILE` /
+/// `KUBEADP_JOBSET_ROOT_KEY_FILE`) is not configured, so nothing else changes.
+fn finish_policy(policy: SandboxPolicy) -> SandboxPolicy {
+    policy
+        .hide_operator_token_file()
+        .hide_jobset_root_key_file()
 }
 
 /// Validates whether the chosen backend's required mechanisms passed probe.
@@ -311,5 +324,112 @@ mod tests {
                 "{rt:?} has a backend and must not be refused"
             );
         }
+    }
+
+    #[test]
+    fn test_finish_policy_adds_both_hides_when_configured() {
+        // `finish_policy` is the policy-finishing step `sandbox-exec` applies to
+        // a hand-run policy: it hides the operator token file and the jobset
+        // root key file (the same two builder methods the in-process launchers
+        // call), so a hand-run sandbox cannot read either credential.
+        //
+        // We READ the env-resolved paths and never mutate the process env, so
+        // this cannot race the CLI token tests or the jobset tests that set
+        // these same vars (they use their own, per-module locks). For whatever
+        // the host has configured, the finished policy must hide each of the
+        // two paths when present, preserve the existing hide list, and change
+        // nothing else. (The deterministic "adds both" mechanic, independent of
+        // the host env, is proven by the `with_hidden_path` test below.)
+        use crate::sandbox::policy::{jobset_root_key_file_path, operator_token_file_path};
+
+        let base = SandboxPolicy::for_job(
+            "job-cli",
+            std::path::Path::new("/w/.agent-jobs/job-cli"),
+            None,
+            None,
+            None,
+        );
+        let token = operator_token_file_path();
+        let key = jobset_root_key_file_path();
+        let finished = finish_policy(base.clone());
+
+        // The finished policy must equal the base policy with the two
+        // configured credential paths appended (each once, deduplicated by
+        // `with_hidden_path`, in token-then-key order) and nothing else
+        // changed. Build the expected vector exactly the way the builder
+        // methods do and compare.
+        let mut expected = base.hide.clone();
+        if let Some(t) = &token {
+            if !expected.iter().any(|h| h == t) {
+                expected.push(t.clone());
+            }
+        }
+        if let Some(k) = &key {
+            if !expected.iter().any(|h| h == k) {
+                expected.push(k.clone());
+            }
+        }
+        assert_eq!(
+            finished.hide, expected,
+            "finish_policy must add each configured credential path exactly once"
+        );
+
+        // No other field may change.
+        assert_eq!(finished.role, base.role);
+        assert_eq!(finished.agent_id, base.agent_id);
+        assert_eq!(finished.rw, base.rw);
+        assert_eq!(finished.ro, base.ro);
+        assert_eq!(finished.shared_rw, base.shared_rw);
+        assert_eq!(finished.tmp, base.tmp);
+        assert_eq!(finished.secret, base.secret);
+        assert_eq!(finished.env_allow, base.env_allow);
+        assert_eq!(finished.net, base.net);
+    }
+
+    #[test]
+    fn test_finish_policy_adds_both_hides_mechanics() {
+        // Deterministic proof of the "adds both hides" mechanic without touching
+        // the (globally shared, race-prone) env. `finish_policy` composes the
+        // two builder methods, each of which calls the pure `with_hidden_path`
+        // on the configured path; `with_hidden_path` adds each distinct path
+        // exactly once. With two distinct configured paths both appear and the
+        // count grows by two; a repeat pass is idempotent.
+        use std::path::Path;
+
+        let base = SandboxPolicy::for_job(
+            "job-cli2",
+            Path::new("/w/.agent-jobs/job-cli2"),
+            None,
+            None,
+            None,
+        );
+        let token_file = Path::new("/run/secrets/api-token");
+        let key_file = Path::new("/run/secrets/jobset-root-key");
+
+        // The exact composition `finish_policy` performs, with the two paths a
+        // configured host would resolve to (two real, distinct files).
+        let finished = base
+            .clone()
+            .with_hidden_path(Some(token_file))
+            .with_hidden_path(Some(key_file));
+        let hide: Vec<&Path> = finished.hide.iter().map(|h| h.as_path()).collect();
+        assert!(hide.contains(&token_file), "token file must be hidden");
+        assert!(hide.contains(&key_file), "root key file must be hidden");
+        assert_eq!(
+            finished.hide.len(),
+            base.hide.len() + 2,
+            "both configured paths added once each"
+        );
+
+        // Idempotent: re-applying both does not duplicate them.
+        let again = finished
+            .clone()
+            .with_hidden_path(Some(token_file))
+            .with_hidden_path(Some(key_file));
+        assert_eq!(
+            again.hide.len(),
+            base.hide.len() + 2,
+            "repeat must not duplicate"
+        );
     }
 }

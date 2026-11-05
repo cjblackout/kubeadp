@@ -30,7 +30,7 @@
 
 use super::detect::probe_landlock_abi;
 use super::exec::exec_target;
-use super::init_shim::kill_tree_and_reap;
+use super::init_shim::{kill_tree_and_reap, zeroize_bytes};
 use super::policy::SandboxPolicy;
 use std::ffi::CString;
 use std::fs;
@@ -338,15 +338,28 @@ pub fn execute_kata(
         ));
     }
 
-    // Read secret fd if configured
-    let secret_bytes = if let Some(ref sec) = policy.secret {
+    // Read secret fd if configured. The guard zeroizes the in-memory copy when
+    // it is dropped: on the success path we drop it right after the secret file
+    // is written (below), and on any earlier error return path it is dropped as
+    // the function unwinds -- so the secret never lingers in the launcher's
+    // heap. Mirrors the gVisor backend, which calls `zeroize_bytes` on its
+    // in-memory secret right after the secret file is written.
+    let secret = SecretBytesGuard(if let Some(ref sec) = policy.secret {
         read_secret_fd(sec.fd)?
     } else {
         Vec::new()
-    };
+    });
 
-    // Setup private tmp and secret file
-    let private_tmp = setup_kata_private_tmp(policy, &secret_bytes)?;
+    // Setup private tmp and secret file (writes the secret to a 0400 file).
+    let private_tmp = setup_kata_private_tmp(policy, &secret.0)?;
+
+    // The secret has now been durably written to its 0400 destination in the
+    // private tmp (or there was no secret). Wipe the in-memory copy before the
+    // fork/exec of the target so it cannot be recovered from the launcher's heap
+    // via /proc/<pid>/mem / ptrace by a same-uid child. The guard's `Drop` does
+    // the zeroizing; the target does not read these bytes (it reads the secret
+    // file on disk), so dropping them now is safe in every path.
+    drop(secret);
 
     // Contract v1.3 fail-closed: every writable policy path (rw, shared_rw and
     // the private tmp itself) must exist before the Landlock domain is built.
@@ -765,29 +778,73 @@ fn setup_kata_private_tmp(
 /// Ensures `path` exists as a real directory owned by the current user, with
 /// mode 0700, creating it (and any missing parents) when needed. Fails closed
 /// when the path exists but is a symlink or is owned by another user.
+///
+/// Symlink-safe: the path is inspected with `symlink_metadata` (lstat, which
+/// never follows a symlink) BEFORE anything is created, so a pre-planted
+/// symlink at the private-tmp path is refused instead of being followed by a
+/// create/chmod/remove. When the path is absent the leaf is created with
+/// `fs::DirBuilder::create` (i.e. `create_dir`, not `create_dir_all`) at mode
+/// 0700 and re-verified as a real directory owned by the current uid.
 fn create_owned_tmp_dir(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path).map_err(|e| format!("failed to create private tmp: {e}"))?;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let meta = fs::symlink_metadata(path)
-        .map_err(|e| format!("failed to stat private tmp {path:?}: {e}"))?;
-    if meta.file_type().is_symlink() {
-        return Err(format!("private tmp {path:?} is a symlink"));
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let euid = unsafe { libc::geteuid() };
+
+    let existing = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Absent: create a fresh 0700 directory at `path`. Missing parents
+            // may be created, but the leaf itself is made with `create` (not
+            // `create_all`) so a symlink planted at the leaf is never followed.
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create private tmp parent: {e}"))?;
+            }
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(path)
+                .map_err(|e| format!("failed to create private tmp {path:?}: {e}"))?;
+            return verify_owned_tmp_dir(path, euid);
+        }
+        Err(e) => return Err(format!("failed to stat private tmp {path:?}: {e}")),
+    };
+
+    if existing.file_type().is_symlink() {
+        // Refuse rather than follow: removing/chmodding through the link would
+        // act on the (possibly foreign) target. Fail closed.
+        return Err(format!(
+            "private tmp {path:?} is a symlink; refusing to follow it"
+        ));
     }
-    if !meta.is_dir() {
+    if !existing.is_dir() {
         return Err(format!("private tmp {path:?} is not a directory"));
     }
-    let euid = unsafe { libc::geteuid() };
+    if existing.uid() != euid {
+        return Err(format!(
+            "private tmp {path:?} is owned by uid {} (expected {euid})",
+            existing.uid()
+        ));
+    }
+    // A real directory we already own: tighten to 0700 (a crashed launcher may
+    // have left it looser). Safe to reuse — no symlink was involved.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("failed to chmod private tmp {path:?} to 0700: {e}"))
+}
+
+/// Confirms `path` is a real directory (not a symlink) owned by `euid`, after
+/// it was just created. Fails closed on any deviation.
+fn verify_owned_tmp_dir(path: &Path, euid: u32) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(path)
+        .map_err(|e| format!("failed to stat private tmp {path:?}: {e}"))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(format!("private tmp {path:?} is not a real directory"));
+    }
     if meta.uid() != euid {
         return Err(format!(
             "private tmp {path:?} is owned by uid {} (expected {euid})",
             meta.uid()
         ));
     }
-    // Tighten permissions: a stale dir left by a crashed launcher may not be
-    // 0700. The tmp is the agent's private scratch; only the agent (same uid)
-    // should ever access it.
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("failed to chmod private tmp {path:?} to 0700: {e}"))?;
     Ok(())
 }
 
@@ -828,6 +885,19 @@ fn read_secret_fd(fd: i32) -> Result<Vec<u8>, String> {
     file.read_to_end(&mut data)
         .map_err(|e| format!("failed to read secret fd {fd}: {e}"))?;
     Ok(data)
+}
+
+/// RAII guard that zeroizes its in-memory secret bytes when dropped, so a copy
+/// read from the secret fd is wiped on every return path (including early error
+/// returns) after it was read. Mirrors the gVisor backend, which calls
+/// `zeroize_bytes` on its in-memory secret right after the secret file is
+/// written.
+struct SecretBytesGuard(Vec<u8>);
+
+impl Drop for SecretBytesGuard {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.0);
+    }
 }
 
 fn execute_target(cmd: &str, args: &[String], env: &[(String, String)]) -> ! {
@@ -1310,6 +1380,81 @@ mod tests {
             .err()
             .expect("a symlink private tmp must fail closed");
         assert!(err.contains("symlink"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_create_owned_tmp_dir_does_not_follow_preplanted_symlink() {
+        // A pre-planted symlink at the private-tmp path (pointing at another
+        // directory) must NOT be followed: no write/chmod/remove may reach the
+        // link's target, and the target and its contents must stay intact. The
+        // result is either a clear error (fail closed) or a fresh real
+        // directory — never a write through the link.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("victim");
+        std::fs::create_dir(&target).unwrap();
+        let marker = target.join("sentinel");
+        std::fs::write(&marker, b"keep-me").unwrap();
+        let link = dir.path().join("tmp");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let res = create_owned_tmp_dir(&link);
+
+        // The target was never followed: its contents are untouched.
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"keep-me".to_vec(),
+            "the symlink target must not be written through"
+        );
+        // No new entry was created inside the target (a write-through would add one).
+        let entries: Vec<_> = std::fs::read_dir(&target)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(entries, vec!["sentinel"], "target must be unchanged");
+
+        match res {
+            Err(e) => {
+                // Fail-closed: the error names the symlink.
+                assert!(e.contains("symlink"), "expected a symlink error, got: {e}");
+            }
+            Ok(()) => {
+                // Otherwise the path must now be a fresh real directory owned
+                // by us, mode 0700 — and the symlink itself is gone (we did not
+                // create the directory through it).
+                let meta = std::fs::symlink_metadata(&link).unwrap();
+                assert!(
+                    !meta.file_type().is_symlink() && meta.is_dir(),
+                    "result must be a real directory, not a symlink"
+                );
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                assert_eq!(
+                    meta.permissions().mode() & 0o777,
+                    0o700,
+                    "fresh private tmp must be 0700"
+                );
+                assert_eq!(meta.uid(), unsafe { libc::geteuid() }, "owned by us");
+            }
+        }
+    }
+
+    #[test]
+    fn test_create_owned_tmp_dir_creates_fresh_0700_when_absent() {
+        // When the path does not exist, `create_owned_tmp_dir` creates a fresh
+        // real 0700 directory owned by the current uid (not a symlink), and a
+        // missing parent is created first.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a/b/tmp");
+        let res = create_owned_tmp_dir(&target);
+        assert!(res.is_ok(), "fresh tmp must succeed: {res:?}");
+        let meta = std::fs::symlink_metadata(&target).unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink());
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o700,
+            "fresh private tmp must be 0700"
+        );
+        assert_eq!(meta.uid(), unsafe { libc::geteuid() }, "owned by us");
     }
 
     #[test]
