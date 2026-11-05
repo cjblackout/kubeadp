@@ -168,21 +168,47 @@ pub async fn run() -> Result<()> {
                 .collect()
         })
     };
-    let app = server::obs::add_observability(
-        server::router_with_rc(state.clone(), auth, rc_state.clone()),
-        auth_state.clone(),
-        ready,
-        state_metrics,
-    );
+    let app = {
+        #[cfg(feature = "engine")]
+        {
+            // Register the agy engine (the per-role default for jobs) so
+            // /api/v1/jobs and /api/v1/capabilities resolve it through the
+            // trait (HL-91 E3).
+            let engines =
+                std::sync::Arc::new(crate::engine::AgyEngine::build_registry(Arc::clone(&state)));
+            server::obs::add_observability(
+                server::router_with_engines(state.clone(), auth, rc_state.clone(), engines),
+                auth_state.clone(),
+                ready,
+                state_metrics,
+            )
+        }
+        #[cfg(not(feature = "engine"))]
+        {
+            server::obs::add_observability(
+                server::router_with_rc(state.clone(), auth, rc_state.clone()),
+                auth_state.clone(),
+                ready,
+                state_metrics,
+            )
+        }
+    };
 
     #[cfg(feature = "a2a")]
     let app = {
+        // The agent card identifies the RUNNING POD (not the retired
+        // agent-run-api image): the name is the pod's own name, the
+        // description and skills name the worker role, the version is the
+        // crate version, and the advertised URL is the cluster Service DNS
+        // (KUBEADP_A2A_URL) when set, else the listen address.
+        let advertised = crate::core::a2a::advertised_url(&format!("http://{listen}"));
         let a2a_model = crate::core::a2a::A2aModel {
-            name: "agent-run-api".to_string(),
-            description: "Remote execution daemon for agent-run jobs".to_string(),
+            name: crate::core::a2a::pod_name(crate::core::a2a::ROLE_WORKER),
+            description: crate::core::a2a::role_description(crate::core::a2a::ROLE_WORKER)
+                .to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            skills: Vec::new(),
-            url: format!("http://{listen}"),
+            skills: crate::core::a2a::role_skills(crate::core::a2a::ROLE_WORKER),
+            url: advertised,
         };
         let a2a_backend = Arc::new(crate::worker::a2a::JobTaskBackend::new(state.clone()));
         // SendMessage resumes the addressed job's conversation with the framed

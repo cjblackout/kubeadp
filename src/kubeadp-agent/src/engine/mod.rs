@@ -7,21 +7,32 @@
 //! -- no endpoint may name `agy`/`claude` after E1.
 //!
 //! E1 wires the module tree, the run model, the capability table and the 501
-//! plumbing; NOTHING routes through the trait yet (the old
-//! `commands::*`/`sessions_api` paths are untouched). The registry and the
-//! selection precedence (request > config > per-role default) exist so the
-//! unit tests lock the contract; E3/E5 move the drivers behind it.
+//! plumbing. E3 adds the agy job engine ([`agy::AgyEngine`]) behind the trait
+//! (design migration step M2): a thin adapter that delegates to the exact
+//! `core::commands::*` / `core::runner` functions the job API already uses,
+//! so no behaviour moves and no existing endpoint changes. The registry and
+//! the selection precedence (request > config > per-role default) still
+//! exist; the worker role registers the agy engine at startup so `/api/v1`
+//! resolves and reports it. The claude engine and the emulation layer follow
+//! in E2/E4.
 //!
 //! The module is behind the `server` feature so the pure `cli` build stays
 //! untouched.
 
+pub mod agy;
 pub mod capability;
+pub mod emulate;
 pub mod errors;
 pub mod run;
+
+/// The claude engine (HL-91 E2): stream-json job driver, transcript parser
+/// and the PTY session adapter over the supervisor machinery.
+pub mod claude;
 
 mod agnostic;
 
 pub use agnostic::EmptyEngineCtx;
+pub use agy::AgyEngine;
 pub use errors::EngineError;
 pub use run::{
     ContextId, EngineEvent, EngineId, PodRole, Run, RunId, RunKind, RunStatus, Transport,
@@ -57,7 +68,7 @@ pub trait EngineCtx: Send + Sync {
 }
 
 /// Specification for [`Engine::start_job`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct JobSpec {
     /// Prompt text to start the job with.
     pub prompt: String,
@@ -69,6 +80,10 @@ pub struct JobSpec {
     pub workdir: PathBuf,
     /// The project name (for git/registry bookkeeping).
     pub project: String,
+    /// Engine-specific start options (opaque JSON; interpreted by the engine
+    /// that resolves the run). Absent/`null` means "engine defaults".
+    #[serde(default)]
+    pub options: serde_json::Value,
 }
 
 /// Specification for [`Engine::start_session`].
@@ -187,10 +202,15 @@ impl Default for RoleDefaults {
 ///
 /// E1 registers a no-op test engine in tests only; production registration
 /// (from config, before the role entry points) lands with the drivers in
-/// E3/E5. The registry is `Send + Sync` so it can be shared behind `Arc`.
+/// E3/E5. Since E4 every registered engine is stored wrapped in
+/// [`emulate::EmulatingEngine`], which fronts the shared control surface; the
+/// registry exposes it both as the opaque `Arc<dyn Engine>` trait objects the
+/// endpoint layer talks to and (via [`EngineRegistry::emulating`]) as the
+/// concrete wrapper the E4 run-control routes use for the emulated `/todo`
+/// list. The registry is `Send + Sync` so it can be shared behind `Arc`.
 #[derive(Default)]
 pub struct EngineRegistry {
-    engines: HashMap<EngineId, Arc<dyn Engine>>,
+    engines: HashMap<EngineId, Arc<emulate::EmulatingEngine>>,
     defaults: RoleDefaults,
 }
 
@@ -203,9 +223,15 @@ impl EngineRegistry {
         }
     }
 
-    /// Registers an engine (wrapped in the E4 emulation layer in E4).
+    /// Registers an engine, wrapped in the E4 emulation layer so every
+    /// registered engine answers the shared control surface (`interrupt`,
+    /// `pause`, `fork`, `compact`, `revert`, `todo`). The wrapper is
+    /// transparent until a key is enabled: dispatching is decided from the
+    /// inner engine's own capability report, and `EmulatingEngine::enable*`
+    /// only flips the reported table.
     pub fn register(&mut self, engine: Arc<dyn Engine>) {
-        self.engines.insert(engine.id(), engine);
+        let wrapped = Arc::new(emulate::EmulatingEngine::new_over(engine));
+        self.engines.insert(wrapped.id(), wrapped);
     }
 
     /// Sets the per-role default engine (precedence level 3).
@@ -250,9 +276,15 @@ impl EngineRegistry {
 
     /// The [`CapabilityTable`] for one registered engine, or `None`.
     pub fn capability_table(&self, engine_id: &str) -> Option<CapabilityTable> {
-        self.engines
-            .get(engine_id)
-            .map(|engine| engine.capabilities())
+        self.engines.get(engine_id).map(|engine| engine.table())
+    }
+
+    /// The concrete E4 emulation wrapper for one registered engine, or `None`.
+    /// The run-control routes use this to reach the emulated `/todo` list and
+    /// the enabled capability gates without naming `agy`/`claude` in the
+    /// endpoint layer.
+    pub fn emulating(&self, engine_id: &str) -> Option<Arc<emulate::EmulatingEngine>> {
+        self.engines.get(engine_id).cloned()
     }
 
     /// Resolves the engine to use for `kind` and `role`, applying the
@@ -275,7 +307,8 @@ impl EngineRegistry {
         };
         if let Some(engine) = self.engines.get(&engine_id) {
             let _ = role;
-            return Ok(Arc::clone(engine));
+            let wrapped: Arc<dyn Engine> = engine.clone();
+            return Ok(wrapped);
         }
         Err(EngineError::UnknownEngine { engine: engine_id })
     }

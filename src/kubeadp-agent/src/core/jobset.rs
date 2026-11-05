@@ -721,6 +721,63 @@ pub fn register_agent(agent_id: &str) -> JobsetCredential {
         };
     }
     let cred = host_jobset().unwrap_or_else(fresh_jobset_credential);
+    register_agent_at(agent_id, &cred);
+    cred
+}
+
+/// Register a newly created agent into an *explicitly chosen* jobset id (the
+/// caller's own jobset), so an API-started worker job joins the jobset of its
+/// orchestrator/caller.
+///
+/// The secret is DERIVED from the configured jobset root key
+/// ([`root_key_file_path`] / `KUBEADP_JOBSET_ROOT_KEY_FILE`), which both roles
+/// mount: the worker cannot otherwise know an arbitrary caller's secret. A
+/// caller-provided `jobset_id` with NO root key configured is a hard error
+/// (there is no way to derive a secret both sides can verify), returned as a
+/// clear string error.
+///
+/// An agent that is already registered (e.g. a retry) keeps its existing
+/// jobset unchanged; registering into a *different* jobset at runtime is not
+/// supported (the job would otherwise lose the credential it was launched
+/// with).
+///
+/// Returns the credential the agent was given.
+pub fn register_agent_into(agent_id: &str, jobset_id: &str) -> Result<JobsetCredential, String> {
+    let jobset_id = jobset_id.trim();
+    if jobset_id.is_empty() {
+        return Err(
+            "refusing to join an empty jobset id: provide a non-empty 'jobset_id'".to_string(),
+        );
+    }
+    // A retry keeps its original jobset (and secret) unchanged.
+    if let Some(existing) = global_registry().get(agent_id) {
+        return Ok(JobsetCredential {
+            jobset_id: existing.jobset_id,
+            secret: existing.secret,
+            epoch: existing.epoch,
+        });
+    }
+    let root_key = global_registry().root_key().ok_or_else(|| {
+        format!(
+            "cannot join jobset '{jobset_id}': no jobset root key configured \
+             ({ROOT_KEY_FILE_ENV} unset or empty); a per-jobset secret can only \
+             be derived from the shared root key \
+             (set the jobset root key file in the worker configuration)"
+        )
+    })?;
+    let secret = derive_jobset_secret(&root_key, jobset_id, EPOCH_ZERO);
+    let cred = JobsetCredential {
+        jobset_id: jobset_id.to_string(),
+        secret,
+        epoch: EPOCH_ZERO,
+    };
+    register_agent_at(agent_id, &cred);
+    Ok(cred)
+}
+
+/// Shared registration helper: inserts `cred` for `agent_id` and persists the
+/// new membership (agent id + jobset id + epoch ONLY -- no secrets).
+fn register_agent_at(agent_id: &str, cred: &JobsetCredential) {
     global_registry().register_at(agent_id, &cred.jobset_id, &cred.secret, cred.epoch);
     // Persist the new membership (agent id + jobset id + epoch ONLY -- no
     // secrets) so a process restart can re-derive the same credential and a
@@ -733,7 +790,6 @@ pub fn register_agent(agent_id: &str) -> JobsetCredential {
             agent_id, e
         );
     }
-    cred
 }
 
 /// Drop an agent's entry from the process-wide registry, called on *every*
@@ -1723,13 +1779,13 @@ mod tests {
             assert_eq!(key.as_bytes().len(), 32);
             // 31 bytes -> clear error naming only the path.
             let short = dir.path().join("short");
-            std::fs::write(&short, vec![b'x'; 31]).unwrap();
+            std::fs::write(&short, vec![0x01u8; 31]).unwrap();
             std::env::set_var(ROOT_KEY_FILE_ENV, short.to_string_lossy().to_string());
             let err = resolve_root_key().unwrap_err();
             assert!(err.contains("short"), "{err}");
             assert!(err.contains("fewer than"), "{err}");
             // The error must not embed the key material.
-            assert!(!err.contains('x'), "no key bytes leak: {err}");
+            assert!(!err.contains('\u{1}'), "no key bytes leak: {err}");
             clear_root_key_env();
         });
     }
@@ -1849,6 +1905,116 @@ mod tests {
                 let retried = register_agent("job-f4");
                 assert_eq!(retried.jobset_id, cred.jobset_id);
                 assert_eq!(retried.secret, derived);
+                clear_root_key_env();
+            });
+        });
+    }
+
+    /// `register_agent_into` joins an agent into a CALLER-CHOSEN jobset id,
+    /// deriving the secret from the root key (the two-way A2A mechanics: an
+    /// API-started worker job joins its caller's jobset).
+    #[test]
+    fn register_agent_into_joins_caller_jobset_with_derived_secret() {
+        with_env_guard(|| {
+            with_isolated_registry(|| {
+                std::env::remove_var(JOBSET_ID_ENV);
+                let dir = tempfile::tempdir().unwrap();
+                with_root_key_file(dir.path(), 32);
+                reset_warned_no_root_key();
+                init_global_jobsets(&dir.path().join("state")).unwrap();
+
+                let cred = register_agent_into("job-into-1", "js-caller").expect("join ok");
+                assert_eq!(cred.jobset_id, "js-caller");
+                assert_eq!(
+                    cred.secret,
+                    derive_jobset_secret(
+                        global_registry().root_key().as_deref().unwrap(),
+                        "js-caller",
+                        EPOCH_ZERO
+                    ),
+                    "the secret is the root-key-derived secret for the caller jobset"
+                );
+                assert_eq!(cred.epoch, EPOCH_ZERO);
+
+                // The registry entry matches, and the derived credential
+                // verifies against the target job.
+                assert_eq!(
+                    global_registry().get("job-into-1").unwrap().jobset_id,
+                    "js-caller"
+                );
+                assert!(
+                    verify_jobset_credential(
+                        &global_registry(),
+                        "job-into-1",
+                        &headers(Some("js-caller"), Some(&cred.secret))
+                    ),
+                    "derived credential verifies"
+                );
+
+                // The SAME caller chose the jobset, so a second agent joining
+                // the same jobset derives the identical secret (both sides can
+                // talk to each other).
+                let cred2 = register_agent_into("job-into-2", "js-caller").unwrap();
+                assert_eq!(cred2.secret, cred.secret);
+                assert!(
+                    verify_jobset_credential(
+                        &global_registry(),
+                        "job-into-2",
+                        &headers(Some("js-caller"), Some(&cred2.secret))
+                    ),
+                    "second member's credential verifies"
+                );
+                clear_root_key_env();
+            });
+        });
+    }
+
+    /// `register_agent_into` with NO root key configured is a hard error
+    /// (there is no way to derive a secret both sides can verify), and an
+    /// empty jobset id is rejected.
+    #[test]
+    fn register_agent_into_requires_root_key_and_nonempty_id() {
+        with_env_guard(|| {
+            with_isolated_registry(|| {
+                std::env::remove_var(JOBSET_ID_ENV);
+                clear_root_key_env();
+                init_global_jobsets(&tempfile::tempdir().unwrap().path().join("state")).unwrap();
+
+                let err = register_agent_into("job-into-3", "js-caller").unwrap_err();
+                assert!(
+                    err.contains("no jobset root key configured"),
+                    "clear error without a root key: {err}"
+                );
+                assert!(global_registry().get("job-into-3").is_none());
+
+                let err = register_agent_into("job-into-4", "   ").unwrap_err();
+                assert!(
+                    err.contains("empty jobset id"),
+                    "clear error for an empty jobset id: {err}"
+                );
+                assert!(global_registry().get("job-into-4").is_none());
+            });
+        });
+    }
+
+    /// A retried job keeps its ORIGINAL jobset even when a later start names a
+    /// different `--jobset`: a live job cannot change its credential at
+    /// runtime (that would lose the secret it was launched with).
+    #[test]
+    fn register_agent_into_ignores_replacement_for_existing_member() {
+        with_env_guard(|| {
+            with_isolated_registry(|| {
+                std::env::remove_var(JOBSET_ID_ENV);
+                let dir = tempfile::tempdir().unwrap();
+                with_root_key_file(dir.path(), 32);
+                reset_warned_no_root_key();
+                init_global_jobsets(&dir.path().join("state")).unwrap();
+
+                let first = register_agent_into("job-into-5", "js-a").unwrap();
+                assert_eq!(first.jobset_id, "js-a");
+                let again = register_agent_into("job-into-5", "js-b").unwrap();
+                assert_eq!(again.jobset_id, "js-a", "existing membership is preserved");
+                assert_eq!(again.secret, first.secret);
                 clear_root_key_env();
             });
         });

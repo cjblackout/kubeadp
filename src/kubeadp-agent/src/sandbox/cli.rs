@@ -74,6 +74,19 @@ pub fn run_sandbox_probe(args: &[String]) {
     }
 }
 
+/// Dispatches `relay-inner` (the in-sandbox loopback relay, started by the
+/// init shim for `net: relay` policies).
+pub fn run_relay_inner(args: &[String]) {
+    let code = super::relay::relay_inner_main(args);
+    exit(code);
+}
+
+/// Dispatches `relay-connect` (the ssh ProxyCommand helper for `net: relay`).
+pub fn run_relay_connect(args: &[String]) {
+    let code = super::relay::relay_connect_main(args);
+    exit(code);
+}
+
 /// Dispatches `sandbox-exec` subcommand.
 ///
 /// Syntax:

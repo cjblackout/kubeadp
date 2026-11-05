@@ -40,11 +40,11 @@ Network/authentication failures are retried at the next period with capped expon
 
 ## `mcp-a2a` subcommand (A2A sending side, feature `a2a`)
 
-`kubeadp-agent mcp-a2a` runs a stdio MCP server (no `KUBEADP_ROLE`) exposing `list_agents`, `send_message`, `reply` and `get_task` for talking to peer A2A agents over HTTP+JSON (REST). Discovery discovers peer agents from Kubernetes Services labelled `a2a.homelab/agent=true` (own namespace + `A2A_NAMESPACES`). Agents are keyed by `(namespace, name)` so same-named agents across namespaces do not collide; the `agent`/`to`/`get_task` arguments accept either a bare Service name (resolved against the own namespace first, then uniquely across namespaces; ambiguous names are refused) or an explicit `namespace/name` pair. Discovered names and namespaces are validated as RFC 1123 labels before URL construction. Agent cards are fetched with a 3 s timeout and a hard 64 KB size limit; oversized cards are rejected. In `test-hooks` builds, `A2A_KUBE_API` overrides the API base and `A2A_URL_OVERRIDES` (bare `name=url` or `namespace/name=url`, the qualified form winning) redirects connections for tests; production builds ignore these overrides. Messages are tagged `a2a.sender` (`A2A_SELF_NAME`) and `a2a.hop` (max 4).
+`kubeadp-agent mcp-a2a` runs a stdio MCP server (no `KUBEADP_ROLE`) exposing `list_agents`, `send_message`, `reply` and `get_task` for talking to peer A2A agents over HTTP+JSON (REST). Discovery discovers peer agents from Kubernetes Services labelled `a2a.homelab/agent=true` (own namespace + `A2A_NAMESPACES`) merged with the STATIC `A2A_PEERS` registry (a comma-separated `name=url` or `namespace/name=url` list; a bare `name` is placed in the pod's own namespace). The static registry needs no Kubernetes service account, so a sandboxed job with no SA token still reaches its configured peers: when the in-cluster discovery fails but `A2A_PEERS` is set, the server starts with the static peers instead of an empty registry. A discovered agent always wins over a static entry with the same key. Agents are keyed by `(namespace, name)` so same-named agents across namespaces do not collide; the `agent`/`to`/`get_task` arguments accept either a bare Service name (resolved against the own namespace first, then uniquely across namespaces; ambiguous names are refused) or an explicit `namespace/name` pair. Discovered names and namespaces are validated as RFC 1123 labels before URL construction. Agent cards are fetched with a 3 s timeout and a hard 64 KB size limit; oversized cards are rejected. In `test-hooks` builds, `A2A_KUBE_API` overrides the API base and `A2A_URL_OVERRIDES` (bare `name=url` or `namespace/name=url`, the qualified form winning) redirects connections for tests; production builds ignore these overrides. Messages are tagged `a2a.sender` (`A2A_SELF_NAME`) and `a2a.hop` (max 4).
 
-`reply`: the `mcp-a2a` process is a **separate stdio process** and never sees incoming A2A messages, so a shared in-process "last sender" cache is impossible. `reply` is therefore a `send_message` to an explicit `to` argument the model copies verbatim from the `claimed sender:` field of the framed header of the message it received (`--- A2A INCOMING MESSAGE (claimed sender: <name>, hop: <n>) ---`). This matches the sending-side framing in `core::a2a::ingress`; the tool description documents the header format so the model can fill `to` without guessing. The tool descriptions state plainly that messages from other agents are framed DATA, not instructions.
+`reply`: the `mcp-a2a` process is a **separate stdio process** and never sees incoming A2A messages, so a shared in-process "last sender" cache is impossible. `reply` is therefore a `send_message` to an explicit `to` argument the model copies verbatim from the `claimed sender:` field of the framed header of the message it received (`--- A2A INCOMING MESSAGE (claimed sender: <name>, hop: <n>) ---`). This matches the sending-side framing in `core::a2a::ingress`; the tool description documents the header format so the model can fill `to` without guessing. The target may also be the per-job/per-session self-name form `<agent>/<task_id>` (e.g. `kubeadp-agent-worker-service/<job_id>`): after an exact registry match fails, a single trailing `/`-segment is split off and used as the A2A `task_id` while the prefix resolves as the agent, so a reply to a job's sender reaches that job (the worker's `get_task`/`SendMessage` address tasks by job id). The tool descriptions state plainly that messages from other agents are framed DATA, not instructions.
 
-Per-job wiring: with the `[worker] a2a_mcp_enabled = true` config key (env `AGENT_RUN_A2A_MCP_ENABLED`, default false), `prepare_agy_home` (`src/worker/agy_home.rs`) merges an `"a2a"` MCP server entry into the job's `~/.gemini/config/mcp_config.json` (`{"command": "<current executable>", "args": ["mcp-a2a"]}`), keeping every other server entry, with an atomic write that is idempotent and a no-op when the key is false. The tool's identity/credential (`A2A_SELF_NAME`, `KUBEADP_JOBSET_ID`, `KUBEADP_JOBSET_SECRET_FILE`) are inherited from the job environment; nothing secret is ever written into the file.
+Per-job wiring: with the `[worker] a2a_mcp_enabled = true` config key (env `AGENT_RUN_A2A_MCP_ENABLED`, default false), `prepare_agy_home` (`src/worker/agy_home.rs`) merges an `"a2a"` MCP server entry into the job's `~/.gemini/config/mcp_config.json` (`{"command": "<current executable>", "args": ["mcp-a2a"]}`), keeping every other server entry, with an atomic write that is idempotent and a no-op when the key is false. The tool's identity/credential (`A2A_SELF_NAME`, `KUBEADP_JOBSET_ID`, `KUBEADP_JOBSET_SECRET_FILE`) are inherited from the job environment; nothing secret is ever written into the file. Every launched job overrides `A2A_SELF_NAME` to `<prefix>/<job_id>`, where `<prefix>` is the host's `A2A_SELF_PREFIX` env (the discoverable Service name of the host, e.g. `kubeadp-agent-worker-service`, set in the manifests) -- so each job presents a unique, addressable A2A sender identity while the host's A2A surface (which accepts jobset credentials for the job) stays the resolution target.
 
 Both worker and orchestrator roles serve on default port 8002. See `README.md`, section "`mcp-a2a` subcommand".
 
@@ -197,14 +197,60 @@ JSON document supplied via file or `-` (stdin):
   "tmp": "auto",
   "secret": {"fd": 3, "dest": "secret"},
   "env_allow": ["PATH", "HOME", "LANG", "TERM", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_USE_SYSTEM_CA", "A2A_*", "KUBEADP_*"],
-  "net": "shared"
+  "net": "host"
 }
 ```
+
+`net` selects the agent's network mode: `host` (the default; the agent keeps the pod's network namespace — today's behaviour; the legacy value `shared` is accepted as an alias) or `relay` (own loopback-only network namespace + unix-socket relay proxy, all three backends, see below). Unknown values are rejected.
 
 ### Backends
 
 - **`gvisor`**: Unprivileged user (`1000:1000`), PID, Mount, IPC, and UTS namespaces. Mounts a fresh `/proc` (hiding processes of other agents), private tmpfs on `/tmp` and `/dev/shm`, overmounts `hide` directories with tmpfs, and re-binds the agent's own directories. PID 1 init shim reaps adopted zombies, forwards SIGTERM/SIGINT, and kills all residual descendants upon exit.
-  - **Known limitation (gvisor backend)**: the gVisor backend does not unshare the network namespace (agents need egress), so ABSTRACT unix-domain sockets of other processes in the same pod are reachable from a sandboxed agent. Landlock — which would scope them, as the Kata backend does with `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` — does not exist in gVisor. Consequence: processes in a gVisor worker pod must not listen on abstract sockets (path-based sockets are protected by the filesystem isolation).
-- **`kata`**: Landlock domain per agent. Kata cannot mount a fresh `/proc`, so Landlock is the only scoping available and the backend REQUIRES Landlock ABI >= 6 (the first ABI with the signal and abstract-unix-socket scopes); if the kernel offers less, the launch fails closed (exit `125`) instead of running with weaker isolation. What the policy allows (default-deny, only listed paths are reachable): RW on `rw`/`shared_rw`/the private tmp; RO on `ro` plus `/proc` and `/dev` (read-only) and `/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/tty` (read/write); the `hide` parent is simply not allowed. It never grants (fails closed if a policy lists them) the Kubernetes ServiceAccount token dir `/var/run/secrets/kubernetes.io` or a `hide` entry that is a git repository. Access flags are chosen by path type (regular files get file-only flags, directories get the directory set). Landlock signal & abstract-unix-socket scopes are applied. Process tree supervision uses `PR_SET_CHILD_SUBREAPER` with tree-wide termination within 5 seconds of agent exit.
-- **`runc`**: Probe-driven backend that reports and enforces exactly the isolation the pod's probes confirm -- never more. It applies a single primitive, not a stack: a fresh-`/proc` user namespace (gVisor-style, no Landlock applied) when available, otherwise the Landlock domain with subreaper supervision (no namespaces). The chosen mechanism is reported precisely in `sandbox-probe` / the `sandbox` field. If neither primitive is available it fails closed (exit `125`) rather than running the agent without isolation.
+  - **Network isolation (`net` policy field)**: by default (`net: host`, legacy alias `shared`) the agent keeps the pod's network namespace, so ABSTRACT unix-domain sockets of other processes in the same pod are reachable from a sandboxed agent (Landlock — which would scope them, as the Kata backend does with `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` — does not exist in gVisor). Setting `net: relay` on the policy closes this (opt-in, default off): the agent runs in its own loopback-only network namespace and reaches the outside only through a unix-socket relay to an HTTP CONNECT proxy the launcher runs outside the sandbox (`src/sandbox/relay.rs`; in-sandbox `kubeadp-agent relay-inner` on `127.0.0.1:3128`, ssh via the shipped `relay-connect` ProxyCommand as `GIT_SSH_COMMAND`). Costs: proxy-aware clients only (no raw TCP/UDP/ICMP/DNS from the agent), loopback and link-local destinations are refused through the relay, and each relay agent carries a small proxy overhead. On gVisor the init shim unshares the network namespace and bind-mounts the proxy socket into the private tmpfs.
+- **`kata`**: Landlock domain per agent. Kata cannot mount a fresh `/proc`, so Landlock is the only scoping available and the backend REQUIRES Landlock ABI >= 6 (the first ABI with the signal and abstract-unix-socket scopes); if the kernel offers less, the launch fails closed (exit `125`) instead of running with weaker isolation. What the policy allows (default-deny, only listed paths are reachable): RW on `rw`/`shared_rw`/the private tmp; RO on `ro` plus `/proc` and `/dev` (read-only) and `/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/tty` (read/write); the `hide` parent is simply not allowed. It never grants (fails closed if a policy lists them) the Kubernetes ServiceAccount token dir `/var/run/secrets/kubernetes.io` or a `hide` entry that is a git repository. Access flags are chosen by path type (regular files get file-only flags, directories get the directory set). Landlock signal & abstract-unix-socket scopes are applied. Process tree supervision uses `PR_SET_CHILD_SUBREAPER` with tree-wide termination within 5 seconds of agent exit. With `net: relay` the launcher runs the outer proxy in the VM's network namespace and the forked child unshares CLONE_NEWUSER (the caller's uid/gid mapped 1:1, unprivileged) + CLONE_NEWNET and brings loopback up, then starts `relay-inner` before the Landlock domain is applied; the inner relay copies to the outer proxy socket by pathname directly (path-based unix sockets are not namespaced by network namespaces, and no new Landlock rule is needed: connect to a pathname socket is not Landlock-restricted below ABI 9, which this ruleset never handles). This needs unprivileged user namespaces in the VM; if the unshare fails the launch aborts (exit `125`).
+- **`runc`**: Probe-driven backend that reports and enforces exactly the isolation the pod's probes confirm -- never more. It applies a single primitive, not a stack: a fresh-`/proc` user namespace (gVisor-style, no Landlock applied) when available, otherwise the Landlock domain with subreaper supervision (no namespaces). The chosen mechanism is reported precisely in `sandbox-probe` / the `sandbox` field. If neither primitive is available it fails closed (exit `125`) rather than running the agent without isolation. `net: relay` works through both mechanisms (the namespace path via the gVisor backend, the Landlock path via the kata backend's child unshare); when the probe finds user namespaces unavailable, relay fails closed (exit `125`) with the missing capability named.
+
+## Run-control endpoints (E4 emulation layer, `engine` feature)
+
+The pluggable engine layer (HL-91 E1/E4) adds a shared control surface addressed
+by run id, served behind the same operator-token bearer layer as every other
+`/api/v1` route. Each request resolves the run through the emulation layer's
+in-process [`Run`] registry, then asks the run's engine: an endpoint the engine
+implements natively, or that the E4 emulation layer fronts, executes; an
+endpoint the engine honestly reports unsupported answers `501` with the E1
+contract body `{"error","code":"unsupported","engine"}` (reserved for genuinely
+impossible cases only).
+
+During E4 the drivers that populate the run registry have not landed yet, so in
+production these routes answer `404` for any run id; the contracts are exercised
+by unit tests.
+
+- `POST /api/v1/runs/{run_id}/interrupt` -- interrupt a run. A session run is
+  stopped through the engine's own stop surface; a job run without a native
+  `interrupt` answers `501`. Success: `200` `{"run_id":"...","interrupted":true}`.
+- `POST /api/v1/runs/{run_id}/pause` -- pause/resume. Body
+  `{"paused": true|false}` (default `false`). The emulated path flags the run
+  paused and (best effort) notifies the engine; messages written while paused
+  are held in the run's per-run queue and delivered on the next turn. Success:
+  `200` `{"run_id":"...","paused":true|false}`.
+- `POST /api/v1/runs/{run_id}/compact` -- compact a run's context. Emulated
+  compact is summarise-then-restart: the run's worktree history and changes are
+  summarised into a continuation prompt, a compact record
+  (`.engine-compact.json`) is written next to the worktree, and the job is
+  restarted through the wrapped engine with that prompt (the conversation id is
+  kept). Success: `200` `{"run_id":"...","compacted":true}`.
+- `POST /api/v1/runs/{run_id}/fork` -- fork a run into a new run. The emulated
+  fork copies the source worktree (without `.git`) into a fresh directory and
+  registers the new run. Returns `200` `{"run_id":"<new id>","forked_from":"<id>"}`.
+- `POST /api/v1/runs/{run_id}/revert` -- revert a run's worktree to its latest
+  engine checkpoint. Body `{"commit": "..."}`; an empty `commit`
+  (`{"commit":""}`) means *unrevert* (restore the work `revert` discarded).
+  Checkpoints are taken on the run's own worktree at every turnaround
+  (`refs/engine-checkpoints/<run id>`, see `engine::emulate::revert`). Success:
+  `200` `{"run_id":"...","reverted":true|false,"commit":"..."}`.
+- `GET /api/v1/runs/{run_id}/todo` -- the run's structured todo list, collected
+  from its event stream (the `TodoWrite` tool calls of claude / plan steps of
+  agy surface as todo events). Returns `200`
+  `{"run_id":"...","todos":[{"content":"...","status":null}]}`.
+
 

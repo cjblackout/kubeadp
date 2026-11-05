@@ -56,6 +56,12 @@
 #   FAKE_RATELIMIT_TEXT  like the base SUCCESS, but in stream-json mode the
 #                    text_delta of the agent_response step_update line contains
 #                    the words "we discuss the rate limit policy"
+#   FAKE_DELIVER_QUEUE  on a resumed invocation, read the run's per-run message
+#                    queue file `.engine-message-queue` (E4 emulation; one
+#                    escaped line per message, in the run worktree) and fold
+#                    the delivered messages into the SUCCESS response
+#                    ("DELIVERED:<text>") so a test can assert the queued text
+#                    arrived in the resume turn's prompt
 #
 # Direct (non job-runner) invocations, matching the engine's own calls:
 #   <fake> models                         model list for `agent-run models`
@@ -358,6 +364,20 @@ done
 END_TIME=$(date +%s) || END_TIME="$START_TIME"
 DURATION=$(( END_TIME - START_TIME ))
 
+# --- FAKE_DELIVER_QUEUE: deliver the engine's per-run message queue ----------
+# The E4 emulation layer keeps mid-run messages in a per-run queue file
+# `.engine-message-queue` in the run worktree (one escaped line per message)
+# and drains it into the resume prompt. On a resumed invocation (cwd is the
+# worktree), read that file and fold the delivered messages into the SUCCESS
+# response so the black-box test can assert the queued text arrived.
+FAKE_DELIVERED_QUEUE=""
+if [[ "$PROMPT" == *FAKE_DELIVER_QUEUE* ]]; then
+  if [ -f ".engine-message-queue" ]; then
+    FAKE_DELIVERED_QUEUE=$(tr '\n' ' ' < .engine-message-queue 2>/dev/null || true)
+    FAKE_DELIVERED_QUEUE=$(printf '%s' "$FAKE_DELIVERED_QUEUE" | sed 's/[[:space:]]*$//')
+  fi
+fi
+
 # --- worktree side effects (cwd is the job worktree) ------------------------
 if [[ "$PROMPT" == *"FAKE_WRITE="* ]]; then
   rest="$PROMPT"
@@ -427,6 +447,13 @@ fi
 if [[ "$PROMPT" == *FAKE_RATELIMIT_TEXT* ]]; then
   RESPONSE_DELTA='we discuss the rate limit policy'
   emit_final "{\"conversation_id\":\"$(uuid)\",\"status\":\"SUCCESS\",\"response\":\"FAKE-DONE\",\"duration_seconds\":$DURATION,\"num_turns\":1,\"usage\":$(json_usage 1 1)}"
+  exit 0
+fi
+
+# --- FAKE_DELIVER_QUEUE: the resume turn reports what the queue delivered -----
+if [[ "$PROMPT" == *FAKE_DELIVER_QUEUE* ]]; then
+  RESPONSE_DELTA="delivered queue: $FAKE_DELIVERED_QUEUE"
+  emit_final "{\"conversation_id\":\"$(uuid)\",\"status\":\"SUCCESS\",\"response\":\"DELIVERED:$FAKE_DELIVERED_QUEUE\",\"duration_seconds\":$DURATION,\"num_turns\":1,\"usage\":$(json_usage 1 1)}"
   exit 0
 fi
 

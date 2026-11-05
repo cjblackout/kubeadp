@@ -38,6 +38,7 @@
 //! caller's [`AuthVerifier`] (each `RequestHandler` method receives the
 //! request's `ServiceParams`); the agent card stays public.
 
+mod auth;
 mod backend;
 mod card;
 mod handler;
@@ -47,8 +48,12 @@ pub mod ingress;
 #[cfg(feature = "a2a")]
 pub mod client;
 
+pub use auth::A2aAuthLayer;
 pub use backend::{map_job_status, A2AError, A2aTask, TaskBackend};
-pub use card::{A2aModel, WELL_KNOWN_AGENT_CARD_PATH};
+pub use card::{
+    advertised_url, pod_name, role_description, role_skills, A2aModel, A2A_URL_ENV,
+    ROLE_ORCHESTRATOR, ROLE_WORKER, WELL_KNOWN_AGENT_CARD_PATH,
+};
 pub use handler::{a2a_rate_limited, MessageSink, ServerRequestHandler};
 
 use std::sync::Arc;
@@ -83,9 +88,13 @@ pub fn a2a_router(
     sink: Option<Arc<dyn MessageSink>>,
     auth: Option<AuthVerifier>,
 ) -> Router {
-    let handler = Arc::new(ServerRequestHandler::new(backend, sink, auth));
+    let handler = Arc::new(ServerRequestHandler::new(backend, sink));
 
-    let rest = rest_router(handler);
+    // Authentication is applied as ONE router-level layer on the SDK REST
+    // sub-router, so it runs for every A2A route before the SDK parses or
+    // validates the body; the public card router is merged separately and is
+    // never gated.
+    let rest = rest_router(handler).layer(A2aAuthLayer::new(auth));
 
     let card_router = agent_card_router(Arc::new(StaticAgentCard::new(model.to_agent_card())));
 
@@ -169,11 +178,12 @@ pub fn a2a_router_with_jobset(
     auth: Option<AuthVerifier>,
     jobset: Option<JobsetCred>,
 ) -> Router {
-    let handler = Arc::new(ServerRequestHandler::with_jobset(
-        backend, sink, auth, jobset,
-    ));
+    let handler = Arc::new(ServerRequestHandler::new(backend, sink));
 
-    let rest = rest_router(handler);
+    // Authentication is ONE router-level layer on the SDK REST sub-router
+    // (run before the body is parsed); the per-jobset credential and the
+    // operator/bearer verifier combine in the layer's target-aware check.
+    let rest = rest_router(handler).layer(A2aAuthLayer::with_jobset(auth, jobset.as_ref()));
 
     let card_router = agent_card_router(Arc::new(StaticAgentCard::new(model.to_agent_card())));
 
@@ -188,6 +198,60 @@ pub fn a2a_router_with_jobset(
 /// `a2a::constant_time_eq` call site is unchanged.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     crate::core::crypto::ct_eq(a, b)
+}
+
+/// Test-only helper: mutate the process environment (which the card helpers
+/// read) under a process-wide lock so env-touching unit tests never race
+/// each other (cargo runs unit tests on parallel threads). Sets the given
+/// (var, value) pairs -- clearing any of `VARS` not listed first -- and
+/// restores the previous values on drop (while still holding the lock).
+#[cfg(test)]
+pub(crate) mod testenv {
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const VARS: &[&str] = &[
+        "KUBEADP_A2A_NAME",
+        "A2A_SELF_NAME",
+        "POD_NAME",
+        "HOSTNAME",
+        "KUBEADP_A2A_URL",
+    ];
+
+    pub struct Guard {
+        _lock: MutexGuard<'static, ()>,
+        prior: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl Guard {
+        pub fn set(pairs: &[(&str, Option<&str>)]) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prior = VARS
+                .iter()
+                .map(|var| (*var, std::env::var(*var).ok()))
+                .collect::<Vec<_>>();
+            for var in VARS {
+                std::env::remove_var(var);
+            }
+            for (var, value) in pairs {
+                if let Some(v) = value {
+                    std::env::set_var(var, v);
+                }
+            }
+            Self { _lock: lock, prior }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            for (var, value) in self.prior.drain(..) {
+                match value {
+                    Some(v) => std::env::set_var(var, v),
+                    None => std::env::remove_var(var),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -339,7 +403,7 @@ mod jobset_router_tests {
             ))
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -360,7 +424,7 @@ mod jobset_router_tests {
             ))
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -378,7 +442,7 @@ mod jobset_router_tests {
             ))
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -402,7 +466,7 @@ mod jobset_router_tests {
         let cred = cred_with_members(&[("t1", "js-1", "secret-1")]);
         let app = a2a_router_with_jobset(model(), backend, None, Some(bearer), Some(cred));
         let res = app.oneshot(get_task_req("/tasks/t1", &[])).await.unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -438,7 +502,7 @@ mod jobset_router_tests {
             ))
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -486,7 +550,7 @@ mod jobset_router_tests {
 
         // Neither valid -> refused.
         let res = app.oneshot(get_task_req("/tasks/t1", &[])).await.unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

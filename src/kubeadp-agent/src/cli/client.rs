@@ -1607,6 +1607,12 @@ pub(crate) fn start_body(args: &StartArgs, caller_cwd: &Path) -> Result<Value> {
     if let Some(v) = &args.max_runtime {
         obj.insert("max_runtime".to_string(), json!(v));
     }
+    if let Some(v) = &args.jobset_id {
+        obj.insert("jobset_id".to_string(), json!(v));
+    }
+    if let Some(v) = &args.engine {
+        obj.insert("engine".to_string(), json!(v));
+    }
     if let Some(v) = &args.from_worktree {
         obj.insert(
             "from_worktree".to_string(),
@@ -1828,6 +1834,8 @@ mod tests {
         args.hindsight_bank = Some("bank-proj".to_string());
         args.hindsight_query = Some("short query".to_string());
         args.proxy = Some("http://proxy:8080".to_string());
+        args.jobset_id = Some("js-caller".to_string());
+        args.engine = Some("agy".to_string());
 
         let body = start_body(&args, std::path::Path::new("/tmp")).expect("start body");
         assert_eq!(
@@ -1846,7 +1854,9 @@ mod tests {
                 "hindsight_bank": "bank-proj",
                 "hindsight_query": "short query",
                 "proxy": "http://proxy:8080",
+                "jobset_id": "js-caller",
                 "from_worktree": "/wt/one",
+                "engine": "agy",
             })
         );
 
@@ -1859,6 +1869,8 @@ mod tests {
         assert!(base_body.get("hindsight_bank").is_none());
         assert!(base_body.get("hindsight_query").is_none());
         assert!(base_body.get("proxy").is_none());
+        assert!(base_body.get("jobset_id").is_none());
+        assert!(base_body.get("engine").is_none());
 
         // An explicit `off` is serialized as the string "off".
         let mut off_args = start_args();

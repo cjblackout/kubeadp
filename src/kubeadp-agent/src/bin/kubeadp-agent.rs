@@ -11,6 +11,11 @@
 //! replacement ([`kubeadp_agent::core::reposync`]) for all configured
 //! repositories; it does not require `KUBEADP_ROLE`.
 //!
+//! The `relay-inner` / `relay-connect` subcommands (first argument) run the
+//! in-sandbox loopback relay and the ssh ProxyCommand helper for the opt-in
+//! `net: relay` sandbox policy (see [`kubeadp_agent::sandbox::relay`]); they
+//! do not require `KUBEADP_ROLE`.
+//!
 //! `KUBEADP_ROLE` unset or set to any other value exits with code 2 and a
 //! clear message. Each role runs exactly the code that the corresponding old
 //! crate's `main()` ran, honouring the same env vars and CLI.
@@ -46,6 +51,16 @@ fn main() {
         Some("sandbox-probe") => {
             let args: Vec<String> = std::env::args().skip(2).collect();
             kubeadp_agent::sandbox::cli::run_sandbox_probe(&args);
+            return;
+        }
+        Some("relay-inner") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            kubeadp_agent::sandbox::cli::run_relay_inner(&args);
+            return;
+        }
+        Some("relay-connect") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            kubeadp_agent::sandbox::cli::run_relay_connect(&args);
             return;
         }
         Some("mcp-a2a") => {

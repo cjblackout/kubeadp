@@ -586,12 +586,38 @@ pub fn run(config: &Config, args: &StartArgs) -> Result<CommandOutput> {
 
     // 10. Launch detached in background
     // Register the new agent in the process-wide jobset registry before the
-    // launch: the job joins the host's jobset (if the host is a member) or
-    // gets a fresh one (an operator request). The monitor's `build_command`
-    // reads this entry to wire the sandbox `secret` channel + jobset env, and
-    // the A2A surface reads it to accept the job's credential. Dropped on
-    // every end path (see `jobset::drop_agent`).
-    crate::core::jobset::register_agent(&meta.job_id);
+    // launch: the job joins the host's jobset (if the host is a member), or
+    // joins the caller's explicitly chosen jobset (`--jobset <id>`, which
+    // derives the secret from the shared root key), or gets a fresh one (an
+    // operator request). The monitor's `build_command` reads this entry to
+    // wire the sandbox `secret` channel + jobset env, and the A2A surface
+    // reads it to accept the job's credential. Dropped on every end path
+    // (see `jobset::drop_agent`).
+    let register = || -> anyhow::Result<()> {
+        match &args.jobset_id {
+            Some(jobset_id) => crate::core::jobset::register_agent_into(&meta.job_id, jobset_id)
+                .map(|_| ())
+                .map_err(anyhow::Error::msg),
+            None => {
+                crate::core::jobset::register_agent(&meta.job_id);
+                Ok(())
+            }
+        }
+    };
+    if let Err(e) = register() {
+        // The row and worktree this start created before the registration
+        // must not survive a failed registration (external worktrees are not
+        // ours to remove).
+        if !is_external_worktree {
+            cleanup_failed_start_worktree(
+                &crate::core::repos::project_git_repo(config, &args.project),
+                &worktree_path,
+                &meta.branch,
+            );
+        }
+        discard_new_job_row(config, &job_id);
+        return Err(e).context("Failed to register the job's jobset membership");
+    }
 
     let worktree_for_cleanup = worktree_path.clone();
     let branch_for_cleanup = meta.branch.clone();

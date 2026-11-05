@@ -18,10 +18,13 @@
 //! `SendMessage` to a caller-supplied [`MessageSink`] (the orchestrator
 //! delivers into the session PTY as a bracketed paste).
 //!
-//! Each method first runs the optional bearer verifier (the SDK's
-//! `RequestAuthorizer` equivalent), then delegates to the backend; the card
-//! route is handled separately by the SDK's public `agent_card_router` and is
-//! never authorized.
+//! Authentication is enforced by the router-level
+//! [`super::auth::A2aAuthLayer`] (installed on the SDK REST sub-router by
+//! [`super::a2a_router`] / [`super::a2a_router_with_jobset`]): it runs BEFORE
+//! the SDK parses or validates the body, answers a failed check with HTTP `401`
+//! (`UNAUTHENTICATED`), and is never applied to the public agent card route
+//! (served separately by the SDK's `agent_card_router`). The methods below
+//! therefore assume an already-authorized request and delegate to the backend.
 //!
 //! `SubscribeToTask`, the push-notification config methods and
 //! `GetExtendedAgentCard` answer the SDK's dedicated errors: the REST binding
@@ -44,7 +47,6 @@ use futures::stream::BoxStream;
 use super::backend::{A2AError as CrateError, TaskBackend};
 #[cfg(feature = "a2a")]
 use super::ingress::process_ingress;
-use crate::core::a2a::AuthVerifier;
 
 /// Converts a crate [`CrateError`] into the SDK's A2A error.
 fn to_sdk_error(e: CrateError) -> A2AError {
@@ -95,144 +97,22 @@ pub trait MessageSink: Send + Sync {
 
 /// A2A request handler directly over a [`TaskBackend`] and an optional
 /// [`MessageSink`].
+///
+/// Authentication (operator/bearer + per-jobset credential) is enforced by the
+/// router-level [`super::auth::A2aAuthLayer`] installed by
+/// [`super::a2a_router`] / [`super::a2a_router_with_jobset`] on the SDK REST
+/// sub-router. The layer runs before the SDK parses or validates the request
+/// body and answers a failed check with HTTP `401` (`UNAUTHENTICATED`). The
+/// handler methods below therefore assume the request is already authorized
+/// and no longer re-check credentials.
 pub struct ServerRequestHandler {
     backend: Arc<dyn TaskBackend>,
     sink: Option<Arc<dyn MessageSink>>,
-    verifier: Option<AuthVerifier>,
-    jobset: Option<super::JobsetCred>,
 }
 
 impl ServerRequestHandler {
-    pub fn new(
-        backend: Arc<dyn TaskBackend>,
-        sink: Option<Arc<dyn MessageSink>>,
-        verifier: Option<AuthVerifier>,
-    ) -> Self {
-        Self::with_jobset(backend, sink, verifier, None)
-    }
-
-    /// Builds the handler with both the operator/bearer verifier AND the
-    /// per-jobset credential context. The jobset check is target-aware: a
-    /// request that presents a jobset credential is verified against the
-    /// *target* task/agent of the request (see [`Self::authorize`]), never
-    /// against this process's own identity.
-    pub fn with_jobset(
-        backend: Arc<dyn TaskBackend>,
-        sink: Option<Arc<dyn MessageSink>>,
-        verifier: Option<AuthVerifier>,
-        jobset: Option<super::JobsetCred>,
-    ) -> Self {
-        Self {
-            backend,
-            sink,
-            verifier,
-            jobset,
-        }
-    }
-
-    /// Reads one header value (case-insensitive) from the SDK's
-    /// `ServiceParams` (header names are lowercased there). Multiple values
-    /// yield the first.
-    fn get_header(params: &ServiceParams, name: &str) -> Option<String> {
-        params
-            .get(&name.to_ascii_lowercase())
-            .and_then(|values| values.first())
-            .cloned()
-    }
-
-    /// The presented jobset credential header pair, if BOTH the id and the
-    /// secret headers are present and non-empty.
-    fn presented_jobset_credential(params: &ServiceParams) -> Option<()> {
-        let id = Self::get_header(params, crate::core::jobset::JOBSET_ID_HEADER)
-            .filter(|s| !s.is_empty());
-        let secret = Self::get_header(params, crate::core::jobset::JOBSET_SECRET_HEADER)
-            .filter(|s| !s.is_empty());
-        match (id, secret) {
-            (Some(_), Some(_)) => Some(()),
-            _ => None,
-        }
-    }
-
-    /// Authorizes the request against `target_agent_id` -- the addressed
-    /// task/agent of THIS request (the `send_message` recipient, or the task
-    /// id on `/tasks/{id}`). `None` is used for target-less operations
-    /// (e.g. `list_tasks` without a context), where the presented jobset
-    /// credential is accepted when the host serves a member of that jobset.
-    ///
-    /// The rules:
-    ///
-    /// - a request that PRESENTS a jobset credential header pair is verified
-    ///   against the TARGET's registered jobset (constant-time). A valid
-    ///   credential for the target's own jobset is accepted; a credential for
-    ///   ANY other jobset, or a target with no registered membership, is
-    ///   rejected with NO bearer fallback.
-    /// - a request that presents NO jobset credential is accepted only when
-    ///   the operator/bearer verifier accepts it (or no verifier is
-    ///   configured -- the network-policy-only model).
-    fn authorize(
-        &self,
-        params: &ServiceParams,
-        target_agent_id: Option<&str>,
-    ) -> Result<(), A2AError> {
-        if Self::presented_jobset_credential(params).is_some() {
-            let getter: crate::core::jobset::HeaderGetter = {
-                let params = params.clone();
-                Arc::new(move |name: &str| {
-                    params
-                        .get(&name.to_ascii_lowercase())
-                        .and_then(|values| values.first())
-                        .cloned()
-                })
-            };
-            let Some(jobset) = &self.jobset else {
-                // No jobset context on this router: a presented jobset
-                // credential cannot be verified, so it is refused (never
-                // downgraded to the operator token).
-                return Err(A2AError::invalid_request("authentication required"));
-            };
-            let ok = match target_agent_id {
-                // Target resolved: the presented id+secret must belong to the
-                // TARGET's jobset.
-                Some(target) => {
-                    crate::core::jobset::verify_jobset_credential(&jobset.registry, target, &getter)
-                }
-                // No single target (list_tasks without a context): the
-                // jobset credential is accepted when the host serves a
-                // member of the presented jobset.
-                None => jobset.registry.has_member_of(
-                    &Self::get_header(params, crate::core::jobset::JOBSET_ID_HEADER)
-                        .unwrap_or_default(),
-                ),
-            };
-            if ok {
-                return Ok(());
-            }
-            return Err(A2AError::invalid_request("authentication required"));
-        }
-        // No jobset credential presented: the operator/bearer gate decides.
-        let Some(verifier) = &self.verifier else {
-            return Ok(());
-        };
-        // The SDK's ServiceParams is the request's header map keyed
-        // lowercased; reconstruct a HeaderMap so the caller's verifier (built
-        // for axum) keeps working unmodified.
-        let mut headers = axum::http::HeaderMap::new();
-        for (name, values) in params {
-            let Ok(header_name) = axum::http::header::HeaderName::from_bytes(name.as_bytes())
-            else {
-                continue;
-            };
-            for value in values {
-                if let Ok(header_value) = axum::http::header::HeaderValue::from_str(value) {
-                    headers.append(header_name.clone(), header_value);
-                }
-            }
-        }
-        if verifier(&headers) {
-            Ok(())
-        } else {
-            Err(A2AError::invalid_request("authentication required"))
-        }
+    pub fn new(backend: Arc<dyn TaskBackend>, sink: Option<Arc<dyn MessageSink>>) -> Self {
+        Self { backend, sink }
     }
 }
 
@@ -258,7 +138,7 @@ async fn task_from_backend_blocking(
 impl RequestHandler for ServerRequestHandler {
     async fn send_message(
         &self,
-        params: &ServiceParams,
+        _params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
         // This role either has an interactive input channel (successful
@@ -266,7 +146,6 @@ impl RequestHandler for ServerRequestHandler {
         // independent of the message shape, so check capability first and
         // answer the unsupported error BEFORE any addressing/shape validation.
         if self.sink.is_none() {
-            self.authorize(params, None)?;
             return Err(A2AError::unsupported_operation(
                 "SendMessage is not supported by this agent role (no interactive input channel)"
                     .to_string(),
@@ -282,10 +161,6 @@ impl RequestHandler for ServerRequestHandler {
             .or(req.message.context_id.as_deref())
             .filter(|s| !s.is_empty())
             .ok_or_else(|| A2AError::invalid_params("message must address a task or context"))?;
-
-        // The A2A credential is verified against the send_message RECIPIENT
-        // (the task/session the message is addressed to).
-        self.authorize(params, Some(task_id))?;
 
         // Existence and state are validated up front so an unknown session or
         // job answers TaskNotFound, never a deliverer-specific error.
@@ -336,10 +211,9 @@ impl RequestHandler for ServerRequestHandler {
 
     async fn send_streaming_message(
         &self,
-        params: &ServiceParams,
+        _params: &ServiceParams,
         _req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        self.authorize(params, None)?;
         Err(A2AError::unsupported_operation(
             "SendStreamingMessage is not supported: this agent only serves the non-streaming binding",
         ))
@@ -347,24 +221,18 @@ impl RequestHandler for ServerRequestHandler {
 
     async fn get_task(
         &self,
-        params: &ServiceParams,
+        _params: &ServiceParams,
         req: GetTaskRequest,
     ) -> Result<Task, A2AError> {
-        // The A2A credential is verified against the addressed task.
-        self.authorize(params, Some(&req.id))?;
         let _ = req.history_length; // no history is served
         task_from_backend_blocking(self.backend.clone(), req.id).await
     }
 
     async fn list_tasks(
         &self,
-        params: &ServiceParams,
+        _params: &ServiceParams,
         req: ListTasksRequest,
     ) -> Result<ListTasksResponse, A2AError> {
-        // No single target: a presented jobset credential is accepted when the
-        // host serves a member of the presented jobset; otherwise the bearer
-        // gate applies.
-        self.authorize(params, req.context_id.as_deref())?;
         let backend = self.backend.clone();
         let context_id = req.context_id.clone();
         let status = req.status.clone();
@@ -424,11 +292,9 @@ impl RequestHandler for ServerRequestHandler {
 
     async fn cancel_task(
         &self,
-        params: &ServiceParams,
+        _params: &ServiceParams,
         req: CancelTaskRequest,
     ) -> Result<Task, A2AError> {
-        // The A2A credential is verified against the addressed task.
-        self.authorize(params, Some(&req.id))?;
         let backend = self.backend.clone();
         let task_id = req.id;
         tokio::task::spawn_blocking(move || {
@@ -443,10 +309,9 @@ impl RequestHandler for ServerRequestHandler {
 
     async fn subscribe_to_task(
         &self,
-        params: &ServiceParams,
+        _params: &ServiceParams,
         _req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        self.authorize(params, None)?;
         Err(A2AError::unsupported_operation(
             "SubscribeToTask is not supported by this agent",
         ))
@@ -454,46 +319,41 @@ impl RequestHandler for ServerRequestHandler {
 
     async fn create_push_config(
         &self,
-        params: &ServiceParams,
+        _params: &ServiceParams,
         _req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.authorize(params, None)?;
         Err(A2AError::push_notification_not_supported())
     }
 
     async fn get_push_config(
         &self,
-        params: &ServiceParams,
+        _params: &ServiceParams,
         _req: GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.authorize(params, None)?;
         Err(A2AError::push_notification_not_supported())
     }
 
     async fn list_push_configs(
         &self,
-        params: &ServiceParams,
+        _params: &ServiceParams,
         _req: ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-        self.authorize(params, None)?;
         Err(A2AError::push_notification_not_supported())
     }
 
     async fn delete_push_config(
         &self,
-        params: &ServiceParams,
+        _params: &ServiceParams,
         _req: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
-        self.authorize(params, None)?;
         Err(A2AError::push_notification_not_supported())
     }
 
     async fn get_extended_agent_card(
         &self,
-        params: &ServiceParams,
+        _params: &ServiceParams,
         _req: GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
-        self.authorize(params, None)?;
         Err(A2AError::extended_card_not_configured())
     }
 }

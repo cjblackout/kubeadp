@@ -17,6 +17,15 @@
 //!
 //! The two mechanisms are alternatives, not a stack: whichever one is selected
 //! is the ONLY extra isolation applied on top of the base container.
+//!
+//! Opt-in `net: relay`: the private network namespace is created through
+//! unprivileged user namespaces -- by the namespace mechanism (the gVisor
+//! backend unshares it itself, see [`super::backend_gvisor`]) or by the
+//! Landlock mechanism (the kata backend's child unshares
+//! CLONE_NEWUSER | CLONE_NEWNET, see [`super::backend_kata`]). Without user
+//! namespaces neither can create the namespace, so relay fails closed with
+//! the missing capability named. `net: host` (the default) and the legacy
+//! `shared` alias keep today's behaviour byte-for-byte.
 
 use super::backend_gvisor::execute_gvisor;
 use super::backend_kata::execute_kata;
@@ -84,9 +93,37 @@ pub fn execute_runc(
         )
     })?;
 
+    // `net: relay` needs the agent's private network namespace, created
+    // through unprivileged user namespaces (by either mechanism's delegate).
+    // When the probe found user namespaces unavailable, neither delegate can
+    // create the namespace, so the launch fails closed with the missing
+    // capability named instead of running with weaker network isolation.
+    if policy.net == "relay" {
+        runc_relay_gate(probe.user_namespace.ok)?;
+    }
+
     match mechanism {
         RuncMechanism::Namespaces => execute_gvisor(policy, cmd, args, env),
         RuncMechanism::Landlock => execute_kata(policy, cmd, args, env),
+    }
+}
+
+/// Pure gate for the runc backend's `net: relay` support. The agent's private
+/// network namespace is created through unprivileged user namespaces -- by the
+/// namespace mechanism (the gVisor delegate) or by the kata delegate's child
+/// unshare (CLONE_NEWUSER | CLONE_NEWNET). When user namespaces are
+/// unavailable, neither can create the namespace, so the launch fails closed
+/// with the missing capability named.
+pub fn runc_relay_gate(user_namespace_ok: bool) -> Result<(), String> {
+    if user_namespace_ok {
+        Ok(())
+    } else {
+        Err(
+            "net=relay requires unprivileged user namespaces (unshare(CLONE_NEWUSER)) to create \
+             the agent's private network namespace; the runc backend's probe reports user \
+             namespaces unavailable -- refusing to run with weaker network isolation"
+                .to_string(),
+        )
     }
 }
 
@@ -134,5 +171,43 @@ mod tests {
     fn test_runc_fails_closed_without_primitives() {
         // When neither primitive is available the backend refuses to run.
         assert!(runc_mechanism(0, false, false).is_none());
+    }
+
+    // ---- net: relay ----------------------------------------------------------
+    //
+    // The runc backend supports `net: relay` through its two mechanisms: the
+    // namespace mechanism delegates to the gVisor backend (which unshares the
+    // private network namespace itself, see `super::backend_gvisor`) and the
+    // Landlock mechanism delegates to the kata backend (whose child unshares
+    // CLONE_NEWUSER|CLONE_NEWNET, see `super::backend_kata`). These tests are
+    // hermetic: they pin the pure gate and the (net-mode-independent)
+    // mechanism selection; the end-to-end launch is not exercised (no real
+    // namespaces in unit tests).
+
+    #[test]
+    fn test_runc_relay_gate_requires_user_namespaces() {
+        // With user namespaces the relay namespace can be created (either
+        // mechanism's delegate handles it); without them the launch fails
+        // closed with the missing capability named.
+        assert_eq!(runc_relay_gate(true), Ok(()));
+        let err = runc_relay_gate(false).unwrap_err();
+        assert!(err.contains("net=relay"), "err: {err}");
+        assert!(err.contains("user namespaces"), "err: {err}");
+    }
+
+    #[test]
+    fn test_runc_relay_delegates_through_both_mechanisms() {
+        // The mechanism selection decides which delegate creates the private
+        // network namespace for `net: relay`; it is unchanged by the network
+        // mode (the same selection that routes host/shared, both of which
+        // keep today's behaviour byte-for-byte).
+        assert_eq!(
+            runc_mechanism(6, true, true),
+            Some(RuncMechanism::Namespaces)
+        );
+        assert_eq!(
+            runc_mechanism(6, false, false),
+            Some(RuncMechanism::Landlock)
+        );
     }
 }

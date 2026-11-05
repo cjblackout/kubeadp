@@ -73,7 +73,7 @@ fn test_model() -> A2aModel {
         name: "test-agent".to_string(),
         description: "A test agent".to_string(),
         version: "1.0.0".to_string(),
-        skills: vec!["proj-a".to_string(), "proj-b".to_string()],
+        skills: vec![],
         url: "http://localhost:8080".to_string(),
     }
 }
@@ -151,11 +151,10 @@ async fn card_is_served_without_auth_and_has_expected_content() {
     assert_eq!(value["version"], "1.0.0");
     // capabilities.streaming = true
     assert_eq!(value["capabilities"]["streaming"], true);
-    // skills = caller-passed project/agent names
+    // skills = the model's skill list (the test model carries none; the
+    // role-specific skill list is covered in core/a2a/card.rs tests).
     let skills = value["skills"].as_array().unwrap();
-    assert_eq!(skills.len(), 2);
-    assert_eq!(skills[0]["name"], "proj-a");
-    assert_eq!(skills[1]["name"], "proj-b");
+    assert_eq!(skills.len(), 0);
     // securitySchemes carries a bearer scheme (nested under the SDK's
     // httpAuthSecurityScheme discriminator, matching the A2A wire shape).
     assert_eq!(
@@ -183,6 +182,75 @@ async fn card_requires_no_token_even_when_auth_configured() {
 }
 
 // ---------------------------------------------------------------------------
+// Auth runs before body validation: unauthenticated requests answer 401 on
+// every protected route (even with an empty/invalid body), never the body's
+// own validation error.
+// ---------------------------------------------------------------------------
+
+fn unauth(uri: &str, method: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request")
+}
+
+async fn assert_unauthenticated(app: &Router, uri: &str, method: &str, body: &str) {
+    let res = app
+        .clone()
+        .oneshot(unauth(uri, method, body))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "{method} {uri} (body {body:?})"
+    );
+    assert_eq!(
+        res.headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer"),
+        "{method} {uri}"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+    assert_eq!(
+        value["error"]["status"], "UNAUTHENTICATED",
+        "{method} {uri}"
+    );
+}
+
+#[tokio::test]
+async fn unauthenticated_message_send_answers_401_not_body_validation() {
+    // A POST /message:send with an EMPTY body addresses no task/context; the
+    // OLD behaviour validated the body first and answered 400
+    // "message must address a task or context". Authentication must run first:
+    // an unauthenticated request answers 401 regardless of the body.
+    let backend: Arc<dyn TaskBackend> = FakeBackend::with(vec![]);
+    let app = test_router(backend, Some(verifier_ok()));
+    assert_unauthenticated(&app, "/message:send", "POST", "").await;
+    assert_unauthenticated(&app, "/message:send", "POST", "{}").await;
+}
+
+#[tokio::test]
+async fn unauthenticated_get_tasks_and_get_task_answer_401() {
+    let task = A2aTask {
+        id: "t1".to_string(),
+        context_id: Some("c1".to_string()),
+        state: TaskState::Working,
+        status_message: None,
+        error: None,
+        artifacts: None,
+    };
+    let backend: Arc<dyn TaskBackend> = FakeBackend::with(vec![task]);
+    let app = test_router(backend, Some(verifier_ok()));
+    assert_unauthenticated(&app, "/tasks", "GET", "").await;
+    assert_unauthenticated(&app, "/tasks/t1", "GET", "").await;
+}
+
+// ---------------------------------------------------------------------------
 // Auth on the non-card routes
 // ---------------------------------------------------------------------------
 
@@ -199,7 +267,8 @@ async fn protected_routes_require_bearer_token() {
     let backend: Arc<dyn TaskBackend> = FakeBackend::with(vec![task]);
     let app = test_router(backend, Some(verifier_ok()));
 
-    // JSON-RPC /rpc is not mounted -> 404
+    // JSON-RPC /rpc is not mounted; unauthenticated, the auth layer answers
+    // 401 before routing (no path probing).
     let req = Request::builder()
         .method("POST")
         .uri("/rpc")
@@ -209,24 +278,31 @@ async fn protected_routes_require_bearer_token() {
         ))
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
-    // No auth header on a REST route -> the SDK maps the authorizer's
-    // INVALID_REQUEST to HTTP 400 (A2A problem+json envelope).
+    // No auth header on a REST route -> HTTP 401 UNAUTHENTICATED (the A2A
+    // problem+json envelope, per the A2A HTTP+JSON binding).
     let res = app.clone().oneshot(get("/tasks")).await.unwrap();
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let challenge = res
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let value: serde_json::Value =
         serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-    assert!(value["error"].is_object());
+    assert_eq!(value["error"]["status"], "UNAUTHENTICATED");
+    // The A2A binding requires a WWW-Authenticate: Bearer challenge.
+    assert_eq!(challenge.as_deref(), Some("Bearer"));
 
-    // Wrong token -> same rejection.
+    // Wrong token -> same 401 rejection.
     let req = Request::builder()
         .uri("/tasks")
         .header("authorization", "Bearer wrong-token")
         .body(Body::empty())
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
     // Correct token -> 200.
     let res = app.clone().oneshot(get_auth("/tasks")).await.unwrap();

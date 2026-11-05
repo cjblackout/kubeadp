@@ -15,10 +15,17 @@
 //! - PID 1 = small init shim (reaps zombies, forwards SIGTERM/SIGINT, propagates exit code, kills descendants).
 //! - Sets `PR_SET_NO_NEW_PRIVS`.
 //! - Writes secret from fd to `<tmp>/<dest>` mode 0400.
+//! - Opt-in `net: relay`: the shim unshares a fresh CLONE_NEWNET (loopback
+//!   only) for the agent, bind-mounts the outer proxy's unix socket into the
+//!   sandbox and starts the `relay-inner` loopback relay before the agent
+//!   process; the launcher runs the outer HTTP CONNECT proxy in the pod's
+//!   network namespace (see [`super::relay`]). `net: host` (the default) and
+//!   the legacy `shared` alias keep today's behaviour byte-for-byte.
 
 use super::exec::exec_target;
 use super::init_shim::{arm_pdeathsig, close_fds_above_2, run_init_shim, zeroize_bytes};
 use super::policy::SandboxPolicy;
+use super::relay as relay_lib;
 use std::env;
 use std::ffi::CString;
 use std::fs;
@@ -44,6 +51,17 @@ pub fn execute_gvisor(
                 .to_string(),
         );
     }
+    // Network mode: fail closed on an unknown value; `relay` opts into the
+    // private network namespace + unix-socket relay (see super::relay).
+    let relay = match policy.net.as_str() {
+        "relay" => true,
+        "host" | "shared" => false,
+        other => {
+            return Err(format!(
+                "unknown net value '{other}' (accepted: host, shared, relay)"
+            ))
+        }
+    };
     // 1. Prepare secret if configured: read secret bytes before unsharing if fd is inherited
     let mut secret_bytes = if let Some(ref sec) = policy.secret {
         read_secret_fd(sec.fd)?
@@ -80,6 +98,20 @@ pub fn execute_gvisor(
         }
     }
 
+    // 3b. Relay pre-flight, in the launcher process: the private socket dir,
+    // the outer proxy (one thread per connection) and the launcher exe path
+    // the shim needs. This MUST happen after the unshares above and before
+    // the PID 1 fork: the proxy threads would make this process
+    // multithreaded, and unshare(CLONE_NEWUSER) fails on a multithreaded
+    // process, while the proxy itself must run in the pod's network namespace
+    // (which this launcher process keeps -- only the shim below unshares
+    // CLONE_NEWNET for the sandbox side).
+    let relay_setup = if relay {
+        Some(relay_lib::setup_relay_launcher(policy)?)
+    } else {
+        None
+    };
+
     // 4. Fork child process which will be PID 1 in the new PID namespace
     let pid1 = unsafe { libc::fork() };
     if pid1 < 0 {
@@ -88,8 +120,13 @@ pub fn execute_gvisor(
     }
 
     if pid1 > 0 {
-        // Parent outside PID ns: wait for PID 1 to exit with signal forwarding
+        // Parent outside PID ns: wait for PID 1 to exit with signal forwarding.
         let code = super::init_shim::wait_with_signal_forwarding(pid1);
+        // Remove the relay socket dir (best-effort): a crashed launcher leaves
+        // a stale dir behind, which the next launch reuses (owner-checked).
+        if let Some(setup) = &relay_setup {
+            let _ = fs::remove_dir_all(&setup.dir);
+        }
         return Ok(code);
     }
 
@@ -122,6 +159,27 @@ pub fn execute_gvisor(
         libc::clearenv();
     }
 
+    // Relay mode: this shim (and everything forked from it -- the relay-inner
+    // and the agent) gets its OWN network namespace, loopback only. The
+    // unshare must happen here, in the forked shim: the launcher (our parent)
+    // keeps the pod's network namespace and runs the outer proxy there. The
+    // namespace is owned by the user namespace unshared above, where this
+    // process holds the capabilities, so the loopback interface can be
+    // brought up afterwards.
+    if relay {
+        unsafe {
+            if libc::unshare(libc::CLONE_NEWNET) != 0 {
+                let err = std::io::Error::last_os_error();
+                eprintln!("kubeadp-agent relay: unshare(CLONE_NEWNET) failed: {err}");
+                libc::_exit(125);
+            }
+        }
+        if let Err(e) = relay_lib::bring_loopback_up() {
+            eprintln!("kubeadp-agent sandbox setup error: {e}");
+            unsafe { libc::_exit(125) };
+        }
+    }
+
     // Ensure every writable policy path (rw / shared_rw / the private tmp
     // itself) exists before the mount plan is built and applied: the hide
     // overmounts preserve these paths by bind-back, so a missing writable dir
@@ -142,6 +200,36 @@ pub fn execute_gvisor(
         eprintln!("kubeadp-agent sandbox setup error: {e}");
         unsafe { libc::_exit(125) };
     }
+
+    // Relay mode: bind-mount the outer proxy's unix socket into the sandbox,
+    // under the agent's private tmpfs (fresh per sandbox, so the bind target
+    // is created without touching the pod's shared filesystem). Fails closed.
+    let relay_socket_target = if let (true, Some(setup)) = (relay, &relay_setup) {
+        match private_tmp.as_ref() {
+            Some(tmp) => {
+                let target = relay_lib::relay_socket_target(tmp);
+                if let Err(e) = fs::write(&target, b"") {
+                    eprintln!("kubeadp-agent relay: cannot create socket bind target: {e}");
+                    unsafe { libc::_exit(125) };
+                }
+                if let Err(e) = apply_mount_plan(&relay_mount_plan(&setup.sock, &target)) {
+                    eprintln!("kubeadp-agent sandbox setup error: {e}");
+                    unsafe { libc::_exit(125) };
+                }
+                Some(target)
+            }
+            None => {
+                // The bind target lives under the private tmp; without one
+                // there is no in-sandbox path for the outer socket.
+                eprintln!(
+                    "kubeadp-agent relay: net=relay requires a private tmp to hold the relay socket"
+                );
+                unsafe { libc::_exit(125) };
+            }
+        }
+    } else {
+        None
+    };
 
     // Set PR_SET_NO_NEW_PRIVS
     unsafe {
@@ -167,6 +255,27 @@ pub fn execute_gvisor(
     // shim -- and the agent forked from it -- inherit none of them.
     close_fds_above_2();
 
+    // Relay mode: start the inner relay (a subcommand of this binary) before
+    // the agent process. It listens on 127.0.0.1:3128 in the agent's network
+    // namespace and copies each TCP connection to the bind-mounted outer
+    // proxy socket. It dies with the namespace: the shim's tree-kill reaps it
+    // when the agent exits.
+    if let (true, Some(setup), Some(target)) = (relay, &relay_setup, &relay_socket_target) {
+        let argv = relay_lib::relay_inner_argv(&setup.exe, target);
+        let inner_env = vec![("PATH".to_string(), super::exec::default_path().to_string())];
+        let relay_pid = unsafe { libc::fork() };
+        if relay_pid < 0 {
+            eprintln!("kubeadp-agent relay: fork relay-inner failed");
+            unsafe { libc::_exit(125) };
+        }
+        if relay_pid == 0 {
+            // --- INSIDE RELAY-INNER ---
+            // If the shim (our parent, PID 1) dies, take ourselves down.
+            arm_pdeathsig(libc::SIGKILL, shim_pid);
+            execute_target(&argv[0], &argv[1..], &inner_env);
+        }
+    }
+
     // Fork the actual agent root process
     let agent_pid = unsafe { libc::fork() };
     if agent_pid < 0 {
@@ -184,8 +293,14 @@ pub fn execute_gvisor(
         close_fds_above_2();
 
         // The agent receives EXACTLY the env_allow-filtered variables (the shim
-        // environment is empty), so nothing inherited can leak through.
-        let final_env = build_agent_env(policy, env, private_tmp.as_deref());
+        // environment is empty), so nothing inherited can leak through. With
+        // `net: relay` the loopback proxy env is injected on top (a no-op for
+        // the host mode, which keeps the filtered set byte-for-byte).
+        let final_env = relay_lib::apply_relay_env(
+            policy,
+            build_agent_env(policy, env, private_tmp.as_deref()),
+            relay_setup.as_ref().map(|s| s.exe.as_path()),
+        );
         // Exec the agent command
         execute_target(cmd, args, &final_env);
     }
@@ -193,6 +308,16 @@ pub fn execute_gvisor(
     // PID 1 runs the init shim: reaps zombies, forwards signals, kills namespace on exit
     let exit_code = run_init_shim(agent_pid);
     unsafe { libc::_exit(exit_code) };
+}
+
+/// Pure relay mount plan: bind-mount the outer proxy's unix socket onto the
+/// in-sandbox target path (under the agent's private tmpfs). Applied by the
+/// shim after the main mount plan; any failure aborts the launch (exit 125).
+pub fn relay_mount_plan(outer_socket: &Path, target: &Path) -> Vec<MountOp> {
+    vec![MountOp::BindRec {
+        src: outer_socket.to_path_buf(),
+        target: target.to_path_buf(),
+    }]
 }
 
 /// Pure environment builder for the gVisor agent root process.
@@ -817,8 +942,8 @@ mod tests {
     use super::super::init_shim::status_to_exit_code;
     use super::super::policy::SandboxPolicy;
     use super::{
-        build_agent_env, hide_is_file, plan_mounts, MountOp, MountSpec, AGENT_TMP_OPTS,
-        SHM_PRIVATE_OPTS,
+        build_agent_env, execute_gvisor, hide_is_file, plan_mounts, relay_mount_plan, MountOp,
+        MountSpec, AGENT_TMP_OPTS, SHM_PRIVATE_OPTS,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -1444,5 +1569,44 @@ mod tests {
         // never overmounted with a fresh tmpfs, so it is not a tmpfs target).
         assert!(tmpfs_targets(&plan2).contains(&PathBuf::from("/dev/shm")));
         assert!(!tmpfs_targets(&plan2).contains(&PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn test_relay_mount_plan_binds_outer_socket_into_sandbox() {
+        // The relay mode binds the outer proxy's unix socket onto the
+        // in-sandbox target (under the agent's private tmpfs) with a single
+        // recursive bind. Asserted on the built plan, no real namespaces.
+        let plan = relay_mount_plan(
+            Path::new("/tmp/kubeadp-relay-agent/proxy.sock"),
+            Path::new("/tmp/agent-sandbox-job1/.relay.sock"),
+        );
+        assert_eq!(
+            plan,
+            vec![MountOp::BindRec {
+                src: PathBuf::from("/tmp/kubeadp-relay-agent/proxy.sock"),
+                target: PathBuf::from("/tmp/agent-sandbox-job1/.relay.sock"),
+            }]
+        );
+        // The host mount plan is unchanged by the relay mode: the relay bind
+        // is an extra plan applied after the main one.
+        let (plan, _) = plan_mounts(&spec(SandboxPolicy::default()));
+        assert!(
+            !plan
+                .iter()
+                .any(|op| matches!(op, MountOp::BindRec { src, .. }
+                if src.as_os_str().to_string_lossy().contains("kubeadp-relay"))),
+            "the host plan must carry no relay mount: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn test_gvisor_refuses_unknown_net_value() {
+        // An unknown net value fails closed before any namespace is unshared.
+        let policy = SandboxPolicy {
+            net: "bridged".to_string(),
+            ..Default::default()
+        };
+        let err = execute_gvisor(&policy, "true", &[], &[]).unwrap_err();
+        assert!(err.contains("unknown net value"), "err: {err}");
     }
 }

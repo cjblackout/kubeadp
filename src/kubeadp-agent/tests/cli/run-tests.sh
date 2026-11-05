@@ -4317,6 +4317,86 @@ t_t170() {
   rec T170 PASS "orphaned worktree re-attached by repair (re-attach idempotent, diff works, --all reports healthy; job $id)"
 }
 
+# T171: the E4 emulation layer's per-run message queue contract (HL-91 2.5).
+# A message written into the run worktree's `.engine-message-queue` while the
+# job runs (the agy channel has no live mid-run prompt surface) is delivered on
+# the next turn: a follow-up retry resumes the conversation and the fake agy
+# folds the queued text into its result.
+t_t171() {
+  start_job "FAKE_SLEEP=8 emulated message queue probe"
+  if [ "$START_RC" -ne 0 ]; then
+    rec T171 FAIL "start exited $START_RC: $START_OUT"
+    return
+  fi
+  local id="$START_JOB_ID"
+  [ -n "$id" ] || { rec T171 FAIL "no job id parsed: $START_OUT"; return; }
+
+  # Wait for the job to be Running (its worktree exists from the start), then
+  # park a mid-run message into the queue file the emulation reads.
+  local worktree st
+  worktree=$(db_field "$id" "worktree_path")
+  if [ -z "$worktree" ] || [ ! -d "$worktree" ]; then
+    cleanup_job "$id"
+    rec T171 FAIL "job worktree missing or unknown (db says: '$worktree')"
+    return
+  fi
+  local i
+  for i in $(seq 1 20); do
+    st=$(get_status "$id")
+    [ "$st" = "running" ] && break
+    sleep 0.5
+  done
+  if [ "$st" != "running" ]; then
+    cleanup_job "$id"
+    rec T171 FAIL "job never showed as running (last status: $st)"
+    return
+  fi
+  printf 'mid-run ping\\n\\nsecond line\n' > "$worktree/.engine-message-queue"
+
+  # The first (unprompted) turn must finish done; the queue file survives it
+  # (a turned-around run keeps its checkpoint/history).
+  st=$(wait_state "$id" done 60) || {
+    cleanup_job "$id"
+    rec T171 FAIL "first turn did not finish done (last status: $st)"
+    return
+  }
+
+  # A follow-up retry on the done job resumes the conversation; the emulation
+  # drains the queue into the resume prompt. The fake agy reads the file and
+  # reports "DELIVERED:<text>".
+  local out rc
+  out=$(ar retry "$id" --prompt "FAKE_DELIVER_QUEUE continue the work" 2>&1)
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$id"
+    rec T171 FAIL "retry --prompt on the done job exited $rc: $out"
+    return
+  fi
+  case "$out" in
+    *"retry launched in background"*) ;;
+    *) cleanup_job "$id"; rec T171 FAIL "retry did not launch (rc $rc): $out"; return ;;
+  esac
+  st=$(wait_state "$id" done 60) || {
+    cleanup_job "$id"
+    rec T171 FAIL "follow-up turn did not finish done (last status: $st)"
+    return
+  }
+  local res
+  res=$(ar result "$id" 2>&1)
+  case "$res" in
+    *"mid-run ping"*) ;;
+    *) cleanup_job "$id"; rec T171 FAIL "resume result is missing the queued message: $res"; return ;;
+  esac
+  # And the queue file is gone after the drain.
+  if [ -f "$worktree/.engine-message-queue" ]; then
+    cleanup_job "$id"
+    rec T171 FAIL "queue file still present after drain: $worktree/.engine-message-queue"
+    return
+  fi
+  cleanup_job "$id"
+  rec T171 PASS "mid-run queue message delivered on the resume turn (result echoes it, queue drained; job $id)"
+}
+
 # --- main ------------------------------------------------------------------------------
 TEARDOWN_DONE=0
 teardown() {
@@ -4431,6 +4511,7 @@ run_test_stops_server T167 t_t167
 run_test_stops_server T168 t_t168
 run_test_stops_server T169 t_t169
 run_test T170 t_t170
+run_test T171 t_t171
 
 echo
 echo "=== per-test results ==="

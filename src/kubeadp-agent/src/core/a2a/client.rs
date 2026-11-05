@@ -28,6 +28,14 @@
 //! - a best-effort fetch of `/.well-known/agent-card.json` (3 s timeout);
 //!   a failed or absent card simply leaves the `card` field out of the entry.
 //!
+//! The `A2A_PEERS` environment variable adds a STATIC peer registry, which
+//! works with no Kubernetes service-account token (e.g. a sandboxed job that
+//! has no SA token): a comma-separated `name=url` or `namespace/name=url`
+//! list merged into the same agent registry (a static entry never overrides a
+//! discovered one with the same key). The static registry alone lets the MCP
+//! server start even when the Kubernetes discovery fails entirely (see
+//! [`crate::mcp_a2a::context::build_server`]).
+//!
 //! The `send_message`/`get_task` tools resolve their `agent` argument by the
 //! Service name from the same registry, so a caller can never point the MCP
 //! client at an arbitrary URL: the target must be a discovered agent.
@@ -61,6 +69,9 @@ pub const META_SENDER: &str = "a2a.sender";
 pub const META_HOP: &str = "a2a.hop";
 /// Label selecting agent Services in the Kubernetes discovery.
 pub const AGENT_LABEL: &str = "a2a.homelab/agent=true";
+/// Env var naming the static A2A peer registry: a comma-separated
+/// `name=url` or `namespace/name=url` list.
+pub const A2A_PEERS_ENV: &str = "A2A_PEERS";
 /// Default in-cluster service-account token path.
 pub const SA_TOKEN_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
 /// Default in-cluster CA bundle path.
@@ -160,6 +171,38 @@ impl A2aClientCtx {
         }
     }
 
+    /// Resolve a send/reply target of the per-job self-name form
+    /// `<agent>[/<task_id>]` (e.g. `kubeadp-agent-worker-service/<job_id>` or
+    /// `opencode/another-agent/<job_id>`).
+    ///
+    /// Target resolution order:
+    /// 1. exact registry match on the full target (a real `namespace/name` pair
+    ///    or a bare name), which wins -- the target names a discovered agent
+    ///    verbatim;
+    /// 2. otherwise, if the target is `<name>/<rest>` (with a single `/`), try
+    ///    `<name>` as the agent (in the default namespace, else unique) and the
+    ///    `<rest>` as the task id;
+    /// 3. otherwise `None` (the target names no agent).
+    ///
+    /// The split keeps replies to the per-job self-name ADDressing the right
+    /// agent while carrying the job id as the A2A `task_id`.
+    pub fn resolve_agent_task(&self, target: &str) -> Option<(&AgentEntry, Option<String>)> {
+        if let Some(entry) = self.agent(target) {
+            return Some((entry, None));
+        }
+        // A trailing task-id segment: `<name>/<rest>` with exactly one '/'.
+        if target.bytes().filter(|&b| b == b'/').count() == 1 {
+            if let Some((name, rest)) = target.split_once('/') {
+                if !rest.is_empty() {
+                    if let Some(entry) = self.agent(name) {
+                        return Some((entry, Some(rest.to_string())));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// The configured sender self-name.
     pub fn self_name(&self) -> &str {
         &self.self_name
@@ -225,8 +268,13 @@ impl A2aClientCtx {
         Ok(message)
     }
 
-    /// Send a text message to the given agent (by name or namespace/name), tagging it
-    /// with the sender name and the next hop.
+    /// Send a text message to the given agent (by name or namespace/name),
+    /// tagging it with the sender name and the next hop.
+    ///
+    /// The target may also be the per-job self-name form `<name>/<task_id>`
+    /// (e.g. the `claimed sender` of a message from a job): the `<name>` is
+    /// resolved as the agent and, when the caller passes no explicit
+    /// `task_id`, the `<task_id>` becomes the message's A2A task id.
     pub async fn send_message(
         &self,
         agent: &str,
@@ -235,9 +283,12 @@ impl A2aClientCtx {
         task_id: Option<String>,
         incoming_hop: Option<u32>,
     ) -> Result<serde_json::Value, String> {
-        let entry = self
-            .agent(agent)
+        let (entry, suffix_task) = self
+            .resolve_agent_task(agent)
             .ok_or_else(|| format!("no A2A agent named '{agent}' in the registry"))?;
+        // An explicit task_id wins; otherwise the suffix of a per-job self-name
+        // target fills it (so a reply to `<worker>/<job>` addresses that job).
+        let task_id = task_id.or(suffix_task);
 
         let message = self.build_send_message(text, context_id, task_id, incoming_hop)?;
 
@@ -262,18 +313,22 @@ impl A2aClientCtx {
     }
 
     /// Fetch the current state of a task from the given agent (by name or
-    /// namespace/name).
+    /// namespace/name). `agent` may also be `<name>/<task_id>`, in which case
+    /// the suffix is the task id (and an empty `task_id` argument is filled
+    /// from it).
     pub async fn get_task(&self, agent: &str, task_id: &str) -> Result<serde_json::Value, String> {
-        let entry = self
-            .agent(agent)
+        let (entry, suffix_task) = self
+            .resolve_agent_task(agent)
             .ok_or_else(|| format!("no A2A agent named '{agent}' in the registry"))?;
-        if task_id.trim().is_empty() {
-            return Err("task_id must not be empty".to_string());
-        }
+        let task_id = if !task_id.trim().is_empty() {
+            task_id.trim().to_string()
+        } else {
+            suffix_task.ok_or_else(|| "task_id must not be empty".to_string())?
+        };
 
         let client = self.client_for(entry)?;
         let req = GetTaskRequest {
-            id: task_id.to_string(),
+            id: task_id,
             history_length: None,
             tenant: None,
         };
@@ -489,9 +544,24 @@ where
             });
     }
 
+    // Static peer registry (`A2A_PEERS`): merges into the same registry.
+    // Discovered entries win (or_insert): a static entry only fills a name the
+    // Kubernetes discovery did not return. This is what keeps the MCP server
+    // usable WITHOUT a service-account token.
+    for (ns, name, url) in static_peers(own_ns.as_deref()) {
+        agents
+            .entry((ns.clone(), name.clone()))
+            .or_insert(AgentEntry {
+                name: name.clone(),
+                namespace: ns,
+                url,
+                card: None,
+            });
+    }
+
     let self_name: Arc<str> = std::env::var("A2A_SELF_NAME")
         .ok()
-        .filter(|s| is_valid_rfc1123_label(s))
+        .filter(|s| is_valid_self_name(s))
         .or_else(|| {
             // The banner hostname is the closest in-pod identity available.
             std::fs::read_to_string("/proc/self/comm")
@@ -520,6 +590,57 @@ pub fn empty_ctx() -> A2aClientCtx {
         self_name: "kubeadp-agent".into(),
         default_namespace: None,
         interceptors: interceptors_from_env(),
+    }
+}
+
+/// A client context built purely from the static `A2A_PEERS` registry (used
+/// when the Kubernetes discovery fails or is unavailable, e.g. a sandboxed
+/// job with no service-account token). Same self-name handling as
+/// [`build_ctx`]; no cards are fetched (no cluster).
+pub fn static_peers_ctx() -> A2aClientCtx {
+    let (_token, _ca, namespace) = read_incluster_creds();
+    let own_ns = namespace.filter(|ns| is_valid_rfc1123_label(ns));
+    let mut agents = HashMap::new();
+    for (ns, name, url) in static_peers(own_ns.as_deref()) {
+        agents.insert(
+            (ns.clone(), name.clone()),
+            AgentEntry {
+                name: name.clone(),
+                namespace: ns,
+                url,
+                card: None,
+            },
+        );
+    }
+    let self_name: Arc<str> = std::env::var("A2A_SELF_NAME")
+        .ok()
+        .filter(|s| is_valid_self_name(s))
+        .unwrap_or_else(|| "kubeadp-agent".to_string())
+        .into();
+    A2aClientCtx {
+        agents: Arc::new(agents),
+        self_name,
+        default_namespace: own_ns,
+        interceptors: interceptors_from_env(),
+    }
+}
+
+/// Whether `s` is a usable `A2A_SELF_NAME`. Accepts either a bare RFC 1123
+/// label (the pod/Service name) or the per-job form `<label>/<segment>` (the
+/// agent prefix plus a task/job-id suffix, e.g.
+/// `kubeadp-agent-worker-service/<job_id>`). The `/`-suffix must not conflict
+/// with the `namespace/name` agent syntax, so only ONE `/` is allowed and both
+/// halves must be valid RFC 1123 segments.
+pub fn is_valid_self_name(s: &str) -> bool {
+    match s.split_once('/') {
+        None => is_valid_rfc1123_label(s),
+        Some((prefix, suffix)) => {
+            !prefix.is_empty()
+                && !suffix.is_empty()
+                && s.bytes().filter(|&b| b == b'/').count() == 1
+                && is_valid_rfc1123_label(prefix)
+                && is_valid_rfc1123_label(suffix)
+        }
     }
 }
 
@@ -597,6 +718,46 @@ fn url_override(name: &str, namespace: &str) -> Option<String> {
         let _ = (name, namespace);
         None
     }
+}
+
+/// Parse the `A2A_PEERS` static peer registry into (namespace, name) -> URL
+/// entries.
+///
+/// The format is a comma-separated list of `name=url` or `namespace/name=url`
+/// pairs (whitespace around separators is accepted). A bare `name` is placed
+/// in the DEFAULT namespace (the pod's own namespace, when known, else `""`).
+/// Malformed pairs (no `=`, empty name/url) and non-RFC1123 names/namespaces
+/// are skipped, never fatal -- a typo in one entry must not kill the whole
+/// registry.
+fn static_peers(default_namespace: Option<&str>) -> Vec<(String, String, String)> {
+    let Ok(peers) = std::env::var(A2A_PEERS_ENV) else {
+        return Vec::new();
+    };
+    let default = default_namespace.unwrap_or("").to_string();
+    let mut out = Vec::new();
+    for pair in peers.split(',') {
+        let Some((key, url)) = pair.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let url = url.trim();
+        if key.is_empty() || url.trim().is_empty() {
+            continue;
+        }
+        let (ns, name) = match key.split_once('/') {
+            Some((ns, name)) => (ns.trim().to_string(), name.trim().to_string()),
+            None => (default.clone(), key.to_string()),
+        };
+        // The name must always be a valid RFC 1123 label; the namespace too,
+        // EXCEPT the `""` sentinel (no known namespace): a bare `name` with an
+        // unknown pod namespace is still a usable entry (resolved later by the
+        // discovery context that knows the default namespace).
+        if !is_valid_rfc1123_label(&name) || (!ns.is_empty() && !is_valid_rfc1123_label(&ns)) {
+            continue;
+        }
+        out.push((ns, name, url.to_string()));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -689,6 +850,128 @@ mod tests {
         );
         std::env::remove_var("A2A_NAMESPACES");
         assert_eq!(discovery_namespaces(None), Vec::<String>::new());
+    }
+
+    #[test]
+    fn self_name_validation_accepts_bare_and_per_job_forms() {
+        assert!(is_valid_self_name("kubeadp-agent-worker-service"));
+        assert!(is_valid_self_name("kubeadp-agent-worker-service/abc123def"));
+        assert!(is_valid_self_name("a/b"));
+        assert!(!is_valid_self_name(""));
+        assert!(!is_valid_self_name("/job-id"));
+        assert!(!is_valid_self_name("prefix/"));
+        assert!(!is_valid_self_name("a/b/c"));
+        assert!(!is_valid_self_name("Upper/Job"));
+        assert!(!is_valid_self_name(&"a".repeat(64)));
+        assert!(!is_valid_self_name("has:colon"));
+        assert!(!is_valid_self_name("has space"));
+    }
+
+    /// `A2A_PEERS` parsing: bare names default to the pod namespace;
+    /// `namespace/name` entries keep their namespace; malformed and invalid
+    /// entries are skipped.
+    #[test]
+    fn static_peers_parses_and_filters() {
+        // Serialize env mutation.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        std::env::set_var(
+            A2A_PEERS_ENV,
+            "worker=http://w:1, ops/peer=http://p:2, Bad-Name=http://x, has:colon=http://y, nodev=",
+        );
+        let peers = static_peers(Some("opencode"));
+        assert!(peers.contains(&(
+            "opencode".to_string(),
+            "worker".to_string(),
+            "http://w:1".to_string()
+        )));
+        assert!(peers.contains(&(
+            "ops".to_string(),
+            "peer".to_string(),
+            "http://p:2".to_string()
+        )));
+        assert_eq!(
+            peers.len(),
+            2,
+            "invalid entries are skipped: {peers:?} (Bad-Name: bad label, has:colon: bad label, nodev: empty URL)"
+        );
+        std::env::remove_var(A2A_PEERS_ENV);
+
+        // Bare names with no known namespace land in "".
+        std::env::set_var(A2A_PEERS_ENV, "worker=http://w:1");
+        let peers = static_peers(None);
+        assert_eq!(
+            peers,
+            vec![(
+                "".to_string(),
+                "worker".to_string(),
+                "http://w:1".to_string()
+            )]
+        );
+        std::env::remove_var(A2A_PEERS_ENV);
+    }
+
+    #[test]
+    fn resolve_agent_task_handles_self_name_suffix() {
+        let ctx = ctx_with(vec![(
+            "kubeadp-agent-worker-service",
+            "opencode",
+            "http://kubeadp-agent-worker-service.opencode.svc:8002",
+        )]);
+        // Exact bare agent name -> agent, no task.
+        let (entry, task) = ctx
+            .resolve_agent_task("kubeadp-agent-worker-service")
+            .unwrap();
+        assert_eq!(entry.name, "kubeadp-agent-worker-service");
+        assert!(task.is_none());
+
+        // Per-job self name `<agent>/<job>` -> the agent + the job as the task.
+        let (entry, task) = ctx
+            .resolve_agent_task("kubeadp-agent-worker-service/abc123def")
+            .unwrap();
+        assert_eq!(entry.name, "kubeadp-agent-worker-service");
+        assert_eq!(task.as_deref(), Some("abc123def"));
+
+        // Unknown name -> None.
+        assert!(ctx.resolve_agent_task("ghost").is_none());
+        assert!(ctx.resolve_agent_task("ghost/task").is_none());
+    }
+
+    #[test]
+    fn send_message_to_self_name_suffix_resolves_agent_and_sets_task_id() {
+        // A per-job self-name target resolves to the host agent and fills the
+        // message task_id from the suffix when no explicit task_id is given.
+        let ctx = ctx_with(vec![(
+            "kubeadp-agent-worker-service",
+            "opencode",
+            "http://kubeadp-agent-worker-service.opencode.svc:8002",
+        )]);
+        // The target `<agent>/<job>` resolves to the host agent with the job as
+        // the suffix task (the resolution send_message uses).
+        let (entry, suffix_task) = ctx
+            .resolve_agent_task("kubeadp-agent-worker-service/job-123")
+            .unwrap();
+        assert_eq!(entry.name, "kubeadp-agent-worker-service");
+        let suffix_task = suffix_task.expect("suffix is the task id");
+
+        // The resolved suffix becomes the message task id (send_message's
+        // `task_id.or(suffix)`).
+        let msg = ctx
+            .build_send_message("hi", None, Some(suffix_task), None)
+            .unwrap();
+        assert_eq!(
+            msg.task_id.as_deref(),
+            Some("job-123"),
+            "suffix task id becomes the message task id"
+        );
+
+        // An explicit task_id in the tool args wins over the suffix (the
+        // send_message implementation prefers the explicit argument).
+        let msg = ctx
+            .build_send_message("hi", None, Some("explicit".to_string()), None)
+            .unwrap();
+        assert_eq!(msg.task_id.as_deref(), Some("explicit"));
     }
 
     #[test]

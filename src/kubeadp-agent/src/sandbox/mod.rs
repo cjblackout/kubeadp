@@ -8,10 +8,10 @@
 //! Known limitation of the contract (R10, shared network): agents keep the pod's network
 //! namespace because they need egress, so ABSTRACT unix-domain sockets of other processes in
 //! the same pod stay reachable. The Kata backend closes this with Landlock
-//! (`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`); the gVisor backend cannot (no Landlock, and a
-//! separate network namespace would remove egress). Path-based sockets are covered by the
-//! filesystem isolation. A pod that runs the gVisor backend must therefore not run processes
-//! that listen on abstract sockets.
+//! (`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`); every backend closes it with the opt-in
+//! policy value `net: relay` (own loopback-only network namespace + unix-socket relay proxy,
+//! see [`relay`]; the default `net: host` and the legacy `shared` alias keep today's
+//! shared-namespace behaviour). Path-based sockets are covered by the filesystem isolation.
 
 pub mod backend_gvisor;
 pub mod backend_kata;
@@ -21,6 +21,7 @@ pub mod detect;
 pub mod exec;
 pub mod init_shim;
 pub mod policy;
+pub mod relay;
 
 /// Test-only launch seam. Compiled only under the `test-hooks` feature so the
 /// production build never carries the passthrough switch.

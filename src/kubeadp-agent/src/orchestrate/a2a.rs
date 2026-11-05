@@ -16,7 +16,10 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::core::a2a::{A2AError, A2aModel, A2aTask, AuthVerifier, TaskBackend};
+use crate::core::a2a::{
+    advertised_url, pod_name, role_description, role_skills, A2AError, A2aModel, A2aTask,
+    AuthVerifier, TaskBackend, ROLE_ORCHESTRATOR,
+};
 use crate::orchestrate::sessions_api;
 use a2a::TaskState;
 use axum::Router;
@@ -221,19 +224,18 @@ pub fn a2a_router(
     auth: Option<AuthVerifier>,
     jobset: Option<crate::core::a2a::JobsetCred>,
 ) -> Router {
-    let session_names = {
-        let st = state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut names: Vec<String> = st.sessions.keys().cloned().collect();
-        names.sort();
-        names
-    };
-
+    // The agent card identifies the RUNNING POD (not the retired
+    // agent-orchestrate image): the name is the pod's own name, the
+    // description and skills name the orchestrator role, the version is the
+    // crate version, and the advertised URL is the cluster Service DNS
+    // (KUBEADP_A2A_URL) when set, else the configured listen address.
+    let listen = crate::orchestrate::http_server::listen_addr_from_env();
     let model = A2aModel {
-        name: "agent-orchestrate".to_string(),
-        description: "Process supervisor for Claude Code agent sessions".to_string(),
+        name: pod_name(ROLE_ORCHESTRATOR),
+        description: role_description(ROLE_ORCHESTRATOR).to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        skills: session_names,
-        url: String::new(),
+        skills: role_skills(ROLE_ORCHESTRATOR),
+        url: advertised_url(&format!("http://{listen}")),
     };
 
     let sink = Arc::new(SessionMessageSink::new(api_state));
@@ -413,13 +415,25 @@ mod tests {
             backend.controls.clone(),
             Arc::new(crate::orchestrate::session_log::SessionLogs::from_env()),
         );
-        let app = a2a_router(
-            backend.supervisor_state.clone(),
-            backend.controls.clone(),
-            api_state,
-            None,
-            None,
-        );
+        // The card name is derived from the environment (the pod name); pin it
+        // deterministically for the card assertion (the model is built eagerly,
+        // so the guard only needs to be held while the router is built).
+        let app = {
+            let _env = crate::core::a2a::testenv::Guard::set(&[
+                ("KUBEADP_A2A_NAME", None),
+                ("A2A_SELF_NAME", Some("kubeadp-agent-orchestrator-test-1")),
+                ("POD_NAME", None),
+                ("HOSTNAME", None),
+                ("KUBEADP_A2A_URL", None),
+            ]);
+            a2a_router(
+                backend.supervisor_state.clone(),
+                backend.controls.clone(),
+                api_state,
+                None,
+                None,
+            )
+        };
 
         // Public agent card at /.well-known/agent-card.json
         let req = Request::builder()
@@ -430,7 +444,13 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let card: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(card["name"], "agent-orchestrate");
+        assert_eq!(card["name"], "kubeadp-agent-orchestrator-test-1");
+        // The orchestrator card names the role and advertises the skill.
+        assert!(card["description"]
+            .as_str()
+            .unwrap()
+            .contains("orchestrator"));
+        assert_eq!(card["skills"][0]["id"], "session-message");
 
         // REST GET /tasks
         let req = Request::builder()
@@ -503,16 +523,32 @@ mod tests {
         let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        // GET /tasks without token -> rejected. The SDK maps the authorizer's
-        // INVALID_REQUEST to HTTP 400 (its REST envelope is the A2A problem+json
-        // shape; the previous hand-written bindings answered 401 with the
-        // crate's {"error","code"} body).
+        // GET /tasks without token -> HTTP 401 UNAUTHENTICATED (the A2A
+        // problem+json envelope) with the WWW-Authenticate challenge required
+        // by the A2A HTTP+JSON binding.
         let req = Request::builder()
             .uri("/tasks")
             .body(Body::empty())
             .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer")
+        );
+
+        // POST /message:send without token -> 401, even for a body that would
+        // otherwise be invalid (auth runs before body validation).
+        let req = Request::builder()
+            .method("POST")
+            .uri("/message:send")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
         // GET /tasks with correct token -> 200
         let req = Request::builder()

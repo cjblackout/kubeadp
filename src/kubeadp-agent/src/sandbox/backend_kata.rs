@@ -27,11 +27,26 @@
 //! - Subreaper supervision (`prctl(PR_SET_CHILD_SUBREAPER, 1)`) + tree-kill on agent exit.
 //! - Sets `PR_SET_NO_NEW_PRIVS`.
 //! - Writes secret from fd to `<tmp>/<dest>` mode 0400.
+//! - Opt-in `net: relay`: the launcher runs the outer HTTP CONNECT proxy in
+//!   the pod's network namespace (see [`super::relay`]); the forked child
+//!   unshares CLONE_NEWUSER (the caller's uid/gid mapped 1:1, unprivileged)
+//!   and CLONE_NEWNET (allowed by the capabilities the fresh user namespace
+//!   grants), brings loopback up and starts the `relay-inner` loopback relay
+//!   before the Landlock domain is applied. The agent connects to the outer
+//!   proxy socket by pathname directly (path-based unix sockets are not
+//!   namespaced by network namespaces, and no new Landlock rule is needed:
+//!   connect to a pathname socket is not Landlock-restricted below ABI 9,
+//!   which this ruleset never handles). The namespace unshares need
+//!   unprivileged user namespaces; if the unshare fails the launch aborts
+//!   (exit 125) rather than running with weaker network isolation.
+//!   `net: host` (the default) and the legacy `shared` alias keep today's
+//!   behaviour byte-for-byte.
 
 use super::detect::probe_landlock_abi;
 use super::exec::exec_target;
-use super::init_shim::{kill_tree_and_reap, zeroize_bytes};
+use super::init_shim::{arm_pdeathsig, kill_tree_and_reap, zeroize_bytes};
 use super::policy::SandboxPolicy;
+use super::relay as relay_lib;
 use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -329,6 +344,11 @@ pub fn execute_kata(
     args: &[String],
     env: &[(String, String)],
 ) -> Result<i32, String> {
+    // Network mode: fail closed on an unknown value, deterministically before
+    // any probe or fork; `relay` opts into the private network namespace +
+    // unix-socket relay (see super::relay). `host`/`shared` keep today's
+    // behaviour byte-for-byte.
+    let relay = kata_net_relay(&policy.net)?;
     let abi = probe_landlock_abi();
     if !kata_abi_ok(abi) {
         return Err(format!(
@@ -369,6 +389,18 @@ pub fn execute_kata(
     // just created (or already existed) so creating it again is idempotent.
     policy.ensure_writable_dirs(private_tmp.as_ref().map(|g| g.path.as_path()))?;
 
+    // Relay pre-flight, in the launcher process: the private socket dir, the
+    // outer proxy (one thread per connection) and the launcher exe path the
+    // child needs. This MUST happen before the fork: the proxy itself must
+    // run in the pod's network namespace (which this launcher process keeps
+    // -- only the forked child unshares into the agent's private network
+    // namespace below).
+    let relay_setup = if relay {
+        Some(relay_lib::setup_relay_launcher(policy)?)
+    } else {
+        None
+    };
+
     // Set self as subreaper
     unsafe {
         if libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0 {
@@ -402,11 +434,12 @@ pub fn execute_kata(
             let r = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
             if r == child_pid {
                 // The agent exited on its own: clean up any adopted
-                // descendants and the private tmp, restore the previous signal
-                // dispositions and return the agent's exit status. The private
-                // tmp cleanup must run even when the agent crashed, so the next
-                // launch with the same agent_id does not trip over a stale
-                // directory / secret file (F1).
+                // descendants, the private tmp and the relay socket dir,
+                // restore the previous signal dispositions and return the
+                // agent's exit status. The cleanups must run even when the
+                // agent crashed, so the next launch with the same agent_id
+                // does not trip over a stale directory / socket / secret file
+                // (F1).
                 let code = if libc::WIFEXITED(status) {
                     libc::WEXITSTATUS(status)
                 } else if libc::WIFSIGNALED(status) {
@@ -418,6 +451,9 @@ pub fn execute_kata(
                 if let Some(g) = private_tmp.as_ref() {
                     g.cleanup();
                 }
+                if let Some(setup) = &relay_setup {
+                    let _ = fs::remove_dir_all(&setup.dir);
+                }
                 restore_launcher_signals((old_term, old_int, old_hup));
                 return Ok(code);
             }
@@ -426,13 +462,16 @@ pub fn execute_kata(
             let sig = KATA_LAUNCHER_SIG.swap(0, Ordering::SeqCst);
             if sig != 0 {
                 // Tear down the whole tree (the agent is our direct child, so
-                // the descendant walk reaches it and its subtree), clean up the
-                // private tmp, and exit 128+signal, mirroring a normal signal
-                // death of the launcher. `_exit` bypasses Drop, so the cleanup
-                // must be explicit.
+                // the descendant walk reaches it and its subtree), clean up
+                // the private tmp and the relay socket dir, and exit
+                // 128+signal, mirroring a normal signal death of the launcher.
+                // `_exit` bypasses Drop, so the cleanup must be explicit.
                 kill_tree_and_reap();
                 if let Some(g) = private_tmp.as_ref() {
                     g.cleanup();
+                }
+                if let Some(setup) = &relay_setup {
+                    let _ = fs::remove_dir_all(&setup.dir);
                 }
                 unsafe {
                     libc::_exit(128 + sig);
@@ -453,7 +492,51 @@ pub fn execute_kata(
     }
 
     // --- INSIDE CHILD PROCESS ---
-    // Apply Landlock ruleset
+    // Relay mode: the child (and everything forked from it -- the relay-inner
+    // and the agent) gets its OWN network namespace, loopback only. The
+    // launcher (our parent) keeps the pod's network namespace and runs the
+    // outer proxy there. The unshares MUST happen before the Landlock domain
+    // is applied: the domain allows /proc read-only, and the uid_map writes
+    // the user-namespace setup performs would be denied behind it.
+    if relay {
+        if let Err(e) = kata_relay_unshare_private_net() {
+            eprintln!("kubeadp-agent sandbox setup error: {e}");
+            unsafe { libc::_exit(125) };
+        }
+    }
+
+    // Relay mode: start the inner relay (a subcommand of this binary) before
+    // the Landlock domain is applied, so the relay stays unrestricted. It
+    // listens on 127.0.0.1:3128 in the agent's network namespace and copies
+    // each TCP connection to the OUTER proxy socket path (path-based unix
+    // sockets are not namespaced by network namespaces, and the kata backend
+    // has no mount plumbing to bind the socket into the private tmp). It dies
+    // with the sandbox: the launcher's tree-kill reaps it when the agent
+    // exits, and its parent-death signal fires when the agent root dies.
+    if let (true, Some(setup)) = (relay, &relay_setup) {
+        let socket_target = kata_relay_socket_target(setup);
+        let argv = relay_lib::relay_inner_argv(&setup.exe, &socket_target);
+        let inner_env = vec![("PATH".to_string(), super::exec::default_path().to_string())];
+        let my_pid = unsafe { libc::getpid() };
+        let relay_pid = unsafe { libc::fork() };
+        if relay_pid < 0 {
+            eprintln!("kubeadp-agent relay: fork relay-inner failed");
+            unsafe { libc::_exit(125) };
+        }
+        if relay_pid == 0 {
+            // --- INSIDE RELAY-INNER ---
+            // If the agent root (our parent) dies, take ourselves down.
+            arm_pdeathsig(libc::SIGKILL, my_pid);
+            execute_target(&argv[0], &argv[1..], &inner_env);
+        }
+    }
+
+    // Apply Landlock ruleset. Unchanged by the relay mode: the agent reaches
+    // the outer proxy socket only through the relay-inner (a loopback TCP
+    // connection to 127.0.0.1:3128), and no new Landlock rule is needed --
+    // connect to a pathname unix socket is not Landlock-restricted below ABI 9
+    // (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`), which this ruleset never handles,
+    // and network sockets are unrestricted (`handled_access_net` is 0).
     if let Err(e) =
         apply_landlock_domain(policy, abi, private_tmp.as_ref().map(|g| g.path.as_path()))
     {
@@ -481,9 +564,91 @@ pub fn execute_kata(
         final_env.retain(|(k, _)| k != "TMPDIR");
         final_env.push(("TMPDIR".to_string(), tmp_path.to_string_lossy().to_string()));
     }
+    // With `net: relay` the loopback proxy env is injected on top of the
+    // filtered set (a no-op for the host mode, which keeps the filtered set
+    // byte-for-byte).
+    let final_env = relay_lib::apply_relay_env(
+        policy,
+        final_env,
+        relay_setup.as_ref().map(|s| s.exe.as_path()),
+    );
 
     // Exec command
     execute_target(cmd, args, &final_env);
+}
+
+/// Pure decision for the Kata backend's network mode: `true` when the policy
+/// selects the relay mode, `false` for `host`/`shared` (today's behaviour,
+/// byte-for-byte). Unknown values fail closed, mirroring the gVisor backend.
+pub fn kata_net_relay(net: &str) -> Result<bool, String> {
+    match net {
+        "relay" => Ok(true),
+        "host" | "shared" => Ok(false),
+        other => Err(format!(
+            "unknown net value '{other}' (accepted: host, shared, relay)"
+        )),
+    }
+}
+
+/// The namespace flags the Kata child unshares for the private network
+/// namespace, in order: CLONE_NEWUSER first (the caller's uid/gid mapped 1:1,
+/// unprivileged), then CLONE_NEWNET (allowed by the capabilities the fresh
+/// user namespace grants). No mount/PID/IPC namespaces: Landlock is the kata
+/// filesystem isolation and /proc stays shared.
+fn kata_relay_unshare_flags() -> (libc::c_int, libc::c_int) {
+    (libc::CLONE_NEWUSER, libc::CLONE_NEWNET)
+}
+
+/// The socket path the Kata relay-inner copies each connection to: the OUTER
+/// proxy socket itself. Path-based unix sockets are not namespaced by network
+/// namespaces, and the kata backend has no mount plumbing to bind the socket
+/// into the private tmp (the gVisor backend bind-mounts it there instead).
+fn kata_relay_socket_target(setup: &relay_lib::RelaySetup) -> PathBuf {
+    setup.sock.clone()
+}
+
+/// Creates the agent's private network namespace in the Kata backend's forked
+/// child: unshare(CLONE_NEWUSER) with the caller's own uid/gid mapped 1:1
+/// (works unprivileged, as with the gVisor backend), then
+/// unshare(CLONE_NEWNET) -- allowed by the capabilities the fresh user
+/// namespace grants -- and bring loopback up inside the new namespace (no
+/// external `ip` binary; see [`relay_lib::bring_loopback_up`]). Fails closed
+/// with the missing capability named: without unprivileged user namespaces
+/// the private network namespace cannot be created, so the launch aborts
+/// (exit 125) rather than running with weaker network isolation.
+fn kata_relay_unshare_private_net() -> Result<(), String> {
+    let (user_flag, net_flag) = kata_relay_unshare_flags();
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    unsafe {
+        if libc::unshare(user_flag) != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(format!(
+                "kubeadp-agent relay: unshare(CLONE_NEWUSER) failed: {err} (the kata backend \
+                 needs unprivileged user namespaces to create the agent's private network \
+                 namespace)"
+            ));
+        }
+    }
+
+    fs::write("/proc/self/setgroups", "deny\n")
+        .map_err(|e| format!("kubeadp-agent relay: write setgroups failed: {e}"))?;
+    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1\n"))
+        .map_err(|e| format!("kubeadp-agent relay: write uid_map failed: {e}"))?;
+    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1\n"))
+        .map_err(|e| format!("kubeadp-agent relay: write gid_map failed: {e}"))?;
+
+    unsafe {
+        if libc::unshare(net_flag) != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(format!(
+                "kubeadp-agent relay: unshare(CLONE_NEWNET) failed: {err}"
+            ));
+        }
+    }
+
+    relay_lib::bring_loopback_up()
 }
 
 /// Applies the Landlock domain ruleset to the current process.
@@ -785,7 +950,8 @@ fn setup_kata_private_tmp(
 /// create/chmod/remove. When the path is absent the leaf is created with
 /// `fs::DirBuilder::create` (i.e. `create_dir`, not `create_dir_all`) at mode
 /// 0700 and re-verified as a real directory owned by the current uid.
-fn create_owned_tmp_dir(path: &Path) -> Result<(), String> {
+/// Shared with the gVisor relay mode (the outer proxy socket dir).
+pub(crate) fn create_owned_tmp_dir(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let euid = unsafe { libc::geteuid() };
 
@@ -1500,5 +1666,99 @@ mod tests {
             !read_ok,
             "a same-uid sibling must not read a non-dumpable agent root's /proc data"
         );
+    }
+
+    // ---- net: relay ----------------------------------------------------------
+    //
+    // `net: relay` on the kata backend gives the agent its own loopback-only
+    // network namespace: the launcher runs the outer proxy (see `super::relay`),
+    // and the forked child unshares CLONE_NEWUSER|CLONE_NEWNET, brings loopback
+    // up and starts `relay-inner` inside the namespace before the Landlock
+    // domain is applied. These tests are hermetic: they pin the pure decisions
+    // of the kata relay path; the unshare plumbing itself is not exercised (no
+    // real namespaces in unit tests).
+
+    #[test]
+    fn test_kata_net_mode_selects_relay() {
+        // The pure net-mode decision: relay on, host/shared off (today's
+        // behaviour byte-for-byte), unknown values fail closed.
+        assert_eq!(kata_net_relay("relay"), Ok(true));
+        assert_eq!(kata_net_relay("host"), Ok(false));
+        assert_eq!(kata_net_relay("shared"), Ok(false));
+        let err = kata_net_relay("bridged").unwrap_err();
+        assert!(err.contains("unknown net value"), "err: {err}");
+    }
+
+    #[test]
+    fn test_kata_refuses_unknown_net_before_probe_or_fork() {
+        // execute_kata rejects an unknown net value deterministically before
+        // any probe or fork (the net-mode match is the first check).
+        let policy = crate::sandbox::policy::SandboxPolicy {
+            net: "bridged".to_string(),
+            ..crate::sandbox::policy::SandboxPolicy::default()
+        };
+        let err = super::execute_kata(&policy, "true", &[], &[]).unwrap_err();
+        assert!(err.contains("unknown net value"), "err: {err}");
+    }
+
+    #[test]
+    fn test_kata_relay_unshares_user_and_net_namespaces_only() {
+        // The kata child creates the private network namespace with
+        // unshare(CLONE_NEWUSER) + unshare(CLONE_NEWNET) only: no mount/PID/
+        // IPC namespaces (Landlock is the kata filesystem isolation and /proc
+        // stays shared).
+        let (user, net) = kata_relay_unshare_flags();
+        assert_eq!(user, libc::CLONE_NEWUSER);
+        assert_eq!(net, libc::CLONE_NEWNET);
+    }
+
+    #[test]
+    fn test_kata_relay_inner_uses_the_outer_socket_path() {
+        // The kata backend has no mount plumbing: relay-inner copies to the
+        // OUTER proxy socket path directly (path-based unix sockets are not
+        // namespaced by network namespaces), never to a bind target under the
+        // private tmp. Asserted on the built argv, no real namespaces.
+        let setup = relay_lib::RelaySetup {
+            dir: PathBuf::from("/tmp/kubeadp-relay-job1"),
+            sock: PathBuf::from("/tmp/kubeadp-relay-job1/proxy.sock"),
+            exe: PathBuf::from("/usr/local/bin/kubeadp-agent"),
+        };
+        let argv = relay_lib::relay_inner_argv(&setup.exe, &kata_relay_socket_target(&setup));
+        assert_eq!(
+            argv,
+            vec![
+                "/usr/local/bin/kubeadp-agent".to_string(),
+                "relay-inner".to_string(),
+                "/tmp/kubeadp-relay-job1/proxy.sock".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_kata_relay_env_host_and_shared_unchanged() {
+        // For host/shared the kata child env is exactly the filtered set plus
+        // the private TMPDIR, byte-for-byte (apply_relay_env is a no-op): no
+        // proxy variables are injected, no relay argv is built.
+        use crate::sandbox::relay::apply_relay_env;
+        let policy = crate::sandbox::policy::SandboxPolicy {
+            net: "host".to_string(),
+            ..crate::sandbox::policy::SandboxPolicy::default()
+        };
+        let filtered = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("TMPDIR".to_string(), "/tmp/agent-sandbox-job1".to_string()),
+        ];
+        let out = apply_relay_env(
+            &policy,
+            filtered.clone(),
+            Some(Path::new("/usr/local/bin/kubeadp-agent")),
+        );
+        assert_eq!(out, filtered, "host env must be unchanged");
+        let shared = crate::sandbox::policy::SandboxPolicy {
+            net: "shared".to_string(),
+            ..crate::sandbox::policy::SandboxPolicy::default()
+        };
+        let out = apply_relay_env(&shared, filtered.clone(), None);
+        assert_eq!(out, filtered, "shared env must be unchanged");
     }
 }

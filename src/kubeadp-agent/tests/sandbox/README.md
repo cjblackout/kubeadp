@@ -66,11 +66,13 @@ then exits 0, which is what the header states.
 
 ## Known limitation (not tested as a leak)
 
-R10 keeps the shared network namespace, so under the gVisor backend an agent can connect to
+R10 keeps the shared network namespace, so under the default `net: host` an agent can connect to
 ABSTRACT unix-domain sockets of other processes in the pod (the Kata backend blocks this with
-Landlock `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`). There is no isolation test for it: the
-behaviour is a documented property of the gVisor backend, and the pod must not run abstract
-socket listeners.
+Landlock `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`). Every backend closes this with the opt-in
+policy value `"net": "relay"` (own loopback-only network namespace + unix-socket relay proxy;
+the default `"net": "host"` and the legacy `"shared"` alias keep today's shared behaviour).
+There is no isolation test for the shared-namespace case: it is a documented property of the
+default network mode, and the pod must not run abstract socket listeners (or must set `net: relay`).
 
 ## Exit code semantics
 
@@ -117,3 +119,25 @@ pid marker files the spawner writes:
 
 The cleanup that kills genuine leaks also matches by the marker prefix, so it
 never touches the victim or other cases (which do not carry the prefix).
+
+## R12 (described, not wired into the runner): net=relay closes the shared network
+
+A black-box case for the opt-in `"net": "relay"` policy value (default off) —
+a new numbered case description, not a runner change:
+
+- Launch agent B with a policy carrying `"net": "relay"` and, on the host
+  side, serve an ABSTRACT unix-domain socket: B must fail to connect it (B
+  runs in its own network namespace).
+- B must have no non-loopback interface: a raw TCP connect (and DNS) to an
+  outside address must fail (no direct egress).
+- A proxy-aware client in B (env `HTTP_PROXY`/`HTTPS_PROXY` =
+  `http://127.0.0.1:3128`, or `GIT_SSH_COMMAND` with the shipped
+  `relay-connect` ProxyCommand) must reach an outside TCP echo only through
+  the relay path, while loopback (`127.0.0.1`, `::1`) and link-local
+  (`169.254.0.0/16`) destinations are refused by the proxy.
+- A second agent B2 with the default policy (`"net": "host"`) must behave
+  exactly as today (R10): abstract sockets reachable, direct egress working.
+
+The suite does not run this case; it needs a relay-capable build and a pod
+whose backend supports `net: relay` (gVisor, or kata/runc-Landlock with
+unprivileged user namespaces -- otherwise it fails closed, exit `125`).

@@ -45,6 +45,7 @@ pub struct GlobalOpts {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)] // one parsed value per process; boxing would only churn the arg structs
 pub enum Commands {
     /// Runtime setup: ensures the server is authenticated (interactive OAuth when its credentials are missing), then ensures job state directories exist and optionally extracts a secret env var to a 0600 file
     Init(InitArgs),
@@ -391,5 +392,28 @@ mod tests {
         // The value passes through verbatim (server validates the duration).
         let args = parsed_start(&["--max-runtime", "30m"]);
         assert_eq!(args.max_runtime.as_deref(), Some("30m"));
+    }
+
+    #[test]
+    fn test_start_jobset_flag_parses_and_defaults_to_none() {
+        // Unset by default: the job gets a fresh jobset (or the host's).
+        let args = parsed_start(&[]);
+        assert_eq!(args.jobset_id, None);
+
+        // Explicit `--jobset <id>` joins the caller's jobset.
+        let args = parsed_start(&["--jobset", "js-caller"]);
+        assert_eq!(args.jobset_id.as_deref(), Some("js-caller"));
+    }
+
+    #[test]
+    fn test_start_engine_flag_parses_and_defaults_to_none() {
+        // Default: no --engine means agy (the server default).
+        let args = parsed_start(&[]);
+        assert_eq!(args.engine, None);
+
+        // The value passes through verbatim (the server maps it to the
+        // engine selection contract of HL-91 E3).
+        let args = parsed_start(&["--engine", "agy"]);
+        assert_eq!(args.engine.as_deref(), Some("agy"));
     }
 }

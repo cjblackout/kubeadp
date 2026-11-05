@@ -524,6 +524,7 @@ fn join_prompts(msgs: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::core::job::{open_state_db, JobStatus};
+    use http_body_util::BodyExt;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
@@ -690,7 +691,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_a2a_endpoints() {
-        use crate::core::a2a::{a2a_router, A2aModel, WELL_KNOWN_AGENT_CARD_PATH};
+        use crate::core::a2a::{a2a_router, A2aModel, AuthVerifier, WELL_KNOWN_AGENT_CARD_PATH};
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;
@@ -701,16 +702,25 @@ mod tests {
         create_test_job(&config, "job-http-1", JobStatus::Done);
 
         let model = A2aModel {
-            name: "agent-run-api".to_string(),
+            name: "kubeadp-agent-worker-http-1".to_string(),
             description: "Test".to_string(),
             version: "0.1.0".to_string(),
             skills: vec![],
             url: "http://localhost:8002".to_string(),
         };
         let backend = Arc::new(JobTaskBackend::new(config));
-        let app = a2a_router(model, backend, None, None);
+        let auth: AuthVerifier = Arc::new(|headers: &axum::http::HeaderMap| {
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v == "Bearer http-token")
+        });
+        let app = a2a_router(model, backend, None, Some(auth));
+        let bearer = |builder: axum::http::request::Builder| {
+            builder.header("authorization", "Bearer http-token")
+        };
 
-        // 1. Agent card (public)
+        // 1. Agent card (public, no auth)
         let res = app
             .clone()
             .oneshot(
@@ -722,12 +732,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let card: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(card["name"], "kubeadp-agent-worker-http-1");
 
-        // 2. GET /tasks/job-http-1
+        // 2. GET /tasks/job-http-1 (authenticated)
         let res = app
             .clone()
             .oneshot(
-                Request::builder()
+                bearer(Request::builder())
                     .uri("/tasks/job-http-1")
                     .body(Body::empty())
                     .unwrap(),
@@ -736,11 +749,11 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        // 3. GET /tasks/nonexistent -> 404
+        // 3. GET /tasks/nonexistent (authenticated) -> 404
         let res = app
             .clone()
             .oneshot(
-                Request::builder()
+                bearer(Request::builder())
                     .uri("/tasks/nonexistent")
                     .body(Body::empty())
                     .unwrap(),
@@ -749,7 +762,9 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
-        // 4. POST /rpc -> 404 (JSON-RPC /rpc is no longer mounted)
+        // 4. POST /rpc, unauthenticated -> 401 (the auth layer runs before
+        // routing, so an unauthenticated peer cannot probe which paths exist;
+        // JSON-RPC /rpc is not mounted)
         let res = app
             .clone()
             .oneshot(
@@ -761,17 +776,32 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
-        // 5. POST /message:send with an empty body -> the message names no task
-        // or context, so it is INVALID_PARAMS; the SDK maps that to HTTP 400.
-        // (A well-formed message that addresses a real job is now accepted: the
-        // worker resumes that job's conversation with the message as the next
-        // turn. See the JobMessageSink tests below.)
+        // 5. POST /message:send with an empty body, UNAUTHENTICATED -> 401.
+        // Authentication is checked before the body is parsed/validated, so
+        // this answers 401 (not the body's "message must address a task or
+        // context" 400).
         let res = app
             .clone()
             .oneshot(
                 Request::builder()
+                    .method("POST")
+                    .uri("/message:send")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // 6. POST /message:send with an empty body, AUTHENTICATED -> 400: the
+        // message names no task/context (INVALID_PARAMS).
+        let res = app
+            .clone()
+            .oneshot(
+                bearer(Request::builder())
                     .method("POST")
                     .uri("/message:send")
                     .header("content-type", "application/json")

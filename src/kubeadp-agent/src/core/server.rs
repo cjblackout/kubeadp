@@ -15,6 +15,8 @@ pub mod capabilities;
 mod events;
 pub mod obs;
 pub mod reject;
+#[cfg(feature = "engine")]
+pub mod runs;
 pub mod token;
 
 pub use reject::{ApiJson, ApiPath, ApiQuery};
@@ -29,6 +31,8 @@ use crate::core::commands;
 use crate::core::config::Config;
 use crate::core::job::JobMetadata;
 use crate::core::output::CommandOutput;
+#[cfg(feature = "engine")]
+use crate::engine::emulate::EngineRunRegistry;
 #[cfg(feature = "engine")]
 use crate::engine::EngineRegistry;
 use anyhow::{Context, Result};
@@ -140,6 +144,13 @@ pub fn router_with_rc(
     #[cfg(feature = "engine")]
     let api_v1 = api_v1
         .route("/capabilities", get(capabilities::capabilities_handler))
+        .route("/runs/{run_id}/interrupt", post(runs::interrupt_run))
+        .route("/runs/{run_id}/pause", post(runs::pause_run))
+        .route("/runs/{run_id}/compact", post(runs::compact_run))
+        .route("/runs/{run_id}/fork", post(runs::fork_run))
+        .route("/runs/{run_id}/revert", post(runs::revert_run))
+        .route("/runs/{run_id}/todo", get(runs::todo_run))
+        .layer(Extension(EngineRunRegistry::global()))
         .layer(Extension(Arc::new(EngineRegistry::new())));
 
     Router::new().nest("/api/v1", api_v1)
@@ -194,6 +205,18 @@ pub fn router_with_engines(
         .route("/auth/code", post(submit_auth_code))
         .route("/auth/cancel", post(cancel_auth))
         .route("/capabilities", get(capabilities::capabilities_handler))
+        // E4 run-control endpoints (design HL-91 2.5): interrupt/pause/compact/
+        // fork/revert/todo, addressed by run id through the shared run
+        // registry. In E4 the routes resolve no runs in production (the
+        // drivers that populate the registry land in E3/E5); contracts are
+        // exercised by tests that register runs directly.
+        .route("/runs/{run_id}/interrupt", post(runs::interrupt_run))
+        .route("/runs/{run_id}/pause", post(runs::pause_run))
+        .route("/runs/{run_id}/compact", post(runs::compact_run))
+        .route("/runs/{run_id}/fork", post(runs::fork_run))
+        .route("/runs/{run_id}/revert", post(runs::revert_run))
+        .route("/runs/{run_id}/todo", get(runs::todo_run))
+        .layer(Extension(EngineRunRegistry::global()))
         .fallback(api_v1_not_found)
         .with_state(state)
         .layer(Extension(auth))
@@ -343,6 +366,15 @@ struct StartRequest {
     /// server-wide `AGENT_RUN_MAX_RUNTIME` default.
     #[serde(default)]
     pub max_runtime: Option<String>,
+    /// Join the job to an existing jobset (see `StartArgs::jobset_id`).
+    #[serde(default)]
+    pub jobset_id: Option<String>,
+    /// Engine to run this job with (HL-91 E3, selection precedence level 1).
+    /// `agy` (the default) uses this pod's agy job driver; `claude` names the
+    /// claude engine this pod does not host yet (501); any other value is an
+    /// unregistered engine the server refuses with 400.
+    #[serde(default)]
+    pub engine: Option<String>,
 }
 
 /// Per-process sequence for unique temp patch file names.
@@ -652,6 +684,59 @@ async fn start_job(
     State(config): State<AppState>,
     ApiJson(req): ApiJson<StartRequest>,
 ) -> Response {
+    // HL-91 E3: engine selection for this job. The agy driver is the only job
+    // engine this pod hosts, so `agy` (and an absent engine) fall through to
+    // the existing command path; `claude` is a real engine this pod does not
+    // host yet (501, not a selection error); anything else is an engine the
+    // pod never registered (400 `unknown_engine` -- an unregistered engine is
+    // a selection error, never a 501; design 2.4). Under the reduced build
+    // without the `engine` feature no engine field is accepted and an explicit
+    // non-`agy` value answers the same contract through the trait mapping.
+    if let Some(engine) = req.engine.as_deref() {
+        match engine {
+            "agy" => {}
+            #[cfg(feature = "engine")]
+            "claude" => {
+                return crate::engine::errors::to_response(
+                    &crate::engine::EngineError::unsupported("claude", "job.start"),
+                )
+            }
+            #[cfg(not(feature = "engine"))]
+            "claude" => {
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(json!({
+                        "error": "engine 'claude' does not support endpoint 'job.start'",
+                        "code": "unsupported",
+                        "engine": "claude",
+                    })),
+                )
+                    .into_response()
+            }
+            other => {
+                #[cfg(feature = "engine")]
+                {
+                    return crate::engine::errors::to_response(
+                        &crate::engine::EngineError::UnknownEngine {
+                            engine: other.to_string(),
+                        },
+                    );
+                }
+                #[cfg(not(feature = "engine"))]
+                {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "unknown engine",
+                            "code": "unknown_engine",
+                            "engine": other,
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
     // Materialize --from-patch content before running (the core applies the
     // patch file path, not content); delete it when run returns, success or
     // error.
@@ -679,6 +764,8 @@ async fn start_job(
         from_patch: temp_patch.clone(),
         plan: req.plan,
         max_runtime: req.max_runtime,
+        jobset_id: req.jobset_id,
+        engine: req.engine,
     };
     let config = Arc::clone(&config);
     let output = run_blocking(move || commands::start::run(&config, &args)).await;
@@ -3382,6 +3469,89 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // POST /api/v1/jobs engine field (HL-91 E3): the agy engine is the job
+    // default; "claude" answers 501 (a real engine this pod does not host);
+    // any other name answers 400 unknown_engine (a selection error).
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    #[cfg(feature = "engine")]
+    async fn test_start_job_rejects_claude_with_501() {
+        let app = test_router();
+        let res = app
+            .oneshot(post_json_request(
+                "/api/v1/jobs",
+                r#"{"project":"p","prompt":"hi","engine":"claude"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+        let value: Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+        assert_eq!(value["code"], "unsupported");
+        assert_eq!(value["engine"], "claude");
+        assert!(
+            value["error"].as_str().unwrap().contains("claude"),
+            "501 body should name the engine: {value}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "engine")]
+    async fn test_start_job_rejects_unknown_engine_with_400() {
+        let app = test_router();
+        let res = app
+            .oneshot(post_json_request(
+                "/api/v1/jobs",
+                r#"{"project":"p","prompt":"hi","engine":"bogus"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let value: Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+        assert_eq!(value["code"], "unknown_engine");
+        assert_eq!(value["engine"], "bogus");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "engine")]
+    async fn test_start_job_absent_and_agy_engine_reach_the_command_path() {
+        // `agy` (and an absent engine) are not rejected by engine selection:
+        // the request proceeds to the real job handler, which answers 400
+        // `project_not_found` for the missing project directory -- never the
+        // 501 `unsupported` or 400 `unknown_engine` of engine selection.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = router(
+            Arc::new(Config {
+                workspace_root: tmp.path().join("ws"),
+                state_root: tmp.path().join("state"),
+                agy_path: tmp.path().join("no-such-agy"),
+                ..Default::default()
+            }),
+            Arc::new(AuthManager::new()),
+        );
+        for body in [
+            r#"{"project":"p","prompt":"hi","engine":"agy"}"#,
+            r#"{"project":"p","prompt":"hi"}"#,
+        ] {
+            let res = app
+                .clone()
+                .oneshot(post_json_request("/api/v1/jobs", body))
+                .await
+                .unwrap();
+            // Engine selection accepted it: the request reached the command
+            // layer, which rejects the missing project directory (not the
+            // 501 `unsupported` or 400 `unknown_engine` of engine selection).
+            let status = res.status();
+            let text = body_string(res.into_body()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}: {text}");
+            assert!(
+                text.contains("project_not_found"),
+                "body {body} must pass engine selection and fail later: {text}"
+            );
+        }
+    }
+
     /// `POST /api/v1/jobsets/{id}/end` requires the operator bearer token (it
     /// is one of the whole /api/v1 group) and 404s on unknown jobset ids.
     #[tokio::test]
@@ -3411,21 +3581,56 @@ mod tests {
 
     /// `POST /api/v1/jobsets/{id}/end` on a KNOWN jobset answers 200 with the
     /// new (bumped) epoch and marks it ended (verify now rejects).
-    #[tokio::test]
-    async fn test_end_jobset_route_ends_known_jobset() {
-        // The route drives the process-wide registry (like production). Use a
-        // unique agent id so this test never collides with other tests.
-        std::env::remove_var(crate::core::jobset::ROOT_KEY_FILE_ENV);
-        let cred = crate::core::jobset::register_agent(&format!("job-end-{}", std::process::id()));
-        let app = test_router();
-        let uri = format!("/api/v1/jobsets/{}/end", cred.jobset_id);
-        let res = app.oneshot(post_json_request(&uri, "{}")).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK, "known jobset ends with 200");
-        let value: Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-        assert_eq!(value["ended"], true);
-        assert!(value["epoch"].as_u64().unwrap() > cred.epoch);
-        // Ended in the registry -> verification now rejects.
-        assert!(crate::core::jobset::global_registry().is_ended(&cred.jobset_id));
-        crate::core::jobset::drop_agent(&format!("job-end-{}", std::process::id()));
+    #[test]
+    fn test_end_jobset_route_ends_known_jobset() {
+        // The route drives the process-wide registry (like production): run
+        // under the isolation lock so a concurrent test asserting an empty
+        // registry never sees this agent.
+        crate::core::jobset::with_isolated_registry(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    std::env::remove_var(crate::core::jobset::ROOT_KEY_FILE_ENV);
+                    let cred = crate::core::jobset::register_agent(&format!(
+                        "job-end-{}",
+                        std::process::id()
+                    ));
+                    let app = test_router();
+                    let uri = format!("/api/v1/jobsets/{}/end", cred.jobset_id);
+                    let res = app.oneshot(post_json_request(&uri, "{}")).await.unwrap();
+                    assert_eq!(res.status(), StatusCode::OK, "known jobset ends with 200");
+                    let value: Value =
+                        serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+                    assert_eq!(value["ended"], true);
+                    assert!(value["epoch"].as_u64().unwrap() > cred.epoch);
+                    // Ended in the registry -> verification now rejects.
+                    assert!(crate::core::jobset::global_registry().is_ended(&cred.jobset_id));
+                    crate::core::jobset::drop_agent(&format!("job-end-{}", std::process::id()));
+                });
+        });
+    }
+
+    /// The `start` body deserializes `jobset_id` (a `--jobset` start from the
+    /// CLI) into `StartRequest`.
+    #[test]
+    fn start_request_deserializes_jobset_id() {
+        let body = json!({
+            "project": "proj",
+            "prompt": "hi",
+            "sandbox": true,
+            "jobset_id": "js-caller",
+        });
+        let req: StartRequest = serde_json::from_value(body).expect("parse StartRequest");
+        assert_eq!(req.jobset_id.as_deref(), Some("js-caller"));
+
+        // Absent field defaults to None.
+        let req: StartRequest = serde_json::from_value(json!({
+            "project": "proj",
+            "prompt": "hi",
+        }))
+        .expect("parse StartRequest");
+        assert_eq!(req.jobset_id, None);
     }
 }

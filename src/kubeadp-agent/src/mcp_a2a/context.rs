@@ -112,7 +112,10 @@ fn read_optional(path: &str) -> Option<String> {
 /// A discovery failure at startup (e.g. the MCP client is being set up before
 /// the cluster is reachable) does not kill the server: it starts with an
 /// empty registry and every tool reports its error, which is far friendlier
-/// for a stdio MCP client than an immediate exit.
+/// for a stdio MCP client than an immediate exit. When the static `A2A_PEERS`
+/// registry is configured, the fallback uses ONLY that registry (so a
+/// sandboxed job with no service-account token still gets its configured
+/// peers), rather than an empty one.
 pub async fn build_server(
     kube_api: Option<String>,
 ) -> Result<crate::mcp_a2a::A2aMcpServer, Box<dyn std::error::Error + Send + Sync>> {
@@ -125,8 +128,24 @@ pub async fn build_server(
     {
         Ok(ctx) => ctx,
         Err(e) => {
-            eprintln!("[mcp-a2a] agent discovery failed ({e}); starting with an empty registry");
-            crate::core::a2a::client::empty_ctx()
+            eprintln!("[mcp-a2a] agent discovery failed ({e}); starting with a fallback registry");
+            let fallback = crate::core::a2a::client::static_peers_ctx();
+            if fallback.list_agents().is_empty() {
+                eprintln!(
+                    "[mcp-a2a] no static A2A_PEERS configured; starting with an empty registry"
+                );
+            } else {
+                eprintln!(
+                    "[mcp-a2a] using {} static A2A_PEERS entr{}",
+                    fallback.list_agents().len(),
+                    if fallback.list_agents().len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
+                );
+            }
+            fallback
         }
     };
     Ok(crate::mcp_a2a::A2aMcpServer::new(ctx))
@@ -154,5 +173,53 @@ mod tests {
             Some("value".to_string())
         );
         assert_eq!(read_optional("/nonexistent/path"), None);
+    }
+
+    /// `static_peers_ctx` builds a context purely from `A2A_PEERS` (the
+    /// no-SA-token fallback): the static entries become the registry and the
+    /// self-name is honoured as-is.
+    #[test]
+    fn static_peers_ctx_registers_configured_peers() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::core::a2a::client::A2A_PEERS_ENV;
+
+        std::env::set_var(
+            A2A_PEERS_ENV,
+            "worker=http://worker.invalid:8002, other/agent=http://agent.invalid:8002",
+        );
+        std::env::set_var("A2A_SELF_NAME", "kubeadp-agent-worker-service/job-a1");
+        let ctx = crate::core::a2a::client::static_peers_ctx();
+        let agents = ctx.list_agents();
+        let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+        assert!(
+            names.contains(&"worker") && names.contains(&"agent"),
+            "static peers are registered: {names:?}"
+        );
+        // The per-job self-name survives into the context.
+        assert_eq!(
+            ctx.self_name(),
+            "kubeadp-agent-worker-service/job-a1",
+            "per-job self-name is honoured"
+        );
+        // A bare peer is placed in the pod namespace when known.
+        let worker = ctx
+            .list_agents()
+            .into_iter()
+            .find(|a| a.name == "worker")
+            .expect("worker peer present");
+        std::env::remove_var(A2A_PEERS_ENV);
+        std::env::remove_var("A2A_SELF_NAME");
+        if std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .is_some()
+        {
+            assert!(
+                !worker.namespace.is_empty(),
+                "bare peer gets the pod namespace"
+            );
+        }
     }
 }

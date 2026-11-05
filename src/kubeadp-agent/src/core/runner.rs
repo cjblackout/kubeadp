@@ -257,9 +257,55 @@ pub fn build_command(
             cmd.env(k, v);
         }
     }
+    // Every job gets its OWN A2A sender identity: `<prefix>/<job_id>` (see
+    // [`apply_a2a_self_name`]).
+    apply_a2a_self_name(&mut cmd, &meta.job_id);
 
     crate::core::proxy::apply_proxy(&mut cmd, Some(config), meta.proxy.as_deref());
     Ok((cmd, policy_path, jobset.map(|c| c.secret)))
+}
+
+/// Sets a launched job's `A2A_SELF_NAME` to `<prefix>/<job_id>` so every job
+/// presents a unique, addressable A2A sender identity.
+///
+/// `<prefix>` is the discoverable agent prefix of THIS host: the `A2A_SELF_PREFIX`
+/// env var (the Service name peers resolve, e.g. `kubeadp-agent-worker-service`,
+/// set in the worker manifest); else the inherited `A2A_SELF_NAME`'s first
+/// `/`-segment; else the pod's kernel comm name; else `kubeadp-agent`. The
+/// `<job_id>` suffix lets a peer address this job as `<prefix>/<job_id>`: the
+/// reply tool splits the single trailing `/`-segment into the A2A `task_id`
+/// while the host's A2A surface (which serves tasks by job id) stays the
+/// resolution target.
+///
+/// `A2A_SELF_NAME` is covered by the default `A2A_*` sandbox allow pattern, so
+/// the value passes through into the sandboxed job.
+pub fn apply_a2a_self_name(cmd: &mut Command, id: &str) {
+    let prefix = std::env::var("A2A_SELF_PREFIX")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            // Inherited `A2A_SELF_NAME`: take its first `/`-segment (whether
+            // the incoming value is `prefix/job` or, when it has no slash, the
+            // prefix is the whole bare name itself).
+            std::env::var("A2A_SELF_NAME")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(|s| match s.split_once('/') {
+                    Some((p, _)) => p.to_string(),
+                    None => s,
+                })
+                .filter(|p| !p.is_empty())
+        })
+        .or_else(|| {
+            std::fs::read_to_string("/proc/self/comm")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "kubeadp-agent".to_string());
+    cmd.env("A2A_SELF_NAME", format!("{prefix}/{id}"));
 }
 
 /// Assembles the process `argv` for a launch. Pure (no process spawn) so the
@@ -1441,6 +1487,58 @@ mod tests {
         assert!(args.contains(&"30s".to_string()));
         // No privilege-separation remnants may leak into the command.
         assert!(!args.iter().any(|a| a.contains("env") || a == "gosu"));
+    }
+
+    #[test]
+    fn apply_a2a_self_name_sets_per_job_identity() {
+        // Serialize env mutation.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Save/restore the env vars this test touches.
+        let saved = ["A2A_SELF_PREFIX", "A2A_SELF_NAME", "HOME"]
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect::<Vec<_>>();
+
+        let self_name_of = |c: &Command| -> Option<String> {
+            c.get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new("A2A_SELF_NAME"))
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+
+        // Explicit prefix wins.
+        std::env::set_var("A2A_SELF_PREFIX", "kubeadp-agent-worker-service");
+        std::env::remove_var("A2A_SELF_NAME");
+        let mut c = Command::new("true");
+        apply_a2a_self_name(&mut c, "job-abc");
+        assert_eq!(
+            self_name_of(&c).as_deref(),
+            Some("kubeadp-agent-worker-service/job-abc")
+        );
+        std::env::set_var("A2A_SELF_NAME", "kubeadp-agent-worker-service");
+        let mut c = Command::new("true");
+        apply_a2a_self_name(&mut c, "job-abc");
+        assert_eq!(
+            self_name_of(&c).as_deref(),
+            Some("kubeadp-agent-worker-service/job-abc")
+        );
+
+        // No prefix: the inherited A2A_SELF_NAME's first segment is used.
+        std::env::remove_var("A2A_SELF_PREFIX");
+        std::env::set_var("A2A_SELF_NAME", "kubeadp-agent-worker-service");
+        let mut c = Command::new("true");
+        apply_a2a_self_name(&mut c, "job-abc");
+        assert_eq!(
+            self_name_of(&c).as_deref(),
+            Some("kubeadp-agent-worker-service/job-abc")
+        );
+
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 
     #[test]

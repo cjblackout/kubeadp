@@ -141,6 +141,21 @@ pub struct StartArgs {
     /// `AGENT_RUN_MAX_RUNTIME` default.
     #[arg(long)]
     pub max_runtime: Option<String>,
+
+    /// Join the job to an existing jobset instead of creating a fresh one:
+    /// the job presents the jobset credential derived from the shared root
+    /// key (`jobset_root_key_file` / `KUBEADP_JOBSET_ROOT_KEY_FILE`) for this
+    /// jobset id, so the caller (e.g. an orchestrator session) and the job
+    /// become members of the same A2A jobset. Requires a configured root key;
+    /// a retried job keeps its original jobset.
+    #[arg(long = "jobset")]
+    pub jobset_id: Option<String>,
+    /// Engine to run this job with (HL-91 E3, selection precedence level 1).
+    /// `agy` (the default) uses the agy job driver; `claude` is a claude
+    /// engine this pod does not host yet (the request answers 501); any other
+    /// value is an unregistered engine the server refuses with 400.
+    #[arg(long, value_name = "<engine>")]
+    pub engine: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -177,6 +192,9 @@ struct StartArgsDeserialize {
     pub plan: bool,
     #[serde(default)]
     pub max_runtime: Option<String>,
+    #[serde(default)]
+    pub jobset_id: Option<String>,
+    pub engine: Option<String>,
 }
 
 impl<'de> serde::Deserialize<'de> for StartArgs {
@@ -202,6 +220,8 @@ impl<'de> serde::Deserialize<'de> for StartArgs {
             from_patch: raw.from_patch,
             plan: raw.plan,
             max_runtime: raw.max_runtime,
+            jobset_id: raw.jobset_id,
+            engine: raw.engine,
         })
     }
 }

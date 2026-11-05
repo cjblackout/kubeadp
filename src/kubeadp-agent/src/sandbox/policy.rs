@@ -71,6 +71,12 @@ pub struct SandboxPolicy {
     pub secret: Option<SecretConfig>,
     #[serde(default = "default_env_allow")]
     pub env_allow: Vec<String>,
+    /// Network mode: `host` (the default; the agent keeps the pod's network
+    /// namespace -- today's behaviour; the legacy value `shared` is an alias),
+    /// or `relay` (the agent gets its own loopback-only network namespace and
+    /// reaches the outside through a unix-socket relay proxy; honoured by all
+    /// three backends: the gVisor shim unshares the namespace, the kata and
+    /// runc-Landlock children unshare user+network namespaces).
     #[serde(default = "default_net")]
     pub net: String,
 }
@@ -93,8 +99,26 @@ fn default_env_allow() -> Vec<String> {
     ]
 }
 
+/// The `net` values the policy accepts. `shared` is the legacy alias of the
+/// default `host` (the agent keeps the pod's network namespace); `relay` is
+/// the opt-in private-namespace + unix-socket-relay mode (all three
+/// backends). Anything else is rejected at parse time.
+pub const NET_MODES: &[&str] = &["host", "shared", "relay"];
+
 fn default_net() -> String {
-    "shared".to_string()
+    "host".to_string()
+}
+
+/// Validates the policy `net` value. Unknown values are an error so a policy
+/// that was never parsed cannot silently select a weaker (or unknown) mode.
+fn validate_net(net: &str) -> Result<(), String> {
+    if NET_MODES.contains(&net) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown net value '{net}' (accepted: host, shared, relay)"
+        ))
+    }
 }
 
 impl Default for SandboxPolicy {
@@ -179,10 +203,12 @@ impl SandboxPolicy {
 
     /// Validates the policy and its grants.
     /// Fails closed (returns Err) if:
+    /// - `net` is not one of the accepted values (`host`, `shared`, `relay`).
     /// - `role` is `Worker` but `grants` is set (worker jobs can never have grants).
     /// - Any grant path is non-absolute, root `/`, `/proc`, `/dev`, or contains traversal `..`.
     /// - Any grant env name is invalid.
     pub fn validate(&self) -> Result<(), String> {
+        validate_net(&self.net)?;
         if self.role == PolicyRole::Worker && self.grants.is_some() {
             return Err("Worker job policy must not specify grants (grants are restricted to session policies)".to_string());
         }
@@ -217,9 +243,13 @@ impl SandboxPolicy {
         Ok(policy)
     }
 
-    /// Parses policy from JSON string. Unknown keys produce an error.
+    /// Parses policy from JSON string. Unknown keys and unknown `net` values
+    /// produce an error.
     pub fn parse_json(json_str: &str) -> Result<Self, String> {
-        serde_json::from_str(json_str).map_err(|e| format!("invalid policy JSON: {e}"))
+        let policy: Self =
+            serde_json::from_str(json_str).map_err(|e| format!("invalid policy JSON: {e}"))?;
+        validate_net(&policy.net)?;
+        Ok(policy)
     }
 
     /// Materializes a policy document on disk at `path` as pretty JSON.
@@ -555,6 +585,27 @@ mod tests {
         }"#;
         let err = SandboxPolicy::parse_json(json).unwrap_err();
         assert!(err.contains("unknown field"), "error was: {err}");
+    }
+
+    #[test]
+    fn test_net_default_host_and_accepted_values() {
+        // No `net` field: the default is `host` (today's behaviour, opt-out).
+        let policy = SandboxPolicy::parse_json(r#"{"rw": ["/workspace"]}"#).expect("parse");
+        assert_eq!(policy.net, "host");
+        // Default::default() carries the host default too.
+        assert_eq!(SandboxPolicy::default().net, "host");
+        // The legacy `shared` alias stays accepted (same behaviour as host).
+        let policy = SandboxPolicy::parse_json(r#"{"net": "shared"}"#).expect("parse");
+        assert_eq!(policy.net, "shared");
+        // The opt-in `relay` value is accepted.
+        let policy = SandboxPolicy::parse_json(r#"{"net": "relay"}"#).expect("parse");
+        assert_eq!(policy.net, "relay");
+        // An unknown value is rejected at parse time.
+        let err = SandboxPolicy::parse_json(r#"{"net": "bridged"}"#).unwrap_err();
+        assert!(
+            err.contains("unknown net value"),
+            "error must name the net value: {err}"
+        );
     }
 
     #[test]
