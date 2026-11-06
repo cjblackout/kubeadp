@@ -427,6 +427,43 @@ mod jobset_router_tests {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// A request that names no target (`GET /tasks`) still has to present the
+    /// jobset's secret: the id alone is not a credential.
+    #[tokio::test]
+    async fn jobset_targetless_request_verifies_the_secret() {
+        let cred = cred_with_members(&[("t1", "js-1", "secret-1")]);
+        let app = a2a_router_with_jobset(
+            model(),
+            FakeBackend::with(vec![task("t1")]),
+            None,
+            None,
+            Some(cred),
+        );
+        let wrong = app
+            .clone()
+            .oneshot(get_task_req(
+                "/tasks",
+                &[
+                    (crate::core::jobset::JOBSET_ID_HEADER, "js-1"),
+                    (crate::core::jobset::JOBSET_SECRET_HEADER, "not-the-secret"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        let right = app
+            .oneshot(get_task_req(
+                "/tasks",
+                &[
+                    (crate::core::jobset::JOBSET_ID_HEADER, "js-1"),
+                    (crate::core::jobset::JOBSET_SECRET_HEADER, "secret-1"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_ne!(right.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn jobset_wrong_secret_rejected() {
         let backend = FakeBackend::with(vec![task("t1")]);

@@ -265,7 +265,11 @@ fn decide(
         let target = target_for(uri, send_body);
         return match target.as_deref() {
             Some(target) => verify_jobset_credential(registry, target, &getter),
-            None => registry.has_member_of(presented_id),
+            // No target named: the presented secret must still verify, against
+            // a live member of the presented jobset.
+            None => registry
+                .any_member_of(presented_id)
+                .is_some_and(|member| verify_jobset_credential(registry, &member, &getter)),
         };
     }
     // No jobset credential presented: the operator/bearer gate decides.

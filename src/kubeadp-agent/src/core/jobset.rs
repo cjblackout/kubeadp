@@ -527,6 +527,16 @@ impl JobsetRegistry {
     /// may all have finished -- their persisted memberships keep the jobset
     /// recognisable). Used by the end route to 404 genuinely unknown jobsets
     /// while still allowing the operator to end a finished one.
+    /// The id of one live member of `jobset_id` (an agent this process
+    /// registered), used to verify a presented credential for a request that
+    /// names no particular target.
+    pub fn any_member_of(&self, jobset_id: &str) -> Option<String> {
+        let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .find(|(_, e)| e.jobset_id == jobset_id)
+            .map(|(id, _)| id.clone())
+    }
+
     pub fn has_member_of(&self, jobset_id: &str) -> bool {
         let known = {
             let known = self.known.lock().unwrap_or_else(|e| e.into_inner());

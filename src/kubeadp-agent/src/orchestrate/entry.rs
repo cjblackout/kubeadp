@@ -346,6 +346,20 @@ fn run_supervisor(config_path: Option<PathBuf>) {
         controls.insert(Arc::new(SessionControl::new(session.clone())));
     }
 
+    // Jobsets: the root key and the membership store must be ready BEFORE the
+    // first session registers itself. Otherwise the session gets a random
+    // secret that the shared root key cannot derive, and no worker job of its
+    // jobset can ever present a credential this process accepts.
+    crate::core::jobset::register_self();
+    {
+        let jobset_state_root = crate::core::config::Config::load()
+            .unwrap_or_default()
+            .state_root;
+        if let Err(e) = crate::core::jobset::init_global_jobsets(&jobset_state_root) {
+            log_event("supervisor", &format!("jobset init failed: {e}"));
+        }
+    }
+
     // Live session threads, keyed by name.
     let mut handles: HashMap<String, thread::JoinHandle<()>> = HashMap::new();
 
