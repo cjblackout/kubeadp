@@ -159,6 +159,38 @@ pub struct SessionGrants {
 }
 
 impl SessionGrants {
+    /// Drops every grant entry that fails validation and returns one warning per
+    /// dropped entry. A forbidden or malformed grant simply is not granted; the
+    /// session still starts, with strictly less access (isolation is unchanged).
+    pub fn sanitize(&mut self, session_name: &str) -> Vec<String> {
+        let mut warnings = Vec::new();
+        self.ro_paths
+            .retain(|p| match validate_grant_path(p, "ro_paths", session_name) {
+                Ok(()) => true,
+                Err(e) => {
+                    warnings.push(format!("grant dropped: {e}"));
+                    false
+                }
+            });
+        self.rw_paths
+            .retain(|p| match validate_grant_path(p, "rw_paths", session_name) {
+                Ok(()) => true,
+                Err(e) => {
+                    warnings.push(format!("grant dropped: {e}"));
+                    false
+                }
+            });
+        self.env
+            .retain(|v| match validate_grant_env_name(v, session_name) {
+                Ok(()) => true,
+                Err(e) => {
+                    warnings.push(format!("grant dropped: {e}"));
+                    false
+                }
+            });
+        warnings
+    }
+
     /// Validates the grants configuration according to sandbox security constraints.
     pub fn validate(&self, session_name: &str) -> Result<(), String> {
         for p in &self.ro_paths {
@@ -358,9 +390,9 @@ impl SessionConfig {
                 ));
             }
         }
-        if let Some(ref g) = self.grants {
-            g.validate(n)?;
-        }
+        // Grants are NOT validated here: an invalid grant must not stop the session
+        // (or the other sessions) from starting. `SessionGrants::sanitize` drops
+        // the offending entries with a warning when the config is loaded.
         Ok(())
     }
 }
@@ -1113,52 +1145,34 @@ mod sandbox_flag_tests {
         }"#;
         assert!(serde_json::from_str::<SessionConfig>(unknown_key).is_err());
 
-        // Relative path rejected
-        let rel_path = r#"{
+        // Invalid grants are DROPPED with a warning; the session config stays valid
+        // (the session still starts) and the valid entries are kept.
+        let mixed = r#"{
             "name": "sess",
             "workdir": "/w",
             "session_id": "s",
             "grants": {
-                "ro_paths": ["relative/path"]
+                "ro_paths": ["relative/path", "/opt/tools"],
+                "rw_paths": ["/workspace", "/workspace/../etc", "/dev/shm", "/proc/1", "/"],
+                "env": ["GH_TOKEN", "", "BAD*VAR", "BAD-VAR", "*", "FOO**", "VIKUNJA_*"]
             }
         }"#;
-        let s: SessionConfig = serde_json::from_str(rel_path).unwrap();
-        let err = s.validate_durations().unwrap_err();
-        assert!(err.contains("non-absolute path"), "err: {err}");
-
-        // Path traversal rejected
-        let traversal = r#"{
-            "name": "sess",
-            "workdir": "/w",
-            "session_id": "s",
-            "grants": {
-                "rw_paths": ["/workspace/../etc"]
-            }
-        }"#;
-        let s: SessionConfig = serde_json::from_str(traversal).unwrap();
-        let err = s.validate_durations().unwrap_err();
-        assert!(err.contains("parent traversal"), "err: {err}");
-
-        // Root or /proc or /dev forbidden
-        for forbidden in ["/", "/proc", "/proc/1", "/dev", "/dev/null"] {
-            let json = format!(
-                r#"{{"name":"sess","workdir":"/w","session_id":"s","grants":{{"ro_paths":["{forbidden}"]}}}}"#
-            );
-            let s: SessionConfig = serde_json::from_str(&json).unwrap();
-            let err = s.validate_durations().unwrap_err();
-            assert!(err.contains("forbidden path"), "err: {err}");
-        }
-
-        // Invalid env names (empty, bad chars, inner wildcard)
-        for bad_env in ["", "BAD*VAR", "BAD-VAR", "*", "FOO**"] {
-            let json = format!(
-                r#"{{"name":"sess","workdir":"/w","session_id":"s","grants":{{"env":["{bad_env}"]}}}}"#
-            );
-            let s: SessionConfig = serde_json::from_str(&json).unwrap();
-            assert!(
-                s.validate_durations().is_err(),
-                "bad env should fail: {bad_env}"
-            );
-        }
+        let mut s: SessionConfig = serde_json::from_str(mixed).unwrap();
+        assert!(
+            s.validate_durations().is_ok(),
+            "a bad grant must not fail the config"
+        );
+        let warnings = s.grants.as_mut().unwrap().sanitize("sess");
+        let g = s.grants.unwrap();
+        assert_eq!(g.ro_paths, vec![PathBuf::from("/opt/tools")]);
+        assert_eq!(g.rw_paths, vec![PathBuf::from("/workspace")]);
+        assert_eq!(g.env, vec!["GH_TOKEN".to_string(), "VIKUNJA_*".to_string()]);
+        assert_eq!(warnings.len(), 1 + 4 + 5, "{warnings:?}");
+        assert!(warnings.iter().all(|w| w.starts_with("grant dropped:")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("forbidden path '/dev/shm'")));
+        assert!(warnings.iter().any(|w| w.contains("parent traversal")));
+        assert!(warnings.iter().any(|w| w.contains("non-absolute path")));
     }
 }

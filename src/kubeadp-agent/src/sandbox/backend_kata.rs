@@ -772,33 +772,28 @@ pub fn apply_landlock_domain(
 
     // 5. Grants allow-list (if session has grants). Grants are optional extras
     //    on top of the base policy, and a Landlock allow-list only ever adds
-    //    access. A policy VIOLATION (a denied path) still aborts the launch, but
-    //    an environmental failure of one grant (the kernel rejecting the rule)
-    //    is dropped with a warning and the session starts with less access:
+    //    access. A grant that cannot be applied (a forbidden/denied path, a
+    //    write to the ServiceAccount dir, or the kernel rejecting the rule) is
+    //    DROPPED with a warning and the session starts with less access:
     //    isolation is unaffected, whereas aborting would crash-loop the whole
     //    session over one optional path. The base policy above stays fatal.
     if let Some(ref g) = policy.grants {
-        let grant = |what: &str, r: Result<(), String>| -> Result<(), String> {
-            match r {
-                Err(e) if e.contains("refusing to grant") => Err(e),
-                Err(e) => {
-                    eprintln!("kubeadp-agent: sandbox grant dropped ({what}): {e}");
-                    Ok(())
-                }
-                Ok(()) => Ok(()),
+        let grant = |what: &str, r: Result<(), String>| {
+            if let Err(e) = r {
+                eprintln!("kubeadp-agent: sandbox grant dropped ({what}): {e}");
             }
         };
         if g.serviceaccount {
             grant(
                 "serviceaccount",
                 add_ro(Path::new(K8S_SERVICEACCOUNT_TOKEN_DIR)),
-            )?;
+            );
         }
         for ro_path in &g.ro_paths {
-            grant(&format!("ro {}", ro_path.display()), add_ro(ro_path))?;
+            grant(&format!("ro {}", ro_path.display()), add_ro(ro_path));
         }
         for rw_path in &g.rw_paths {
-            grant(&format!("rw {}", rw_path.display()), add_rw(rw_path))?;
+            grant(&format!("rw {}", rw_path.display()), add_rw(rw_path));
         }
     }
 
@@ -1365,7 +1360,7 @@ mod tests {
         }
         assert!(libc::WIFEXITED(st3) && libc::WEXITSTATUS(st3) == 0);
 
-        // (b2) Session attempting to write SA path must fail closed!
+        // (b2) A session asking for write access to the SA path has that grant dropped (not fatal)
         let session_write_sa = SandboxPolicy {
             role: PolicyRole::Session,
             grants: Some(GrantsConfig {
@@ -1379,9 +1374,10 @@ mod tests {
         assert!(pid4 >= 0);
         if pid4 == 0 {
             let res = apply_landlock_domain(&session_write_sa, KATA_MIN_LANDLOCK_ABI, None);
-            // Must fail closed because write to SA path is refused!
+            // The write grant to the SA path is refused, but only that grant is
+            // dropped: the domain is still applied (the session starts).
             unsafe {
-                libc::_exit(if res.is_err() { 0 } else { 1 });
+                libc::_exit(if res.is_ok() { 0 } else { 1 });
             }
         }
         let mut st4 = 0;
