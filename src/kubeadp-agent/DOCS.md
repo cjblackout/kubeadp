@@ -145,6 +145,8 @@ Orchestrator sessions running under sandbox isolation can receive scoped access 
 
 Worker jobs cannot declare grants. Any attempt to supply grants to a worker job fails closed.
 
+A forbidden or failing session grant is dropped, never fatal: an entry that fails validation (relative path, `..`, `/`, `/proc`, `/dev/...`, bad env name) is removed with a `grant dropped:` warning when the supervisor config is loaded, and a grant the kata backend refuses or the kernel rejects (for example a write to the ServiceAccount directory) is dropped with `sandbox grant dropped (...)` at launch. The session and every other session still start, with strictly less access; isolation is unchanged because a grant only ever adds access. The base sandbox policy (system roots, Landlock itself, no-new-privs) stays fail-closed.
+
 ---
 
 ## 4. Agent-to-Agent (A2A) Protocol
