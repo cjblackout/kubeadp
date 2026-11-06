@@ -14,9 +14,15 @@ extern "C" fn sig_handler(sig: libc::c_int) {
     FORWARD_SIG.store(sig, Ordering::SeqCst);
 }
 
-/// Waits for a child process while forwarding SIGTERM and SIGINT to it,
-/// returning the child's exit code once it finishes.
-pub fn wait_with_signal_forwarding(child_pid: libc::pid_t) -> i32 {
+/// Installs the SIGTERM/SIGINT handlers that record the signal for forwarding.
+///
+/// The gVisor-style launcher's shim runs as PID 1 of a fresh PID namespace; the
+/// kernel does not deliver a signal with default disposition to a namespace
+/// init, so a SIGTERM aimed at the shim before these handlers exist is silently
+/// dropped. The shim therefore installs them as its very first action. Calling
+/// it again later (from [`run_init_shim`]) re-installs the same handler and is
+/// harmless.
+pub fn install_shim_signal_handlers() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = sig_handler as *const () as usize;
@@ -25,9 +31,20 @@ pub fn wait_with_signal_forwarding(child_pid: libc::pid_t) -> i32 {
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
         libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
     }
+}
+
+/// Waits for a child process while forwarding SIGTERM and SIGINT to it,
+/// returning the child's exit code once it finishes.
+pub fn wait_with_signal_forwarding(child_pid: libc::pid_t) -> i32 {
+    install_shim_signal_handlers();
 
     loop {
-        let sig = FORWARD_SIG.swap(0, Ordering::SeqCst);
+        // Read (do not clear) the recorded signal and re-send it on every pass
+        // until the child exits. A forward that lands in the window before the
+        // namespace's PID 1 has installed its handler is dropped by the kernel;
+        // retrying -- standard signals coalesce while pending -- makes the
+        // forward survive that window instead of being given up after one shot.
+        let sig = FORWARD_SIG.load(Ordering::SeqCst);
         if sig != 0 {
             unsafe {
                 libc::kill(child_pid, sig);
@@ -56,15 +73,9 @@ pub fn wait_with_signal_forwarding(child_pid: libc::pid_t) -> i32 {
 /// and when `target_pid` exits, kills all remaining processes (SIGTERM, then SIGKILL if needed)
 /// and returns the exit status code (standard Unix: 0-255 or 128 + sig).
 pub fn run_init_shim(target_pid: libc::pid_t) -> i32 {
-    unsafe {
-        // Install signal handler for SIGTERM and SIGINT
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sig_handler as *const () as usize;
-        sa.sa_flags = libc::SA_RESTART;
-        libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
-    }
+    // Install the signal handler for SIGTERM and SIGINT (idempotent with the
+    // early install the shim performs for the namespace-init case).
+    install_shim_signal_handlers();
 
     let mut target_exit_code = None;
 
@@ -612,6 +623,84 @@ mod tests {
         // Signaled by SIGKILL (9) -> 128 + 9 = 137
         let status_sig_9 = libc::SIGKILL;
         assert_eq!(status_to_exit_code(status_sig_9), 137);
+    }
+
+    #[test]
+    fn test_wait_forwards_term_to_child_handler() {
+        // Mirrors R08.sigterm_launcher in-process (no PID namespace): a child
+        // ("launcher") waits on a grandchild ("agent") via
+        // `wait_with_signal_forwarding`; the launcher child installs the
+        // SIGTERM handler itself. The test parent then SIGTERMs the launcher
+        // child, exactly like the orchestrator does. The wait loop must
+        // forward the TERM to the agent, the agent's own handler must run, and
+        // the launcher must report the agent's clean exit (0). Everything
+        // happens inside forked children so the test runner's signal state is
+        // never touched.
+        let launcher = unsafe { libc::fork() };
+        assert!(launcher >= 0, "fork launcher child");
+        if launcher == 0 {
+            let agent = unsafe { libc::fork() };
+            if agent == 0 {
+                // Agent: install a SIGTERM handler that exits 0, mark that we
+                // got the signal on a fd the launcher watches, then idle.
+                extern "C" fn onterm(_: libc::c_int) {
+                    unsafe {
+                        libc::_exit(0);
+                    }
+                }
+                let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+                sa.sa_sigaction = onterm as *const () as usize;
+                unsafe {
+                    libc::sigemptyset(&mut sa.sa_mask);
+                    libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+                }
+                loop {
+                    raw_nanosleep(100);
+                }
+            }
+            // Launcher: wait on the agent with signal forwarding. The SIGTERM
+            // the test parent sends to THIS process is recorded by the handler
+            // this function installs, forwarded to the agent, and the agent's
+            // exit (0) is returned.
+            let code = wait_with_signal_forwarding(agent);
+            unsafe { libc::_exit(code) };
+        }
+
+        // Give the launcher time to fork the agent and install its handler,
+        // then signal the launcher exactly like `case_R8_term` does. The wait
+        // is bounded so a regression (no forward -> agent never exits -> the
+        // launcher never exits) fails the test cleanly instead of hanging the
+        // whole suite.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        unsafe {
+            libc::kill(launcher, libc::SIGTERM);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut st = 0;
+            let r = unsafe { libc::waitpid(launcher, &mut st, libc::WNOHANG) };
+            if r == launcher {
+                assert_eq!(
+                    status_to_exit_code(st),
+                    0,
+                    "launcher must exit 0 after forwarding SIGTERM to the agent"
+                );
+                break;
+            }
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                assert_eq!(
+                    e.raw_os_error(),
+                    Some(libc::EINTR),
+                    "waitpid(launcher): {e}"
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launcher did not forward SIGTERM to the agent and exit within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     #[test]

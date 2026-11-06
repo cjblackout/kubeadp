@@ -23,7 +23,9 @@
 //!   the legacy `shared` alias keep today's behaviour byte-for-byte.
 
 use super::exec::exec_target;
-use super::init_shim::{arm_pdeathsig, close_fds_above_2, run_init_shim, zeroize_bytes};
+use super::init_shim::{
+    arm_pdeathsig, close_fds_above_2, install_shim_signal_handlers, run_init_shim, zeroize_bytes,
+};
 use super::policy::SandboxPolicy;
 use super::relay as relay_lib;
 use std::env;
@@ -140,6 +142,14 @@ pub fn execute_gvisor(
     //
     // 1. If the launcher (our parent, outside the namespace) dies abnormally,
     //    take the whole sandbox down with us.
+    //
+    // Install the SIGTERM/SIGINT handlers FIRST, before any setup work or
+    // entry into run_init_shim: as PID 1 of a fresh PID namespace the kernel
+    // drops a default-disposition signal, so a SIGTERM forwarded by the
+    // launcher before the handler exists would be consumed and never reach the
+    // agent (R08.sigterm_launcher). The re-install inside run_init_shim is a
+    // harmless no-op with the same handler.
+    install_shim_signal_handlers();
     arm_pdeathsig(libc::SIGKILL, unsafe { libc::getppid() });
 
     // 2. Stop /proc/1/{mem,environ} and ptrace from exposing us to same-uid
