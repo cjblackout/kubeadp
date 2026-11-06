@@ -164,7 +164,20 @@ When built with `--features a2a`, the server exposes the standard A2A endpoints 
 - `POST /tasks/{id}:cancel`: Cancels an active task.
 - `POST /message:send`: Sends a message to a specific agent task or session.
 
-Unsupported methods (`SendStreamingMessage`, `SubscribeToTask`, push notifications) return HTTP 400 (`UNSUPPORTED_OPERATION`).
+Unsupported methods (`SendStreamingMessage`, `SubscribeToTask`, push notifications, `GetExtendedAgentCard`) return HTTP 400.
+
+Error responses are `application/problem+json`; the A2A reason is carried in `error.details[0].reason`.
+
+| A2A reason | HTTP | When |
+|---|---|---|
+| `TASK_NOT_FOUND` | `404` | Task id does not match a live job/session (unknown, cleaned, or discarded). |
+| `TASK_NOT_CANCELABLE` | `400` | The addressed task is not cancelable. |
+| `UNSUPPORTED_OPERATION` | `400` | A method the surface does not implement (streaming, subscriptions, push, extended card). |
+| `PUSH_NOTIFICATION_NOT_SUPPORTED` | `400` | Push-notification config request. |
+| `EXTENDED_CARD_NOT_CONFIGURED` | `400` | Extended agent card not configured. |
+| `INVALID_PARAMS` | `400` | Invalid request, an oversized message, or a throttled (rate-limited) delivery. |
+
+`GET /tasks` is paginated: default page size `50`, hard maximum `100`.
 
 ### 4.2 Authentication and Authorization
 
@@ -265,6 +278,15 @@ All `/api/v1` endpoints require a bearer token matching `KUBEADP_API_TOKEN_FILE`
 - `POST /api/v1/jobs/repair`: Sweeps and repairs all orphaned job worktrees.
 - `POST /api/v1/jobs/wait`: Long-polls until target jobs reach a terminal status.
 
+Job statuses: `running`, `done`, `failed`, `self-terminated`, `killed`, `incomplete`, `quota-exhausted`. `done`, `failed`, `self-terminated`, `killed`, `incomplete`, and `quota-exhausted` are terminal.
+
+| Job status | A2A `TaskState` |
+|---|---|
+| `running` | `working` |
+| `done` | `completed` |
+| `failed`, `incomplete`, `quota-exhausted` | `failed` |
+| `self-terminated`, `killed` | `canceled` |
+
 ### 5.3 Run-Control Endpoints (Engine Layer)
 
 - `GET /api/v1/capabilities`: Returns capability tables across all registered engines.
@@ -285,15 +307,73 @@ All `/api/v1` endpoints require a bearer token matching `KUBEADP_API_TOKEN_FILE`
 - `GET /api/v1/sessions/{name}/log?tail=5000`: Returns sanitized log lines from the session ring buffer.
 - `POST /api/v1/sessions/{name}/message`: Injects text into the session PTY via bracketed paste (`{"text": "..."}`).
 
+| Outcome | HTTP | Body `code` |
+|---|---|---|
+| Accepted | `202` | `{"session", "accepted": true, "bytes"}` |
+| Body not JSON / no `text` / empty after trim | `400` | `invalid_body` |
+| Trimmed text exceeds `8192` bytes | `413` | `too_large` |
+| Unknown session | `404` | — |
+| Session stopped/paused or no live PTY | `409` | `not_running` |
+| More than `30` messages per minute for the (session, sender) pair | `429` (`Retry-After`) | `rate_limited` |
+
+The message is written as a bracketed paste (`ESC[200~ ... ESC[201~`) followed by a single Enter, so pasted newlines never submit early and the text cannot run as a command.
+
+### 5.5 Orchestrator Session Configuration
+
+The supervisor resolves its session configuration in this order: `--config <path>`, then `AGENT_ORCHESTRATE_CONFIG` (legacy `CLAUDE_SUPERVISOR_CONFIG` still accepted), then `/etc/agent-orchestrate/config.json` (only if it exists), then built-in defaults. The session file is JSON or TOML (chosen by extension, same serde structs).
+
+Global options:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `state_file` | `/tmp/claude-supervisor-state.json` | Path of the atomic JSON state file. |
+| `heartbeat_interval_secs` | `2.0` | Heartbeat write interval. |
+| `stale_heartbeat_secs` | `15.0` | Age after which the heartbeat is considered stale by the `status` probe. |
+| `shutdown_grace_secs` | `5.0` | Grace period before SIGKILL on supervisor shutdown. |
+| `claude_config_dir` | `$HOME/.claude` | Base Claude configuration directory. |
+
+Per-session backoff, retry, and supervision options:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `readiness_poll_secs` | `5.0` (env-generated sessions: `30.0`) | Interval between auth readiness checks. |
+| `hang_timeout_secs` | `0.0` (off) | Seconds of silent PTY inactivity before kill and restart. |
+| `kill_grace_secs` | `5.0` | Grace between SIGTERM and SIGKILL escalation. |
+| `pty_eof_grace_secs` | `10.0` | Wait for the child to exit after PTY EOF before escalation. |
+| `kill_wait_secs` | `15.0` | Bounded wait for reaping after SIGKILL before marking the child unkillable. |
+| `base_backoff_secs` | `2.0` | Initial restart backoff. |
+| `max_backoff_secs` | `60.0` | Cap of the exponential backoff. |
+| `backoff_window_secs` | `600.0` | Sliding window for backoff accounting across restarts. |
+| `healthy_run_secs` | `30.0` | Uptime that resets the backoff counter as healthy. |
+| `max_crashes` | `5` (env-generated: `0` = unlimited) | Crashes within `crash_window_secs` before the session is marked `failed`. |
+| `crash_window_secs` | `60.0` | Sliding window for crash-threshold accounting. |
+| `failed_cooldown_secs` | `300.0` (minimum `1.0`) | Time a `failed` session stays failed before supervision resumes. |
+| `resume_fail_quarantine_after` | `5` | Consecutive fast `--resume` failures before the transcript is quarantined for a fresh start. |
+| `resume_fail_uptime_secs` | `5.0` | Uptime that still counts a `--resume` launch as a fast resume failure. |
+| `sandbox` | `true` | Run the session under `sandbox-exec`; `false` is a trusted session (full environment, no grants). |
+
+Restart delay is `min(base_backoff_secs * 2^n, max_backoff_secs)` where `n` is the restarts already in the window (the first restart in the window uses `base_backoff_secs`), with +0..+25% jitter applied on top.
+
+The `agent-orchestrate status` probe exits `0` (healthy), `1` (heartbeat stale), `2` (a session is `failed` or a session thread died), `3` (state file unreadable), or `4` (supervisor stopped or a session is `stopped`).
+
 ---
 
 ## 6. Repository Synchronization (`repo-sync`)
 
 The `repo-sync` subcommand maintains local mirrors of Git repositories without sidecar dependencies.
 
-### 6.1 Configuration (`repo-sync.toml`)
+### 6.1 Flags
 
-Configured via `KUBEADP_REPO_SYNC_CONFIG` (default: `/etc/kubeadp-agent/repo-sync.toml`):
+`kubeadp-agent repo-sync` runs as a single process for every configured repository (the git-sync sidecar replacement).
+
+| Flag | Behaviour |
+|---|---|
+| `--once` | Runs one cycle over every repository and exits. Exit code `1` on any failure, `0` on success. |
+| `--loop` | The default. Runs each repository on its own period, retrying a failed repository at the next period. |
+
+### 6.2 Configuration (`repo-sync.toml`)
+
+Configured via `KUBEADP_REPO_SYNC_CONFIG` (default `/etc/kubeadp-agent/repo-sync.toml`, used only if it exists; an absent file means environment-only config). The file is separate from the main `KUBEADP_CONFIG_FILE`: a `[repo_sync]` section in the main file is a hard error.
 
 ```toml
 [repo_sync]
@@ -309,7 +389,32 @@ period_secs = 300
 depth = 1
 ```
 
-### 6.2 Synchronization Cycle
+Top-level keys:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `repos` | required (non-empty) | Array of repository tables, one per repository. |
+| `token_env` | none | Name of the environment variable holding the git token. |
+| `token_file` | none | Path to a file whose trimmed content is the git token (re-read every cycle for rotation). |
+| `max_failures` | `0` | Consecutive per-repo failures before `--loop` aborts (`0` = any failure exits, negative = retry forever). |
+
+Per-repository keys:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `name` | required | Unique repository name. |
+| `url` | required | Remote URL; embedded userinfo is stripped. |
+| `ref` | `main` | Ref to fetch. |
+| `root` | `/workspace/.roots/<name>` | Path of the bare Git repository (expanded: `~`, `{name}`, `{workspace_root}`). |
+| `link` | required | Absolute path of the symlink the pod reads through (e.g. `/workspace/<name>`). |
+| `period_secs` | `300` (minimum `30`) | Sync period for `--loop`. |
+| `depth` | `0` (full history) | Positive value makes the fetch shallow; an automatic `--unshallow` restores full history when depth drops back to `0`. |
+
+Unknown keys are a hard error. Environment overrides (environment always wins): `KUBEADP_REPO_SYNC_TOKEN_ENV`, `KUBEADP_REPO_SYNC_TOKEN_FILE`, `KUBEADP_REPO_SYNC_PERIOD_SECS`, `KUBEADP_REPO_SYNC_FETCH_TIMEOUT_SECS`, `KUBEADP_REPO_SYNC_MAX_FAILURES`.
+
+Secrets are never inline: the token comes only from `token_env` or `token_file`, is never printed, never placed in `argv`, and is fed to Git through `git credential approve` on stdin (`GIT_TERMINAL_PROMPT=0`, a private per-process git config).
+
+### 6.3 Synchronization Cycle
 
 Each synchronization cycle executes the following steps under a per-repository file lock (`<root>/.repo-sync.lock`):
 1. Verifies the bare repository at `<root>`.
@@ -318,6 +423,17 @@ Each synchronization cycle executes the following steps under a per-repository f
 4. Checks out a read-only worktree at `<root>/.worktrees/<sha>`.
 5. Atomically flips the relative symlink `link` to point to the new worktree.
 6. Prunes old worktrees, retaining the active commit and the two preceding revisions.
+
+A crash or failure at any step leaves `link` pointing at a complete previous checkout.
+
+### 6.4 Failure Behaviour
+
+| Mode | Failure handling |
+|---|---|
+| `--once` | One cycle over every repository; the first failure exits `1`. |
+| `--loop` | A failed repository is retried at its next period. Consecutive failures are counted per repository; the loop aborts when a repository reaches `max_failures` (`0` = any failure exits, negative = retry forever). |
+
+Network and authentication failures are logged without secrets and never delete the current checkout. Each cycle prints one status line on stderr: `repo-sync <name>: <old sha> -> <new sha> (<ms>)`.
 
 ---
 
@@ -328,13 +444,23 @@ Each synchronization cycle executes the following steps under a per-repository f
 - **401 Unauthorized**: Ensure `Authorization: Bearer <token>` matches the contents of `KUBEADP_API_TOKEN_FILE`. Check that the token file is readable and non-empty.
 - **429 Too Many Requests**: Triggered when more than 10 failed authentication attempts occur within 60 seconds from a single IP address. Wait for the `Retry-After` duration before retrying.
 
-### 7.2 Sandbox Execution Failures (Exit Code 125)
+### 7.2 Sandbox Execution Exit Codes
 
-Exit code 125 indicates sandbox setup failed before the target command could execute:
+`sandbox-exec` propagates the target command's exit code, or a signal death as `128 + N`. The launcher's own failures use distinct codes:
+
+| Exit code | Meaning |
+|---|---|
+| `125` | Sandbox setup failed or no backend is supported on the pod; the command never ran. |
+| `126` | The target command exists but is not executable. |
+| `127` | The target command was not found. |
+
+For a `125` (sandbox setup failure):
 - Check container capabilities using `kubeadp-agent sandbox-probe --json`.
 - For `kata` environments, verify that the host kernel supports Landlock ABI >= 6.
 - For `net: relay` environments, ensure that unprivileged user and network namespaces are supported by the container runtime.
 - Verify that paths listed in `ro_paths` or `rw_paths` are absolute and exist on disk.
+
+When a launcher exits `125` for a supervised session, the supervisor records the session's last exit reason as `sandbox-setup-failed (rc=125): <reason>` (the first non-empty line of the launcher output, capped at 200 characters).
 
 ### 7.3 Orphaned Git Worktrees
 

@@ -58,7 +58,7 @@ File resolution:
 
 Environment variables take precedence over settings in the configuration file.
 
-The file contains three sections: `[common]`, `[orchestrator]`, and `[worker]`. Unknown, misplaced, or duplicate keys produce a configuration error and exit code 1.
+The file contains three sections: `[common]`, `[orchestrator]`, and `[worker]`. Unknown, misplaced, or duplicate keys produce a configuration error and exit code 1. A `[repo_sync]` section is rejected in this file; repo-sync has its own file (see [DOCS.md](DOCS.md), section 6).
 
 ### Configuration Keys
 
@@ -140,6 +140,29 @@ max_parallel = 4
 default_engine = "agy"
 a2a_mcp_enabled = true
 ```
+
+### Environment-Only Variables
+
+Variables that are read at runtime and have no configuration-file key. Environment always wins over any file setting.
+
+| Variable | Used by | Default / Notes |
+|---|---|---|
+| `A2A_NAMESPACES` | A2A discovery (`mcp-a2a`, A2A client) | Comma-separated namespaces to scan for Services labelled `a2a.homelab/agent=true`, in addition to the pod's own namespace. |
+| `A2A_PEERS` | A2A discovery (`mcp-a2a`, A2A client) | Static peer registry, comma-separated `name=url` or `namespace/name=url`; needs no Kubernetes service account, so a sandboxed job without an SA token still reaches configured peers. |
+| `A2A_SELF_NAME` | A2A card and client | Outbound sender identity and the `name` field of the agent card (precedence over `POD_NAME`/`HOSTNAME`). Default: `kubeadp-agent`. |
+| `A2A_SELF_PREFIX` | Worker jobs | Prefix for each job's A2A sender identity; a launched job's `A2A_SELF_NAME` is set to `<A2A_SELF_PREFIX>/<job_id>`. |
+| `KUBEADP_JOBSET_ID` | A2A jobset members | The jobset id handed to an agent by its launcher (secret travels via `KUBEADP_JOBSET_SECRET_FILE`, never this variable). |
+| `KUBEADP_JOBSET_SECRET_FILE` | A2A jobset members | Path to the mode `0400` file holding the derived jobset secret. |
+| `KUBEADP_REPO_SYNC_CONFIG` | `repo-sync` | Path to the repo-sync TOML file (default `/etc/kubeadp-agent/repo-sync.toml`, used only if it exists). |
+| `KUBEADP_REPO_SYNC_TOKEN_ENV` | `repo-sync` | Name of the environment variable holding the git token (overrides the file's `token_env`). |
+| `KUBEADP_REPO_SYNC_TOKEN_FILE` | `repo-sync` | Path to a file whose trimmed content is the git token (overrides the file's `token_file`; re-read every cycle). |
+| `KUBEADP_REPO_SYNC_PERIOD_SECS` | `repo-sync` | Per-cycle sync period in seconds (overrides each repo's `period_secs`). |
+| `KUBEADP_REPO_SYNC_FETCH_TIMEOUT_SECS` | `repo-sync` | Per-fetch git command timeout in seconds (default `300`; always wins over the file). |
+| `KUBEADP_REPO_SYNC_MAX_FAILURES` | `repo-sync` | Consecutive per-repo failures before `--loop` aborts (`0` = any failure exits, negative = retry forever). |
+| `A2A_KUBE_API` | `mcp-a2a` discovery | Overrides the Kubernetes API base URL. **Test-only**: compiled in only with the `test-hooks` feature; ignored in production builds. |
+| `A2A_URL_OVERRIDES` | `mcp-a2a` / A2A client | Redirects the connection (and card fetch) for `name=url` or `namespace/name=url`, the qualified form winning. **Test-only**: compiled in only with the `test-hooks` feature; ignored in production builds. |
+
+The agent card `url` is derived from `KUBEADP_A2A_URL` (when set, authoritative) and falls back to the local listen address.
 
 ## Quick Usage
 
