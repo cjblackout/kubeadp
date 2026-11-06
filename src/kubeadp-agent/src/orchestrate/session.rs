@@ -42,14 +42,14 @@ pub fn run_session_loop(
     pty_input: Arc<Mutex<crate::orchestrate::pty::PtyInput>>,
     mut stdout_sender: StdoutSender,
 ) {
-    // Register the session in the process-wide jobset registry (idempotent; a
+    // Register the session in the process-wide jobset registry under its name,
+    // the id peers address it by over A2A (idempotent; a
     // respawned session reuses its jobset). The entry is dropped when this
     // thread exits (the drop guard covers Stopped, Failed, and any unexpected
     // exit), so the A2A surface stops accepting the session's credential the
     // moment the session ends.
-    crate::core::jobset::register_agent(&session.session_id);
-    let _session_jobset_drop =
-        crate::core::jobset::JobsetDropGuard::new(session.session_id.clone());
+    crate::core::jobset::register_agent(&session.name);
+    let _session_jobset_drop = crate::core::jobset::JobsetDropGuard::new(session.name.clone());
 
     // Fix #4: use SlideWindowBackoff for backoff computation.
     let mut swb = SlideWindowBackoff::new(
@@ -664,9 +664,9 @@ fn run_session_iteration(
         // sandbox `secret` channel and only the jobset id + the secret file PATH
         // reach the environment (never the secret value). A session with no
         // registered jobset is launched unchanged. The policy's agent id
-        // (`session.session_id`) is the same key the session is registered under,
-        // so the private-tmp (and thus the secret file PATH) matches the sandbox.
-        let session_jobset = crate::core::jobset::agent_jobset(&session.session_id);
+        // (`session.session_id`) only names the private tmp; the registry key is the
+        // session name.
+        let session_jobset = crate::core::jobset::agent_jobset(&session.name);
         let policy = match &session_jobset {
             Some(_) => crate::core::jobset::build_jobset_policy(&base_policy),
             None => base_policy,
