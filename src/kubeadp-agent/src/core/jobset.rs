@@ -797,6 +797,29 @@ pub fn register_agent_into(agent_id: &str, jobset_id: &str) -> Result<JobsetCred
     Ok(cred)
 }
 
+/// File (under the state root) that remembers which jobset a job was started
+/// into, so a retry rejoins it instead of getting a fresh one. Holds the
+/// jobset id only, never a secret.
+fn job_jobset_path(state_root: &std::path::Path, job_id: &str) -> std::path::PathBuf {
+    state_root.join("job-jobsets").join(job_id)
+}
+
+/// Records that `job_id` was started into `jobset_id` (best effort).
+pub fn remember_job_jobset(state_root: &std::path::Path, job_id: &str, jobset_id: &str) {
+    let path = job_jobset_path(state_root, job_id);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, jobset_id.trim());
+}
+
+/// The jobset `job_id` was explicitly started into, if any.
+pub fn recall_job_jobset(state_root: &std::path::Path, job_id: &str) -> Option<String> {
+    let id = std::fs::read_to_string(job_jobset_path(state_root, job_id)).ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 /// Shared registration helper: inserts `cred` for `agent_id` and persists the
 /// new membership (agent id + jobset id + epoch ONLY -- no secrets).
 fn register_agent_at(agent_id: &str, cred: &JobsetCredential) {
@@ -1298,6 +1321,16 @@ pub fn build_jobset_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_jobset_is_remembered_across_retries() {
+        let dir = std::env::temp_dir().join(format!("jj-{}", new_jobset_id()));
+        assert_eq!(recall_job_jobset(&dir, "j1"), None);
+        remember_job_jobset(&dir, "j1", " abc ");
+        assert_eq!(recall_job_jobset(&dir, "j1").as_deref(), Some("abc"));
+        assert_eq!(recall_job_jobset(&dir, "j2"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use std::sync::Arc;
 
     /// Serializes tests that mutate the process-global jobset env vars

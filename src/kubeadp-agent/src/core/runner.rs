@@ -739,7 +739,18 @@ pub fn launch_background_job_with_timeout(
     // env and the A2A surface can accept the job's credential. The secret
     // exists in memory only and the entry is dropped on every end path
     // (monitor completion / kill / clean / gc / a failed start's row delete).
-    crate::core::jobset::register_agent(&meta.job_id);
+    // A job started with `--jobset` rejoins that jobset on every retry.
+    match crate::core::jobset::recall_job_jobset(&config.state_root, &meta.job_id) {
+        Some(jobset_id) => {
+            if let Err(e) = crate::core::jobset::register_agent_into(&meta.job_id, &jobset_id) {
+                eprintln!("jobset rejoin failed for job {}: {e}", meta.job_id);
+                let _ = crate::core::jobset::register_agent(&meta.job_id);
+            }
+        }
+        None => {
+            let _ = crate::core::jobset::register_agent(&meta.job_id);
+        }
+    }
 
     // 3. Spawn the job monitor on an in-process thread. The handshake is
     // the atomic state machine coordinating launcher and monitor:

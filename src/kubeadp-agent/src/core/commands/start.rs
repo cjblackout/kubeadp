@@ -595,9 +595,16 @@ pub fn run(config: &Config, args: &StartArgs) -> Result<CommandOutput> {
     // (see `jobset::drop_agent`).
     let register = || -> anyhow::Result<()> {
         match &args.jobset_id {
-            Some(jobset_id) => crate::core::jobset::register_agent_into(&meta.job_id, jobset_id)
-                .map(|_| ())
-                .map_err(anyhow::Error::msg),
+            Some(jobset_id) => {
+                crate::core::jobset::register_agent_into(&meta.job_id, jobset_id)
+                    .map_err(anyhow::Error::msg)?;
+                crate::core::jobset::remember_job_jobset(
+                    &config.state_root,
+                    &meta.job_id,
+                    jobset_id,
+                );
+                Ok(())
+            }
             None => {
                 crate::core::jobset::register_agent(&meta.job_id);
                 Ok(())
