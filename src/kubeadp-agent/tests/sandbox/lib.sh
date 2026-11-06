@@ -299,7 +299,12 @@ wait_ready() {  # wait_ready <state-dir> <timeout>
   return 1
 }
 
-pid_alive() { kill -0 "$1" 2>/dev/null; }
+# A zombie (state Z) is not alive: when the harness runs under a launcher that adopts reparented orphans and does not
+# reap them, `kill -0` keeps succeeding for a process that has long exited.
+pid_alive() {
+  kill -0 "$1" 2>/dev/null || return 1
+  ! grep -qE '^State:[[:space:]]+Z' "/proc/$1/status" 2>/dev/null
+}
 
 wait_agent_done() {
   local pid="$1" t="$2" i=0

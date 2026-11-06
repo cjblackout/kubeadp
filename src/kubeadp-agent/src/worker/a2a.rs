@@ -436,6 +436,50 @@ impl MessageSink for JobMessageSink {
             return Err(SdkA2AError::task_not_found(task_id));
         }
 
+        // Live fast path: a RUNNING job that was launched in live mode (an A2A
+        // mesh member, `[worker] a2a_live_stdin` on) reads its messages from a
+        // stdin pipe, so the message is delivered to the RUNNING process as one
+        // NDJSON line -- no kill, no resume, the same conversation continues.
+        // The channel holds the process identity it was registered with, so a
+        // recycled pid can never be written into. A missing / stale / dead
+        // channel (or a write failure) unregisters it and falls through to the
+        // interrupt-and-resume path unchanged; the per-job gate is taken for
+        // the write so a live delivery never interleaves with a resume or
+        // another live delivery.
+        if self.config.a2a_live_stdin {
+            if let Some(channel) = crate::core::a2a_live::lookup(task_id) {
+                if channel.is_alive_for(meta.pid, meta.pid_start_time)
+                    && compute_status(&meta, &self.config.state_root) == JobStatus::Running
+                {
+                    let job = self.slot(task_id);
+                    // The per-job gate serialises the write against a concurrent
+                    // resume; a live delivery that cannot take it immediately
+                    // falls through to the coalesce path.
+                    let gate = job.gate.try_lock();
+                    if let Ok(gate) = gate {
+                        match channel.deliver_line(text) {
+                            Ok(()) => {
+                                channel.touch();
+                                drop(gate);
+                                return Ok(());
+                            }
+                            Err(_) => {
+                                // The pipe broke: unregister the channel so the
+                                // fallback resume path takes over from a clean
+                                // state.
+                                drop(gate);
+                                crate::core::a2a_live::close_for(task_id);
+                            }
+                        }
+                    }
+                } else {
+                    // The process is gone or its identity changed (a retry has
+                    // since claimed the row): drop the stale channel.
+                    crate::core::a2a_live::close_for(task_id);
+                }
+            }
+        }
+
         // The per-job gate serialises at most one resume at a time for this
         // job (and only this job -- other jobs are unaffected). A delivery that
         // cannot take the gate immediately means a resume is already in flight:
@@ -1308,5 +1352,268 @@ mod tests {
             sink.slot("e2e").pending.lock().unwrap().is_empty(),
             "the pending buffer must be fully drained"
         );
+    }
+
+    // ---- Live stdin delivery ---------------------------------------------
+
+    /// A fake agy that records its argv and reads NDJSON `user` messages from
+    /// stdin, appending each delivered content line to `received.txt` (one per
+    /// line), then prints a structured SUCCESS and exits. Used to verify the
+    /// live fast path wrote directly into a RUNNING process.
+    fn write_fake_agy_live(bin: &std::path::Path, worktree: &std::path::Path) {
+        std::fs::write(
+            bin,
+            format!(
+                "#!/bin/sh\n\
+                 {{\n\
+                 \x20 printf '%s\\n' \"$@\" > {argv}\n\
+                 \x20 while IFS= read -r line; do\n\
+                 \x20\x20 printf '%s\\n' \"$line\" >> {received}\n\
+                 \x20 done\n\
+                 \x20 echo '{{\"status\":\"SUCCESS\",\"response\":\"ok\",\"conversation_id\":\"{conv}\"}}'\n\
+                 }}\n",
+                argv = worktree.join("argv.txt").display(),
+                received = worktree.join("received.txt").display(),
+                conv = CONV,
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Saves a RUNNING job row (live pid, matching start time via `this`
+    /// process) whose worktree exists and whose agy path is already wired, so
+    /// the live channel can be registered against it and `deliver` takes the
+    /// fast path. The row's pid points at the CURRENT test process (alive), so
+    /// `is_alive_for` and `compute_status == Running` both pass.
+    fn save_running_job(config: &Config, job_id: &str, worktree: &std::path::Path) -> JobMetadata {
+        let meta = JobMetadata {
+            job_id: job_id.to_string(),
+            project: "p".to_string(),
+            prompt: "p".to_string(),
+            resolved_prompt: "p".to_string(),
+            model: None,
+            effort: None,
+            sandbox: false,
+            mode: "accept-edits".to_string(),
+            add_dirs: vec![],
+            print_timeout: None,
+            created_at: chrono::Utc::now(),
+            worktree_path: worktree.to_path_buf(),
+            branch: String::new(),
+            base_ref: "main".to_string(),
+            conversation_id: Some(CONV.to_string()),
+            retry_count: 0,
+            pid: Some(std::process::id()),
+            // The test process's own start time, matching the channel.
+            pid_start_time: crate::core::job::get_process_start_time(std::process::id()),
+            exit_code: None,
+            status: Some(JobStatus::Running),
+            hindsight: None,
+            auto_recall: None,
+            auto_retain: None,
+            retry_prompt: None,
+            read_only: false,
+            external_worktree: false,
+            hindsight_bank: None,
+            proxy: None,
+            max_runtime: None,
+            started_at: None,
+            hindsight_query: None,
+            sandbox_info: None,
+        };
+        meta.save(&config.state_root).unwrap();
+        let log_path = JobMetadata::log_path(&config.state_root, job_id);
+        if let Some(parent) = log_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(
+            &log_path,
+            "{\"status\":\"SUCCESS\",\"response\":\"live-ok\"}\n",
+        );
+        meta
+    }
+
+    /// Registers a live channel for `job_id` whose write end is fed to a
+    /// `/bin/sh` reader that appends its stdin to `received.txt` in the
+    /// worktree (so a delivery is observable), keyed by the SAME pid/start
+    /// time the job row carries (the current test process, which is alive).
+    /// Returns the reader child for cleanup.
+    fn register_live_channel_for_test(
+        config: &Config,
+        job_id: &str,
+        meta: &JobMetadata,
+        worktree: &std::path::Path,
+    ) -> std::process::Child {
+        let received = worktree.join("received.txt");
+        let received_s = received.to_string_lossy().into_owned();
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("cat >> {received_s}"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn reader");
+        let stdin = child.stdin.take().expect("piped stdin");
+        crate::core::a2a_live::register(
+            job_id,
+            std::process::id(),
+            meta.pid_start_time,
+            stdin,
+            JobMetadata::log_path(&config.state_root, job_id),
+        );
+        child
+    }
+
+    #[test]
+    fn sink_live_delivery_writes_to_running_stdin() {
+        crate::core::a2a_live::with_isolated_live(|| {
+            let temp = TempDir::new().unwrap();
+            let state_root = temp.path().join("state");
+            let worktree = temp.path().join("wt");
+            std::fs::create_dir_all(&worktree).unwrap();
+            crate::core::job::ensure_state_store(&state_root).unwrap();
+            let config = Config {
+                state_root: state_root.clone(),
+                workspace_root: temp.path().join("ws"),
+                repos_root: temp.path().join("ws").join(".agent-repos"),
+                agy_path: temp.path().join("fake-agy"),
+                a2a_interrupt_min_secs: 0,
+                a2a_live_stdin: true,
+                ..Default::default()
+            };
+            let meta = save_running_job(&config, "livedel", &worktree);
+            write_fake_agy_live(&config.agy_path, &worktree);
+            let mut reader = register_live_channel_for_test(&config, "livedel", &meta, &worktree);
+
+            let sink = JobMessageSink::new(Arc::new(config));
+            assert!(
+                sink.deliver("livedel", "peer", "please live-deliver", "m1")
+                    .is_ok(),
+                "a message to a live RUNNING job must be delivered over stdin"
+            );
+            // The running process actually received the framed user line.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let content =
+                    std::fs::read_to_string(worktree.join("received.txt")).unwrap_or_default();
+                if content.contains("please live-deliver") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the live process never received the message; got: {content:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            // The line is the NDJSON `user` envelope, one line.
+            let content = std::fs::read_to_string(worktree.join("received.txt")).unwrap();
+            for line in content.lines() {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert_eq!(v["event"], "user");
+            }
+            // No resume was triggered: retry_count is unchanged.
+            let after = JobMetadata::load(&state_root, "livedel").unwrap();
+            assert_eq!(
+                after.retry_count, 0,
+                "live delivery must not claim a resume attempt"
+            );
+            // Idempotency still applies to a repeated message id.
+            assert!(sink.deliver("livedel", "peer", "dup", "m1").is_ok());
+            let _ = reader.kill();
+            let _ = reader.wait();
+            crate::core::a2a_live::close_for("livedel");
+        });
+    }
+
+    #[test]
+    fn sink_live_stale_channel_falls_back_to_resume() {
+        crate::core::a2a_live::with_isolated_live(|| {
+            let temp = TempDir::new().unwrap();
+            // A DONE job (clean resume target) with a leftover live channel
+            // registered for a DIFFERENT pid: `is_alive_for` fails, the stale
+            // channel is unregistered, and the message falls through to the
+            // interrupt-and-resume path.
+            let (config, worktree) = save_resumable_done_job(&temp, "livemiss", 0);
+            let config = Config {
+                a2a_live_stdin: true,
+                ..config
+            };
+            write_fake_agy(&config.agy_path, &worktree);
+            // Register a stale channel pointing at a dead pid (999999) so the
+            // registry looks live while the process identity does not match.
+            let mut cat = register_live_channel_stale(&config, "livemiss", 999999);
+
+            let sink = JobMessageSink::new(Arc::new(config));
+            assert!(
+                sink.deliver("livemiss", "peer", "must resume", "m2")
+                    .is_ok(),
+                "with no matching live channel the message must resume via retry"
+            );
+            let after = JobMetadata::load(&temp.path().join("state"), "livemiss").unwrap();
+            assert_eq!(
+                after.retry_count, 1,
+                "the fallback must claim a resume attempt"
+            );
+            // The stale channel must have been unregistered.
+            assert!(crate::core::a2a_live::lookup("livemiss").is_none());
+            let _ = cat.kill();
+            let _ = cat.wait();
+        });
+    }
+
+    #[test]
+    fn sink_live_disabled_forces_resume() {
+        crate::core::a2a_live::with_isolated_live(|| {
+            let temp = TempDir::new().unwrap();
+            let (config, worktree) = save_resumable_done_job(&temp, "liveoff", 0);
+            let config = Config {
+                a2a_live_stdin: false,
+                ..config
+            };
+            write_fake_agy(&config.agy_path, &worktree);
+            // A live channel EXISTS but the config is off: resume path. Since
+            // the job is Done (pid None), a stale channel is irrelevant, but
+            // the config gate alone must already force the resume.
+            let mut cat = register_live_channel_stale(&config, "liveoff", 999999);
+
+            let sink = JobMessageSink::new(Arc::new(config));
+            assert!(
+                sink.deliver("liveoff", "peer", "resume anyway", "m3")
+                    .is_ok(),
+                "with a2a_live_stdin=false the message must resume"
+            );
+            let after = JobMetadata::load(&temp.path().join("state"), "liveoff").unwrap();
+            assert_eq!(
+                after.retry_count, 1,
+                "live disabled must claim a resume attempt"
+            );
+            crate::core::a2a_live::close_for("liveoff");
+            let _ = cat.kill();
+            let _ = cat.wait();
+        });
+    }
+
+    /// Registers a live channel for `job_id` holding a real `/bin/cat` stdin
+    /// but carrying an arbitrary (possibly stale) pid, so tests can simulate a
+    /// channel whose process identity doesn't match the job row. The spawned
+    /// cat is returned for cleanup.
+    fn register_live_channel_stale(config: &Config, job_id: &str, pid: u32) -> std::process::Child {
+        let mut child = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let stdin = child.stdin.take().expect("piped stdin");
+        crate::core::a2a_live::register(
+            job_id,
+            pid,
+            Some(1),
+            stdin,
+            JobMetadata::log_path(&config.state_root, job_id),
+        );
+        child
     }
 }

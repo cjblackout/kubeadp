@@ -83,10 +83,17 @@ pub enum InvocationMode {
 /// credential files in the home volume reach the job).
 ///
 /// `<agy_path> --dangerously-skip-permissions --mode <m> --output-format stream-json ...`
+///
+/// `live` (a live-mode job, see [`crate::core::a2a_live`]) changes the
+/// invocation: the prompt is no longer handed on `-p` but as the FIRST stdin
+/// line (`--input-format stream-json`); agy still requires a prompt argument,
+/// so `--print ""` is passed in its place. Every other element is unchanged,
+/// and the caller writes the (normalized) prompt over the piped stdin.
 pub fn build_command_and_args(
     config: &Config,
     meta: &JobMetadata,
     mode: &InvocationMode,
+    live: bool,
 ) -> (std::path::PathBuf, Vec<String>) {
     // Build agy arguments:
     // ALWAYS pass --dangerously-skip-permissions, --mode, and --output-format stream-json
@@ -104,8 +111,15 @@ pub fn build_command_and_args(
     // Prompt or Retry continuation
     match mode {
         InvocationMode::Start { resolved_prompt } => {
-            agy_args.push("-p".to_string());
-            agy_args.push(resolved_prompt.clone());
+            if live {
+                // Live mode: the prompt travels as the first stdin line; agy
+                // still requires a prompt arg, so supply an empty one here.
+                agy_args.push("--print".to_string());
+                agy_args.push("".to_string());
+            } else {
+                agy_args.push("-p".to_string());
+                agy_args.push(resolved_prompt.clone());
+            }
         }
         InvocationMode::Retry {
             conversation_id,
@@ -121,11 +135,21 @@ pub fn build_command_and_args(
                 // reaching here; kept so this function remains a total mapping over InvocationMode.
                 agy_args.push("--continue".to_string());
             }
-            if let Some(p) = prompt {
+            if live {
+                agy_args.push("--print".to_string());
+                agy_args.push("".to_string());
+            } else if let Some(p) = prompt {
                 agy_args.push("-p".to_string());
                 agy_args.push(p.clone());
             }
         }
+    }
+
+    // Live mode: A2A messages arrive as NDJSON over stdin, so switch the input
+    // transport to stream-json (the prompt itself is the first stdin line).
+    if live {
+        agy_args.push("--input-format".to_string());
+        agy_args.push("stream-json".to_string());
     }
 
     // Model
@@ -180,8 +204,9 @@ pub fn build_command(
     config: &Config,
     meta: &JobMetadata,
     mode: &InvocationMode,
+    live: bool,
 ) -> Result<(Command, std::path::PathBuf, Option<String>), anyhow::Error> {
-    let (prog, args) = build_command_and_args(config, meta, mode);
+    let (prog, args) = build_command_and_args(config, meta, mode, live);
 
     // Base policy for the job: main's `shared_rw` override (the writable
     // shared home path, default `/home/agent`) is preserved.
@@ -928,8 +953,22 @@ pub fn run_internal_runner(
         }
     };
 
-    let (cmd, policy_path, jobset_secret) =
-        build_command(config, &meta, &mode).with_context(|| {
+    // Live mode (an A2A mesh job): the agy process reads newline-delimited
+    // JSON from its stdin (`--print "" --input-format stream-json`) instead of
+    // taking the prompt on `-p`, and A2A messages are delivered to the running
+    // process over that pipe rather than by killing and resuming it. A job is
+    // live-eligible only when `[worker] a2a_live_stdin` is on AND the job is a
+    // member of a real mesh: either this worker's host is itself a jobset
+    // member (so the job joined the host's mesh) or the job was explicitly
+    // started into a jobset (`--jobset`, see `commands::start`). The marker is
+    // the module's own `job-live/<job_id>` file, never `agent_jobset()` --
+    // every job carries a jobset registration, but only meshed ones are live.
+    let live = config.a2a_live_stdin
+        && (crate::core::jobset::host_jobset().is_some()
+            || crate::core::a2a_live::live_member(&config.state_root, job_id));
+
+    let (cmd, policy_path, jobset_secret) = build_command(config, &meta, &mode, live)
+        .with_context(|| {
             format!(
                 "Failed to build sandboxed command for job '{}'",
                 meta.job_id
@@ -968,6 +1007,13 @@ pub fn run_internal_runner(
     // as a 0400 file). `None` secret = a plain job, identical to the old
     // `detached_session` behavior.
     attach_session_and_secret(&mut spawn_cmd, jobset_secret);
+    // Live mode: the job's stdin is a pipe the worker owns; A2A messages (and
+    // the initial prompt) are written into it as NDJSON lines. The pipe
+    // survives the sandbox wrapper (fds 0-2 are kept open by the backends), so
+    // agy reads exactly what the worker writes.
+    if live {
+        spawn_cmd.stdin(std::process::Stdio::piped());
+    }
 
     // Cancellation check, immediately before the spawn: if the launcher
     // already declared this launch failed (PID not confirmed in time), do
@@ -1037,6 +1083,49 @@ pub fn run_internal_runner(
     meta.pid = Some(pid);
     meta.pid_start_time = get_process_start_time(pid);
     let _ = meta.save(&config.state_root);
+
+    // Live mode: hand the pipe write end to the live-channel registry (keyed by
+    // the job id, with the process identity) so `JobMessageSink::deliver` can
+    // write A2A messages into the RUNNING process, then deliver the initial
+    // prompt as the first NDJSON line -- the exact same normalized text agy
+    // would have received on `-p`, so conversation-id recovery still matches.
+    // The `JobsetDropGuard`-style RAII guard below closes the channel (EOF to
+    // agy) on EVERY exit path of this monitor.
+    let _live_drop = crate::core::a2a_live::LiveChannelGuard::new(job_id);
+    if live {
+        if let Some(stdin) = child.stdin.take() {
+            crate::core::a2a_live::register(
+                job_id,
+                pid,
+                meta.pid_start_time,
+                stdin,
+                log_path.clone(),
+            );
+            // The initial prompt is the same normalized turn prompt computed
+            // for `mode`: the start prompt (turn 0) or this attempt's retry
+            // prompt. Writing it over stdin is best-effort -- a failure means
+            // the pipe broke, which the fallback deliverer turns into an
+            // interrupt-and-resume path.
+            let initial = match &mode {
+                InvocationMode::Start { resolved_prompt } => resolved_prompt.clone(),
+                InvocationMode::Retry { prompt, .. } => prompt.clone().unwrap_or_default(),
+            };
+            if !initial.is_empty() {
+                // The initial prompt is a normal first user message on the
+                // live channel (it is the same NDJSON `user` envelope the
+                // deliverer uses), so deliver it through the channel for the
+                // same serialization + EOF-safety the A2A path gets.
+                if let Some(ch) = crate::core::a2a_live::lookup(job_id) {
+                    let _ = ch.deliver_line(&initial);
+                    ch.touch();
+                }
+            }
+            // Idle watchdog: after `a2a_live_idle_secs` of no delivery and no
+            // log output, close stdin (EOF) so agy finishes the turn and the
+            // job classifies Done instead of hanging.
+            crate::core::a2a_live::spawn_idle_watchdog(job_id, config.a2a_live_idle_secs);
+        }
+    }
 
     // While the child runs, the final JSON line (and with it the
     // conversation ID) is still in the future; if agy never writes it,
@@ -1480,7 +1569,7 @@ mod tests {
             resolved_prompt: start_prompt.clone(),
         };
 
-        let (prog, args) = build_command_and_args(&config, &meta, &mode);
+        let (prog, args) = build_command_and_args(&config, &meta, &mode, false);
 
         assert_eq!(prog, PathBuf::from("/usr/local/bin/agy"));
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
@@ -1503,6 +1592,46 @@ mod tests {
         assert!(args.contains(&"30s".to_string()));
         // No privilege-separation remnants may leak into the command.
         assert!(!args.iter().any(|a| a.contains("env") || a == "gosu"));
+    }
+
+    #[test]
+    fn test_build_command_live_agy_args() {
+        // A live (meshed) job must invoke `agy --print "" --input-format
+        // stream-json ...` (prompt travels over stdin, not `-p`), with every
+        // other element identical to the non-live invocation.
+        let config = Config {
+            agy_path: PathBuf::from("/usr/local/bin/agy"),
+            ..Default::default()
+        };
+
+        let mut meta = test_meta_overrides();
+        meta.model = Some("gemini-pro".to_string());
+        meta.sandbox = true;
+        let mode = InvocationMode::Start {
+            resolved_prompt: "Test prompt".to_string(),
+        };
+
+        let (prog, args) = build_command_and_args(&config, &meta, &mode, true);
+
+        assert_eq!(prog, PathBuf::from("/usr/local/bin/agy"));
+        assert!(args.contains(&"--print".to_string()));
+        // The empty-string prompt placeholder agy requires in live mode.
+        assert!(args.contains(&"".to_string()));
+        assert!(args.contains(&"--input-format".to_string()));
+        assert!(args.contains(&"stream-json".to_string()));
+        // The prompt itself must NOT travel as a -p argv element in live mode.
+        assert!(!args.contains(&"Test prompt".to_string()));
+        assert!(!args.contains(&"-p".to_string()));
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(args.contains(&"--mode".to_string()));
+        assert!(args.contains(&"accept-edits".to_string()));
+        assert!(args.contains(&"--output-format".to_string()));
+        assert!(args.contains(&"stream-json".to_string()));
+        assert!(args.contains(&"--model".to_string()));
+        assert!(args.contains(&"gemini-pro".to_string()));
+        assert!(args.contains(&"--sandbox".to_string()));
+        assert!(args.contains(&"--add-dir".to_string()));
+        assert!(args.contains(&"/workspace/homelab/.agent-jobs/test1234".to_string()));
     }
 
     #[test]
@@ -1569,7 +1698,7 @@ mod tests {
             conversation_id: Some("conv-uuid-999".to_string()),
             prompt: None,
         };
-        let (_, args1) = build_command_and_args(&config, &meta, &mode1);
+        let (_, args1) = build_command_and_args(&config, &meta, &mode1, false);
         assert!(args1.contains(&"--conversation".to_string()));
         assert!(args1.contains(&"conv-uuid-999".to_string()));
         assert!(args1.contains(&"--output-format".to_string()));
@@ -1581,7 +1710,7 @@ mod tests {
             conversation_id: None,
             prompt: None,
         };
-        let (_, args2) = build_command_and_args(&config, &meta, &mode2);
+        let (_, args2) = build_command_and_args(&config, &meta, &mode2, false);
         assert!(args2.contains(&"--continue".to_string()));
         assert!(!args2.contains(&"--conversation".to_string()));
         assert!(!args2.contains(&"-p".to_string()));
@@ -1597,7 +1726,7 @@ mod tests {
                 meta.retry_count,
             )),
         };
-        let (_, args3) = build_command_and_args(&config, &meta, &mode3);
+        let (_, args3) = build_command_and_args(&config, &meta, &mode3, false);
         assert!(args3.contains(&"--conversation".to_string()));
         assert!(args3.contains(&"-p".to_string()));
         assert!(args3.contains(&format!(
@@ -1619,7 +1748,7 @@ mod tests {
             resolved_prompt: "Test".to_string(),
         };
 
-        let (_, args_empty) = build_command_and_args(&config, &meta, &mode);
+        let (_, args_empty) = build_command_and_args(&config, &meta, &mode, false);
         let add_dir_indices: Vec<usize> = args_empty
             .iter()
             .enumerate()
@@ -1638,7 +1767,7 @@ mod tests {
             PathBuf::from("/workspace/extra2"),
         ];
 
-        let (_, args_multi) = build_command_and_args(&config, &meta, &mode);
+        let (_, args_multi) = build_command_and_args(&config, &meta, &mode, false);
         let add_dir_indices_multi: Vec<usize> = args_multi
             .iter()
             .enumerate()
@@ -2814,14 +2943,14 @@ mod tests {
         // wrap is a working sandbox, not a failure).
         let (mut cmd, policy_path, _jobset_secret) = {
             crate::sandbox::testhook::set_sandbox_passthrough(false);
-            let built = build_command(&config, &meta, &mode);
+            let built = build_command(&config, &meta, &mode, false);
             crate::sandbox::testhook::set_sandbox_passthrough(true);
             built.expect("build_command must succeed with the seam off")
         };
         // Sanity: the production wrapper form is what we are about to run.
         let argv = launch_argv(
             &config.agy_path,
-            &build_command_and_args(&config, &meta, &mode).1,
+            &build_command_and_args(&config, &meta, &mode, false).1,
             &policy_path,
             false,
         );

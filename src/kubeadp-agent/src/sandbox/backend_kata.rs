@@ -337,6 +337,80 @@ pub fn is_denied_path(path: &Path, hide: &[PathBuf], allow_serviceaccount: bool)
     })
 }
 
+/// Drains every exited child other than `child_pid` (the agent root) so the
+/// launcher does not accumulate `<defunct>` zombies, and reports whether the
+/// agent root itself exited while draining.
+///
+/// The launcher is a child subreaper, so any orphaned descendant of the agent
+/// (or of a process that reparented here) becomes a direct child of the
+/// launcher. If the supervise loop only ever waited for `child_pid`, every
+/// orphan that exited afterwards would stay a zombie of the launcher until the
+/// launcher itself exited -- a long-lived session launcher would accumulate
+/// them until the pod pid limit is hit, and `kill -0` on such a zombie still
+/// succeeds, so liveness probes misread an exited process as alive.
+///
+/// Returns `Some(status)` when the drain reaped `child_pid` first (the agent
+/// just exited in the gap between the targeted wait and the drain); the caller
+/// must then run the normal exit path on that `status`, exactly as if the
+/// targeted wait had seen it. Returns `None` when only other children (pure
+/// orphans) were reaped, or when there is nothing left to reap.
+///
+/// `WNOHANG` keeps the caller's polling cadence (the short sleep) intact -- the
+/// loop never busy-waits. Stops when no child has exited (`0`), when there are
+/// no more children to reap (`ECHILD`), or when the agent is reaped here.
+/// `EINTR` re-tries the drain.
+///
+/// `clippy::zombie_processes` is suppressed: the whole point of this helper is
+/// to collect (reap) exited children rather than leave them unwaited, so a
+/// linter that flags "a child is spawned and never waited" does not apply.
+#[allow(clippy::zombie_processes)]
+fn drain_adopted_orphans(child_pid: libc::pid_t) -> Option<libc::c_int> {
+    let mut orphan_status: libc::c_int = 0;
+    loop {
+        let reaped = unsafe { libc::waitpid(-1, &mut orphan_status, libc::WNOHANG) };
+        if reaped == 0 {
+            return None;
+        }
+        if reaped < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                return None; // ECHILD (or other): no other exited children left
+            }
+            continue;
+        }
+        if reaped == child_pid {
+            // The agent exited and the drain reaped it first: hand its status
+            // back so the caller takes the normal exit path on it.
+            return Some(orphan_status);
+        }
+        // Reaped an adopted orphan; keep draining the rest.
+    }
+}
+
+/// Returns the reason a GRANT path cannot be applied as a Landlock rule, or
+/// `None` when it can. `add_rule` silently skips a path that does not exist or
+/// cannot be opened (the base policy's long-standing behaviour), so the grant
+/// path checks both itself and reports the grant as dropped with this reason
+/// instead of skipping it quietly: the session starts with strictly less
+/// access, one warning per dropped grant.
+pub fn grant_apply_blocker(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return Some(format!("path '{}' does not exist", path.display()));
+    }
+    let c_path = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
+    let Ok(c_path) = CString::new(c_path) else {
+        // A NUL byte is reported by `add_rule` itself; nothing to pre-check.
+        return None;
+    };
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return Some(format!("path '{}' cannot be opened: {err}", path.display()));
+    }
+    unsafe { libc::close(fd) };
+    None
+}
+
 /// Executes a command in the Kata sandbox backend.
 pub fn execute_kata(
     policy: &SandboxPolicy,
@@ -431,9 +505,23 @@ pub fn execute_kata(
 
         let mut status: libc::c_int = 0;
         loop {
-            let r = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+            let mut r = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+            if r == 0 {
+                // The agent has not exited yet. Drain the exited children that
+                // this subreaper adopted (orphans of the agent's subtree) so
+                // they do not pile up as zombies of the launcher. If the agent
+                // happened to exit in the gap after the targeted wait above,
+                // the drain reaps it and reports its status; the exit path
+                // below is then taken on that status, exactly as if the
+                // targeted wait had seen it (no exit status is lost).
+                if let Some(adopted) = drain_adopted_orphans(child_pid) {
+                    status = adopted;
+                    r = child_pid;
+                }
+            }
             if r == child_pid {
-                // The agent exited on its own: clean up any adopted
+                // The agent exited (either seen by the targeted wait, or
+                // reaped by the orphan drain above): clean up any adopted
                 // descendants, the private tmp and the relay socket dir,
                 // restore the previous signal dispositions and return the
                 // agent's exit status. The cleanups must run even when the
@@ -773,27 +861,43 @@ pub fn apply_landlock_domain(
     // 5. Grants allow-list (if session has grants). Grants are optional extras
     //    on top of the base policy, and a Landlock allow-list only ever adds
     //    access. A grant that cannot be applied (a forbidden/denied path, a
-    //    write to the ServiceAccount dir, or the kernel rejecting the rule) is
-    //    DROPPED with a warning and the session starts with less access:
-    //    isolation is unaffected, whereas aborting would crash-loop the whole
-    //    session over one optional path. The base policy above stays fatal.
+    //    write to the ServiceAccount dir, a missing/unopenable path, or the
+    //    kernel rejecting the rule) is DROPPED with a warning and the session
+    //    starts with less access: isolation is unaffected, whereas aborting
+    //    would crash-loop the whole session over one optional path. The base
+    //    policy above stays fatal.
     if let Some(ref g) = policy.grants {
         let grant = |what: &str, r: Result<(), String>| {
             if let Err(e) = r {
                 eprintln!("kubeadp-agent: sandbox grant dropped ({what}): {e}");
             }
         };
+        // `add_rule` silently skips a missing/unopenable path (base-policy
+        // behaviour), so each grant is pre-checked and reported as dropped.
+        let applicable = |path: &Path| -> Result<(), String> {
+            match grant_apply_blocker(path) {
+                Some(reason) => Err(reason),
+                None => Ok(()),
+            }
+        };
         if g.serviceaccount {
             grant(
                 "serviceaccount",
-                add_ro(Path::new(K8S_SERVICEACCOUNT_TOKEN_DIR)),
+                applicable(Path::new(K8S_SERVICEACCOUNT_TOKEN_DIR))
+                    .and_then(|()| add_ro(Path::new(K8S_SERVICEACCOUNT_TOKEN_DIR))),
             );
         }
         for ro_path in &g.ro_paths {
-            grant(&format!("ro {}", ro_path.display()), add_ro(ro_path));
+            grant(
+                &format!("ro {}", ro_path.display()),
+                applicable(ro_path).and_then(|()| add_ro(ro_path)),
+            );
         }
         for rw_path in &g.rw_paths {
-            grant(&format!("rw {}", rw_path.display()), add_rw(rw_path));
+            grant(
+                &format!("rw {}", rw_path.display()),
+                applicable(rw_path).and_then(|()| add_rw(rw_path)),
+            );
         }
     }
 
@@ -1387,6 +1491,66 @@ mod tests {
         assert!(libc::WIFEXITED(st4) && libc::WEXITSTATUS(st4) == 0);
     }
 
+    // A grant whose path does not exist is DROPPED with a reason (never fatal),
+    // while a grant whose path exists is kept: `add_rule` silently skips
+    // missing/unopenable paths, so the grant path pre-check produces the
+    // "grant dropped" warning text instead of skipping the grant quietly.
+    #[test]
+    fn test_grant_apply_blocker_drops_missing_and_keeps_existing_paths() {
+        let missing = tempfile::tempdir().unwrap().path().join("does-not-exist");
+        let reason = grant_apply_blocker(&missing);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("does not exist")),
+            "missing grant path must report a reason: {reason:?}"
+        );
+
+        // An existing, openable path is applicable: the grant is kept.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(grant_apply_blocker(dir.path()).is_none());
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(grant_apply_blocker(&file).is_none());
+    }
+
+    // HL-117 (behavioral): a session with a grant whose path does not exist
+    // still gets its domain applied -- the grant is dropped with a warning,
+    // never fatal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_apply_landlock_domain_in_child_drops_nonexistent_grant() {
+        use crate::sandbox::policy::{GrantsConfig, PolicyRole};
+
+        let missing = tempfile::tempdir().unwrap().path().join("gone");
+        let policy = SandboxPolicy {
+            role: PolicyRole::Session,
+            grants: Some(GrantsConfig {
+                ro_paths: vec![missing],
+                rw_paths: vec![PathBuf::from("/workspace/definitely-not-here")],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let res = apply_landlock_domain(&policy, KATA_MIN_LANDLOCK_ABI, None);
+            // Nonexistent grant paths are dropped (warned), the session starts.
+            unsafe {
+                libc::_exit(if res.is_ok() { 0 } else { 1 });
+            }
+        }
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "a nonexistent grant path must not abort the domain application"
+        );
+    }
+
     // H6c (behavioral): a child that applies the FULL default domain (proc/dev
     // rules + ro/rw allow-list, all flags chosen by path type) and restricts
     // only itself must either succeed (kernel supports Landlock >= 6) or fail
@@ -1756,5 +1920,284 @@ mod tests {
         };
         let out = apply_relay_env(&shared, filtered.clone(), None);
         assert_eq!(out, filtered, "shared env must be unchanged");
+    }
+
+    // The Kata launcher is a child subreaper: any orphaned descendant of the
+    // agent reparents to it and must be reaped as it exits, otherwise a
+    // long-lived launcher accumulates `<defunct>` children (and `kill -0` on a
+    // zombie still succeeds, so liveness checks misread an exited process as
+    // alive). This is the defect the supervise loop's `drain_adopted_orphans`
+    // step fixes. The test mirrors that step: a forked "launcher" child becomes
+    // a subreaper, spawns an "agent" (its main child) plus a short-lived parent
+    // that leaves an "orphan" grandchild; the launcher runs one supervise
+    // iteration (the targeted wait for the agent + the orphan drain) and must
+    // have reaped the orphan while the agent's exit status is still reported
+    // correctly. Everything runs inside forked children so the test runner's
+    // own signal state and children are never touched.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_drain_adopted_orphans_reaps_orphan_and_keeps_agent_status() {
+        // Allocation-free raw /proc helpers (stack-only). The assertions below
+        // run INSIDE a forked child, which must not touch the Rust heap or
+        // std's locks (a fork of the multi-threaded test runner can deadlock on
+        // an inherited lock) -- the same discipline as init_shim's raw_* helpers.
+        const SYS_GETDENTS64: libc::c_long = if cfg!(target_arch = "aarch64") {
+            61
+        } else if cfg!(target_arch = "riscv64") {
+            28
+        } else {
+            217
+        };
+
+        fn raw_sleep_ms(ms: u32) {
+            let mut ts = libc::timespec {
+                tv_sec: (ms / 1000) as libc::time_t,
+                tv_nsec: ((ms % 1000) * 1_000_000) as libc::c_long,
+            };
+            unsafe {
+                libc::nanosleep(&ts as *const _, &mut ts as *mut _);
+            }
+        }
+
+        /// (ppid, is_zombie) from `/proc/<pid>/stat` via raw syscalls, or None.
+        fn stat_ppid_state(pid: i32) -> Option<(i32, bool)> {
+            let mut path = [0i8; 32];
+            let mut i = 0usize;
+            for &c in b"/proc/" {
+                path[i] = c as i8;
+                i += 1;
+            }
+            let mut digits = [0i8; 12];
+            let mut nd = 0usize;
+            let mut v = pid as u32;
+            loop {
+                digits[nd] = (v % 10) as i8 + b'0' as i8;
+                nd += 1;
+                v /= 10;
+                if v == 0 {
+                    break;
+                }
+            }
+            for k in (0..nd).rev() {
+                path[i] = digits[k];
+                i += 1;
+            }
+            for &c in b"/stat\0" {
+                path[i] = c as i8;
+                i += 1;
+            }
+            unsafe {
+                let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
+                if fd < 0 {
+                    return None;
+                }
+                let mut buf = [0u8; 512];
+                let r = libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len());
+                libc::close(fd);
+                if r <= 0 {
+                    return None;
+                }
+                let data = &buf[..r as usize];
+                let close = data.iter().rposition(|&b| b == b')')?;
+                let after = &data[close + 1..];
+                // After the last ')' the fields are: state ppid pgrp ...
+                let mut j = 0usize;
+                while j < after.len() && after[j] == b' ' {
+                    j += 1;
+                }
+                let state = after.get(j).copied();
+                j += 1;
+                while j < after.len() && after[j] == b' ' {
+                    j += 1;
+                }
+                let mut ppid = 0i32;
+                let mut found = false;
+                while j < after.len() && after[j].is_ascii_digit() {
+                    ppid = ppid * 10 + (after[j] - b'0') as i32;
+                    found = true;
+                    j += 1;
+                }
+                if !found {
+                    return None;
+                }
+                Some((ppid, state == Some(b'Z')))
+            }
+        }
+
+        /// Count this process's direct children currently in a zombie state.
+        fn zombie_children() -> u32 {
+            let mut count = 0u32;
+            unsafe {
+                let fd = libc::open(c"/proc".as_ptr(), libc::O_RDONLY);
+                if fd < 0 {
+                    return 0;
+                }
+                let self_pid = libc::getpid();
+                let mut buf = [0u8; 16384];
+                loop {
+                    let r = libc::syscall(SYS_GETDENTS64, fd, buf.as_mut_ptr(), buf.len());
+                    if r <= 0 {
+                        break;
+                    }
+                    let mut off = 0usize;
+                    while off + 20usize <= r as usize {
+                        let reclen = (buf[off + 16] as usize) | ((buf[off + 17] as usize) << 8);
+                        if reclen == 0 || off + reclen > r as usize {
+                            break;
+                        }
+                        let name = &buf[off + 19..reclen];
+                        let mut pid = 0i32;
+                        let mut nd = 0usize;
+                        while nd < name.len() && name[nd].is_ascii_digit() {
+                            pid = pid * 10 + (name[nd] - b'0') as i32;
+                            nd += 1;
+                        }
+                        if nd > 0 && pid > 0 {
+                            if let Some((ppid, z)) = stat_ppid_state(pid) {
+                                if ppid == self_pid && z {
+                                    count += 1;
+                                }
+                            }
+                        }
+                        off += reclen;
+                    }
+                }
+                libc::close(fd);
+            }
+            count
+        }
+
+        let launcher = unsafe { libc::fork() };
+        assert!(launcher >= 0, "fork launcher child");
+        if launcher == 0 {
+            // INSIDE THE LAUNCHER CHILD: mark as subreaper so orphans of the
+            // agent's subtree reparent here, exactly like the real launcher.
+            // Die with the test runner: a launcher left behind (panic, timeout kill)
+            // must never outlive the test process and hold its output pipe open.
+            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
+            if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+                unsafe { libc::_exit(2) };
+            }
+
+            // The agent (the launcher's main child, the analogue of child_pid):
+            // stays paused until we kill it, so we control when it leaves.
+            let agent = unsafe { libc::fork() };
+            if agent < 0 {
+                unsafe { libc::_exit(3) };
+            }
+            if agent == 0 {
+                // Never outlive the launcher: an agent left paused forever keeps the
+                // CI step's output pipe open and the gate never finishes.
+                unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
+                loop {
+                    unsafe { libc::pause() };
+                }
+            }
+
+            // The orphan factory: a child that leaves one grandchild behind and
+            // exits, orphaning the grandchild to this subreaper.
+            let mid = unsafe { libc::fork() };
+            if mid < 0 {
+                unsafe { libc::_exit(3) };
+            }
+            if mid == 0 {
+                let gc = unsafe { libc::fork() };
+                if gc < 0 {
+                    unsafe { libc::_exit(3) };
+                }
+                if gc == 0 {
+                    // The orphan: exits once reparented to the launcher, where
+                    // (without the fix) it would linger as a zombie.
+                    unsafe { libc::_exit(9) };
+                }
+                unsafe { libc::_exit(0) }; // leave the grandchild orphaned
+            }
+
+            // Reap `mid` (it exits immediately), which is what triggers the
+            // grandchild's re-parenting to this subreaper.
+            let mut st = 0;
+            if unsafe { libc::waitpid(mid, &mut st, 0) } != mid {
+                unsafe { libc::_exit(4) };
+            }
+
+            // Wait (bounded) until the adopted orphan is actually a zombie
+            // child of this launcher; that is the precondition the supervise
+            // step's drain must clear.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while zombie_children() == 0 {
+                if std::time::Instant::now() >= deadline {
+                    unsafe { libc::_exit(5) };
+                }
+                raw_sleep_ms(20);
+            }
+
+            // Run the supervise step the launcher performs each loop
+            // iteration, exactly as the fix wires it: the targeted wait for
+            // the agent, then the adopted-orphan drain. The agent has not
+            // exited yet, so the drain must reap the orphan (not the agent)
+            // and report that the agent is still pending (None).
+            let mut status = 0;
+            let r = unsafe { libc::waitpid(agent, &mut status, libc::WNOHANG) };
+            let drained = if r == 0 {
+                drain_adopted_orphans(agent)
+            } else {
+                None
+            };
+            if drained.is_some() {
+                // The agent exited in the gap -- unexpected for a paused
+                // agent; treat it as a failure of the setup, not the fix.
+                unsafe { libc::_exit(6) };
+            }
+
+            // The orphan must be fully reaped (no zombie child of this launcher
+            // is left) and the agent must still be alive.
+            let orphan_gone = zombie_children() == 0;
+            // `kill(pid, 0)` instead of a /proc path built with `format!`: this runs in
+            // a forked child of the multi-threaded test runner, where a heap
+            // allocation can deadlock on a malloc lock inherited from another thread.
+            let agent_alive = unsafe { libc::kill(agent, 0) } == 0;
+            if !orphan_gone || !agent_alive {
+                unsafe { libc::_exit(7) };
+            }
+
+            // Now signal the agent to exit 7; the next supervise iteration
+            // (targeted wait) must reap it and report its status, proving the
+            // drain did not consume the agent's exit status.
+            unsafe {
+                libc::kill(agent, libc::SIGKILL);
+            }
+            let mut status2 = 0;
+            let r2 = unsafe { libc::waitpid(agent, &mut status2, 0) };
+            let agent_reaped = r2 == agent;
+            let status_ok = libc::WIFSIGNALED(status2) && libc::WTERMSIG(status2) == libc::SIGKILL;
+            unsafe { libc::_exit(if agent_reaped && status_ok { 0 } else { 8 }) };
+        }
+
+        // INSIDE THE TEST RUNNER: the launcher exits 0 only if it reaped the
+        // adopted orphan while still reporting the agent's exit status.
+        // Bounded wait: if the forked launcher ever wedges, kill it and fail the
+        // test instead of blocking the whole test binary (and the CI gate) forever.
+        let mut st = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let r = loop {
+            let r = unsafe { libc::waitpid(launcher, &mut st, libc::WNOHANG) };
+            if r != 0 {
+                break r;
+            }
+            if std::time::Instant::now() >= deadline {
+                unsafe {
+                    libc::kill(launcher, libc::SIGKILL);
+                    libc::waitpid(launcher, &mut st, 0);
+                }
+                panic!("launcher child did not finish within 60 s (hung after fork)");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(r, launcher, "waitpid(launcher)");
+        assert_eq!(
+            super::super::init_shim::status_to_exit_code(st),
+            0,
+            "launcher must reap the adopted orphan and still report the agent's exit status"
+        );
     }
 }

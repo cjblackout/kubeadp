@@ -23,6 +23,23 @@ pub const DEFAULT_STALL_MINUTES: u64 = 20;
 /// interrupt is younger than this is rejected as rate-limited (in addition to
 /// the per-jobset hop-token budget). `0` disables the interval.
 pub const DEFAULT_A2A_INTERRUPT_MIN_SECS: u64 = 20;
+/// Whether a meshed job is launched in live mode: its `agy` process gets a
+/// pipe as stdin (`--print "" --input-format stream-json`) and A2A messages
+/// are delivered to the RUNNING job as NDJSON lines over that pipe instead of
+/// killing and resuming it. See [`config::a2a_live_stdin`] for the full
+/// contract; `false` forces the interrupt-and-resume path for every job.
+pub const DEFAULT_A2A_LIVE_STDIN: bool = true;
+/// How long (seconds) a live job's stdin stays open after its last delivered
+/// message / log write before the watchdog closes it (EOF), letting agy finish
+/// the turn and the job go `Done` through the normal classifier.
+/// `0` means never close (the channel lives until the job ends on its own).
+/// Non-zero values below [`MIN_A2A_LIVE_IDLE_SECS`] are clamped up.
+pub const DEFAULT_A2A_LIVE_IDLE_SECS: u64 = 120;
+/// Floor for a non-zero [`config::a2a_live_idle_secs`]: a live channel must
+/// not be closed after a sub-second idle (agy needs time to flush its
+/// response), so values below this are clamped up. `0` (never close) is
+/// unaffected.
+pub const MIN_A2A_LIVE_IDLE_SECS: u64 = 10;
 pub const DEFAULT_HINDSIGHT_PATH: &str = "hindsight";
 pub const DEFAULT_REMOTE_CONTROL_CHECK_SECS: u64 = 60;
 pub const MIN_REMOTE_CONTROL_CHECK_SECS: u64 = 10;
@@ -102,6 +119,14 @@ pub struct ConfigFile {
     pub default_session_engine: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub a2a_interrupt_min_secs: Option<u64>,
+    /// Whether jobs that are members of an A2A mesh (jobset) are launched in
+    /// live mode with a stdin pipe (see [`DEFAULT_A2A_LIVE_STDIN`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a2a_live_stdin: Option<bool>,
+    /// Idle (seconds) after which a live job's stdin pipe is closed
+    /// (see [`DEFAULT_A2A_LIVE_IDLE_SECS`]); `0` = never close.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a2a_live_idle_secs: Option<u64>,
 }
 
 /// Fully resolved, layered runtime configuration for the agent-run engine.
@@ -179,6 +204,21 @@ pub struct Config {
     /// Minimum seconds between two A2A `SendMessage` interrupts of the same
     /// job (see [`DEFAULT_A2A_INTERRUPT_MIN_SECS`]); `0` disables the interval.
     pub a2a_interrupt_min_secs: u64,
+    /// Whether a job that belongs to an A2A mesh is launched in live mode: its
+    /// `agy` process reads A2A messages from its stdin pipe (`--print ""
+    /// --input-format stream-json`) and an inbound message is delivered to the
+    /// RUNNING process as an NDJSON line instead of killing and resuming it.
+    /// When this is on, a job is live-eligible only when the worker is itself
+    /// a mesh member (its host is a jobset member) or the job was explicitly
+    /// started into a jobset (`agent-run start --jobset`). `false` forces the
+    /// interrupt-and-resume path for every job.
+    pub a2a_live_stdin: bool,
+    /// How long (seconds) a live job's stdin stays open after its last
+    /// delivered message / job-log write before the watchdog closes it (EOF),
+    /// letting agy finish the turn and the job go `Done` through the normal
+    /// classifier. `0` means never close. Non-zero values below
+    /// [`MIN_A2A_LIVE_IDLE_SECS`] are clamped up.
+    pub a2a_live_idle_secs: u64,
 }
 
 impl Default for Config {
@@ -221,6 +261,8 @@ impl Default for Config {
             default_engine: None,
             default_session_engine: None,
             a2a_interrupt_min_secs: DEFAULT_A2A_INTERRUPT_MIN_SECS,
+            a2a_live_stdin: DEFAULT_A2A_LIVE_STDIN,
+            a2a_live_idle_secs: DEFAULT_A2A_LIVE_IDLE_SECS,
         }
     }
 }
@@ -464,6 +506,56 @@ impl Config {
             file_cfg
                 .a2a_interrupt_min_secs
                 .unwrap_or(DEFAULT_A2A_INTERRUPT_MIN_SECS)
+        };
+
+        // 10e2. Resolve a2a_live_stdin: whether a meshed job is launched in
+        // live mode (stdin pipe for A2A messages) instead of always using the
+        // interrupt-and-resume path. Boolean env values parse exactly like the
+        // other boolean settings; an unparseable value fails loud (a mistyped
+        // flag defaulting one way could silently change inter-A2A delivery
+        // behaviour either direction, so there is no silent fallback).
+        let a2a_live_stdin = if let Some(env_val) = env_vars.get("AGENT_RUN_A2A_LIVE_STDIN") {
+            parse_bool_env("AGENT_RUN_A2A_LIVE_STDIN", env_val)?
+        } else {
+            file_cfg.a2a_live_stdin.unwrap_or(DEFAULT_A2A_LIVE_STDIN)
+        };
+
+        // 10e3. Resolve a2a_live_idle_secs: how long a live job's stdin stays
+        // open after its last activity before the watchdog closes it (EOF).
+        // `0` (never close) is valid; non-zero values below the floor are
+        // clamped up so a live channel is never closed before agy can flush
+        // its current turn; anything unparseable falls back with a warning.
+        let a2a_live_idle_secs = if let Some(env_val) = env_vars
+            .get("AGENT_RUN_A2A_LIVE_IDLE_SECS")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            match env_val.parse::<u64>() {
+                Ok(0) => 0,
+                Ok(secs) => secs.max(MIN_A2A_LIVE_IDLE_SECS),
+                _ => {
+                    eprintln!(
+                        "agent-run: ignoring invalid AGENT_RUN_A2A_LIVE_IDLE_SECS value {env_val:?}; using the default"
+                    );
+                    let v = file_cfg
+                        .a2a_live_idle_secs
+                        .unwrap_or(DEFAULT_A2A_LIVE_IDLE_SECS);
+                    if v == 0 {
+                        0
+                    } else {
+                        v.max(MIN_A2A_LIVE_IDLE_SECS)
+                    }
+                }
+            }
+        } else {
+            let v = file_cfg
+                .a2a_live_idle_secs
+                .unwrap_or(DEFAULT_A2A_LIVE_IDLE_SECS);
+            if v == 0 {
+                0
+            } else {
+                v.max(MIN_A2A_LIVE_IDLE_SECS)
+            }
         };
 
         // 10f. Resolve max_runtime (the server-wide DEFAULT job runtime).
@@ -755,6 +847,8 @@ impl Config {
             default_engine,
             default_session_engine,
             a2a_interrupt_min_secs,
+            a2a_live_stdin,
+            a2a_live_idle_secs,
         })
     }
 }
@@ -861,6 +955,40 @@ mod tests {
         assert!(!cfg.hindsight_enabled);
         assert_eq!(cfg.hindsight_bank, None);
         assert_eq!(cfg.hindsight_path, PathBuf::from("hindsight"));
+        assert_eq!(cfg.a2a_live_stdin, DEFAULT_A2A_LIVE_STDIN);
+        assert_eq!(cfg.a2a_live_idle_secs, DEFAULT_A2A_LIVE_IDLE_SECS);
+    }
+
+    #[test]
+    fn test_a2a_live_keys_env_and_fallback() {
+        // Env booleans parse like the other boolean settings.
+        let env = env_with(&[("AGENT_RUN_A2A_LIVE_STDIN", "false")]);
+        let cfg = Config::load_with_env(&env).expect("load bool env");
+        assert!(!cfg.a2a_live_stdin);
+
+        // Invalid boolean fails loud (a mistyped default must not silently
+        // flip either way).
+        let env = env_with(&[("AGENT_RUN_A2A_LIVE_STDIN", "maybe")]);
+        assert!(Config::load_with_env(&env).is_err());
+
+        // Idle: 0 = never close; a non-zero sub-floor value is clamped up.
+        let env = env_with(&[("AGENT_RUN_A2A_LIVE_IDLE_SECS", "0")]);
+        let cfg = Config::load_with_env(&env).expect("load idle 0");
+        assert_eq!(cfg.a2a_live_idle_secs, 0);
+
+        let env = env_with(&[("AGENT_RUN_A2A_LIVE_IDLE_SECS", "1")]);
+        let cfg = Config::load_with_env(&env).expect("load idle 1");
+        assert_eq!(cfg.a2a_live_idle_secs, MIN_A2A_LIVE_IDLE_SECS);
+
+        let env = env_with(&[("AGENT_RUN_A2A_LIVE_IDLE_SECS", "333")]);
+        let cfg = Config::load_with_env(&env).expect("load idle 333");
+        assert_eq!(cfg.a2a_live_idle_secs, 333);
+
+        // Unparseable idle falls back to the default (not fail-loud): a
+        // mistyped idle must not refuse to start the worker.
+        let env = env_with(&[("AGENT_RUN_A2A_LIVE_IDLE_SECS", "soon")]);
+        let cfg = Config::load_with_env(&env).expect("load invalid idle");
+        assert_eq!(cfg.a2a_live_idle_secs, DEFAULT_A2A_LIVE_IDLE_SECS);
     }
 
     #[test]

@@ -603,10 +603,23 @@ pub fn run(config: &Config, args: &StartArgs) -> Result<CommandOutput> {
                     &meta.job_id,
                     jobset_id,
                 );
+                // A caller-chosen jobset is a real A2A mesh: mark the job
+                // live-eligible so its agy runs in live mode (stdin pipe for
+                // A2A messages), `[worker] a2a_live_stdin` permitting. See
+                // [`crate::core::a2a_live`].
+                crate::core::a2a_live::set_live_member(&config.state_root, &meta.job_id, true);
                 Ok(())
             }
             None => {
-                crate::core::jobset::register_agent(&meta.job_id);
+                let cred = crate::core::jobset::register_agent(&meta.job_id);
+                // The job is part of a real mesh exactly when it joined the
+                // HOST's jobset (the worker is itself a mesh member); a job an
+                // operator started outside any mesh gets a fresh random jobset
+                // and stays non-live. See [`crate::core::a2a_live`].
+                let meshed = crate::core::jobset::host_jobset()
+                    .map(|h| h.jobset_id == cred.jobset_id)
+                    .unwrap_or(false);
+                crate::core::a2a_live::set_live_member(&config.state_root, &meta.job_id, meshed);
                 Ok(())
             }
         }

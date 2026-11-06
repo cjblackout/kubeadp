@@ -16,6 +16,7 @@
 //! feature, so the `cli` module (which does not serve HTTP) stays free of the
 //! HTTP dependency tree.
 
+pub mod a2a_live;
 pub mod activity;
 pub mod agy_cleanup;
 pub mod agy_conversations;

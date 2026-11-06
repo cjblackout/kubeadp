@@ -26,7 +26,7 @@ use super::exec::exec_target;
 use super::init_shim::{
     arm_pdeathsig, close_fds_above_2, install_shim_signal_handlers, run_init_shim, zeroize_bytes,
 };
-use super::policy::SandboxPolicy;
+use super::policy::{GrantsConfig, SandboxPolicy};
 use super::relay as relay_lib;
 use std::env;
 use std::ffi::CString;
@@ -39,6 +39,27 @@ use std::path::{Path, PathBuf};
 const AGENT_TMP_OPTS: &str = "size=64m,mode=0700";
 const SHM_PRIVATE_OPTS: &str = "size=64m,mode=0700";
 
+/// Returns one `(what, reason)` pair per path grant this backend cannot apply.
+/// The gVisor namespace sandbox enforces the filesystem policy with mounts
+/// (private tmp, hide overmounts, ro bind-remounts), not Landlock, so path
+/// grants (`serviceaccount`, `ro_paths`, `rw_paths`) are not enforceable and
+/// are dropped with a warning instead of aborting the session. Env grants are
+/// not listed: `build_agent_env` applies them through `filter_env`.
+fn gvisor_grant_warnings(g: &GrantsConfig) -> Vec<(String, String)> {
+    const REASON: &str = "the gvisor backend cannot enforce path grants (no Landlock)";
+    let mut warnings = Vec::new();
+    if g.serviceaccount {
+        warnings.push(("serviceaccount".to_string(), REASON.to_string()));
+    }
+    for p in &g.ro_paths {
+        warnings.push((format!("ro {}", p.display()), REASON.to_string()));
+    }
+    for p in &g.rw_paths {
+        warnings.push((format!("rw {}", p.display()), REASON.to_string()));
+    }
+    warnings
+}
+
 /// Executes a command in the gVisor sandbox backend.
 /// Returns the exit code or error string.
 pub fn execute_gvisor(
@@ -47,11 +68,16 @@ pub fn execute_gvisor(
     args: &[String],
     env: &[(String, String)],
 ) -> Result<i32, String> {
-    if policy.grants.is_some() {
-        return Err(
-            "gvisor backend does not support session grants; refusing to run without grant enforcement (fail closed)"
-                .to_string(),
-        );
+    // Grants are optional extras on top of the base policy, and a dropped
+    // grant only ever means LESS access: a grant this backend cannot apply
+    // must never abort the session (that would crash-loop it over one
+    // optional path). Path grants are dropped with one warning each; env
+    // grants ARE applied (build_agent_env honours grants.env). The base
+    // mount policy below stays fail-closed.
+    if let Some(ref g) = policy.grants {
+        for (what, reason) in gvisor_grant_warnings(g) {
+            eprintln!("kubeadp-agent: sandbox grant dropped ({what}): {reason}");
+        }
     }
     // Network mode: fail closed on an unknown value; `relay` opts into the
     // private network namespace + unix-socket relay (see super::relay).
@@ -952,8 +978,8 @@ mod tests {
     use super::super::init_shim::status_to_exit_code;
     use super::super::policy::SandboxPolicy;
     use super::{
-        build_agent_env, execute_gvisor, hide_is_file, plan_mounts, relay_mount_plan, MountOp,
-        MountSpec, AGENT_TMP_OPTS, SHM_PRIVATE_OPTS,
+        build_agent_env, execute_gvisor, gvisor_grant_warnings, hide_is_file, plan_mounts,
+        relay_mount_plan, MountOp, MountSpec, AGENT_TMP_OPTS, SHM_PRIVATE_OPTS,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -1618,5 +1644,72 @@ mod tests {
         };
         let err = execute_gvisor(&policy, "true", &[], &[]).unwrap_err();
         assert!(err.contains("unknown net value"), "err: {err}");
+    }
+
+    #[test]
+    fn test_gvisor_drops_path_grants_with_one_warning_each() {
+        // Path grants are not enforceable in the gVisor mount sandbox: each is
+        // dropped with one warning naming the grant (the session starts with
+        // strictly less access). Env grants are NOT listed -- build_agent_env
+        // applies them.
+        use super::super::policy::GrantsConfig;
+        let grants = GrantsConfig {
+            serviceaccount: true,
+            ro_paths: vec![PathBuf::from("/opt/tools")],
+            rw_paths: vec![PathBuf::from("/workspace"), PathBuf::from("/no/such/path")],
+            env: vec!["GH_TOKEN".to_string(), "VIKUNJA_*".to_string()],
+        };
+        let warnings = gvisor_grant_warnings(&grants);
+        assert_eq!(
+            warnings.len(),
+            4,
+            "one warning per path grant: {warnings:?}"
+        );
+        let whats: Vec<&str> = warnings.iter().map(|(w, _)| w.as_str()).collect();
+        assert!(whats.contains(&"serviceaccount"), "{whats:?}");
+        assert!(whats.contains(&"ro /opt/tools"), "{whats:?}");
+        assert!(whats.contains(&"rw /workspace"), "{whats:?}");
+        assert!(whats.contains(&"rw /no/such/path"), "{whats:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|(_, r)| r.contains("cannot enforce path grants")),
+            "{warnings:?}"
+        );
+        // No grants -> no warnings.
+        assert!(gvisor_grant_warnings(&GrantsConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn test_gvisor_build_agent_env_keeps_env_grants() {
+        // Env grants ARE applied by the gVisor backend: build_agent_env filters
+        // through is_env_allowed, which honours grants.env on top of env_allow.
+        use super::super::policy::GrantsConfig;
+        let policy = SandboxPolicy {
+            env_allow: vec!["PATH".to_string()],
+            grants: Some(GrantsConfig {
+                env: vec!["GH_TOKEN".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let launcher_env = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("GH_TOKEN".to_string(), "tok".to_string()),
+            ("SECRET_BYTES".to_string(), "abc".to_string()),
+        ];
+        let out = build_agent_env(&policy, &launcher_env, None);
+        let got: BTreeMap<&str, &str> = out.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(got.get("PATH"), Some(&"/usr/bin"));
+        assert_eq!(
+            got.get("GH_TOKEN"),
+            Some(&"tok"),
+            "env grant must be applied"
+        );
+        assert_eq!(
+            got.get("SECRET_BYTES"),
+            None,
+            "ungranted var must stay filtered"
+        );
     }
 }

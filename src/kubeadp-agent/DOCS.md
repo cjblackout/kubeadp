@@ -145,7 +145,7 @@ Orchestrator sessions running under sandbox isolation can receive scoped access 
 
 Worker jobs cannot declare grants. Any attempt to supply grants to a worker job fails closed.
 
-A forbidden or failing session grant is dropped, never fatal: an entry that fails validation (relative path, `..`, `/`, `/proc`, `/dev/...`, bad env name) is removed with a `grant dropped:` warning when the supervisor config is loaded, and a grant the kata backend refuses or the kernel rejects (for example a write to the ServiceAccount directory) is dropped with `sandbox grant dropped (...)` at launch. The session and every other session still start, with strictly less access; isolation is unchanged because a grant only ever adds access. The base sandbox policy (system roots, Landlock itself, no-new-privs) stays fail-closed.
+A forbidden or failing session grant is dropped, never fatal: an entry that fails validation (relative path, `..`, `/`, `/proc`, `/dev/...`, bad env name) is removed with a `grant dropped:` warning when the supervisor config is loaded, and a grant the backend cannot apply at launch — the kata backend refuses it, the kernel rejects the rule, or the path does not exist or cannot be opened — is dropped with `sandbox grant dropped (...)`; on the gVisor backend (no Landlock) the path grants are dropped the same way while `env` grants still apply. The session and every other session still start, with strictly less access; isolation is unchanged because a grant only ever adds access. The base sandbox policy (system roots, Landlock itself, no-new-privs) stays fail-closed.
 
 ---
 
@@ -225,7 +225,8 @@ Incoming messages delivered via `POST /message:send` pass through strict ingress
   ```
 - **Receiving Behavior**:
   - **Orchestrator**: Writes framed content directly to the session PTY using bracketed paste (`ESC[200~ ... ESC[201~`) followed by a newline.
-  - **Worker**: Interrupts the active execution turn cleanly (via process group SIGTERM), appends the message to the conversation history, and restarts execution.
+  - **Worker (live)**: When `[worker] a2a_live_stdin` is on and the job is a member of a real A2A mesh (started into a jobset), a meshed job runs in live mode (`--print "" --input-format stream-json`): its `agy` process reads NDJSON from a stdin pipe and an incoming message is delivered to the RUNNING process as a single `{"event":"user","message":{"content":"..."}}` line — no kill, no restart, the same conversation continues. The pipe is closed (EOF, letting agy finish and the job go `Done`) when the job ends or after `[worker] a2a_live_idle_secs` of no delivery and no log output (`0` = never close).
+  - **Worker (interrupt-and-resume)**: For a job without a live channel (or when live delivery fails/becomes stale), the worker interrupts the active execution turn cleanly (via process group SIGTERM), appends the message to the conversation history, and restarts execution.
   - **Rate Limiting**: Delivery is metered per (session, sender) pair at 30 messages per minute. Throttled requests receive HTTP 429 with `Retry-After`.
 
 ### 4.5 Outbound A2A via `mcp-a2a`

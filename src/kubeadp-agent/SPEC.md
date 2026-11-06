@@ -175,6 +175,14 @@ mapping), the same sandbox wrapping and launch handshake. Start flags: `-p
 `--print-timeout <t>`. No privilege-separation remnants (`env`/`gosu`) may leak
 into the command.
 
+A *live-mode* job (`[worker] a2a_live_stdin`, `[worker] a2a_live_idle_secs` — a
+member of a real A2A mesh, see §7.1/§7.11) changes the invocation to
+`--print "" --input-format stream-json` (the job's prompt travels as the
+FIRST NDJSON line over the piped stdin, with `--print ""` satisfying agy's
+required prompt argument); every other element is unchanged, and A2A messages
+are delivered to the running process over that pipe instead of an
+interrupt-and-resume.
+
 ### 3.3 claude engine (`"claude"`)
 - Job mode invokes `claude -p --input-format stream-json --output-format
   stream-json` (newline-delimited JSON) with a bounded, drop-oldest event buffer.
@@ -648,10 +656,14 @@ with a conversation id is auto-resumed as a retry whose prompt is the framed
 message. Addressing: session name = A2A context id (e.g. `homelab`); job id =
 A2A task id; per-job sender = `<A2A_SELF_PREFIX>/<job id>`.
 
-On the worker, an inbound message for a running job interrupts the active turn
-cleanly (process-group SIGTERM), appends the message to the conversation
-history, and restarts execution; logs `[a2a interrupt]` lines to the job log.
-Finished jobs are resumed and answer.
+On the worker, an inbound message for a running job that was launched in
+live mode (an A2A mesh member, `[worker] a2a_live_stdin` on) is delivered to
+the RUNNING `agy` process as one NDJSON `{"event":"user",...}` line over its
+piped stdin (no kill, no restart, the same conversation continues). A running
+job without a live channel is interrupted cleanly (process-group SIGTERM), the
+message is appended to the conversation history, and execution is restarted;
+logs `[a2a interrupt]` lines to the job log. Finished jobs are resumed and
+answer.
 
 ### 7.2 Membership
 1. A jobset is created by the process that starts its first member. A process
@@ -718,8 +730,10 @@ Finished jobs are resumed and answer.
 - Size cap before framing: whole-message text ≤ `MESSAGE_MAX_BYTES` (8192)
   minus framing; reject, never truncate.
 - Rate limits: per (session, sender) 30/min → `429` + `Retry-After`. Worker
-  additionally: per-job interrupt interval `a2a_interrupt_min_secs` (default 20
-  s; `0` off) rejects an interrupt of a job whose previous interrupt is younger.
+  additionally: the per-job interrupt interval `a2a_interrupt_min_secs` (default
+  20 s; `0` off) rejects an interrupt of a job whose previous interrupt is
+  younger — it applies only to the interrupt-and-resume path; a LIVE delivery
+  (stdin pipe, §7.11) is not an interrupt and is not rate-limited by it.
 - Framing delimiters carry a per-message random nonce (16 random bytes,
   hex-encoded). Hop token `{hop, expiry, message_id}` HMAC-SHA256 keyed by the
   jobset secret, `base64url(json).base64url(mac)`, constant-time verified; fresh
@@ -797,7 +811,20 @@ events, incompatible with long-lived sessions). Unsupported SDK methods map per
   `CancelTask` via `kill::run_exact` (never prefix resolution); terminal job →
   `TASK_NOT_CANCELABLE`.
 
-### 7.11 Worker message sink (interrupt-and-resume)
+### 7.11 Worker message sink (live stdin, else interrupt-and-resume)
+- **Live fast path**: when `[worker] a2a_live_stdin` is on and the job has a
+  live channel (it was launched in live mode — a real A2A mesh member, §7.1), a
+  message for a RUNNING job is delivered to the running `agy` process as ONE
+  JSON-encoded NDJSON `{"event":"user","message":{"content":"<framed text>"}}`
+  line over the piped stdin: no kill, no resume, the same conversation
+  continues. The write is serialized by the per-job gate (a message can exceed
+  `PIPE_BUF`; the gate plus the channel's mutex guarantee no byte interleave)
+  and gated additionally on the channel's recorded pid + start time matching
+  the row's (`is_alive_for`), so a recycled pid is never written into.
+- **Live fallback**: an absent / stale (dead pid or changed identity) / failed
+  (broken pipe) channel is UNREGISTERED and the delivery falls through to the
+  interrupt-and-resume path below unchanged (idempotency + rate limit +
+  coalesce bounds all still apply to the fallback).
 - In-memory per-job pending buffer while a resume is in flight:
   `MAX_COALESCE_MSGS` (8) / `MAX_COALESCE_BYTES` (8 KiB), drop-oldest; a single
   over-cap message → `invalid_params`; a persistent inbox is never used.
@@ -932,6 +959,8 @@ sections; they are the separate trusted config of §4.2.
 | `remote_control_check_secs` | `AGENT_RUN_REMOTE_CONTROL_CHECK_SECS` | 60 (min 10) |
 | `agy_mcp_source` | `AGENT_RUN_AGY_MCP_SOURCE` | template MCP config path |
 | `a2a_interrupt_min_secs` | `AGENT_RUN_A2A_INTERRUPT_MIN_SECS` | 20 |
+| `a2a_live_stdin` | `AGENT_RUN_A2A_LIVE_STDIN` | boolean, default true |
+| `a2a_live_idle_secs` | `AGENT_RUN_A2A_LIVE_IDLE_SECS` | 120 (0 = never close; min 10) |
 | `a2a_mcp_enabled` | `AGENT_RUN_A2A_MCP_ENABLED` | boolean, default false |
 
 Secrets are never inline: bearer tokens via `api_token_file`/`token_file`

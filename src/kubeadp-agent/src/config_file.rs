@@ -76,6 +76,8 @@
 //!   api_listen              -> AGENT_RUN_API_LISTEN
 //!   agy_mcp_source          -> AGENT_RUN_AGY_MCP_SOURCE
 //!   a2a_interrupt_min_secs  -> AGENT_RUN_A2A_INTERRUPT_MIN_SECS
+//!   a2a_live_stdin          -> AGENT_RUN_A2A_LIVE_STDIN
+//!   a2a_live_idle_secs      -> AGENT_RUN_A2A_LIVE_IDLE_SECS
 //!   a2a_mcp_enabled         -> AGENT_RUN_A2A_MCP_ENABLED
 //!   hindsight_api_key       -> (rejected: secret, set AGENT_RUN_HINDSIGHT_API_KEY from a Secret)
 //! ```
@@ -316,6 +318,8 @@ fn var_for_section_key(section: &str, key: &str) -> Option<String> {
         ("worker", "a2a_interrupt_min_secs") => {
             Some("AGENT_RUN_A2A_INTERRUPT_MIN_SECS".to_string())
         }
+        ("worker", "a2a_live_stdin") => Some("AGENT_RUN_A2A_LIVE_STDIN".to_string()),
+        ("worker", "a2a_live_idle_secs") => Some("AGENT_RUN_A2A_LIVE_IDLE_SECS".to_string()),
         ("worker", "a2a_mcp_enabled") => Some("AGENT_RUN_A2A_MCP_ENABLED".to_string()),
 
         _ => None,
@@ -435,6 +439,8 @@ fn section_keys(section: &str) -> Vec<&'static str> {
             "agy_mcp_source",
             "default_engine",
             "a2a_interrupt_min_secs",
+            "a2a_live_stdin",
+            "a2a_live_idle_secs",
             "a2a_mcp_enabled",
         ],
         _ => Vec::new(),
@@ -548,6 +554,39 @@ a2a_mcp_enabled = true
         assert_eq!(
             var_for_section_key("worker", "a2a_mcp_enabled").as_deref(),
             Some("AGENT_RUN_A2A_MCP_ENABLED")
+        );
+    }
+
+    #[test]
+    fn test_a2a_live_keys_map_to_env() {
+        let toml = r#"
+[worker]
+a2a_live_stdin = false
+a2a_live_idle_secs = 300
+"#;
+        let vars = parse(toml);
+        assert_eq!(
+            vars.get("AGENT_RUN_A2A_LIVE_STDIN").map(|s| s.as_str()),
+            Some("false")
+        );
+        assert_eq!(
+            vars.get("AGENT_RUN_A2A_LIVE_IDLE_SECS").map(|s| s.as_str()),
+            Some("300")
+        );
+        // Inverse mapping recovers both keys over the table.
+        let (section, key) = section_and_key_for_var("AGENT_RUN_A2A_LIVE_STDIN").unwrap();
+        assert_eq!(section, "worker");
+        assert_eq!(key, "a2a_live_stdin");
+        let (section, key) = section_and_key_for_var("AGENT_RUN_A2A_LIVE_IDLE_SECS").unwrap();
+        assert_eq!(section, "worker");
+        assert_eq!(key, "a2a_live_idle_secs");
+        assert_eq!(
+            var_for_section_key("worker", "a2a_live_stdin").as_deref(),
+            Some("AGENT_RUN_A2A_LIVE_STDIN")
+        );
+        assert_eq!(
+            var_for_section_key("worker", "a2a_live_idle_secs").as_deref(),
+            Some("AGENT_RUN_A2A_LIVE_IDLE_SECS")
         );
     }
 
