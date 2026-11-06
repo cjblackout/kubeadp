@@ -191,7 +191,7 @@ fn load_base_config(config_path: Option<PathBuf>) -> SupervisorConfig {
         .ok()
         .or_else(|| std::env::var("CLAUDE_SUPERVISOR_CONFIG").ok());
     let etc_path = Path::new("/etc/agent-orchestrate/config.json");
-    let cfg = match crate::orchestrate::config::resolve_base_config_from_sources(
+    let mut cfg = match crate::orchestrate::config::resolve_base_config_from_sources(
         config_path.as_deref(),
         env_config.as_deref(),
         etc_path,
@@ -208,11 +208,19 @@ fn load_base_config(config_path: Option<PathBuf>) -> SupervisorConfig {
         log_event("supervisor", &e);
         std::process::exit(1);
     }
-    for s in &cfg.sessions {
+    for s in &mut cfg.sessions {
         if let Err(e) = s.validate_durations() {
             eprintln!("{}", e);
             log_event("supervisor", &e);
             std::process::exit(1);
+        }
+        // A forbidden grant is dropped, not fatal: the session still starts.
+        let name = s.name.clone();
+        if let Some(g) = s.grants.as_mut() {
+            for w in g.sanitize(&name) {
+                eprintln!("{}", w);
+                log_event(&name, &w);
+            }
         }
     }
     cfg
