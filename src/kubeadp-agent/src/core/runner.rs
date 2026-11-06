@@ -748,7 +748,12 @@ pub fn launch_background_job_with_timeout(
             }
         }
         None => {
-            let _ = crate::core::jobset::register_agent(&meta.job_id);
+            let cred = crate::core::jobset::register_agent(&meta.job_id);
+            crate::core::jobset::remember_job_jobset(
+                &config.state_root,
+                &meta.job_id,
+                &cred.jobset_id,
+            );
         }
     }
 

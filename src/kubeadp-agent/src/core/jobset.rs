@@ -475,6 +475,21 @@ impl JobsetRegistry {
         map.get(agent_id).cloned()
     }
 
+    /// The jobset entry of `agent_id`: the live registration, else (for a
+    /// job that has finished and was dropped) the jobset it was started into,
+    /// remembered under the data dir, at the base epoch. The returned entry of
+    /// a finished job carries no secret (the secret is re-derived from the root
+    /// key, so it verifies only with a root key configured).
+    pub fn get_or_remembered(&self, agent_id: &str) -> Option<JobsetEntry> {
+        if let Some(entry) = self.get(agent_id) {
+            return Some(entry);
+        }
+        self.root_key()?;
+        let dir = self.data_dir()?;
+        let jobset_id = recall_job_jobset(&dir, agent_id)?;
+        Some(JobsetEntry::new(jobset_id, String::new(), EPOCH_ZERO))
+    }
+
     /// Whether `agent_id` has a registered jobset.
     pub fn contains(&self, agent_id: &str) -> bool {
         let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
@@ -1215,8 +1230,11 @@ pub type HeaderGetter = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 /// the target's jobset id, and the presented secret matches the target's
 /// secret -- both compared through constant-time SHA-256 digest comparison.
 ///
+/// A finished job (dropped from the registry) is still a target: its remembered
+/// jobset is used, so a message can resume it.
+///
 /// Returns `false` when either header is absent, the target agent has no
-/// registered jobset, or any field mismatches.
+/// registered or remembered jobset, or any field mismatches.
 pub fn verify_jobset_credential(
     registry: &JobsetRegistry,
     target_agent_id: &str,
@@ -1239,7 +1257,7 @@ pub fn verify_jobset_credential(
 
     // Membership check: the TARGET agent must be a member of the presented
     // jobset (its registered jobset id matches the presented one).
-    let Some(entry) = registry.get(target_agent_id) else {
+    let Some(entry) = registry.get_or_remembered(target_agent_id) else {
         return false;
     };
     if !crypto::digest_eq(presented_id.as_bytes(), entry.jobset_id.as_bytes()) {
@@ -1321,6 +1339,29 @@ pub fn build_jobset_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finished_job_credential_verifies_from_remembered_jobset() {
+        let dir = std::env::temp_dir().join(format!("fj-{}", new_jobset_id()));
+        let reg = JobsetRegistry::new();
+        reg.set_root_key(Some(Arc::from(&b"root-key"[..])));
+        reg.set_data_dir(dir.clone());
+        remember_job_jobset(&dir, "job1", "js1");
+        let secret = derive_jobset_secret(b"root-key", "js1", EPOCH_ZERO);
+        let h = |id: &str, sec: &str| -> HeaderGetter {
+            let (id, sec) = (id.to_string(), sec.to_string());
+            Arc::new(move |n: &str| match n {
+                JOBSET_ID_HEADER => Some(id.clone()),
+                JOBSET_SECRET_HEADER => Some(sec.clone()),
+                _ => None,
+            })
+        };
+        assert!(verify_jobset_credential(&reg, "job1", &h("js1", &secret)));
+        assert!(!verify_jobset_credential(&reg, "job1", &h("js1", "wrong")));
+        assert!(!verify_jobset_credential(&reg, "job1", &h("js2", &secret)));
+        assert!(!verify_jobset_credential(&reg, "other", &h("js1", &secret)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn job_jobset_is_remembered_across_retries() {
