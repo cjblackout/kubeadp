@@ -109,7 +109,7 @@ Runtime environment capabilities are auto-detected by `kubeadp-agent sandbox-pro
 | Backend | Runtime Environment | Mechanisms Enforced | Failure Action |
 |---|---|---|---|
 | `gvisor` | gVisor (`runsc`) | Unprivileged UID 1000:1000, PID namespace, Mount namespace, fresh procfs, private tmpfs on `/tmp` and `/dev/shm`. | Fails closed (exit 125) if namespace unshare fails. |
-| `kata` | Kata Containers | Landlock ABI >= 6 (signal and abstract Unix socket scoping), process tree supervision via `PR_SET_CHILD_SUBREAPER`. | Fails closed (exit 125) if Landlock ABI < 6. |
+| `kata` | Kata Containers | Landlock ABI >= 6 (signal and abstract Unix socket scoping), process tree supervision via `PR_SET_CHILD_SUBREAPER`, private tmpfs on `/dev/shm` (best effort: without unprivileged user namespaces the session still starts and `/dev/shm` stays read-only). | Fails closed (exit 125) if Landlock ABI < 6 or setup fails. |
 | `runc` | Standard Linux container | Single-primitive enforcement: Fresh procfs in user namespace if supported; otherwise Landlock ruleset with subreaper supervision. | Fails closed (exit 125) if neither mechanism is supported. |
 | `trusted` | Unsandboxed (`"sandbox": false`) | Inherits host environment without confinement. | Only allowed when explicitly configured for trusted sessions. |
 
@@ -125,12 +125,16 @@ The sandbox policy controls network namespace isolation via the `net` field:
   - SSH traffic tunnels through `kubeadp-agent relay-connect` configured via `GIT_SSH_COMMAND`.
   - Fails closed (exit 125) if the host lacks namespace unsharing capabilities.
 
-### 3.3 Path Hiding and Secret Isolation
+### 3.3 Path Hiding, Secret Isolation, and Private `/dev/shm`
 
 Every sandboxed policy automatically applies access restrictions to host credentials:
 - **Operator Token File (`KUBEADP_API_TOKEN_FILE`)**: Hidden via mount overmounting. Sandboxed processes cannot inspect host API bearer tokens.
 - **Jobset Root Key File (`KUBEADP_JOBSET_ROOT_KEY_FILE`)**: Hidden via mount overmounting. Derived secrets are supplied exclusively via private file descriptors.
 - **Secret Channel**: Temporary credentials pass into the sandbox via an inherited file descriptor (`secret.fd`), written to a mode `0400` private file inside the agent's private temporary directory.
+
+#### Private `/dev/shm`
+
+For tools requiring POSIX shared memory or semaphores (e.g. Ansible, Python multiprocessing), sandboxed Kata sessions create an isolated per-session `/dev/shm` tmpfs (`size=64m,nr_inodes=65536,mode=0700`) inside a private mount namespace before Landlock restricts filesystem access. The private tmpfs disappears with the session, leaves no files on the pod filesystem, and is granted read-write access under Landlock. It is best effort: where unprivileged user namespaces or the tmpfs mount are not available, the session still starts with a warning and `/dev/shm` stays read-only (the shared guest `/dev/shm` is never opened up).
 
 ### 3.4 Orchestrator Session Grants
 

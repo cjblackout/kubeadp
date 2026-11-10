@@ -25,6 +25,9 @@
 //! - Landlock scopes `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` and
 //!   `LANDLOCK_SCOPE_SIGNAL` (both ABI >= 6, required here).
 //! - Subreaper supervision (`prctl(PR_SET_CHILD_SUBREAPER, 1)`) + tree-kill on agent exit.
+//! - Private per-session `/dev/shm`: mounted tmpfs (64 MiB, 65536 inodes, mode 0700)
+//!   inside an unprivileged user and mount namespace before Landlock is applied,
+//!   with Landlock granting read-write access to `/dev/shm`.
 //! - Sets `PR_SET_NO_NEW_PRIVS`.
 //! - Writes secret from fd to `<tmp>/<dest>` mode 0400.
 //! - Opt-in `net: relay`: the launcher runs the outer HTTP CONNECT proxy in
@@ -51,6 +54,15 @@ use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
+
+/// tmpfs mount options for the private per-session `/dev/shm`.
+pub const KATA_SHM_PRIVATE_OPTS: &str = "size=64m,nr_inodes=65536,mode=0700";
+
+/// Set once the private `/dev/shm` tmpfs is mounted in this process (the forked
+/// launcher child); only then does the Landlock domain get a read-write rule for
+/// `/dev/shm`, so the shared guest `/dev/shm` is never opened up.
+static PRIVATE_SHM_MOUNTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // Landlock syscall constants & access flags
 const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
@@ -593,6 +605,17 @@ pub fn execute_kata(
         }
     }
 
+    // Private /dev/shm tmpfs: mounts a private tmpfs over /dev/shm inside a
+    // dedicated mount namespace (unsharing CLONE_NEWUSER if not already unshared
+    // for relay, then CLONE_NEWNS). Best effort: it is a convenience (POSIX
+    // semaphores / shared memory), not a security boundary, and a session must
+    // always start. If a step is not permitted (no unprivileged user namespaces,
+    // no tmpfs mount), the launch goes on without it and /dev/shm stays
+    // read-only under the Landlock policy (no rw rule for the shared /dev/shm).
+    if let Err(e) = kata_prepare_private_shm(relay) {
+        eprintln!("kubeadp-agent sandbox warning: private /dev/shm not available: {e}");
+    }
+
     // Relay mode: start the inner relay (a subcommand of this binary) before
     // the Landlock domain is applied, so the relay stays unrestricted. It
     // listens on 127.0.0.1:3128 in the agent's network namespace and copies
@@ -661,7 +684,11 @@ pub fn execute_kata(
         relay_setup.as_ref().map(|s| s.exe.as_path()),
     );
 
-    // Exec command
+    // Exec command.
+    // Inside the user namespace the agent runs as an unprivileged UID (1000:1000
+    // mapped 1:1), so execve clears all process capabilities; the agent has no
+    // capabilities after exec. PR_SET_NO_NEW_PRIVS and Landlock restrict_self
+    // remain in place.
     execute_target(cmd, args, &final_env);
 }
 
@@ -695,6 +722,86 @@ fn kata_relay_socket_target(setup: &relay_lib::RelaySetup) -> PathBuf {
     setup.sock.clone()
 }
 
+/// Unshares a user namespace with the caller's uid and gid mapped 1:1,
+/// denying additional groups. Fails closed with the caller context in the error.
+fn kata_unshare_user_ns(context: &str) -> Result<(), String> {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(format!(
+                "kubeadp-agent {context}: unshare(CLONE_NEWUSER) failed: {err} (the kata backend \
+                 needs unprivileged user namespaces)"
+            ));
+        }
+    }
+
+    fs::write("/proc/self/setgroups", "deny\n")
+        .map_err(|e| format!("kubeadp-agent {context}: write setgroups failed: {e}"))?;
+    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1\n"))
+        .map_err(|e| format!("kubeadp-agent {context}: write uid_map failed: {e}"))?;
+    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1\n"))
+        .map_err(|e| format!("kubeadp-agent {context}: write gid_map failed: {e}"))?;
+
+    Ok(())
+}
+
+/// Prepares a private per-session `/dev/shm` tmpfs mount inside the Kata child.
+///
+/// Unshares `CLONE_NEWUSER` (if not already unshared by relay setup) mapped 1:1,
+/// unshares `CLONE_NEWNS`, marks the root mount tree private (`MS_REC | MS_PRIVATE`),
+/// and mounts a tmpfs over `/dev/shm` with options `size=64m,nr_inodes=65536,mode=0700`.
+///
+/// Fails closed on any error.
+pub fn kata_prepare_private_shm(user_ns_already_unshared: bool) -> Result<(), String> {
+    if !user_ns_already_unshared {
+        kata_unshare_user_ns("/dev/shm")?;
+    }
+
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWNS) != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(format!(
+                "kubeadp-agent /dev/shm: unshare(CLONE_NEWNS) failed: {err}"
+            ));
+        }
+
+        if libc::mount(
+            c"none".as_ptr(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        ) != 0
+        {
+            let err = std::io::Error::last_os_error();
+            return Err(format!(
+                "kubeadp-agent /dev/shm: mount(/, MS_PRIVATE) failed: {err}"
+            ));
+        }
+
+        let opts = CString::new(KATA_SHM_PRIVATE_OPTS).map_err(|e| e.to_string())?;
+        if libc::mount(
+            c"tmpfs".as_ptr(),
+            c"/dev/shm".as_ptr(),
+            c"tmpfs".as_ptr(),
+            0,
+            opts.as_ptr() as *const libc::c_void,
+        ) != 0
+        {
+            let err = std::io::Error::last_os_error();
+            return Err(format!(
+                "kubeadp-agent /dev/shm: mount tmpfs on /dev/shm failed: {err}"
+            ));
+        }
+    }
+
+    PRIVATE_SHM_MOUNTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
 /// Creates the agent's private network namespace in the Kata backend's forked
 /// child: unshare(CLONE_NEWUSER) with the caller's own uid/gid mapped 1:1
 /// (works unprivileged, as with the gVisor backend), then
@@ -705,27 +812,8 @@ fn kata_relay_socket_target(setup: &relay_lib::RelaySetup) -> PathBuf {
 /// the private network namespace cannot be created, so the launch aborts
 /// (exit 125) rather than running with weaker network isolation.
 fn kata_relay_unshare_private_net() -> Result<(), String> {
-    let (user_flag, net_flag) = kata_relay_unshare_flags();
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-
-    unsafe {
-        if libc::unshare(user_flag) != 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(format!(
-                "kubeadp-agent relay: unshare(CLONE_NEWUSER) failed: {err} (the kata backend \
-                 needs unprivileged user namespaces to create the agent's private network \
-                 namespace)"
-            ));
-        }
-    }
-
-    fs::write("/proc/self/setgroups", "deny\n")
-        .map_err(|e| format!("kubeadp-agent relay: write setgroups failed: {e}"))?;
-    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1\n"))
-        .map_err(|e| format!("kubeadp-agent relay: write uid_map failed: {e}"))?;
-    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1\n"))
-        .map_err(|e| format!("kubeadp-agent relay: write gid_map failed: {e}"))?;
+    let (_user_flag, net_flag) = kata_relay_unshare_flags();
+    kata_unshare_user_ns("relay")?;
 
     unsafe {
         if libc::unshare(net_flag) != 0 {
@@ -856,6 +944,12 @@ pub fn apply_landlock_domain(
     }
     if let Some(tmp) = private_tmp {
         add_rw(tmp)?;
+    }
+    // Private /dev/shm tmpfs is mounted inside the sandbox; Landlock requires an
+    // explicit RW rule for /dev/shm so the agent can create semaphores and shared memory.
+    // Only when the private tmpfs is really there: the shared guest /dev/shm is never opened up.
+    if PRIVATE_SHM_MOUNTED.load(std::sync::atomic::Ordering::SeqCst) {
+        add_rw(Path::new("/dev/shm"))?;
     }
 
     // 5. Grants allow-list (if session has grants). Grants are optional extras
@@ -2210,6 +2304,108 @@ mod tests {
             super::super::init_shim::status_to_exit_code(st),
             0,
             "launcher must reap the adopted orphan and still report the agent's exit status"
+        );
+    }
+
+    // ---- Private /dev/shm ----------------------------------------------------
+
+    #[test]
+    fn test_kata_shm_private_opts_content() {
+        assert_eq!(
+            KATA_SHM_PRIVATE_OPTS, "size=64m,nr_inodes=65536,mode=0700",
+            "shm options must match specification"
+        );
+        assert!(KATA_SHM_PRIVATE_OPTS.contains("size=64m"));
+        assert!(KATA_SHM_PRIVATE_OPTS.contains("nr_inodes=65536"));
+        assert!(KATA_SHM_PRIVATE_OPTS.contains("mode=0700"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_kata_private_shm_isolation_in_child() {
+        // Forks child 1, runs kata_prepare_private_shm, writes a file to /dev/shm,
+        // checks statfs (tmpfs and size cap), then exits.
+        // Then forks child 2, runs kata_prepare_private_shm, and checks that child 1's
+        // file is NOT visible.
+        // Skips cleanly if unshare(CLONE_NEWUSER) or mount is not permitted in the environment.
+
+        // Child 1
+        let pid1 = unsafe { libc::fork() };
+        assert!(pid1 >= 0, "fork child 1 failed");
+        if pid1 == 0 {
+            if let Err(e) = kata_prepare_private_shm(false) {
+                // If unshare(CLONE_NEWUSER) or mount is not permitted in this test environment,
+                // skip cleanly with exit code 77.
+                eprintln!("kata_prepare_private_shm skipped in test env: {e}");
+                unsafe { libc::_exit(77) };
+            }
+
+            // Verify statfs
+            unsafe {
+                let mut buf: libc::statfs = std::mem::zeroed();
+                let path = CString::new("/dev/shm").unwrap();
+                if libc::statfs(path.as_ptr(), &mut buf) != 0 {
+                    libc::_exit(1);
+                }
+                // TMPFS_MAGIC is 0x01021994
+                if buf.f_type != 0x01021994 {
+                    libc::_exit(2);
+                }
+                // size cap: 64 MiB (67108864 bytes)
+                let total_bytes = buf.f_blocks as u64 * buf.f_bsize as u64;
+                if total_bytes != 64 * 1024 * 1024 {
+                    libc::_exit(3);
+                }
+                // nr_inodes cap: 65536
+                if buf.f_files != 65536 {
+                    libc::_exit(4);
+                }
+            }
+
+            // Write test file
+            if fs::write("/dev/shm/kata_test_marker.txt", b"child1").is_err() {
+                unsafe { libc::_exit(5) };
+            }
+
+            unsafe { libc::_exit(0) };
+        }
+
+        let mut st1 = 0;
+        unsafe {
+            libc::waitpid(pid1, &mut st1, 0);
+        }
+        let code1 = super::super::init_shim::status_to_exit_code(st1);
+        if code1 == 77 {
+            // Environment does not support unprivileged userns or mount; skip cleanly.
+            return;
+        }
+        assert_eq!(code1, 0, "child 1 private /dev/shm setup failed");
+
+        // Child 2
+        let pid2 = unsafe { libc::fork() };
+        assert!(pid2 >= 0, "fork child 2 failed");
+        if pid2 == 0 {
+            if let Err(e) = kata_prepare_private_shm(false) {
+                eprintln!("kata_prepare_private_shm child 2 skipped in test env: {e}");
+                unsafe { libc::_exit(77) };
+            }
+
+            // Check that child 1's marker file is NOT present
+            if Path::new("/dev/shm/kata_test_marker.txt").exists() {
+                unsafe { libc::_exit(6) };
+            }
+
+            unsafe { libc::_exit(0) };
+        }
+
+        let mut st2 = 0;
+        unsafe {
+            libc::waitpid(pid2, &mut st2, 0);
+        }
+        let code2 = super::super::init_shim::status_to_exit_code(st2);
+        assert_eq!(
+            code2, 0,
+            "child 2 saw child 1's file or failed private /dev/shm setup"
         );
     }
 }
