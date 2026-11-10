@@ -30,6 +30,63 @@ pub enum Capability {
 /// A stable endpoint key name (identical across engines).
 pub type CapEndpointKey = &'static str;
 
+/// One A2A injection channel (design HL-113 §7.14): the native context
+/// channel a harness uses to put a queued A2A message into a run's model
+/// context. The injection is the acknowledgement; a channel that delivered a
+/// message marks it `injected` in the run's inbox
+/// ([`crate::core::a2a::inbox`]).
+///
+/// - `Hook` (Claude Code): the harness-configured session hooks; the
+///   `kubeadp-agent a2a-hook <event>` subcommand prints the hook JSON for the
+///   messages queued at the hook boundary.
+/// - `ToolResult` (every engine): the harness-owned `mcp-a2a` server appends
+///   the queued messages to the result of its tool calls; `wait_message` is a
+///   blocking receive whose result is the message.
+/// - `IdleTurn` (every engine): at an idle turn boundary the harness starts
+///   the next turn with the message (phase 2 wiring).
+/// - `Interrupt`: the explicit last resort (the existing kill-and-resume,
+///   only for `interrupt: true` messages or a force timeout; phase 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InjectChannel {
+    Hook,
+    ToolResult,
+    IdleTurn,
+    Interrupt,
+}
+
+impl InjectChannel {
+    /// The stable channel name (the inbox marker's `channel` field).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InjectChannel::Hook => "hook",
+            InjectChannel::ToolResult => "tool_result",
+            InjectChannel::IdleTurn => "idle_turn",
+            InjectChannel::Interrupt => "interrupt",
+        }
+    }
+}
+
+/// The injection channels each engine supports (design HL-113 §7.14). Both
+/// engines support `hook`, `tool_result` and `idle_turn` (the parity
+/// requirement: the agy hook channel is a native agy plugin `PreInvocation`
+/// hook, verified live; the Claude Code hook channel is the
+/// PostToolUse/UserPromptSubmit/Stop hooks). `Interrupt` is not listed: it is
+/// the explicit last resort every engine already reaches through the existing
+/// kill-and-resume, never an advertised channel. Unknown engines answer empty
+/// (no injection).
+pub fn inject_channels(engine: &str) -> &'static [InjectChannel] {
+    const CHANNELS: &[InjectChannel] = &[
+        InjectChannel::Hook,
+        InjectChannel::ToolResult,
+        InjectChannel::IdleTurn,
+    ];
+    match engine {
+        "claude" | "agy" => CHANNELS,
+        _ => &[],
+    }
+}
+
 /// One row of the static endpoint table: the key plus the run kinds that can
 /// reach it (metadata for clients; the capability value lives in the table).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -149,6 +206,11 @@ pub const ENDPOINTS: &[CapEndpoint] = &[
         job: true,
         session: true,
     },
+    CapEndpoint {
+        key: "a2a.inject",
+        job: true,
+        session: true,
+    },
 ];
 
 /// Looks up the static row (capability applicability metadata) for a key.
@@ -167,6 +229,11 @@ pub struct CapabilityTable {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<Transport>,
     pub endpoints: BTreeMap<CapEndpointKey, Capability>,
+    /// The A2A injection channels this engine supports (design HL-113 §7.14,
+    /// [`inject_channels`]); empty (and omitted) for engines without
+    /// injection.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inject_channels: Vec<InjectChannel>,
 }
 
 impl CapabilityTable {
@@ -251,10 +318,12 @@ impl CapabilityTableBuilder {
             };
             endpoints.insert(row.key, capability);
         }
+        let inject_channels = inject_channels(&self.engine).to_vec();
         CapabilityTable {
             engine: self.engine,
             transport: self.transport,
             endpoints,
+            inject_channels,
         }
     }
 }
@@ -309,6 +378,7 @@ mod tests {
             "permissions",
             "workspace.*",
             "a2a.send_message",
+            "a2a.inject",
         ] {
             assert!(
                 keys.contains(key),
@@ -323,6 +393,66 @@ mod tests {
         assert!(!endpoint_by_key("job.start").unwrap().session);
         assert!(endpoint_by_key("interrupt").unwrap().job);
         assert!(endpoint_by_key("interrupt").unwrap().session);
+        assert!(endpoint_by_key("a2a.inject").unwrap().job);
+        assert!(endpoint_by_key("a2a.inject").unwrap().session);
+    }
+
+    #[test]
+    fn inject_channels_are_declared_per_engine() {
+        // The design parity: both engines support hook + tool_result +
+        // idle_turn (the agy hook channel is the verified native agy plugin
+        // PreInvocation hook). Interrupt is the last resort, never an
+        // advertised channel.
+        for engine in ["claude", "agy"] {
+            assert_eq!(
+                inject_channels(engine),
+                &[
+                    InjectChannel::Hook,
+                    InjectChannel::ToolResult,
+                    InjectChannel::IdleTurn
+                ],
+                "{engine} channels"
+            );
+        }
+        assert!(inject_channels("other").is_empty());
+        // The stable channel names serialize snake_case.
+        assert_eq!(InjectChannel::ToolResult.as_str(), "tool_result");
+        assert_eq!(
+            serde_json::to_string(&InjectChannel::IdleTurn).unwrap(),
+            "\"idle_turn\""
+        );
+        assert_eq!(
+            serde_json::from_str::<InjectChannel>("\"hook\"").unwrap(),
+            InjectChannel::Hook
+        );
+    }
+
+    #[test]
+    fn inject_channels_land_in_the_table() {
+        let agy = CapabilityTable::builder("agy")
+            .native(&["a2a.inject"])
+            .build();
+        assert_eq!(
+            agy.inject_channels,
+            vec![
+                InjectChannel::Hook,
+                InjectChannel::ToolResult,
+                InjectChannel::IdleTurn
+            ]
+        );
+        assert_eq!(agy.capability("a2a.inject"), Some(Capability::Native));
+
+        // An engine without injection omits the field entirely.
+        let other = CapabilityTable::builder("testcfg").build();
+        assert!(other.inject_channels.is_empty());
+        let value = serde_json::to_value(&other).unwrap();
+        assert!(value.get("inject_channels").is_none());
+        // A table with channels serializes them.
+        let value = serde_json::to_value(&agy).unwrap();
+        assert_eq!(
+            value["inject_channels"],
+            serde_json::json!(["hook", "tool_result", "idle_turn"])
+        );
     }
 
     #[test]

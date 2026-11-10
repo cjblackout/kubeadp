@@ -28,8 +28,11 @@ cli = ["dep:ureq"]
 # agent-run-api/a2a). Depends on `server` for the shared axum stack.
 # The `mcp-a2a` subcommand (A2A sending side over MCP) lives on the same
 # feature: it reuses the official A2A client SDK plus rmcp for the stdio MCP
-# transport, so none of that dependency tree reaches non-a2a builds.
-a2a = ["server", "dep:a2a", "dep:a2a-server-lf", "dep:async-trait", "dep:futures", "dep:a2a-client-lf", "dep:rmcp", "dep:schemars", "dep:reqwest"]
+# transport, so none of that dependency tree reaches non-a2a builds. Implies
+# `engine`: the A2A injection framework (design HL-113 §7.14) is defined
+# against the engine capability vocabulary (`a2a.inject`, the per-engine
+# injection channels).
+a2a = ["server", "engine", "dep:a2a", "dep:a2a-server-lf", "dep:async-trait", "dep:futures", "dep:a2a-client-lf", "dep:rmcp", "dep:schemars", "dep:reqwest"]
 # Test-only hooks used by the supervisor black-box suite (agent-orchestrate).
 # Implies `server` (the old agent-orchestrate crate always compiled its HTTP
 # stack; the supervisor binary needs it).

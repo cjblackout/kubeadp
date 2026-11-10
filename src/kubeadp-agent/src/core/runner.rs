@@ -217,6 +217,32 @@ pub fn build_command(
         Some(&config.agy_path),
         Some(vec![config.sandbox_home.clone()]),
     );
+    // HL-113 phase 1 (a2a builds): the run's durable A2A inbox. The sandbox
+    // gets the inbox directory read-only (the queued messages) and its
+    // `injected/` subdirectory read-write (the injection markers only), as an
+    // automatic grant; the directory itself is named to the agent by the
+    // `KUBEADP_A2A_INBOX_DIR` env var below (the `mcp-a2a` server the agent
+    // spawns and the `a2a-hook` subcommand read it). Nothing enqueues yet
+    // (phase 2 wires the delivery), so the receive side answers empty until
+    // then.
+    #[cfg(feature = "a2a")]
+    let base_policy = {
+        let mut p = base_policy;
+        let a2a_inbox_dir =
+            crate::core::a2a::inbox::inbox_dir_for(&config.state_root, &meta.job_id);
+        let injected_dir = crate::core::a2a::inbox::injected_dir_for(&a2a_inbox_dir);
+        // Both directories must exist for the grants to be real (a sandbox
+        // backend silently skips a rule on a non-existent path).
+        let _ = std::fs::create_dir_all(&a2a_inbox_dir);
+        let _ = std::fs::create_dir_all(&injected_dir);
+        if !p.ro.contains(&a2a_inbox_dir) {
+            p.ro.push(a2a_inbox_dir.clone());
+        }
+        if !p.rw.contains(&injected_dir) {
+            p.rw.push(injected_dir);
+        }
+        p
+    };
     // Jobset wiring: if this job is a jobset member (registered in the
     // process-wide registry before launch), its jobset secret rides the
     // sandbox `secret` channel (an inherited fd the sandbox turns into a 0400
@@ -285,6 +311,17 @@ pub fn build_command(
     // Every job gets its OWN A2A sender identity: `<prefix>/<job_id>` (see
     // [`apply_a2a_self_name`]).
     apply_a2a_self_name(&mut cmd, &meta.job_id);
+
+    // HL-113 phase 1 (a2a builds): name the run's durable A2A inbox for the
+    // injecting processes (the `mcp-a2a` receive side and the `a2a-hook`
+    // subcommand). The var matches the default `KUBEADP_*` sandbox allow
+    // pattern, so it passes through into the sandboxed job.
+    #[cfg(feature = "a2a")]
+    {
+        let a2a_inbox_dir =
+            crate::core::a2a::inbox::inbox_dir_for(&config.state_root, &meta.job_id);
+        cmd.env(crate::core::a2a::inbox::INBOX_ENV, &a2a_inbox_dir);
+    }
 
     crate::core::proxy::apply_proxy(&mut cmd, Some(config), meta.proxy.as_deref());
     Ok((cmd, policy_path, jobset.map(|c| c.secret)))

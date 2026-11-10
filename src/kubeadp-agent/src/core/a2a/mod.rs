@@ -46,6 +46,12 @@ mod handler;
 pub mod ingress;
 
 #[cfg(feature = "a2a")]
+pub mod inbox;
+
+#[cfg(feature = "a2a")]
+pub mod inject;
+
+#[cfg(feature = "a2a")]
 pub mod client;
 
 pub use auth::A2aAuthLayer;

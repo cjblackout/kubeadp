@@ -247,6 +247,10 @@ impl Engine for AgyEngine {
             "job.result",
             "pause",
             "workspace.*",
+            // Design HL-113 §7.14: the harness puts queued A2A messages into
+            // the model's context (the mcp-a2a tool_result channel); the
+            // supported channels are listed in `inject_channels`.
+            "a2a.inject",
         ];
         let emulated: &[crate::engine::capability::CapEndpointKey] = &[
             "interrupt",

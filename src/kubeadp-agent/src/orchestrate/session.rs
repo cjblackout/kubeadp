@@ -632,6 +632,20 @@ fn run_session_iteration(
     // the sandbox `secret` channel inside the sandboxed branch below, so a
     // trusted session never receives a jobset secret fd.
     let mut session_secret_fd = None;
+    // HL-113 phase 1 (a2a builds): the session's durable A2A inbox directory.
+    // Named to the agent by the `KUBEADP_A2A_INBOX_DIR` env var (below, after
+    // the command is finalized); the sandboxed branch additionally grants the
+    // directory read-only (messages) and its `injected/` subdirectory
+    // read-write (the injection markers only). Nothing enqueues yet (phase 2
+    // wires the delivery), so the receive side answers empty until then.
+    #[cfg(feature = "a2a")]
+    let a2a_inbox_dir = crate::core::a2a::inbox::inbox_dir_for(
+        supervisor_config
+            .state_file
+            .parent()
+            .unwrap_or(std::path::Path::new("/tmp")),
+        &session.name,
+    );
     // Under `test-hooks`, the process-global `sandbox_passthrough` switch also lets
     // tests run unwrapped on platforms without sandbox support.
     let wrap_in_sandbox = session.sandbox && {
@@ -678,6 +692,27 @@ fn run_session_iteration(
         // The jobset root key file is hidden too (agents see only their derived
         // per-jobset secret through the `secret` channel). No-op when unset.
         let policy = policy.hide_jobset_root_key_file();
+        // HL-113 phase 1 (a2a builds): the durable A2A inbox grant -- the
+        // inbox directory read-only (queued messages) and its `injected/`
+        // subdir read-write (the injection markers only). The injected dir is
+        // a writable policy path, so `ensure_writable_dirs` creates it at
+        // launch.
+        #[cfg(feature = "a2a")]
+        let policy = {
+            let mut p = policy;
+            let injected_dir = crate::core::a2a::inbox::injected_dir_for(&a2a_inbox_dir);
+            // The inbox directory must exist for the read grant to be real
+            // (a sandbox backend silently skips a rule on a non-existent
+            // path); the injected dir is created by ensure_writable_dirs.
+            let _ = std::fs::create_dir_all(&a2a_inbox_dir);
+            if !p.ro.contains(&a2a_inbox_dir) {
+                p.ro.push(a2a_inbox_dir.clone());
+            }
+            if !p.rw.contains(&injected_dir) {
+                p.rw.push(injected_dir);
+            }
+            p
+        };
         let policy_path =
             std::env::temp_dir().join(format!("session-policy-{}.json", session.session_id));
         if let Err(e) = crate::sandbox::SandboxPolicy::write_policy_file(&policy, &policy_path) {
@@ -743,6 +778,14 @@ fn run_session_iteration(
         sandboxed_cmd.args(&args);
         cmd = sandboxed_cmd;
     }
+
+    // HL-113 phase 1 (a2a builds): name the session's durable A2A inbox for
+    // the injecting processes (the `mcp-a2a` receive side and the `a2a-hook`
+    // subcommand), on the final (sandboxed or trusted) command. The var
+    // matches the default `KUBEADP_*` sandbox allow pattern (and the
+    // session's grants filter), so it passes through.
+    #[cfg(feature = "a2a")]
+    cmd.env(crate::core::a2a::inbox::INBOX_ENV, &a2a_inbox_dir);
 
     // 5. Open PTY
     let mut pty = match Pty::open() {

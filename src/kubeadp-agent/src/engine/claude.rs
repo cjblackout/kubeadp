@@ -470,6 +470,10 @@ impl Engine for ClaudeEngine {
                 "session.restart",
                 "session.log",
                 "session.message",
+                // Design HL-113 §7.14: the harness puts queued A2A messages
+                // into the model's context (mcp-a2a tool_result + the session
+                // hooks); the supported channels are in `inject_channels`.
+                "a2a.inject",
             ])
             .build()
     }

@@ -243,6 +243,15 @@ The `kubeadp-agent mcp-a2a` stdio server exposes tools for outbound communicatio
 
 When `[worker] a2a_mcp_enabled = true` is configured, worker jobs automatically register `mcp-a2a` inside their local `~/.gemini/config/mcp_config.json`. Outbound sender identities default to `<A2A_SELF_PREFIX>/<job_id>`.
 
+### 4.6 Harness-injected A2A delivery (HL-113, phase 1)
+
+Incoming A2A messages for a run land in a durable per-run inbox (`core/a2a/inbox.rs`): one JSON file per message under `<state_root>/a2a-inbox/<run_id>/`, states `queued -> injected`, bounded (8 messages / 8 KiB, oldest dropped with a durable note) with a 1 h TTL. The harness — never the model — puts each message into the run's model context at the earliest safe boundary through one of the engine's injection channels (capability `a2a.inject`: both engines `tool_result` + `idle_turn`, Claude Code additionally `hook`); the injection IS the acknowledgement, and the model never has to decide to read its messages. Nothing is killed by default.
+
+- **`tool_result` (both engines)**: the `mcp-a2a` server appends the queued messages (full framed text, untrusted data, size-capped) to the result of every one of its tool calls, and `wait_message {timeout_s}` is a blocking receive whose result is the message (returns the moment one is queued; capped at 25 s). There is no model-driven `inbox` read tool.
+- **`hook` (both engines)**: `kubeadp-agent a2a-hook <event>` reads the inbox and prints the hook JSON for the engine's native hook: Claude Code `PostToolUse`/`UserPromptSubmit` (`additionalContext`) and `Stop` (`decision: block` + `reason`, so a session about to end its turn continues with the message); agy's verified native plugin `PreInvocation` hook (`pre-invocation`, stdout `injectSteps` system message put into the model's context before every model call). Silent, exit 0, when nothing is queued. The plugin install, the hook settings writer and the `idle_turn`/`interrupt` (escalation ladder) wiring are phase 2.
+
+The launcher grants each sandboxed job/session its inbox directory automatically (read for messages, write for the `injected/` markers only) and names it in `KUBEADP_A2A_INBOX_DIR`. Exactly once by message id across all channels: the inbox is the dedupe store, and a message another channel injected first is never delivered twice.
+
 ---
 
 ## 5. HTTP API Reference (`/api/v1`)

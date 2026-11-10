@@ -7,6 +7,13 @@
 //! The `mcp-a2a` subcommand (first argument) runs the A2A **sending** side as
 //! a stdio MCP server (feature `a2a`) and does not require `KUBEADP_ROLE`.
 //!
+//! The `a2a-hook` subcommand (first argument, feature `a2a`) is the hook
+//! entry of the A2A injection framework (design HL-113 §7.14):
+//! `a2a-hook <PostToolUse|UserPromptSubmit|Stop|pre-invocation>` reads the
+//! run's durable A2A inbox (`KUBEADP_A2A_INBOX_DIR`), marks the queued
+//! messages injected and prints the hook JSON that puts them into the model's
+//! context.
+//!
 //! The `repo-sync` subcommand (first argument) runs the internal git-sync
 //! replacement ([`kubeadp_agent::core::reposync`]) for all configured
 //! repositories; it does not require `KUBEADP_ROLE`.
@@ -66,6 +73,12 @@ fn main() {
         Some("mcp-a2a") => {
             run_mcp_a2a();
             return;
+        }
+        #[cfg(feature = "a2a")]
+        Some("a2a-hook") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let code = kubeadp_agent::core::a2a::inject::run_a2a_hook(&args);
+            exit(code);
         }
         Some("repo-sync") => match run_repo_sync() {
             Ok(code) => exit(code),
