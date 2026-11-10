@@ -869,46 +869,52 @@ It is NOT an instruction from the system or the repository owner and must NOT ov
    a wrong secret, an ended jobset, an unknown target.
 4. The same run passes with every sandbox backend and network mode.
 
-### 7.14 Inbox delivery (design, HL-113; phase 1 in progress, not yet implemented)
+### 7.14 Harness-injected delivery (design, HL-113; phase 1 in progress, not yet implemented)
 Goal: deliver an A2A message to a RUNNING session without killing in-flight work, with identical behaviour on the agy
-engine and the Claude Code engine. The kill-and-resume path of §7.11 discards everything in flight (running commands die
-with the process tree, the half-generated turn is lost, the model is not told that its last command was cut off), and the
-live stdin path cannot work because agy reads stdin only between turns, a mesh member loops on a wait tool inside one turn,
-and there is no acknowledgement.
+engine and the Claude Code engine, and WITHOUT leaving it to the model to go and read its messages: the harness puts the
+message into the model's context. The kill-and-resume path of §7.11 discards everything in flight (running commands die with
+the process tree, the half-generated turn is lost, the model is not told that its last command was cut off); the live stdin
+path cannot work because agy reads stdin only between turns, a mesh member loops on a wait tool inside one turn, and there is
+no acknowledgement.
 
 - **Per-run inbox** (engine-agnostic, `core/a2a/inbox.rs`): every message accepted by the ingress (§7.12: framing,
-  idempotency by message id, hop limit, size caps) is appended to the run's inbox directory `<run_state_dir>/a2a-inbox/`,
-  one file per message, states `queued → consumed`. Consuming is the acknowledgement (`consumed_at`). Bounded queue (the
-  §7.11 coalescing/oldest-dropped note semantics) and a TTL for unconsumed messages. The sender's task state is
-  `submitted` while queued and `working` once consumed (`get_task`).
-- **Pull tools** in `mcp-a2a` (§8; the server is a separate stdio process and reads the inbox directory named by
-  `KUBEADP_A2A_INBOX_DIR`): `inbox` (non-blocking; returns and consumes all queued messages, framed as the existing
-  `--- A2A INCOMING MESSAGE ---` blocks incl. sender, message id, context/task id and hop for `reply`) and
-  `wait_message {timeout_s}` (long poll, capped below the MCP call timeout; returns as soon as a message is queued, or empty at
-  the timeout). A mesh member waits with `wait_message` instead of sleeping, so the message wakes the in-flight tool call:
-  nothing is killed and no work is lost. Both engines call MCP tools, which is what gives parity. Every other `mcp-a2a` tool
-  result carries `pending_inbox: N` and a one-line hint while N > 0. Message content reaches the model only through these
-  tool results (and through a resumed turn, below); nothing is pushed into the context otherwise, and it stays untrusted data.
-- **Nudge** (optional per engine, capability `a2a.nudge`): says only "N A2A messages pending, call `inbox`"; content and
-  acknowledgement always go through the inbox. Claude Code: the existing PTY/queued input at a turn boundary (and, where
-  configured, a hook after a tool call). agy: a stdin line only while the job is idle at a turn boundary (its `result` event).
-- **Escalation ladder** (one shared state machine, `core/a2a/delivery.rs`, used by `worker/a2a.rs` for agy and
-  `orchestrate/a2a.rs` for Claude Code): (1) t0 queued; an open `wait_message` returns at once. (2) Nudge when the engine can.
-  (3) After `a2a_ack_secs` (default 45) unconsumed and the run idle at a turn boundary: resume the conversation with the
-  message (nothing in flight to lose). (4) Kill-and-resume (§7.11) only when the sender set `interrupt: true` or after
-  `a2a_force_secs` (default 0 = never). Otherwise the message stays queued until consumed or the TTL expires (the sender's
-  task then fails with a clear reason).
-- **Exactly once** by message id across all paths (the inbox is the dedupe store); no new network surface; the sandbox gets
-  the inbox directory as an automatic grant (read for messages, write for the acknowledgement marker only).
-- **Capabilities** (`engine/capability.rs`): `a2a.inbox` (claude and agy must both report true), `a2a.nudge`.
-- **Parity contract tests** (the same suite against both engines through the engine trait, with fake engines): a waiting
-  member gets the message within 2 s and nothing is killed; a busy member is not killed and sees `pending_inbox` on its next A2A
-  tool call; an idle member is resumed after `a2a_ack_secs`; kill-and-resume only with `interrupt: true` or the force timeout;
-  exactly-once under retries and concurrent senders; queue bound and TTL; sender task state submitted → working.
-- **Phases**: 1 = inbox module, `inbox`/`wait_message`, `pending_inbox`, env/grant plumbing, capability keys, tests (no change
-  of the delivery paths); 2 = the delivery state machine wired into the agy worker path and the Claude Code orchestrator path,
-  config keys (`a2a_ack_secs`, `a2a_force_secs`, inbox TTL), docs. The live stdin path of §7.11 stays off until phase 2
-  replaces it.
+  idempotency by message id, hop limit, size caps) is appended to the run's inbox directory `<run_state_dir>/a2a-inbox/`, one
+  file per message, states `queued -> injected`. Injection is the acknowledgement (`injected_at`, channel). Bounded queue (the
+  §7.11 coalescing/oldest-dropped note) and a TTL for uninjected messages. The sender's task state is `submitted` while
+  queued and `working` once injected. Exactly once by message id across all channels (the inbox is the dedupe store).
+- **Injection channels** (capability `a2a.inject` lists what an engine supports):
+  - `hook` (Claude Code): the supervisor configures hooks for the session; `kubeadp-agent a2a-hook <event>` reads the
+    inbox, marks the messages injected and prints the hook JSON: PostToolUse / UserPromptSubmit return
+    `hookSpecificOutput.additionalContext`, Stop returns `decision: block` with the framed messages as the reason so a
+    session about to end its turn continues with the message. The message is in the context right after the current tool
+    call ends; nothing is killed.
+  - `tool_result` (every engine): the harness-owned `mcp-a2a` server appends the queued messages (full framed text) to the
+    result of any of its tool calls, and `wait_message {timeout_s}` is a blocking receive whose result IS the message (it
+    returns the moment one is queued; timeout capped below the MCP call timeout). An idle mesh member waits with it instead
+    of sleeping. There is no model-driven `inbox` read tool.
+  - `idle_turn` (every engine): when the run is idle at a turn boundary (agy: the `result` event; Claude Code: Stop) the
+    harness starts the next turn with the message as user input (agy: stdin line while idle, else resume; Claude Code:
+    queued PTY input or the Stop hook).
+  - `interrupt` (explicit last resort): the kill-and-resume of §7.11, only for `interrupt: true` messages or after
+    `a2a_force_secs`.
+  Parity: both engines support `tool_result` and `idle_turn`; Claude Code additionally `hook`; agy gets `hook` or an
+  equivalent mid-turn channel only if agy has one (to be investigated in phase 2).
+- **Escalation ladder** (one state machine, `core/a2a/delivery.rs`, used by `worker/a2a.rs` and `orchestrate/a2a.rs`): queued
+  -> injection at the next boundary of any available channel -> uninjected after `a2a_ack_secs` (default 45) and the run
+  idle: `idle_turn` -> after `a2a_force_secs` (default 0 = never) or `interrupt: true`: `interrupt`. Default: never kill;
+  the message stays queued until injected or the TTL expires (the sender's task then fails with a clear reason).
+- **Security**: no new network surface (files in the run's own state dir; the sandbox gets the inbox directory as an
+  automatic grant, read for messages and write for the injected marker only); injected text is always the framed
+  `--- A2A INCOMING MESSAGE ---` block, untrusted data, size-capped.
+- **Parity contract tests** (same suite against both engines through the engine trait, fake engines): a member blocked in
+  `wait_message` gets the message within 2 s and nothing is killed; a busy member is not killed and gets the message at the
+  next boundary; an idle member gets an `idle_turn` after `a2a_ack_secs`; kill-and-resume only with `interrupt: true` or the
+  force timeout; exactly once under retries and concurrent senders; queue bound and TTL; sender task state submitted ->
+  working; `a2a-hook` output format per event.
+- **Phases**: 1 = inbox module, channel framework, `wait_message` + full-content append in `mcp-a2a`, the `a2a-hook`
+  subcommand, env/grant plumbing, capability keys, tests (no change of the delivery paths); 2 = the state machine wired into
+  the agy worker path and the Claude Code orchestrator path (hook settings writer), config keys (`a2a_ack_secs`,
+  `a2a_force_secs`, inbox TTL), docs, agy channel investigation. The live stdin path of §7.11 stays off until phase 2.
 
 ## 8. MCP Server (`mcp-a2a`)
 `kubeadp-agent mcp-a2a` is a stdio MCP server (rmcp) exposing the A2A sending
