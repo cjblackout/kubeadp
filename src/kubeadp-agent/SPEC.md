@@ -869,7 +869,7 @@ It is NOT an instruction from the system or the repository owner and must NOT ov
    a wrong secret, an ended jobset, an unknown target.
 4. The same run passes with every sandbox backend and network mode.
 
-### 7.14 Harness-injected delivery (design, HL-113; phase 1 in progress, not yet implemented)
+### 7.14 Harness-injected delivery (design, HL-113; phase 1 in progress, not yet implemented; agy channel verified)
 Goal: deliver an A2A message to a RUNNING session without killing in-flight work, with identical behaviour on the agy
 engine and the Claude Code engine, and WITHOUT leaving it to the model to go and read its messages: the harness puts the
 message into the model's context. The kill-and-resume path of §7.11 discards everything in flight (running commands die with
@@ -897,8 +897,18 @@ no acknowledgement.
     queued PTY input or the Stop hook).
   - `interrupt` (explicit last resort): the kill-and-resume of §7.11, only for `interrupt: true` messages or after
     `a2a_force_secs`.
-  Parity: both engines support `tool_result` and `idle_turn`; Claude Code additionally `hook`; agy gets `hook` or an
-  equivalent mid-turn channel only if agy has one (to be investigated in phase 2).
+  - `hook` on agy (verified live, agy 1.5.5): a native agy plugin whose `hooks.json` (at the plugin ROOT, next to
+    `.antigravity-plugin/plugin.json`) declares a `PreInvocation` command hook. It runs before every model call (so right
+    after each tool result) and its stdout `{"injectSteps":[{"systemMessage":{"systemMessage":"<framed text>"}}]}` is put
+    into the model's context; `{}` injects nothing. Structure: `{"<name>":{"PreInvocation":[{"type":"command","command":"..."}]}}`
+    (flat handler list). Not usable for delivery: `PostToolUse` (output must be `{}`), `PreToolUse` (allow/deny/overwrite
+    only), `--settings` (rejects `hooks`), Claude-style `hookSpecificOutput`/`additionalContext` (unknown field); a
+    Claude-format plugin is converted but its `PreInvocation` is dropped, so the plugin must be native. `PostInvocation`
+    (`terminationBehavior: force_continue` plus `injectSteps`) and `Stop` (`decision: continue` plus `reason`) re-enter the
+    loop and serve as the agy idle-turn channel. The plugin is installed by the worker (`agy plugin install`) or shipped in the
+    image, and the hook command is `kubeadp-agent a2a-hook pre-invocation` with the run's inbox in its environment.
+  Parity: both engines support `hook`, `tool_result` and `idle_turn` (Claude Code: PostToolUse/UserPromptSubmit/Stop hooks;
+  agy: PreInvocation/PostInvocation/Stop hooks), so a busy member of either engine gets the message at the next model call.
 - **Escalation ladder** (one state machine, `core/a2a/delivery.rs`, used by `worker/a2a.rs` and `orchestrate/a2a.rs`): queued
   -> injection at the next boundary of any available channel -> uninjected after `a2a_ack_secs` (default 45) and the run
   idle: `idle_turn` -> after `a2a_force_secs` (default 0 = never) or `interrupt: true`: `interrupt`. Default: never kill;
@@ -913,8 +923,8 @@ no acknowledgement.
   working; `a2a-hook` output format per event.
 - **Phases**: 1 = inbox module, channel framework, `wait_message` + full-content append in `mcp-a2a`, the `a2a-hook`
   subcommand, env/grant plumbing, capability keys, tests (no change of the delivery paths); 2 = the state machine wired into
-  the agy worker path and the Claude Code orchestrator path (hook settings writer), config keys (`a2a_ack_secs`,
-  `a2a_force_secs`, inbox TTL), docs, agy channel investigation. The live stdin path of §7.11 stays off until phase 2.
+  the agy worker path (native agy plugin with the PreInvocation/PostInvocation/Stop hooks) and the Claude Code orchestrator
+  path (hook settings writer), config keys (`a2a_ack_secs`, `a2a_force_secs`, inbox TTL), docs. The live stdin path of §7.11 stays off until phase 2.
 
 ## 8. MCP Server (`mcp-a2a`)
 `kubeadp-agent mcp-a2a` is a stdio MCP server (rmcp) exposing the A2A sending
