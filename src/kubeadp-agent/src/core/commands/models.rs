@@ -172,6 +172,7 @@ mod tests {
     fn config_with_agy(agy: std::path::PathBuf) -> Config {
         Config {
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         }
     }

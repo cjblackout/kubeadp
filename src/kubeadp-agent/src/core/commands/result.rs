@@ -114,6 +114,17 @@ pub fn run(config: &Config, args: &ResultArgs) -> Result<CommandOutput> {
 fn final_error_text(log: &str) -> Option<String> {
     let mut last: Option<Option<String>> = None;
     for line in log.lines() {
+        // A claude stream-json terminal line (`result`/`system` with
+        // `type`), which `structured_value`'s agy status-field recognition
+        // would skip: its error text is the `error`/`message` payload.
+        if let Some((st, text)) = crate::core::job::claude_structured_text(line) {
+            last = Some(if matches!(st, crate::core::job::StructuredStatus::Error) {
+                Some(text)
+            } else {
+                None
+            });
+            continue;
+        }
         let Some((status, v)) = structured_value(line) else {
             continue;
         };
@@ -252,6 +263,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         };
         meta.save(state_root).unwrap();
         // The log carries a complete structured terminal line, so the job is

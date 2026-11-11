@@ -176,6 +176,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         }
     }
 
@@ -233,6 +234,7 @@ mod tests {
             workspace_root: ws,
             state_root: state_root.clone(),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -314,6 +316,7 @@ mod tests {
             workspace_root: ws,
             state_root: state_root.clone(),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -369,6 +372,7 @@ mod tests {
             workspace_root: ws,
             state_root: state_root.clone(),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
         let job_id = format!("shrd{}", std::process::id());

@@ -438,6 +438,7 @@ mod tests {
     fn test_config(dir: &Path, agy: &Path) -> Config {
         Config {
             agy_path: agy.to_path_buf(),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             repos_root: dir.to_path_buf().join(".agent-repos"),
             workspace_root: dir.to_path_buf(),
             ..Default::default()

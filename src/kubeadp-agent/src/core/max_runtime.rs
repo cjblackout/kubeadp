@@ -378,6 +378,7 @@ mod tests {
             started_at: Some(Utc::now() - chrono::Duration::seconds(120)),
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         };
         meta.save(state_root).unwrap();
     }

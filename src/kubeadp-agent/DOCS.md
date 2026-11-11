@@ -242,7 +242,7 @@ Incoming messages delivered via `POST /message:send` pass through strict ingress
   --- END CONTENT (<nonce>) ---
   ```
 - **Receiving Behavior**:
-  - **Orchestrator**: An inbound message is enqueued into the session's durable inbox and delivered by the escalation ladder (§4.6); the queued PTY input (bracketed paste `ESC[200~ ... ESC[201~`, followed by a newline) is the `idle_turn`/`interrupt` escalation step, applied only past `a2a_ack_secs` with the session running (or immediately for `interrupt: true` / past `a2a_force_secs`). Nothing is killed.
+  - **Orchestrator**: An inbound message is enqueued into the session's durable inbox and delivered by the escalation ladder (§4.6); the queued PTY input (claude: bracketed paste `ESC[200~ ... ESC[201~`, followed by a newline; agy: one `{"event":"user","message":{"content":"..."}}` NDJSON line plus Enter) is the `idle_turn`/`interrupt` escalation step, applied only past `a2a_ack_secs` with the session running (or immediately for `interrupt: true` / past `a2a_force_secs`). Nothing is killed.
   - **Worker (live stdin, idle turn only)**: A RUNNING agy that was launched in live mode (a real A2A mesh member, `[worker] a2a_live_stdin` on) reads its next turn from a stdin pipe; the ladder's `idle_turn` step writes the message into that pipe as a single `{"event":"user","message":{"content":"..."}}` NDJSON line — no kill, no restart, the same conversation continues. The live stdin path stays off otherwise.
   - **Worker (interrupt-and-resume)**: The explicit last resort only (`interrupt: true` messages or a message still queued past `a2a_force_secs`, default 0 = never): the worker interrupts the active execution turn cleanly (via process group SIGTERM), appends the message to the conversation history, and restarts execution.
   - **Rate Limiting**: Session delivery is metered per (session, sender) pair at 30 messages per minute. Throttled requests receive HTTP 429 with `Retry-After`.
@@ -283,7 +283,7 @@ queued -> injection at the next boundary of any available channel (the hook
 
 - The sender's task state follows the message: `submitted` while queued, `working` once injected, `failed` with the durable expiry reason after the TTL.
 - **agy (worker)**: the `idle_turn` step writes the message into a RUNNING live-mode job's stdin pipe (the §7.11 live path, off unless the idle turn needs it); a finished job is resumed with the message as the next turn. The `interrupt` step is the existing kill-and-resume.
-- **Claude Code (orchestrator)**: the `idle_turn`/`interrupt` steps write the message as queued PTY input (bracketed paste) into the running session; the Stop hook re-enters the loop at the turn boundary. Nothing is killed on the session path.
+- **Claude Code (orchestrator)**: the `idle_turn`/`interrupt` steps write the message as queued PTY input (bracketed paste) into the running claude session; the Stop hook re-enters the loop at the turn boundary. Nothing is killed on the session path. An agy session receives the same escalation as a single NDJSON user line (the engine-aware `deliver_message` picks the frame).
 - **Config keys** (`[worker]` of the agent-run config file; the same file serves the orchestrator):
 
 | Key | Env | Default | Meaning |
@@ -366,7 +366,7 @@ Job statuses: `running`, `done`, `failed`, `self-terminated`, `killed`, `incompl
 - `POST /api/v1/sessions/{name}/stop`: Halts a running session.
 - `POST /api/v1/sessions/{name}/restart`: Restarts a session process group.
 - `GET /api/v1/sessions/{name}/log?tail=5000`: Returns sanitized log lines from the session ring buffer.
-- `POST /api/v1/sessions/{name}/message`: Injects text into the session PTY via bracketed paste (`{"text": "..."}`).
+- `POST /api/v1/sessions/{name}/message`: Injects text into the session PTY (`{"text": "..."}`); delivery format follows the session's engine (claude: bracketed paste; agy: one stream-json user NDJSON line).
 
 | Outcome | HTTP | Body `code` |
 |---|---|---|
@@ -377,7 +377,13 @@ Job statuses: `running`, `done`, `failed`, `self-terminated`, `killed`, `incompl
 | Session stopped/paused or no live PTY | `409` | `not_running` |
 | More than `30` messages per minute for the (session, sender) pair | `429` (`Retry-After`) | `rate_limited` |
 
-The message is written as a bracketed paste (`ESC[200~ ... ESC[201~`) followed by a single Enter, so pasted newlines never submit early and the text cannot run as a command.
+The message is delivered per the session's engine (HL-91 E5): a claude
+session receives a bracketed paste (`ESC[200~ ... ESC[201~`) so pasted
+newlines never submit early and the text cannot run as a command; an agy
+session receives a single `{"event":"user","message":{"content":"..."}}`
+NDJSON line plus Enter, its live stream-json stdin contract (the same frame
+the worker's live A2A path uses). Both are followed by a single Enter and
+neither can submit a raw shell command.
 
 ### 5.5 Orchestrator Session Configuration
 

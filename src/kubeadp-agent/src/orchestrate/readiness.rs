@@ -48,6 +48,24 @@ pub fn is_executable_binary(binary: &Path) -> bool {
     resolve_executable_binary(binary, &HashMap::new()).is_some()
 }
 
+/// Engine-agnostic readiness for a session that needs no login gate (an agy
+/// session, HL-91 E5 cross-use): the binary must resolve (and be executable);
+/// agy has no `auth status` concept, so a successful resolution is enough.
+pub fn binary_ready(
+    binary: &Path,
+    env_vars: &HashMap<String, String>,
+    timeout: Duration,
+    shutdown: &AtomicBool,
+) -> (bool, String) {
+    if resolve_executable_binary(binary, env_vars).is_some() {
+        let _ = timeout;
+        (true, "binary-found".to_string())
+    } else {
+        let _ = shutdown;
+        (false, "binary-missing".to_string())
+    }
+}
+
 /// Checks readiness by running `claude auth status --json`.
 ///
 /// Fix #6:
@@ -164,7 +182,8 @@ pub fn claude_readiness(
     (false, "not-logged-in".to_string())
 }
 
-/// Blocks until claude is installed and logged in, logging changes in reason.
+/// Blocks until the engine binary is installed and logged in (claude uses
+/// `auth status --json`), logging changes in reason.
 /// Can be cleanly interrupted by `shutdown`.
 pub fn wait_until_ready(
     binary: &Path,

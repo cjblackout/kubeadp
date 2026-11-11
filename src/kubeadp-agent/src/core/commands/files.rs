@@ -539,6 +539,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         };
         let config = Config {
             state_root: temp.path().join("state"),

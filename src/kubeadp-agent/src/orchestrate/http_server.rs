@@ -24,7 +24,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::Router;
 
-use crate::orchestrate::server::{router_with_rc, RemoteControlState};
+#[cfg(not(feature = "engine"))]
+use crate::orchestrate::server::router_with_rc;
+use crate::orchestrate::server::RemoteControlState;
 use crate::orchestrate::session_control::SessionControlRegistry;
 use crate::orchestrate::session_log::SessionLogs;
 use crate::orchestrate::sessions_api::{
@@ -63,7 +65,56 @@ pub fn build_router(
         force_secs: core_config.a2a_force_secs,
         ttl_secs: core_config.a2a_inbox_ttl_secs,
     };
-    let base = router_with_rc(Arc::new(core_config), auth, rc_state);
+    #[cfg(not(feature = "engine"))]
+    let base = router_with_rc(
+        Arc::new(core_config.clone()),
+        auth.clone(),
+        rc_state.clone(),
+    );
+
+    // Engine-aware base router (HL-91 E1/E5): the orchestrator merges the
+    // same router the worker uses so `/api/v1/capabilities` and the E4
+    // run-control routes resolve; the registry carries the claude session
+    // engine and the agy job engine (the orchestrator's roles per the E5
+    // cross-use matrix). The shared/router_with_engines is behaviourally
+    // identical to router_with_rc except for these engine routes.
+    #[cfg(feature = "engine")]
+    let base = {
+        use crate::engine::EngineRegistry;
+        use crate::engine::RunKind;
+        let mut registry = EngineRegistry::new();
+        // The claude session engine fronts the supervisor machinery; agy is
+        // the job engine (and reports its capability surface).
+        registry.register(std::sync::Arc::new(
+            crate::engine::claude::ClaudeEngine::new(core_config.claude_path.clone(), None),
+        ));
+        registry.register(std::sync::Arc::new(crate::engine::AgyEngine::new(
+            std::sync::Arc::new(core_config.clone()),
+        )));
+        // Selection precedence level 2 (config): the configured defaults
+        // override the per-role fallbacks (agy for jobs, claude for
+        // sessions); a request still wins. Empty values keep the fallback.
+        if let Some(default) = core_config
+            .default_engine
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+        {
+            registry.set_default(RunKind::Job, default);
+        }
+        if let Some(default) = core_config
+            .default_session_engine
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+        {
+            registry.set_default(RunKind::Session, default);
+        }
+        crate::core::server::router_with_engines(
+            std::sync::Arc::new(core_config.clone()),
+            auth,
+            rc_state,
+            std::sync::Arc::new(registry),
+        )
+    };
 
     let api_state = SessionsApiState::new(state.clone(), controls.clone(), session_logs);
     let sessions = sessions_router(api_state.clone());

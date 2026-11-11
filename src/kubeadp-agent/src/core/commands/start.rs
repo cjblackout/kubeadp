@@ -564,6 +564,10 @@ pub fn run(config: &Config, args: &StartArgs) -> Result<CommandOutput> {
         started_at: Some(Utc::now()),
         hindsight_query,
         sandbox_info: None,
+        // The engine this job runs on, resolved before the row is created
+        // (request > config > role default). Stored so status/retry/kill
+        // re-derive the right driver after a restart (HL-91 E5).
+        engine: args.engine.clone(),
     };
 
     // 9a. Create the job row with a plain INSERT that hard-fails on an id
@@ -861,6 +865,7 @@ mod tests {
                 started_at: None,
                 hindsight_query: None,
                 sandbox_info: None,
+                engine: None,
             };
             meta.save(&state_dir).unwrap();
         }
@@ -1059,6 +1064,7 @@ mod tests {
                 workspace_root: workspace_root.clone(),
                 state_root: temp_dir.path().join("state"),
                 agy_path: agy,
+                claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
                 ..Default::default()
             };
 
@@ -1107,6 +1113,7 @@ mod tests {
             workspace_root: workspace_root.clone(),
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -1165,6 +1172,7 @@ mod tests {
             workspace_root: workspace_root.clone(),
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             hindsight_enabled: true,
             hindsight_auto_recall: true,
             hindsight_auto_retain: true,
@@ -1232,6 +1240,7 @@ mod tests {
             workspace_root: workspace_root.clone(),
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             hindsight_enabled: true,
             hindsight_auto_recall: true,
             ..Default::default()
@@ -1355,6 +1364,7 @@ mod tests {
             workspace_root: workspace_root.clone(),
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -1427,6 +1437,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         };
 
         // A failed insert of a worktree this start created must tear the
@@ -1527,6 +1538,7 @@ mod tests {
             workspace_root: workspace_root.clone(),
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -1573,6 +1585,7 @@ mod tests {
             workspace_root: workspace_root.clone(),
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -1652,6 +1665,7 @@ mod tests {
             workspace_root: workspace_root.clone(),
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             hindsight_bank: Some("bank-big".to_string()),
             hindsight_path: hindsight,
             hindsight_auto_recall: true,
@@ -1726,6 +1740,7 @@ mod tests {
             workspace_root: workspace_root.clone(),
             state_root: state_root.clone(),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             hindsight_bank: Some("bank-q".to_string()),
             hindsight_path: hindsight,
             hindsight_auto_recall: true,
@@ -1881,6 +1896,7 @@ mod tests {
             workspace_root: workspace_root.clone(),
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             hindsight_enabled: false,
             hindsight_auto_recall: true,
             ..Default::default()

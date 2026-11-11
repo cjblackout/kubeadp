@@ -969,6 +969,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         }
     }
 

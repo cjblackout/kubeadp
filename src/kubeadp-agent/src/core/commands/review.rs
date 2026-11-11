@@ -147,6 +147,9 @@ Be specific: cite file and line. If the diff is fine, say so.\n\n\
         started_at: None,
         hindsight_query: None,
         sandbox_info: None,
+        // The review job runs on the same engine as the target job it
+        // reviews (an agy review of a claude job must drive claude).
+        engine: target.engine.clone(),
     };
 
     // Enforce the same max-parallel limit `start` applies before

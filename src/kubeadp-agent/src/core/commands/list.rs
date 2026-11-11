@@ -295,6 +295,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         };
         meta.save(state_root).unwrap();
         if let Some(line) = log_line {

@@ -573,6 +573,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         };
         meta.save(state_root).unwrap();
     }
@@ -831,6 +832,7 @@ mod tests {
             repos_root: temp.path().join("ws").join(".agent-repos"),
             workspace_root: temp.path().join("ws"),
             agy_path: temp.path().join("fake-agy"),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
         save_job(
@@ -931,6 +933,7 @@ mod tests {
             repos_root: temp.path().join("ws").join(".agent-repos"),
             workspace_root: temp.path().join("ws"),
             agy_path: temp.path().join("fake-agy"),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             agy_home: Some(home.clone()),
             max_parallel: 4,
             ..Default::default()
@@ -1246,6 +1249,7 @@ mod tests {
             repos_root: temp.path().join("ws").join(".agent-repos"),
             workspace_root: temp.path().join("ws"),
             agy_path: temp.path().join("fake-agy"),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
         // A failed job with a conversation ID.
@@ -1344,6 +1348,7 @@ mod tests {
             repos_root: temp.path().join("ws").join(".agent-repos"),
             workspace_root: temp.path().join("ws"),
             agy_path: temp.path().join("fake-agy"),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
         // A failed job with a conversation ID whose row still carries the
@@ -1415,6 +1420,7 @@ mod tests {
             repos_root: temp.path().join("ws").join(".agent-repos"),
             workspace_root: temp.path().join("ws"),
             agy_path: temp.path().join("fake-agy"),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             hindsight_bank: Some("bank-h".to_string()),
             hindsight_auto_recall: true,
             ..Default::default()
@@ -1501,6 +1507,7 @@ mod tests {
             repos_root: temp.path().join("ws").join(".agent-repos"),
             workspace_root: temp.path().join("ws"),
             agy_path: temp.path().join("fake-agy"),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             hindsight_bank: Some("bank-big".to_string()),
             hindsight_auto_recall: true,
             ..Default::default()
@@ -1639,6 +1646,7 @@ mod tests {
             repos_root: temp.path().join("ws").join(".agent-repos"),
             workspace_root: temp.path().join("ws"),
             agy_path: temp.path().join("fake-agy"),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             hindsight_bank: Some(bank.to_string()),
             hindsight_auto_recall: true,
             ..Default::default()

@@ -27,6 +27,10 @@ fn default_claude_binary() -> PathBuf {
     PathBuf::from("claude")
 }
 
+fn default_agy_binary() -> PathBuf {
+    PathBuf::from("agy")
+}
+
 fn default_claude_args() -> Vec<String> {
     vec![
         "--dangerously-skip-permissions".to_string(),
@@ -336,11 +340,27 @@ pub struct SessionConfig {
     pub workdir: PathBuf,
     pub session_id: String,
 
+    /// The engine this session runs on (HL-91 E5 cross-use). `None` uses the
+    /// orchestrator's `default_session_engine` (or the per-role default
+    /// "claude"). The supervisor currently drives the claude PTY transport;
+    /// an explicitly requested engine that cannot back a session here is
+    /// resolved against the engine registry at start (an unregistered engine
+    /// is a selection error, never a 501).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+
     #[serde(default = "default_claude_binary")]
     pub claude_binary: PathBuf,
 
     #[serde(default = "default_claude_args")]
     pub claude_args: Vec<String>,
+
+    /// Binary invoked for an agy session (HL-91 E5 cross-use). Defaults to
+    /// `"agy"`; the supervisor-level `agy_path` (env
+    /// `AGENT_ORCHESTRATE_AGY_PATH`) overrides it for every session that runs
+    /// on the agy engine. Mirrors the worker-side `[worker] agy_path`.
+    #[serde(default = "default_agy_binary")]
+    pub agy_binary: PathBuf,
 
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -418,6 +438,18 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
+    /// Resolves this session's engine with the selection precedence
+    /// (HL-91 E1/E5): per-session `engine` > `default_session_engine` >
+    /// per-role default ("claude"). The empty string is treated as unset.
+    pub fn effective_engine(&self, default_session_engine: Option<&str>) -> String {
+        self.engine
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| default_session_engine.filter(|s| !s.trim().is_empty()))
+            .unwrap_or("claude")
+            .to_string()
+    }
+
     /// Validates all f64 duration fields.  Returns `Err` with a human-readable
     /// message on the first violation.  Must be called at load time so that
     /// no `Duration::from_secs_f64` can panic later.
@@ -468,6 +500,21 @@ pub struct SupervisorConfig {
     #[serde(default)]
     pub claude_config_dir: Option<PathBuf>,
 
+    /// Default engine for sessions that do not set `engine` themselves
+    /// (HL-91 E5 selection precedence level 2; the per-role default is
+    /// "claude"). Mirrors the worker-side `[orchestrator]
+    /// default_session_engine` config key and `AGENT_ORCHESTRATE_DEFAULT_SESSION_ENGINE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_session_engine: Option<String>,
+
+    /// The agy binary used for every agy session (HL-91 E5 cross-use),
+    /// falling back to each session's `agy_binary` then the `PATH` default
+    /// `"agy"`. Loaded from the config and the
+    /// `AGENT_ORCHESTRATE_AGY_PATH` environment variable (mirrors the
+    /// worker-side `[worker] agy_path` / `AGENT_RUN_AGY_PATH`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agy_path: Option<PathBuf>,
+
     #[serde(default)]
     pub sessions: Vec<SessionConfig>,
 }
@@ -480,6 +527,8 @@ impl Default for SupervisorConfig {
             stale_heartbeat_secs: default_stale_heartbeat(),
             shutdown_grace_secs: default_shutdown_grace(),
             claude_config_dir: None,
+            default_session_engine: None,
+            agy_path: None,
             sessions: Vec::new(),
         }
     }
@@ -802,6 +851,68 @@ session_id = "id-b"
     }
 
     #[test]
+    fn test_effective_engine_selection_precedence() {
+        // HL-91 E5 selection precedence: per-session `engine` > configured
+        // `default_session_engine` > per-role default ("claude"). Empty values
+        // count as unset.
+        let base = SessionConfig {
+            name: "s".to_string(),
+            workdir: PathBuf::from("/tmp"),
+            session_id: "i".to_string(),
+            engine: None,
+            claude_binary: PathBuf::from("claude"),
+            claude_args: vec![],
+            agy_binary: std::path::PathBuf::from("agy"),
+            env: HashMap::new(),
+            session_file: None,
+            transcript_path: None,
+            memory_file: None,
+            readiness_poll_secs: 5.0,
+            hang_timeout_secs: 0.0,
+            kill_grace_secs: 5.0,
+            pty_eof_grace_secs: 10.0,
+            kill_wait_secs: 15.0,
+            sandbox: true,
+            grants: None,
+            base_backoff_secs: 2.0,
+            max_backoff_secs: 60.0,
+            healthy_run_secs: 30.0,
+            max_crashes: 5,
+            crash_window_secs: 60.0,
+            prefix_output: false,
+            failed_cooldown_secs: 300.0,
+            backoff_window_secs: 600.0,
+            resume_fail_quarantine_after: 5,
+            resume_fail_uptime_secs: 5.0,
+        };
+
+        // 1. No engine, no default -> claude.
+        assert_eq!(base.effective_engine(None), "claude");
+        // 2. No engine, default -> uses the default.
+        assert_eq!(base.effective_engine(Some("agy")), "agy");
+        // 3. Per-session engine wins over the default.
+        let with_engine = SessionConfig {
+            engine: Some("agy".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(with_engine.effective_engine(Some("claude")), "agy");
+        // 4. Empty strings are treated as unset.
+        let default_only = SessionConfig {
+            engine: Some("  ".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(default_only.effective_engine(Some("agy")), "agy");
+        assert_eq!(default_only.effective_engine(Some("")), "claude");
+        // 5. An unrecognised engine is NOT coerced here: it flows to the
+        //    registry/start validation (a selection error, never a 501).
+        let bogus = SessionConfig {
+            engine: Some("warp".to_string()),
+            ..base
+        };
+        assert_eq!(bogus.effective_engine(Some("claude")), "warp");
+    }
+
+    #[test]
     fn test_parse_toml_invalid() {
         // Not an array-of-tables for sessions.
         let bad = "sessions = 5\n";
@@ -929,8 +1040,10 @@ session_id = "id-b"
             name: "test".to_string(),
             workdir: PathBuf::from("/workspace/foo"),
             session_id: "id-123".to_string(),
+            engine: None,
             claude_binary: PathBuf::from("claude"),
             claude_args: vec![],
+            agy_binary: std::path::PathBuf::from("agy"),
             env: HashMap::new(),
             session_file: Some(PathBuf::from("/old/session.jsonl")),
             transcript_path: Some(PathBuf::from("/custom/explicit/transcript.jsonl")),
@@ -973,8 +1086,10 @@ session_id = "id-b"
             name: name.to_string(),
             workdir: PathBuf::from("/tmp"),
             session_id: "id-test".to_string(),
+            engine: None,
             claude_binary: PathBuf::from("claude"),
             claude_args: vec![],
+            agy_binary: std::path::PathBuf::from("agy"),
             env: HashMap::new(),
             session_file: None,
             transcript_path: None,

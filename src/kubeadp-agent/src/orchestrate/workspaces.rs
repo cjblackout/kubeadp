@@ -270,8 +270,10 @@ pub fn resolve_supervisor_config_with_env(
             name: "default".to_string(),
             workdir: home,
             session_id: default_session_id,
+            engine: None,
             claude_binary: PathBuf::from("claude"),
             claude_args: args,
+            agy_binary: PathBuf::from("agy"),
             env: HashMap::new(),
             session_file: None,
             transcript_path: None,
@@ -328,8 +330,10 @@ pub fn resolve_supervisor_config_with_env(
                     name: ws_name,
                     workdir: ws_path,
                     session_id,
+                    engine: None,
                     claude_binary: PathBuf::from("claude"),
                     claude_args: args,
+                    agy_binary: PathBuf::from("agy"),
                     env: HashMap::new(),
                     session_file: None,
                     transcript_path: None,
@@ -401,6 +405,12 @@ pub fn resolve_supervisor_config_with_env(
         if sess.transcript_path.is_none() {
             let transcript = base.resolve_session_file(sess);
             sess.transcript_path = Some(transcript);
+        }
+        // HL-91 E5 cross-use: the supervisor-level agy path overrides every
+        // session's agy binary (the per-session value only matters when no
+        // supervisor-wide path is configured).
+        if let Some(agy_path) = &base.agy_path {
+            sess.agy_binary = agy_path.clone();
         }
     }
 
@@ -595,8 +605,10 @@ mod tests {
             name: "file-sess".to_string(),
             workdir: PathBuf::from("/tmp"),
             session_id: "10000000-0000-4000-8000-000000000001".to_string(), // Same ID as default!
+            engine: None,
             claude_binary: PathBuf::from("claude"),
             claude_args: vec![],
+            agy_binary: std::path::PathBuf::from("agy"),
             env: HashMap::new(),
             session_file: None,
             transcript_path: None,
@@ -635,8 +647,10 @@ mod tests {
             name: "default".to_string(), // Same name as default session!
             workdir: PathBuf::from("/custom/workdir"),
             session_id: "custom-file-id-123".to_string(),
+            engine: None,
             claude_binary: PathBuf::from("claude"),
             claude_args: vec![],
+            agy_binary: std::path::PathBuf::from("agy"),
             env: HashMap::new(),
             session_file: None,
             transcript_path: None,
@@ -674,8 +688,10 @@ mod tests {
             name: "dup-file".to_string(),
             workdir: PathBuf::from("/tmp/1"),
             session_id: "id-1".to_string(),
+            engine: None,
             claude_binary: PathBuf::from("claude"),
             claude_args: vec![],
+            agy_binary: std::path::PathBuf::from("agy"),
             env: HashMap::new(),
             session_file: None,
             transcript_path: None,
@@ -721,8 +737,10 @@ mod tests {
             name: "file-1".to_string(),
             workdir: PathBuf::from("/tmp/1"),
             session_id: "same-id".to_string(),
+            engine: None,
             claude_binary: PathBuf::from("claude"),
             claude_args: vec![],
+            agy_binary: std::path::PathBuf::from("agy"),
             env: HashMap::new(),
             session_file: None,
             transcript_path: None,
@@ -856,8 +874,10 @@ mod tests {
             name: "explicit-session".to_string(),
             workdir: PathBuf::from("/tmp"),
             session_id: "id-explicit".to_string(),
+            engine: None,
             claude_binary: PathBuf::from("claude"),
             claude_args: vec![],
+            agy_binary: std::path::PathBuf::from("agy"),
             env: HashMap::new(),
             session_file: None,
             transcript_path: Some(PathBuf::from("/custom/explicit/file.jsonl")),

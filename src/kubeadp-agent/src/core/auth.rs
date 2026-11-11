@@ -868,6 +868,7 @@ mod tests {
             workspace_root: tmp.join("ws"),
             state_root: tmp.join("state"),
             agy_path: agy.to_path_buf(),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         }
     }

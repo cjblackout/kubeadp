@@ -149,6 +149,13 @@ pub struct JobMetadata {
     /// and info can print it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_info: Option<crate::sandbox::SandboxInfo>,
+    /// The engine this job runs on (`"agy"`, `"claude"`, ...). `None` for
+    /// rows created before engine selection existed (they are agy jobs by
+    /// definition). Resolved from request > config > role default at start
+    /// (HL-91 E1 §3.1), persisted so status/retry/kill re-derive the right
+    /// driver after a server restart (HL-91 E5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
 }
 
 /// Serde hook for [`JobMetadata::proxy`]: every JSON rendering carries the
@@ -198,7 +205,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     max_runtime INTEGER,
     started_at INTEGER,
     hindsight_query TEXT,
-    sandbox_info TEXT
+    sandbox_info TEXT,
+    engine TEXT
 )
 ";
 
@@ -355,6 +363,24 @@ pub fn open_state_db(state_root: &Path) -> Result<Connection> {
             }
         }
     }
+    if !columns.iter().any(|c| c == "engine") {
+        // Engine selection (HL-91 E5): an optional TEXT column defaulting to
+        // NULL. NULL rows are the historical agy jobs (the agy engine was the
+        // only driver before engine selection existed) -- `engine` resolves to
+        // the configured/role default at read time, so NULL never changes
+        // status/retry behaviour. A concurrent process may add the same column
+        // between the table_info check and this ALTER; that error is benign.
+        if let Err(e) = conn.execute_batch("ALTER TABLE jobs ADD COLUMN engine TEXT;") {
+            if !e.to_string().contains("duplicate column") {
+                return Err(e).with_context(|| {
+                    format!(
+                        "Failed to migrate state database at {} (missing column 'engine')",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
     Ok(conn)
 }
 
@@ -422,6 +448,7 @@ fn row_to_job(row: &Row<'_>) -> rusqlite::Result<JobMetadata> {
         sandbox_info: row
             .get::<_, Option<String>>(31)?
             .and_then(|s| serde_json::from_str::<crate::sandbox::SandboxInfo>(&s).ok()),
+        engine: row.get(32)?,
     })
 }
 
@@ -457,9 +484,9 @@ impl JobMetadata {
                 conversation_id, retry_count, pid, exit_code, status, hindsight,
                 auto_recall, auto_retain, retry_prompt, read_only, external_worktree,
                 pid_start_time, hindsight_bank, proxy, max_runtime, started_at,
-                hindsight_query, sandbox_info
+                hindsight_query, sandbox_info, engine
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33
             )
             ON CONFLICT(job_id) DO UPDATE SET
                 project = excluded.project,
@@ -492,7 +519,8 @@ impl JobMetadata {
                 max_runtime = excluded.max_runtime,
                 started_at = excluded.started_at,
                 hindsight_query = excluded.hindsight_query,
-                sandbox_info = excluded.sandbox_info",
+                sandbox_info = excluded.sandbox_info,
+                engine = excluded.engine",
             params![
                 self.job_id,
                 self.project,
@@ -528,6 +556,7 @@ impl JobMetadata {
                 self.sandbox_info
                     .as_ref()
                     .and_then(|s| serde_json::to_string(s).ok()),
+                self.engine,
             ],
         )
         .with_context(|| {
@@ -559,9 +588,9 @@ impl JobMetadata {
                 conversation_id, retry_count, pid, exit_code, status, hindsight,
                 auto_recall, auto_retain, retry_prompt, read_only, external_worktree,
                 pid_start_time, hindsight_bank, proxy, max_runtime, started_at,
-                hindsight_query, sandbox_info
+                hindsight_query, sandbox_info, engine
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33
             )",
             params![
                 self.job_id,
@@ -598,6 +627,7 @@ impl JobMetadata {
                 self.sandbox_info
                     .as_ref()
                     .and_then(|s| serde_json::to_string(s).ok()),
+                self.engine,
             ],
         )
         .map_err(|e| -> anyhow::Error {
@@ -630,7 +660,7 @@ impl JobMetadata {
     pub fn load(state_root: &Path, job_id: &str) -> Result<Self> {
         let conn = open_state_db(state_root)?;
         let mut stmt = conn
-            .prepare("SELECT job_id, project, prompt, resolved_prompt, model, effort, sandbox, mode, add_dirs, print_timeout, created_at, worktree_path, branch, base_ref, conversation_id, retry_count, pid, exit_code, status, hindsight, auto_recall, auto_retain, retry_prompt, read_only, external_worktree, pid_start_time, hindsight_bank, proxy, max_runtime, started_at, hindsight_query, sandbox_info FROM jobs WHERE job_id = ?1")
+            .prepare("SELECT job_id, project, prompt, resolved_prompt, model, effort, sandbox, mode, add_dirs, print_timeout, created_at, worktree_path, branch, base_ref, conversation_id, retry_count, pid, exit_code, status, hindsight, auto_recall, auto_retain, retry_prompt, read_only, external_worktree, pid_start_time, hindsight_bank, proxy, max_runtime, started_at, hindsight_query, sandbox_info, engine FROM jobs WHERE job_id = ?1")
             .with_context(|| format!("Failed to read job metadata for '{}' from {}", job_id, state_db_path(state_root).display()))?;
         let mut rows = stmt
             .query_map(params![job_id], row_to_job)
@@ -1126,7 +1156,19 @@ pub fn compute_status(meta: &JobMetadata, state_root: &Path) -> JobStatus {
         Err(_) => String::new(),
     };
 
-    determine_status_from_signals(meta.exit_code, &log_content)
+    // 3b. Engine-aware classification. The recorded `engine` selects the
+    //     status taxonomy whose stream the log carries: claude runs stream
+    //     NDJSON `{"type":"result",...}` lines (a different shape from agy's
+    //     `{"event":"result",...}` / `status` lines), so the claude job driver
+    //     classifies them with the claude rules. A NULL/absent engine row is
+    //     a historical agy job (agy was the only driver before engine
+    //     selection), so the agy path stays the unconditional default and is
+    //     byte-identical to the pre-E5 behaviour.
+    if meta.engine.as_deref() == Some("claude") {
+        determine_status_from_claude(meta.exit_code, &log_content)
+    } else {
+        determine_status_from_signals(meta.exit_code, &log_content)
+    }
 }
 
 /// Status classification from structured agy JSON output.
@@ -1152,6 +1194,12 @@ pub enum StructuredStatus {
 /// finished work worth surfacing.
 fn scan_final_structured(log: &str) -> Option<(StructuredStatus, String)> {
     for line in log.lines().rev() {
+        // A claude stream-json terminal line has no agy `status` field, so
+        // `structured_value` would skip it; recognize it first (its text is
+        // the `result`/`error`/`message` payload).
+        if let Some((outcome, text)) = claude_structured_text(line) {
+            return Some((outcome, text));
+        }
         let Some((status, val)) = structured_value(line) else {
             continue;
         };
@@ -1447,6 +1495,161 @@ pub fn determine_status_from_signals(exit_code: Option<i32>, log: &str) -> JobSt
     }
 }
 
+/// A claude stream-json terminal outcome, read from a `result` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeOutcome {
+    /// A `result` line that is not an error (`subtype` != `"error"`, `is_error`
+    /// false or absent): the claude job completed.
+    Done,
+    /// A `result` line with `subtype:"error"` / `is_error:true`, or a `system`
+    /// `subtype:"error"` line: the claude job failed.
+    Failed,
+}
+
+/// Recognizes a claude stream-json terminal line in `line` and returns its
+/// outcome. The shapes mirror `engine/claude/stream_json.rs`:
+/// - `{"type":"result","subtype":"success"|...,"is_error":false|absent,...}` -> Done
+/// - `{"type":"result","subtype":"error","is_error":true,...}` -> Failed
+/// - `{"type":"system","subtype":"error","message":"..."}` -> Failed
+///
+/// Any other line (a `stream_event`, an `assistant`/`user` message, an
+/// unparseable blob) is `None`, so the scan keeps going.
+fn claude_line_outcome(line: &str) -> Option<ClaudeOutcome> {
+    let value = json_object_line(line)?;
+    let ty = value.get("type").and_then(|t| t.as_str())?;
+    match ty {
+        "result" => {
+            let is_err = value.get("subtype").and_then(|s| s.as_str()) == Some("error")
+                || value.get("is_error") == Some(&serde_json::Value::Bool(true));
+            Some(if is_err {
+                ClaudeOutcome::Failed
+            } else {
+                ClaudeOutcome::Done
+            })
+        }
+        "system" => {
+            if value.get("subtype").and_then(|s| s.as_str()) == Some("error") {
+                Some(ClaudeOutcome::Failed)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The last claude terminal outcome in `log` (scanning backwards), restricted
+/// to the LAST attempt like the agy scan, so a stale `result` from a
+/// superseded attempt never misclassifies a later attempt.
+fn scan_claude_outcome(log: &str) -> Option<ClaudeOutcome> {
+    for line in last_attempt_log(log).lines().rev() {
+        if let Some(outcome) = claude_line_outcome(line) {
+            return Some(outcome);
+        }
+    }
+    None
+}
+
+/// Returns the `StructuredStatus` + text payload of a claude stream-json
+/// terminal line, for the `result`/error surfacing path (`result` command):
+/// a success `result` line yields its `result` text; an error `result` yields
+/// its `error` text; a `system:error` line yields its `message`.
+pub(crate) fn claude_structured_text(line: &str) -> Option<(StructuredStatus, String)> {
+    let value = json_object_line(line)?;
+    let ty = value.get("type").and_then(|t| t.as_str())?;
+    match ty {
+        "result" => {
+            let is_err = value.get("subtype").and_then(|s| s.as_str()) == Some("error")
+                || value.get("is_error") == Some(&serde_json::Value::Bool(true));
+            let text = if is_err {
+                value.get("error").and_then(|e| e.as_str()).unwrap_or("")
+            } else {
+                value.get("result").and_then(|r| r.as_str()).unwrap_or("")
+            }
+            .to_string();
+            Some(if is_err {
+                (StructuredStatus::Error, text)
+            } else {
+                (StructuredStatus::Success, text)
+            })
+        }
+        "system" => {
+            if value.get("subtype").and_then(|s| s.as_str()) == Some("error") {
+                let text = value
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Some((StructuredStatus::Error, text))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Status classification for a claude stream-json job log (HL-91 E5).
+///
+/// Rules, mirroring the agy taxonomy on the claude contract:
+/// - A terminal `result` success (the claude analogue of a complete agy
+///   SUCCESS) is `Done`. claude exits 0 on a successful `result`, so the
+///   outcome carries the same weight as agy's structured SUCCESS.
+/// - A `result`/`system` error line is `Failed` -- but a 137/143 kill without
+///   an error line stays `SelfTerminated` (the external-kill taxonomy).
+/// - A quota/rate-limit exhaustion signal anywhere in the log is
+///   `QuotaExhausted` (claude surfaces upstream rejection in its error text,
+///   including on `system`/`result` lines, which the generic scan matches).
+/// - Exit 0 with no terminal success line is `Incomplete` (the harness
+///   finished without reporting a result).
+/// - Non-zero exit with no error line is `Failed` (137/143 unless the log
+///   shows an error, which the killed-job paths write explicitly).
+/// - No exit code with no error line is `SelfTerminated` (the row was cut
+///   short without an outcome, e.g. an orphan of a dead server).
+pub fn determine_status_from_claude(exit_code: Option<i32>, log: &str) -> JobStatus {
+    let outcome = scan_claude_outcome(log);
+    let has_error = outcome == Some(ClaudeOutcome::Failed);
+    let done = outcome == Some(ClaudeOutcome::Done);
+
+    if done {
+        return JobStatus::Done;
+    }
+
+    // Quota/rate-limit exhaustion (same markers and last-attempt scoping as
+    // the agy scan; claude emits the upstream error text on its error lines,
+    // which the marker scan catches).
+    if has_quota_exhaustion_signal(last_attempt_log(log)) {
+        return JobStatus::QuotaExhausted;
+    }
+
+    match exit_code {
+        Some(0) => {
+            // Clean exit but no terminal success result.
+            if has_error {
+                JobStatus::Failed
+            } else {
+                JobStatus::Incomplete
+            }
+        }
+        Some(code) => {
+            // Non-zero exit: kill signals (137/143) without an error line are
+            // SelfTerminated, anything else Failed.
+            if (code == 137 || code == 143) && !has_error {
+                JobStatus::SelfTerminated
+            } else {
+                JobStatus::Failed
+            }
+        }
+        None => {
+            if has_error {
+                JobStatus::Failed
+            } else {
+                JobStatus::SelfTerminated
+            }
+        }
+    }
+}
+
 /// Strips ANSI escape sequences (CSI codes like `\x1b[32m`, OSC codes, etc.) from `input`.
 pub fn strip_ansi_escapes(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
@@ -1603,6 +1806,25 @@ pub fn extract_conversation_id(log: &str) -> Option<String> {
             }
         }
 
+        // Pattern 2b: claude stream-json carries the harness session id on
+        // `"session_id"` (assistant/result lines). This is the resume key for
+        // a claude job, so it is captured exactly like an agy conversation id:
+        // `retry` / resume reuse the same `conversation_id` field.
+        if let Some(pos) = line.find("\"session_id\"") {
+            let rest = line[pos + "\"session_id\"".len()..].trim_start();
+            if let Some(after_colon) = rest.strip_prefix(':') {
+                let rest = after_colon.trim_start();
+                if let Some(after_quote) = rest.strip_prefix('"') {
+                    if let Some(end) = after_quote.find('"') {
+                        let id = &after_quote[..end];
+                        if !id.is_empty() {
+                            return Some(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
         // Pattern 3: Early agy notice emitted before first turn completes:
         // "Forwarding user message to conversation <id>"
         // Real agy format: "Forwarding user message to conversation %s (items=%d, media=%d)"
@@ -1632,7 +1854,7 @@ pub fn list_jobs(state_root: &Path, project_filter: Option<&str>) -> Result<Vec<
     let conn = open_state_db(state_root)?;
     let mut stmt = conn
         .prepare(
-            "SELECT job_id, project, prompt, resolved_prompt, model, effort, sandbox, mode, add_dirs, print_timeout, created_at, worktree_path, branch, base_ref, conversation_id, retry_count, pid, exit_code, status, hindsight, auto_recall, auto_retain, retry_prompt, read_only, external_worktree, pid_start_time, hindsight_bank, proxy, max_runtime, started_at, hindsight_query, sandbox_info \
+            "SELECT job_id, project, prompt, resolved_prompt, model, effort, sandbox, mode, add_dirs, print_timeout, created_at, worktree_path, branch, base_ref, conversation_id, retry_count, pid, exit_code, status, hindsight, auto_recall, auto_retain, retry_prompt, read_only, external_worktree, pid_start_time, hindsight_bank, proxy, max_runtime, started_at, hindsight_query, sandbox_info, engine \
               FROM jobs WHERE ?1 IS NULL OR project = ?1 ORDER BY created_at DESC, job_id DESC",
         )
         .with_context(|| format!("Failed to prepare job list query in {}", state_db_path(state_root).display()))?;
@@ -2433,6 +2655,7 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
                 runtime: "gvisor".to_string(),
                 policy_path: "/tmp/roundtrip.policy.json".to_string(),
             }),
+            engine: Some("claude".to_string()),
         };
 
         meta.save(temp_dir.path()).unwrap();
@@ -2776,6 +2999,7 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         }
     }
 
@@ -2817,6 +3041,7 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
         assert_eq!(meta.pid_start_time, None);
         assert_eq!(meta.hindsight_query, None);
         assert_eq!(meta.sandbox_info, None);
+        assert_eq!(meta.engine, None);
 
         // The migrated row can also be round-tripped through save().
         let mut meta = meta;
@@ -2829,6 +3054,7 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
             runtime: "runc".to_string(),
             policy_path: "/tmp/migrated.policy.json".to_string(),
         });
+        meta.engine = Some("claude".to_string());
         meta.save(temp_dir.path()).unwrap();
         let reloaded = JobMetadata::load(temp_dir.path(), "oldjob01").unwrap();
         assert!(reloaded.read_only);
@@ -2843,6 +3069,7 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
                 policy_path: "/tmp/migrated.policy.json".to_string(),
             })
         );
+        assert_eq!(reloaded.engine, Some("claude".to_string()));
     }
 
     #[test]
@@ -2907,6 +3134,7 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         };
 
         let status = compute_status(&meta, temp_dir.path());

@@ -208,6 +208,13 @@ fn load_base_config(config_path: Option<PathBuf>) -> SupervisorConfig {
         log_event("supervisor", &e);
         std::process::exit(1);
     }
+    // The agy binary for cross-engine sessions (HL-91 E5): env wins over the
+    // config file's `agy_path`, mirroring `AGENT_RUN_AGY_PATH` on the worker.
+    if cfg.agy_path.is_none() {
+        if let Ok(p) = std::env::var("AGENT_ORCHESTRATE_AGY_PATH") {
+            cfg.agy_path = Some(PathBuf::from(p));
+        }
+    }
     for s in &mut cfg.sessions {
         if let Err(e) = s.validate_durations() {
             eprintln!("{}", e);
@@ -319,14 +326,22 @@ fn run_supervisor(config_path: Option<PathBuf>) {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let state = Arc::new(Mutex::new(SupervisorState::new(std::process::id())));
 
-    // Initialize session states
+    // Initialize session states. Each session records the engine it resolved
+    // (per-session `engine` > `default_session_engine` > "claude", HL-91 E5)
+    // so the sessions API and a restart keep the engine stable. The default
+    // may come from the supervisor config OR the worker-side core config file
+    // (the same resolution `run_session_iteration` applies at spawn time).
+    let default_session_engine = config.default_session_engine.clone().or_else(|| {
+        crate::core::config::Config::load()
+            .ok()
+            .and_then(|c| c.default_session_engine)
+    });
     {
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         for sess in &config.sessions {
-            st.sessions.insert(
-                sess.name.clone(),
-                crate::orchestrate::state::SessionState::new(sess.name.clone()),
-            );
+            let mut session_state = crate::orchestrate::state::SessionState::new(sess.name.clone());
+            session_state.engine = Some(sess.effective_engine(default_session_engine.as_deref()));
+            st.sessions.insert(sess.name.clone(), session_state);
         }
     }
 

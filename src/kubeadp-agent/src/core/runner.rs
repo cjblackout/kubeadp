@@ -95,6 +95,14 @@ pub fn build_command_and_args(
     mode: &InvocationMode,
     live: bool,
 ) -> (std::path::PathBuf, Vec<String>) {
+    // A claude job (HL-91 E5 `engine:"claude"`) runs the headless stream-json
+    // harness instead of agy: same worktree/sandbox/log lifecycle, different
+    // argv + prompt transport (the prompt is a stdin NDJSON line, delivered by
+    // the monitor). The argv mirrors `engine::claude::stream_json::StreamJsonArgs`.
+    if meta.engine.as_deref() == Some("claude") {
+        return build_claude_command_and_args(config, meta, mode, live);
+    }
+
     // Build agy arguments:
     // ALWAYS pass --dangerously-skip-permissions, --mode, and --output-format stream-json
     // unconditionally. Stream-JSON emits NDJSON step events as they happen, so
@@ -187,6 +195,54 @@ pub fn build_command_and_args(
     (config.agy_path.clone(), agy_args)
 }
 
+/// Builds the claude stream-json argv for a claude job (HL-91 E5).
+///
+/// Mirrors `engine::claude::stream_json::StreamJsonArgs` (kept self-contained
+/// here so `core` does not depend on the `engine` layer): the run is always
+/// headless auto-approve (`--dangerously-skip-permissions`), the mode maps
+/// meta.mode to `normal`/`plan`, and a retry resumes the harness conversation
+/// via `--resume <conversation_id>`. The prompt is NOT part of the argv: the
+/// stream-json input format reads it as an NDJSON line on stdin (the monitor
+/// writes it, exactly like `render_text_request` in the engine driver).
+fn build_claude_command_and_args(
+    config: &Config,
+    meta: &JobMetadata,
+    mode: &InvocationMode,
+    live: bool,
+) -> (std::path::PathBuf, Vec<String>) {
+    let mut args: Vec<String> = vec![
+        "--dangerously-skip-permissions".to_string(),
+        "-p".to_string(),
+        "--mode".to_string(),
+        if meta.mode.eq_ignore_ascii_case("plan") {
+            "plan".to_string()
+        } else {
+            "normal".to_string()
+        },
+        "--input-format".to_string(),
+        "stream-json".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+    ];
+    // A retry resumes the harness session: like agy's `--conversation`, the
+    // claude resume key is the captured conversation/session id of the last
+    // attempt. `live` A2A jobs deliver the prompt over stdin like any claude
+    // job (stream-json is already the stdin transport), so no `--print` knob.
+    if let InvocationMode::Retry {
+        conversation_id: Some(conv_id),
+        ..
+    } = mode
+    {
+        args.push("--resume".to_string());
+        args.push(conv_id.clone());
+    }
+    // `live` (an A2A mesh job) has no separate argv consequence for claude:
+    // the stdin pipe the monitor opens is the same stream-json channel used
+    // for the initial prompt and for A2A messages.
+    let _ = live;
+    (config.claude_path.clone(), args)
+}
+
 /// Builds the `std::process::Command` according to configuration and job metadata.
 ///
 /// Every job (and every retry attempt, which goes through the same function)
@@ -208,13 +264,21 @@ pub fn build_command(
 ) -> Result<(Command, std::path::PathBuf, Option<String>), anyhow::Error> {
     let (prog, args) = build_command_and_args(config, meta, mode, live);
 
+    // The sandbox policy names the harness binary whose argv the launch wraps:
+    // agy path for agy jobs, claude path for claude jobs (HL-91 E5).
+    let engine_bin = if meta.engine.as_deref() == Some("claude") {
+        &config.claude_path
+    } else {
+        &config.agy_path
+    };
+
     // Base policy for the job: main's `shared_rw` override (the writable
     // shared home path, default `/home/agent`) is preserved.
     let base_policy = crate::sandbox::SandboxPolicy::for_job(
         &meta.job_id,
         &meta.worktree_path,
         None,
-        Some(&config.agy_path),
+        Some(engine_bin),
         Some(vec![config.sandbox_home.clone()]),
     );
     // HL-113 phase 1 (a2a builds): the run's durable A2A inbox. The sandbox
@@ -967,6 +1031,12 @@ pub fn run_internal_runner(
 
     let mut meta = JobMetadata::load(&config.state_root, job_id)?;
 
+    // A claude job (HL-91 E5) streams its prompt as an NDJSON line over stdin
+    // (the stream-json input contract); the agy reference-line normalization is
+    // agy-specific and must not run for it (the claude harness has no
+    // conversation database to stamp).
+    let is_claude = meta.engine.as_deref() == Some("claude");
+
     // Every prompt handed to agy is normalized to carry exactly one
     // per-job/per-turn reference line ([`agy_conversations::normalize_ref_prompt`]):
     // turn 0 for the start prompt, the attempt number for retries. The line
@@ -974,20 +1044,26 @@ pub fn run_internal_runner(
     // and is what the recovery below scans for -- unique by construction,
     // unlike the old 80-byte prompt prefix two sibling jobs could share.
     let mode = if meta.retry_count > 0 {
+        let prompt = if is_claude {
+            meta.retry_prompt.clone().unwrap_or_default()
+        } else {
+            agy_conversations::normalize_ref_prompt(
+                meta.retry_prompt.as_deref().unwrap_or_default(),
+                &meta.job_id,
+                meta.retry_count,
+            )
+        };
         InvocationMode::Retry {
             conversation_id: meta.conversation_id.clone(),
-            prompt: meta.retry_prompt.clone().map(|p| {
-                agy_conversations::normalize_ref_prompt(&p, &meta.job_id, meta.retry_count)
-            }),
+            prompt: Some(prompt),
         }
     } else {
-        InvocationMode::Start {
-            resolved_prompt: agy_conversations::normalize_ref_prompt(
-                &meta.resolved_prompt,
-                &meta.job_id,
-                0,
-            ),
-        }
+        let resolved_prompt = if is_claude {
+            meta.resolved_prompt.clone()
+        } else {
+            agy_conversations::normalize_ref_prompt(&meta.resolved_prompt, &meta.job_id, 0)
+        };
+        InvocationMode::Start { resolved_prompt }
     };
 
     // Live mode (an A2A mesh job): the agy process reads newline-delimited
@@ -1048,7 +1124,11 @@ pub fn run_internal_runner(
     // the initial prompt) are written into it as NDJSON lines. The pipe
     // survives the sandbox wrapper (fds 0-2 are kept open by the backends), so
     // agy reads exactly what the worker writes.
-    if live {
+    //
+    // A claude job (HL-91 E5) also needs the stdin pipe: the stream-json input
+    // contract reads the initial prompt as an NDJSON line, which the monitor
+    // writes below right after the spawn.
+    if live || is_claude {
         spawn_cmd.stdin(std::process::Stdio::piped());
     }
 
@@ -1077,9 +1157,14 @@ pub fn run_internal_runner(
             append_to_log_file(
                 &log_path,
                 &format!(
-                    "Failed to spawn agy: {} (configured path: {})",
+                    "Failed to spawn {}: {} (configured path: {})",
+                    if is_claude { "claude" } else { "agy" },
                     e,
-                    config.agy_path.display()
+                    if is_claude {
+                        config.claude_path.display()
+                    } else {
+                        config.agy_path.display()
+                    }
                 ),
             );
             bail!(
@@ -1163,6 +1248,34 @@ pub fn run_internal_runner(
             // log output, close stdin (EOF) so agy finishes the turn and the
             // job classifies Done instead of hanging.
             crate::core::a2a_live::spawn_idle_watchdog(job_id, config.a2a_live_idle_secs);
+        }
+    }
+
+    // A claude job (HL-91 E5) delivers its prompt as the first NDJSON user
+    // line over stdin (the stream-json input contract; same envelope the
+    // `render_text_request` driver renders). Written once right after the
+    // spawn; stdin stays open for A2A/live deliveries on the live path.
+    if is_claude {
+        if let Some(mut stdin) = child.stdin.take() {
+            let initial = match &mode {
+                InvocationMode::Start { resolved_prompt } => resolved_prompt.clone(),
+                InvocationMode::Retry { prompt, .. } => prompt.clone().unwrap_or_default(),
+            };
+            // Mirrors `engine::claude::stream_json::render_text_request`.
+            let request = serde_json::json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{ "type": "text", "text": initial }]
+                }
+            });
+            use std::io::Write;
+            let _ = stdin.write_all(format!("{}\n", request).as_bytes());
+            let _ = stdin.flush();
+            // Keep no handle: the child's stdin reaches EOF on the job's own
+            // turn boundary; the child is spawned with piped stdin so this
+            // drop of the `stdin` handle at the end of the block sends EOF.
+            let _ = stdin;
         }
     }
 
@@ -1553,6 +1666,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         }
     }
 
@@ -1591,6 +1705,7 @@ mod tests {
     fn test_build_command_bare_agy_args() {
         let config = Config {
             agy_path: PathBuf::from("/usr/local/bin/agy"),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -1640,6 +1755,7 @@ mod tests {
         // other element identical to the non-live invocation.
         let config = Config {
             agy_path: PathBuf::from("/usr/local/bin/agy"),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -1832,6 +1948,7 @@ mod tests {
     fn test_validate_executable_paths_missing_agy() {
         let config = Config {
             agy_path: PathBuf::from("/nonexistent/agy-binary"),
+            claude_path: std::path::PathBuf::from("claude"),
             ..Default::default()
         };
         assert!(validate_executable_paths(&config).is_err());
@@ -1839,6 +1956,7 @@ mod tests {
         // A relative agy path is resolved at spawn time and is not validated.
         let rel_config = Config {
             agy_path: PathBuf::from("agy"),
+            claude_path: std::path::PathBuf::from("claude"),
             ..Default::default()
         };
         assert!(validate_executable_paths(&rel_config).is_ok());
@@ -1846,6 +1964,7 @@ mod tests {
         // An absolute path that exists passes validation.
         let ok_config = Config {
             agy_path: PathBuf::from("/bin/sh"),
+            claude_path: std::path::PathBuf::from("claude"),
             ..Default::default()
         };
         assert!(validate_executable_paths(&ok_config).is_ok());
@@ -1872,6 +1991,7 @@ mod tests {
             workspace_root,
             state_root: state_root.clone(),
             agy_path: agy.clone(),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -1940,6 +2060,7 @@ mod tests {
             workspace_root,
             state_root: state_root.clone(),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             agy_home: Some(home.clone()),
             ..Default::default()
         };
@@ -2034,6 +2155,7 @@ mod tests {
             workspace_root,
             state_root: state_root.clone(),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             agy_home: Some(home.clone()),
             ..Default::default()
         };
@@ -2127,6 +2249,7 @@ mod tests {
             workspace_root,
             state_root: state_root.clone(),
             agy_path: agy.clone(),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -2357,6 +2480,7 @@ mod tests {
             workspace_root,
             state_root: state_root.clone(),
             agy_path: PathBuf::from("/bin/sh"),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -2445,6 +2569,7 @@ mod tests {
             workspace_root,
             state_root: state_root.clone(),
             agy_path: agy.clone(),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -2537,6 +2662,7 @@ mod tests {
             workspace_root,
             state_root: state_root.clone(),
             agy_path: agy.clone(),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -2661,6 +2787,7 @@ mod tests {
             workspace_root,
             state_root: state_root.clone(),
             agy_path: agy.clone(),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -2825,6 +2952,7 @@ mod tests {
             workspace_root,
             state_root: state_root.clone(),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         };
 
@@ -2888,6 +3016,7 @@ mod tests {
             workspace_root,
             state_root: state_root.clone(),
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             launch_timeout_secs: 1,
             ..Default::default()
         };
@@ -3010,6 +3139,7 @@ mod tests {
             workspace_root,
             state_root,
             agy_path: agy,
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             // Point the policy's writable shared path (the agent's home) at a
             // temp dir the sandbox backend can actually create; the production
             // default `/home/agent` is not creatable on this (or a CI) host.

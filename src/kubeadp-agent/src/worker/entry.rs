@@ -184,11 +184,19 @@ pub async fn run() -> Result<()> {
     let app = {
         #[cfg(feature = "engine")]
         {
-            // Register the agy engine (the per-role default for jobs) so
-            // /api/v1/jobs and /api/v1/capabilities resolve it through the
-            // trait (HL-91 E3).
-            let engines =
-                std::sync::Arc::new(crate::engine::AgyEngine::build_registry(Arc::clone(&state)));
+            // Register the agy engine (the per-role default for jobs) and the
+            // claude engine (HL-91 E5 cross-use: claude drives jobs through
+            // the engine-aware runner and reports its capabilities) so
+            // /api/v1/jobs and /api/v1/capabilities resolve them through the
+            // trait (HL-91 E3/E5).
+            let mut registry = crate::engine::AgyEngine::build_registry(Arc::clone(&state));
+            // The claude job engine's capabilities and registry presence come
+            // from the trait; the launcher is the engine-aware runner
+            // (`meta.engine == "claude"`), not the trait's in-memory driver.
+            registry.register(std::sync::Arc::new(
+                crate::engine::claude::ClaudeEngine::new(state.claude_path.clone(), None),
+            ));
+            let engines = std::sync::Arc::new(registry);
             server::obs::add_observability(
                 server::router_with_engines(state.clone(), auth, rc_state.clone(), engines),
                 auth_state.clone(),

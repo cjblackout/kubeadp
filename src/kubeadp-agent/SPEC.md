@@ -233,8 +233,16 @@ also the pause accumulator.
 ## 4. Orchestrator
 
 ### 4.1 Responsibilities
-Supervises interactive sessions: each runs an engine (claude by default) in a PTY
-with crash handling, restart backoff, readiness tracking and a persistent state file.
+Supervises interactive sessions: each runs an engine (claude by default, agy
+requested per session or as the orchestrator default) in a PTY with crash
+handling, restart backoff, readiness tracking and a persistent state file.
+The engine is per-session with the E5 precedence (session `engine` >
+`default_session_engine` > claude) and survives restarts via `SessionState`.
+Claude sessions use the `--remote-control` PTY transport with an injected
+CLAUDE.md; agy sessions run the live stream-json transport (`--print ""`
+`--input-format stream-json`) reading turns as NDJSON lines from the same
+PTY, supervised by the identical crash/restart/backoff machinery (both answer
+the identical sessions API; neither is limited by the engine).
 
 ### 4.2 Session configuration
 Resolution order: (1) `--config <path>`; (2) `AGENT_ORCHESTRATE_CONFIG` (legacy
@@ -246,7 +254,9 @@ requested at runtime.
 
 Global options (defaults): `state_file` `/tmp/claude-supervisor-state.json`;
 `heartbeat_interval_secs` 2.0; `stale_heartbeat_secs` 15.0; `shutdown_grace_secs`
-5.0; `claude_config_dir` `$HOME/.claude`.
+5.0; `claude_config_dir` `$HOME/.claude`; `default_session_engine` unset
+(claude); `agy_path` unset (`AGENT_ORCHESTRATE_AGY_PATH`, the per-session
+`agy_binary`, then `PATH`).
 
 Per-session options (defaults):
 | Key | Default | Meaning |
@@ -266,6 +276,9 @@ Per-session options (defaults):
 | `resume_fail_quarantine_after` | 5 | consecutive fast `--resume` failures before quarantine |
 | `resume_fail_uptime_secs` | 5.0 | uptime still counting a fast resume failure |
 | `sandbox` | true | run under `sandbox-exec`; `false` = trusted (full env, no grants) |
+| `engine` | unset (claude) | engine for this session (E5 selection level 1) |
+| `claude_binary` / `claude_args` | `claude` / `--dangerously-skip-permissions --remote-control ai-server` | claude PTY transport binary and args |
+| `agy_binary` | `agy` | binary for the agy live stream-json session transport |
 
 Restart delay is `min(base * 2^n, max)` where `n` is restarts already in the
 window (first uses `base`), plus `+0..+25%` jitter. Durations are validated at
@@ -412,8 +425,12 @@ GET  /api/v1/remote-control/status
 `start` body: `{project, prompt, git_ref, model, effort, sandbox, add_dirs, plan,
 print_timeout, hindsight, hindsight_bank, hindsight_query, proxy, from_worktree,
 from_patch_content, max_runtime, jobset_id, engine}` (all optional default).
-Engine resolution first: agy → command path; claude → `501 unsupported`;
-other → `400 unknown_engine`. `from_patch_content` is materialized to a temp
+Engine resolution (HL-91 E1/E5 precedence): request `engine` > configured
+`default_engine` > per-role default (`agy` for jobs). The effective engine is
+resolved before validation: `agy` and `claude` route to the engine-aware
+command path (claude runs the headless stream-json job driver); any other
+name answers `400 unknown_engine` (an unregistered engine is a selection
+error, never a 501). `from_patch_content` is materialized to a temp
 file, removed after the run. `wait` returns `{job_ids, statuses}` with exit
 codes 0/2/3 per the core command convention.
 

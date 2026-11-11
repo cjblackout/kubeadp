@@ -663,6 +663,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         };
         meta.save(&config.state_root).unwrap();
 
@@ -967,6 +968,7 @@ mod tests {
             workspace_root: temp.path().join("ws"),
             repos_root: temp.path().join("ws").join(".agent-repos"),
             agy_path: temp.path().join("fake-agy"),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             a2a_interrupt_min_secs: min_secs,
             ..Default::default()
         };
@@ -1004,6 +1006,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         };
         meta.save(&state_root).unwrap();
         let log_path = JobMetadata::log_path(&state_root, job_id);
@@ -1075,6 +1078,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         };
         meta.save(&state_root).unwrap();
 
@@ -1139,6 +1143,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         };
         meta.save(&state_root).unwrap();
 
@@ -1397,6 +1402,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         };
         meta.save(&config.state_root).unwrap();
         let log_path = JobMetadata::log_path(&config.state_root, job_id);
@@ -1455,6 +1461,7 @@ mod tests {
                 workspace_root: temp.path().join("ws"),
                 repos_root: temp.path().join("ws").join(".agent-repos"),
                 agy_path: temp.path().join("fake-agy"),
+                claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
                 a2a_interrupt_min_secs: 0,
                 a2a_live_stdin: true,
                 a2a_ack_secs: 1,

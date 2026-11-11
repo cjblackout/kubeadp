@@ -138,6 +138,7 @@ fn session_json(
         "last_health_result": sess.last_health_result,
         "paused": paused,
         "controlled": running,
+        "engine": sess.engine,
     })
 }
 
@@ -591,6 +592,22 @@ pub fn deliver_message(
     // not_running when the session has no live PTY (stopped/paused or a
     // dead thread left a stale slot).
     let payload = sanitize_message_text(text);
+    // The engine this session runs on (HL-91 E5 cross-use): read from the
+    // resolved session state (the supervisor seeded it there when it spawned
+    // the thread) and fall back to the config's effective engine. It selects
+    // the PTY payload format: claude gets the bracketed paste (so newlines
+    // never submit early), agy gets a single stream-json user NDJSON line
+    // (agy's live stdin contract, see `core::a2a_live::frame_user_line`).
+    let engine = {
+        let st = state
+            .supervisor_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        st.sessions
+            .get(name)
+            .and_then(|s| s.engine.clone())
+            .unwrap_or_else(|| control.config.effective_engine(None))
+    };
     let write_ok = {
         let mut slot = control.pty_input.lock().unwrap_or_else(|e| e.into_inner());
         if !slot.taken() {
@@ -609,11 +626,20 @@ pub fn deliver_message(
             // a stuck child that never drains its input queue turns into a
             // timeout instead of wedging the tokio worker / session thread.
             let deadline = Instant::now() + crate::orchestrate::pty::PTY_WRITE_TOTAL_DEADLINE;
-            let written = slot
-                .write_all(PASTE_START, deadline)
-                .and_then(|_| slot.write_all(&payload, deadline))
-                .and_then(|_| slot.write_all(PASTE_END, deadline))
-                .and_then(|_| slot.write_all(b"\r", deadline));
+            let written = if engine == "agy" {
+                // A single NDJSON user line (framed JSON, embedded newlines
+                // escaped) followed by Enter, exactly what agy's live
+                // stream-json stdin consumes as the next turn.
+                let line =
+                    crate::core::a2a_live::frame_user_line(&String::from_utf8_lossy(&payload));
+                slot.write_all(line.as_bytes(), deadline)
+                    .and_then(|_| slot.write_all(b"\r", deadline))
+            } else {
+                slot.write_all(PASTE_START, deadline)
+                    .and_then(|_| slot.write_all(&payload, deadline))
+                    .and_then(|_| slot.write_all(PASTE_END, deadline))
+                    .and_then(|_| slot.write_all(b"\r", deadline))
+            };
             written.is_ok()
         }
     };
@@ -693,8 +719,10 @@ mod tests {
                 name: "sess-a".to_string(),
                 workdir: std::path::PathBuf::from("/tmp"),
                 session_id: "session-a".to_string(),
+                engine: None,
                 claude_binary: std::path::PathBuf::from("/bin/true"),
                 claude_args: vec![],
+                agy_binary: std::path::PathBuf::from("agy"),
                 env: Default::default(),
                 session_file: None,
                 memory_file: None,
@@ -1403,12 +1431,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::ACCEPTED);
-
         let received = read_slave_available(pty.slave, wait_len, Duration::from_secs(2));
         assert_eq!(
             received,
             [PASTE_START, expected, PASTE_END, b"\r"].concat(),
             "child must see bracketed paste + one final Enter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inject_agy_session_is_ndjson_user_line_not_paste() {
+        // HL-91 E5 cross-use: an agy session's `/message` writes one
+        // stream-json user NDJSON line (agy's live stdin contract) instead of
+        // the claude bracketed paste. The outcome/staleness/rate contract is
+        // otherwise identical (no engine-dependent status, never a 501).
+        let st = seeded_registry_state();
+        {
+            let mut st = st
+                .supervisor_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            st.sessions.get_mut("sess-a").unwrap().engine = Some("agy".to_string());
+        }
+        let pty = crate::orchestrate::pty::Pty::open().expect("pty");
+        make_slave_raw(pty.slave);
+        seed_pty_input(&st.controls.get("sess-a").unwrap(), &pty);
+        let app = router(st.clone());
+
+        let text = "hello there\nsecond line";
+        let expected_line = crate::core::a2a_live::frame_user_line(text);
+        let wait_len = expected_line.len() + 1; // + the trailing Enter
+
+        let res = app
+            .oneshot(message_request(
+                "/api/v1/sessions/sess-a/message",
+                r#"{"text":"hello there\nsecond line\n"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let value: Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+        assert_eq!(value["bytes"].as_u64().unwrap(), text.len() as u64);
+
+        let received = read_slave_available(pty.slave, wait_len, Duration::from_secs(2));
+        assert_eq!(
+            received,
+            [expected_line.as_bytes(), b"\r"].concat(),
+            "agy session must see one framed NDJSON user line + one final Enter"
         );
     }
 

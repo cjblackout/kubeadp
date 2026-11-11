@@ -56,10 +56,19 @@ impl AgyEngine {
 
     /// A registry carrying the agy engine (the per-role default for jobs). The
     /// worker role builds this at startup so `/api/v1/jobs` and
-    /// `/api/v1/capabilities` resolve it through the trait.
+    /// `/api/v1/capabilities` resolve it through the trait. When the config
+    /// sets `default_engine` (HL-91 E1, selection precedence level 2) it
+    /// becomes the registry's job fallback (level 3 is per-role "agy").
     pub fn build_registry(config: Arc<Config>) -> crate::engine::EngineRegistry {
         let mut registry = crate::engine::EngineRegistry::new();
-        registry.register(Arc::new(Self::new(config)));
+        registry.register(Arc::new(Self::new(config.clone())));
+        if let Some(default) = config
+            .default_engine
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+        {
+            registry.set_default(crate::engine::RunKind::Job, default);
+        }
         registry
     }
 
@@ -317,6 +326,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         }
     }
 
@@ -537,6 +547,7 @@ some non-json noise line
             workspace_root,
             state_root: state_root.clone(),
             agy_path: agy.clone(),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             agy_home: Some(tmp.path().join("agy-home")),
             ..Default::default()
         }));

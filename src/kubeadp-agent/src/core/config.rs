@@ -11,6 +11,7 @@ pub const DEFAULT_JOBS_DIR_NAME: &str = ".agent-jobs";
 /// root when the config is loaded.
 pub const DEFAULT_REPOS_ROOT_TEMPLATE: &str = "{workspace_root}/.agent-repos";
 pub const DEFAULT_AGY_PATH: &str = "/usr/local/libexec/agy";
+pub const DEFAULT_CLAUDE_PATH: &str = "/usr/local/bin/claude";
 pub const DEFAULT_BASE_BRANCH: &str = "main";
 pub const DEFAULT_STATE_ROOT: &str = "~/.agent-run";
 pub const DEFAULT_GC_MAX_AGE_DAYS: u64 = 14;
@@ -73,6 +74,8 @@ pub struct ConfigFile {
     pub jobs_dir_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agy_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,6 +171,11 @@ pub struct Config {
     pub workspace_root: PathBuf,
     pub jobs_dir_name: String,
     pub agy_path: PathBuf,
+    /// The claude stream-json binary path, used to launch claude jobs (HL-91
+    /// E5). The union image bakes claude at this path on every pod (worker and
+    /// orchestrator). Overridable via `AGENT_RUN_CLAUDE_PATH` / the
+    /// `claude_path` config key.
+    pub claude_path: PathBuf,
     pub default_model: Option<String>,
     pub default_effort: Option<String>,
     pub default_base_branch: String,
@@ -273,6 +281,7 @@ impl Default for Config {
             workspace_root: workspace_root.clone(),
             jobs_dir_name: DEFAULT_JOBS_DIR_NAME.to_string(),
             agy_path: PathBuf::from(DEFAULT_AGY_PATH),
+            claude_path: PathBuf::from(DEFAULT_CLAUDE_PATH),
             default_model: None,
             default_effort: None,
             default_base_branch: DEFAULT_BASE_BRANCH.to_string(),
@@ -381,6 +390,13 @@ impl Config {
             .or_else(|| file_cfg.agy_path.clone())
             .unwrap_or_else(|| DEFAULT_AGY_PATH.to_string());
         let agy_path = expand_path(&agy_path_raw, &workspace_root);
+
+        let claude_path_raw = env_vars
+            .get("AGENT_RUN_CLAUDE_PATH")
+            .cloned()
+            .or_else(|| file_cfg.claude_path.clone())
+            .unwrap_or_else(|| DEFAULT_CLAUDE_PATH.to_string());
+        let claude_path = expand_path(&claude_path_raw, &workspace_root);
 
         // 6. Resolve model and effort
         let default_model_raw = env_vars
@@ -928,6 +944,7 @@ impl Config {
             workspace_root,
             jobs_dir_name,
             agy_path,
+            claude_path,
             default_model,
             default_effort,
             default_base_branch,

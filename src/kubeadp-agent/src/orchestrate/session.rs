@@ -491,26 +491,56 @@ fn run_session_iteration(
         paused,
     };
 
-    // 1. Ensure Claude configuration (onboarding, trust, dangerous mode bypass)
-    if let Err(e) = ensure_claude_config(cfg_path, settings_path, &[&session.workdir]) {
-        log_event(
-            &session.name,
-            &format!("Failed to update Claude configuration: {}", e),
-        );
-    }
+    // The engine this session runs on (HL-91 E5 cross-use): per-session
+    // `engine` > `default_session_engine` > "claude". It selects the spawn
+    // args, the setup steps and the message-delivery format. claude is the
+    // historical supervisor PTY path; agy uses its live stream-json mode
+    // (`--print "" --input-format stream-json`) reading consecutive turns
+    // from the PTY, supervised by the same crash/restart/backoff loop.
+    // `default_session_engine` may come from the supervisor config OR the
+    // worker-side core config file (mirror of `AGENT_ORCHESTRATE_DEFAULT_SESSION_ENGINE`
+    // on the supervisor side); both are resolved here so the seed below agrees
+    // with the engine actually launched.
+    let default_session_engine = supervisor_config
+        .default_session_engine
+        .clone()
+        .or_else(|| {
+            crate::core::config::Config::load()
+                .ok()
+                .and_then(|c| c.default_session_engine)
+        });
+    let engine = session.effective_engine(default_session_engine.as_deref());
 
-    // 1b. Merge the A2A hooks into the session settings (design HL-113
-    // §7.14, phase 2): PostToolUse / UserPromptSubmit / Stop pointing at
-    // `kubeadp-agent a2a-hook`, so the hook channel injects queued messages
-    // at the next tool call / prompt / turn boundary. Existing hook entries
-    // are kept; the merge is idempotent. FAIL-OPEN: on error, log and start
-    // the session without the hooks (the ladder's escalation steps still
-    // deliver).
-    if let Err(e) = crate::orchestrate::claude_config::ensure_a2a_hooks(settings_path) {
-        log_event(
-            &session.name,
-            &format!("Failed to merge the a2a hook settings: {}", e),
-        );
+    // 1. Engine-specific setup. claude needs its headless configuration
+    // (onboarding/trust/dangerous-mode), the A2A hook settings, the
+    // per-project CLAUDE.md and the transcript machinery; an agy session
+    // needs none of those (its prompts travel as stream-json lines, and A2A
+    // delivery uses the typed user events below).
+    if engine == "agy" {
+        // (nothing to configure for agy: no claude config, no CLAUDE.md, no
+        // cjson transcript; the sandbox still applies below)
+    } else {
+        // 1. Ensure Claude configuration (onboarding, trust, dangerous mode bypass)
+        if let Err(e) = ensure_claude_config(cfg_path, settings_path, &[&session.workdir]) {
+            log_event(
+                &session.name,
+                &format!("Failed to update Claude configuration: {}", e),
+            );
+        }
+
+        // 1b. Merge the A2A hooks into the session settings (design HL-113
+        // §7.14, phase 2): PostToolUse / UserPromptSubmit / Stop pointing at
+        // `kubeadp-agent a2a-hook`, so the hook channel injects queued messages
+        // at the next tool call / prompt / turn boundary. Existing hook entries
+        // are kept; the merge is idempotent. FAIL-OPEN: on error, log and start
+        // the session without the hooks (the ladder's escalation steps still
+        // deliver).
+        if let Err(e) = crate::orchestrate::claude_config::ensure_a2a_hooks(settings_path) {
+            log_event(
+                &session.name,
+                &format!("Failed to merge the a2a hook settings: {}", e),
+            );
+        }
     }
 
     // 2. Wait until Claude is installed and logged in
@@ -520,16 +550,33 @@ fn run_session_iteration(
             .sessions
             .entry(session.name.clone())
             .or_insert_with(|| SessionState::new(session.name.clone()));
+        if sess_st.engine.is_none() {
+            // A session state created before engine selection (or by a path
+            // that did not seed it) records the effective engine so the API
+            // reports it and a restart keeps the engine stable (HL-91 E5).
+            sess_st.engine = Some(session.effective_engine(default_session_engine.as_deref()));
+        }
         sess_st.status = SessionStatus::Starting;
     }
 
-    let (ready, health_reason) = wait_until_ready(
-        &session.claude_binary,
-        &session.env,
-        &session.name,
-        Duration::from_secs_f64(session.readiness_poll_secs),
-        shutdown,
-    );
+    let (ready, health_reason) = if engine == "agy" {
+        // An agy session needs no login gate: agy runs headless in stream-json
+        // mode. Readiness = the binary resolves and answers `--version`.
+        crate::orchestrate::readiness::binary_ready(
+            &session.agy_binary,
+            &session.env,
+            Duration::from_secs_f64(session.readiness_poll_secs),
+            shutdown,
+        )
+    } else {
+        wait_until_ready(
+            &session.claude_binary,
+            &session.env,
+            &session.name,
+            Duration::from_secs_f64(session.readiness_poll_secs),
+            shutdown,
+        )
+    };
 
     {
         let mut st = shared_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -544,80 +591,131 @@ fn run_session_iteration(
 
     // 2b. Inject the per-project CLAUDE.md into the workdir before spawning.
     // FAIL-OPEN: on error, log prominently and still start the session.
-    if let Some(ref memory_file) = session.memory_file {
-        match crate::orchestrate::memory::inject_memory_file(&session.workdir, memory_file) {
-            Ok(crate::orchestrate::memory::InjectOutcome::Written) => {
-                log_event(
-                    &session.name,
-                    &format!(
-                        "memory file injected: {} -> {}",
-                        memory_file.display(),
-                        session.workdir.join("CLAUDE.md").display()
-                    ),
-                );
-            }
-            Ok(crate::orchestrate::memory::InjectOutcome::Unchanged) => {
-                log_event(
-                    &session.name,
-                    &format!("memory file unchanged: {}", memory_file.display()),
-                );
-            }
-            Err(e) => {
-                log_event(
-                    &session.name,
-                    &format!(
-                        "ERROR: failed to inject memory file '{}': {} (continuing without it)",
-                        memory_file.display(),
-                        e
-                    ),
-                );
-            }
-        }
-    }
-
-    // 3. Check session transcript validity (fix #2: new policy)
-    let session_file = supervisor_config.resolve_session_file(session);
-    match classify_transcript(&session_file) {
-        TranscriptStatus::Unusable => {
-            // Empty / garbage file: quarantine and start fresh.
-            *force_resume = false;
-            match quarantine_corrupt_session_file(&session_file) {
-                Ok(backup) => {
+    // Claude-only: agy sessions have no CLAUDE.md (their context is the
+    // stream-json prompts).
+    if engine != "agy" {
+        if let Some(ref memory_file) = session.memory_file {
+            match crate::orchestrate::memory::inject_memory_file(&session.workdir, memory_file) {
+                Ok(crate::orchestrate::memory::InjectOutcome::Written) => {
                     log_event(
                         &session.name,
                         &format!(
-                            "Session transcript has no parseable lines. Quarantined {} -> {}",
-                            session_file.display(),
-                            backup.display()
+                            "memory file injected: {} -> {}",
+                            memory_file.display(),
+                            session.workdir.join("CLAUDE.md").display()
                         ),
+                    );
+                }
+                Ok(crate::orchestrate::memory::InjectOutcome::Unchanged) => {
+                    log_event(
+                        &session.name,
+                        &format!("memory file unchanged: {}", memory_file.display()),
                     );
                 }
                 Err(e) => {
                     log_event(
                         &session.name,
-                        &format!("Failed to quarantine unusable session transcript: {}", e),
+                        &format!(
+                            "ERROR: failed to inject memory file '{}': {} (continuing without it)",
+                            memory_file.display(),
+                            e
+                        ),
                     );
                 }
             }
         }
-        // Usable or Missing: proceed normally (no quarantine for truncated/corrupt lines).
-        TranscriptStatus::Usable | TranscriptStatus::Missing => {}
+    }
+
+    // 3. Check session transcript validity (fix #2: new policy). Claude-only:
+    // agy sessions have no ~/.claude transcript; `resolve_session_file` and
+    // the quarantine/resume logic are claude-specific.
+    let session_file = if engine == "agy" {
+        std::path::PathBuf::new()
+    } else {
+        supervisor_config.resolve_session_file(session)
+    };
+    if engine != "agy" {
+        match classify_transcript(&session_file) {
+            TranscriptStatus::Unusable => {
+                // Empty / garbage file: quarantine and start fresh.
+                *force_resume = false;
+                match quarantine_corrupt_session_file(&session_file) {
+                    Ok(backup) => {
+                        log_event(
+                            &session.name,
+                            &format!(
+                                "Session transcript has no parseable lines. Quarantined {} -> {}",
+                                session_file.display(),
+                                backup.display()
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        log_event(
+                            &session.name,
+                            &format!("Failed to quarantine unusable session transcript: {}", e),
+                        );
+                    }
+                }
+            }
+            // Usable or Missing: proceed normally (no quarantine for truncated/corrupt lines).
+            TranscriptStatus::Usable | TranscriptStatus::Missing => {}
+        }
     }
 
     let fingerprint_before = get_transcript_fingerprint(&session_file);
     let is_resume = *force_resume || session_file.exists();
 
-    // 4. Build command arguments
-    let mut cmd = Command::new(&session.claude_binary);
+    // 4. Build command arguments (engine-aware, HL-91 E5 cross-use).
+    let is_agy = engine == "agy";
+    let binary = if is_agy {
+        &session.agy_binary
+    } else {
+        &session.claude_binary
+    };
+    let mut cmd = Command::new(binary);
     cmd.current_dir(&session.workdir);
     cmd.envs(&session.env);
 
     let mut args: Vec<String> = Vec::new();
-    let mut session_arg_inserted = false;
+    if is_agy {
+        // The agy session contract (mirrors `core::runner` live mode): agy
+        // runs headless stream-json with an empty `--print`, so it idles
+        // reading consecutive turns as NDJSON lines from the PTY (each
+        // `/message` injects one `{"event":"user",...}` line). There is no
+        // claude-style persistent `--session-id`/`--resume` and no
+        // `--remote-control ai-server` summary transport; the supervisor's
+        // crash/restart/backoff loop still supervises the child exactly like
+        // a claude session.
+        args.push("--dangerously-skip-permissions".to_string());
+        args.push("--mode".to_string());
+        args.push("accept-edits".to_string());
+        args.push("--output-format".to_string());
+        args.push("stream-json".to_string());
+        args.push("--print".to_string());
+        args.push("".to_string());
+        args.push("--input-format".to_string());
+        args.push("stream-json".to_string());
+        args.push("--add-dir".to_string());
+        args.push(session.workdir.to_string_lossy().to_string());
+    } else {
+        let mut session_arg_inserted = false;
 
-    for arg in &session.claude_args {
-        args.push(arg.clone());
-        if arg == "--dangerously-skip-permissions" && !session_arg_inserted {
+        for arg in &session.claude_args {
+            args.push(arg.clone());
+            if arg == "--dangerously-skip-permissions" && !session_arg_inserted {
+                if is_resume {
+                    args.push("--resume".to_string());
+                    args.push(session.session_id.clone());
+                } else {
+                    args.push("--session-id".to_string());
+                    args.push(session.session_id.clone());
+                }
+                session_arg_inserted = true;
+            }
+        }
+
+        if !session_arg_inserted {
             if is_resume {
                 args.push("--resume".to_string());
                 args.push(session.session_id.clone());
@@ -625,17 +723,6 @@ fn run_session_iteration(
                 args.push("--session-id".to_string());
                 args.push(session.session_id.clone());
             }
-            session_arg_inserted = true;
-        }
-    }
-
-    if !session_arg_inserted {
-        if is_resume {
-            args.push("--resume".to_string());
-            args.push(session.session_id.clone());
-        } else {
-            args.push("--session-id".to_string());
-            args.push(session.session_id.clone());
         }
     }
 
@@ -788,7 +875,7 @@ fn run_session_iteration(
         sandboxed_cmd.arg("--policy");
         sandboxed_cmd.arg(policy_path.to_string_lossy().to_string());
         sandboxed_cmd.arg("--");
-        sandboxed_cmd.arg(&session.claude_binary);
+        sandboxed_cmd.arg(binary);
         sandboxed_cmd.args(&args);
         cmd = sandboxed_cmd;
     }
@@ -1130,74 +1217,83 @@ fn run_session_iteration(
     // Self-healing: if launch with --session-id exited within 15s and output contains "already in use",
     // switch to --resume for subsequent launches in memory.
     let tail_str = String::from_utf8_lossy(&tail_buf);
-    if !is_resume && uptime <= 15.0 && !*force_resume && tail_str.contains("already in use") {
-        log_event(
-            &session.name,
-            "Detected 'already in use' with --session-id; switching to --resume for subsequent launches",
-        );
-        *force_resume = true;
-    }
-
-    let fingerprint_after = get_transcript_fingerprint(&session_file);
-    if fingerprint_after.is_none() {
-        resume_fail_tracker.reset();
-    } else if let (Some(last_fp), Some(curr_fp)) = (
-        resume_fail_tracker.last_fingerprint(),
-        fingerprint_after.as_ref(),
-    ) {
-        if last_fp != curr_fp {
-            resume_fail_tracker.reset();
+    // The claude-only resume/transcript machinery: an agy session never
+    // resumes a claude transcript (its conversation lives in agy's own store,
+    // keyed by `--conversation`), so the `already in use` switch and the
+    // fast-resume quarantine do not apply.
+    if !is_agy {
+        if !is_resume && uptime <= 15.0 && !*force_resume && tail_str.contains("already in use") {
+            log_event(
+                &session.name,
+                "Detected 'already in use' with --session-id; switching to --resume for subsequent launches",
+            );
+            *force_resume = true;
         }
-    }
 
-    if is_resume && exit_code != Some(0) && uptime <= session.resume_fail_uptime_secs {
-        if output_contains_resume_not_found(&tail_str) {
-            if fingerprint_before.is_some() && fingerprint_after == fingerprint_before {
-                let count = resume_fail_tracker.record_failure(fingerprint_after);
-                if session.resume_fail_quarantine_after > 0
-                    && count >= session.resume_fail_quarantine_after
-                {
-                    match quarantine_corrupt_session_file(&session_file) {
-                        Ok(backup) => {
-                            log_event(
-                                &session.name,
-                                &format!(
-                                    "Session transcript failed to resume {} consecutive times within {:.1}s with missing session error ('{}') and identical size/mtime. Quarantined {} -> {} and starting fresh with --session-id.",
-                                    count,
-                                    session.resume_fail_uptime_secs,
-                                    RESUME_NOT_FOUND_ERROR,
-                                    session_file.display(),
-                                    backup.display()
-                                ),
-                            );
-                            *force_resume = false;
-                            resume_fail_tracker.reset();
-                        }
-                        Err(e) => {
-                            log_event(
-                                &session.name,
-                                &format!("Failed to quarantine stuck session transcript: {}", e),
-                            );
-                        }
-                    }
-                } else {
-                    log_event(
-                        &session.name,
-                        &format!(
-                            "Resume failed early with missing session error (consecutive fast resume failures: {}/{}); {} not quarantined (no decision yet), retrying next iteration.",
-                            count,
-                            session.resume_fail_quarantine_after,
-                            session_file.display()
-                        ),
-                    );
-                }
-            } else {
+        let fingerprint_after = get_transcript_fingerprint(&session_file);
+        if fingerprint_after.is_none() {
+            resume_fail_tracker.reset();
+        } else if let (Some(last_fp), Some(curr_fp)) = (
+            resume_fail_tracker.last_fingerprint(),
+            fingerprint_after.as_ref(),
+        ) {
+            if last_fp != curr_fp {
                 resume_fail_tracker.reset();
             }
         }
-        // Failures whose output does not contain the resume error neither count nor reset an existing streak.
-    } else if !is_resume || exit_code == Some(0) {
-        resume_fail_tracker.reset();
+
+        if is_resume && exit_code != Some(0) && uptime <= session.resume_fail_uptime_secs {
+            if output_contains_resume_not_found(&tail_str) {
+                if fingerprint_before.is_some() && fingerprint_after == fingerprint_before {
+                    let count = resume_fail_tracker.record_failure(fingerprint_after);
+                    if session.resume_fail_quarantine_after > 0
+                        && count >= session.resume_fail_quarantine_after
+                    {
+                        match quarantine_corrupt_session_file(&session_file) {
+                            Ok(backup) => {
+                                log_event(
+                                    &session.name,
+                                    &format!(
+                                        "Session transcript failed to resume {} consecutive times within {:.1}s with missing session error ('{}') and identical size/mtime. Quarantined {} -> {} and starting fresh with --session-id.",
+                                        count,
+                                        session.resume_fail_uptime_secs,
+                                        RESUME_NOT_FOUND_ERROR,
+                                        session_file.display(),
+                                        backup.display()
+                                    ),
+                                );
+                                *force_resume = false;
+                                resume_fail_tracker.reset();
+                            }
+                            Err(e) => {
+                                log_event(
+                                    &session.name,
+                                    &format!(
+                                        "Failed to quarantine stuck session transcript: {}",
+                                        e
+                                    ),
+                                );
+                            }
+                        }
+                    } else {
+                        log_event(
+                            &session.name,
+                            &format!(
+                                "Resume failed early with missing session error (consecutive fast resume failures: {}/{}); {} not quarantined (no decision yet), retrying next iteration.",
+                                count,
+                                session.resume_fail_quarantine_after,
+                                session_file.display()
+                            ),
+                        );
+                    }
+                } else {
+                    resume_fail_tracker.reset();
+                }
+            }
+            // Failures whose output does not contain the resume error neither count nor reset an existing streak.
+        } else if !is_resume || exit_code == Some(0) {
+            resume_fail_tracker.reset();
+        }
     }
 
     // Fix #1: clone state, release lock, THEN write file.
@@ -1530,8 +1626,10 @@ mod tests {
             name: name.to_string(),
             workdir: PathBuf::from("/tmp"),
             session_id: "id-test".to_string(),
+            engine: None,
             claude_binary: PathBuf::from("claude"),
             claude_args: vec![],
+            agy_binary: std::path::PathBuf::from("agy"),
             env: std::collections::HashMap::new(),
             session_file: None,
             transcript_path: None,

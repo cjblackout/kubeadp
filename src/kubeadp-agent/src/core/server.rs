@@ -684,22 +684,27 @@ async fn start_job(
     State(config): State<AppState>,
     ApiJson(req): ApiJson<StartRequest>,
 ) -> Response {
-    // HL-91 E3: engine selection for this job. The agy driver is the only job
-    // engine this pod hosts, so `agy` (and an absent engine) fall through to
-    // the existing command path; `claude` is a real engine this pod does not
-    // host yet (501, not a selection error); anything else is an engine the
-    // pod never registered (400 `unknown_engine` -- an unregistered engine is
-    // a selection error, never a 501; design 2.4). Under the reduced build
-    // without the `engine` feature no engine field is accepted and an explicit
-    // non-`agy` value answers the same contract through the trait mapping.
-    if let Some(engine) = req.engine.as_deref() {
+    // HL-91 E3/E5: engine selection for this job with the documented
+    // precedence -- request (`engine` in the body) > configured default
+    // (`default_engine` / `AGENT_RUN_DEFAULT_ENGINE`) > per-role default
+    // ("agy"). The effective engine is resolved BEFORE validation so the
+    // config default can route a job to `claude` without an explicit body
+    // field, and a bogus configured default fails with 400 `unknown_engine`
+    // just like a bogus request value (never a 501 -- a selection error,
+    // design 2.4).
+    let engine = req
+        .engine
+        .clone()
+        .or_else(|| config.default_engine.clone())
+        .or_else(|| Some("agy".to_string()));
+    if let Some(engine) = engine.as_deref() {
         match engine {
             "agy" => {}
             #[cfg(feature = "engine")]
             "claude" => {
-                return crate::engine::errors::to_response(
-                    &crate::engine::EngineError::unsupported("claude", "job.start"),
-                )
+                // claude is a registered job engine: accept it and let the
+                // engine-aware runner drive it (the row is built with
+                // `engine: claude`, `launch_background_job` branches on it).
             }
             #[cfg(not(feature = "engine"))]
             "claude" => {
@@ -765,7 +770,7 @@ async fn start_job(
         plan: req.plan,
         max_runtime: req.max_runtime,
         jobset_id: req.jobset_id,
-        engine: req.engine,
+        engine: engine.clone(),
     };
     let config = Arc::clone(&config);
     let output = run_blocking(move || commands::start::run(&config, &args)).await;
@@ -2289,6 +2294,7 @@ mod tests {
             started_at: None,
             hindsight_query: None,
             sandbox_info: None,
+            engine: None,
         }
     }
 
@@ -2726,6 +2732,7 @@ mod tests {
             workspace_root: tmp.join("ws"),
             state_root: tmp.join("state"),
             agy_path: agy.to_path_buf(),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
             ..Default::default()
         })
     }
@@ -3458,6 +3465,39 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "engine")]
+    async fn test_start_job_claude_request_reaches_command_path() {
+        // HL-91 E5 cross-use: with the `engine` feature the claude engine is a
+        // registered job engine, so an explicit `engine: "claude"` request is
+        // accepted by engine selection (never a 501 because of the engine) and
+        // fails later at the command layer for the missing project directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = router(
+            Arc::new(Config {
+                workspace_root: tmp.path().join("ws"),
+                state_root: tmp.path().join("state"),
+                agy_path: tmp.path().join("no-such-agy"),
+                claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+                ..Default::default()
+            }),
+            Arc::new(AuthManager::new()),
+        );
+        let res = app
+            .oneshot(post_json_request(
+                "/api/v1/jobs",
+                r#"{"project":"p","prompt":"hi","engine":"claude"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let text = body_string(res.into_body()).await;
+        assert!(
+            text.contains("project_not_found"),
+            "claude request must pass engine selection and fail later: {text}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "engine"))]
     async fn test_start_job_rejects_claude_with_501() {
         let app = test_router();
         let res = app
@@ -3507,6 +3547,7 @@ mod tests {
                 workspace_root: tmp.path().join("ws"),
                 state_root: tmp.path().join("state"),
                 agy_path: tmp.path().join("no-such-agy"),
+                claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
                 ..Default::default()
             }),
             Arc::new(AuthManager::new()),
@@ -3531,6 +3572,67 @@ mod tests {
                 "body {body} must pass engine selection and fail later: {text}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "engine")]
+    async fn test_start_job_config_default_engine_applies_without_request_field() {
+        // HL-91 E5 precedence: request engine > configured default >
+        // per-role default. With `default_engine = "claude"` and NO engine in
+        // the body the job is routed as a claude job (accepted by engine
+        // selection, then fails at the command layer for the missing project)
+        // -- never a 501. A bogus configured default answers 400
+        // `unknown_engine` (a selection error, never a 501).
+        let tmp = tempfile::tempdir().unwrap();
+
+        let app_claude_default = router(
+            Arc::new(Config {
+                workspace_root: tmp.path().join("ws1"),
+                state_root: tmp.path().join("state1"),
+                agy_path: tmp.path().join("no-such-agy"),
+                claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+                default_engine: Some("claude".to_string()),
+                ..Default::default()
+            }),
+            Arc::new(AuthManager::new()),
+        );
+        let res = app_claude_default
+            .oneshot(post_json_request(
+                "/api/v1/jobs",
+                r#"{"project":"p","prompt":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        let status = res.status();
+        let text = body_string(res.into_body()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert!(
+            text.contains("project_not_found"),
+            "claude default must reach the command layer: {text}"
+        );
+
+        let app_bogus = router(
+            Arc::new(Config {
+                workspace_root: tmp.path().join("ws2"),
+                state_root: tmp.path().join("state2"),
+                agy_path: tmp.path().join("no-such-agy"),
+                claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+                default_engine: Some("warp".to_string()),
+                ..Default::default()
+            }),
+            Arc::new(AuthManager::new()),
+        );
+        let res = app_bogus
+            .oneshot(post_json_request(
+                "/api/v1/jobs",
+                r#"{"project":"p","prompt":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let value: Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
+        assert_eq!(value["code"], "unknown_engine");
+        assert_eq!(value["engine"], "warp");
     }
 
     /// `POST /api/v1/jobsets/{id}/end` requires the operator bearer token (it

@@ -40,6 +40,13 @@ pub struct SessionState {
     pub last_exit_reason: Option<String>,
     pub status: SessionStatus,
     pub last_health_result: Option<String>,
+    /// The engine this session runs on (`"claude"`, `"agy"`, ...). `None`
+    /// for sessions created before engine selection existed (they are claude
+    /// sessions by definition). Resolved from request > config > role default
+    /// at start (HL-91 E1 §3.1) and persisted so the session survives a
+    /// restart on the same engine (HL-91 E5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
 }
 
 impl SessionState {
@@ -54,6 +61,7 @@ impl SessionState {
             last_exit_reason: None,
             status: SessionStatus::Starting,
             last_health_result: None,
+            engine: None,
         }
     }
 }
@@ -280,6 +288,36 @@ mod tests {
         assert_eq!(read.supervisor_pid, 42);
         assert_eq!(read.sessions["sess1"].status, SessionStatus::Running);
         assert_eq!(read.sessions["sess1"].pid, Some(1001));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_session_engine_persists_across_atomic_write_read() {
+        let temp_dir = env::temp_dir().join(format!("test_state_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let state_path = temp_dir.join("state.json");
+
+        // A session created with an explicit engine round-trips the field.
+        let mut state = SupervisorState::new(42);
+        let mut sess = SessionState::new("sess-agy".to_string());
+        sess.engine = Some("agy".to_string());
+        state.sessions.insert("sess-agy".to_string(), sess);
+
+        write_state_atomic(&state_path, &state).expect("Atomic write must succeed");
+        let read = read_state(&state_path).expect("Read state must succeed");
+        assert_eq!(
+            read.sessions["sess-agy"].engine.as_deref(),
+            Some("agy"),
+            "the persisted session engine must survive a state file round-trip"
+        );
+
+        // A pre-selection session (engine absent) still deserialises: the
+        // field defaults to None like today.
+        let legacy = r#"{"supervisor_pid":42,"heartbeat":"2026-01-01T00:00:00Z","heartbeat_epoch":0,"status":"running","sessions":{"old":{"name":"old","pid":null,"start_time":null,"start_time_epoch":null,"uptime_secs":null,"restart_count":0,"last_exit_reason":null,"status":"starting","last_health_result":null}}}"#;
+        let legacy_state = serde_json::from_str::<SupervisorState>(legacy)
+            .expect("a legacy state file without an engine field must deserialise");
+        assert_eq!(legacy_state.sessions["old"].engine, None);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

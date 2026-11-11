@@ -50,6 +50,7 @@
 //!   workspace_root          -> AGENT_RUN_WORKSPACE_ROOT
 //!   jobs_dir_name           -> AGENT_RUN_JOBS_DIR_NAME
 //!   agy_path                -> AGENT_RUN_AGY_PATH
+//!   claude_path             -> AGENT_RUN_CLAUDE_PATH
 //!   default_model           -> AGENT_RUN_DEFAULT_MODEL
 //!   default_effort          -> AGENT_RUN_DEFAULT_EFFORT
 //!   default_base_branch     -> AGENT_RUN_DEFAULT_BASE_BRANCH
@@ -286,6 +287,7 @@ fn var_for_section_key(section: &str, key: &str) -> Option<String> {
         ("worker", "workspace_root") => Some("AGENT_RUN_WORKSPACE_ROOT".to_string()),
         ("worker", "jobs_dir_name") => Some("AGENT_RUN_JOBS_DIR_NAME".to_string()),
         ("worker", "agy_path") => Some("AGENT_RUN_AGY_PATH".to_string()),
+        ("worker", "claude_path") => Some("AGENT_RUN_CLAUDE_PATH".to_string()),
         ("worker", "default_model") => Some("AGENT_RUN_DEFAULT_MODEL".to_string()),
         ("worker", "default_effort") => Some("AGENT_RUN_DEFAULT_EFFORT".to_string()),
         ("worker", "default_base_branch") => Some("AGENT_RUN_DEFAULT_BASE_BRANCH".to_string()),
@@ -413,6 +415,7 @@ fn section_keys(section: &str) -> Vec<&'static str> {
             "workspace_root",
             "jobs_dir_name",
             "agy_path",
+            "claude_path",
             "default_model",
             "default_effort",
             "default_base_branch",
@@ -861,6 +864,16 @@ a2a_live_idle_secs = 300
             vars.get("AGENT_ORCHESTRATE_DEFAULT_SESSION_ENGINE")
                 .map(|s| s.as_str()),
             Some("agy")
+        );
+    }
+
+    #[test]
+    fn test_claude_path_key_maps_to_env() {
+        // HL-91 E5: the worker's claude job engine binary path.
+        let vars = parse("[worker]\nclaude_path = \"/opt/claude/bin/claude\"\n");
+        assert_eq!(
+            vars.get("AGENT_RUN_CLAUDE_PATH").map(|s| s.as_str()),
+            Some("/opt/claude/bin/claude")
         );
     }
 }
