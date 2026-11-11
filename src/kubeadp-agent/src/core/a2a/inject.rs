@@ -1,33 +1,18 @@
-//! The A2A injection framework (design HL-113 §7.14, phase 1).
+//! The A2A injection framework (design HL-113 §7.14): the harness puts a
+//! queued A2A message into the run's model context through the engine's
+//! native channel; the injection is the acknowledgement. This module holds
+//! the framed-block join with the response byte cap and the hook JSON of the
+//! `hook` channel, printed by the `kubeadp-agent a2a-hook <event>`
+//! subcommand ([`run_a2a_hook`]). The `tool_result` channel lives in
+//! [`crate::mcp_a2a`]; the `idle_turn`/`interrupt` channels are driven by
+//! the escalation ladder ([`crate::core::a2a::delivery`]).
 //!
-//! The harness puts a queued A2A message into the run's model context at the
-//! earliest safe boundary, through the engine's native context channel; the
-//! injection is the acknowledgement. The channels are declared per engine by
-//! the capability `a2a.inject` ([`InjectChannel`]); this module holds the
-//! pieces every channel shares:
-//!
-//! - the framed-block join with the response byte cap (the injected text is
-//!   always the framed `--- A2A INCOMING MESSAGE ---` block, untrusted data,
-//!   size-capped);
-//! - the hook JSON of the `hook` channel, printed by the
-//!   `kubeadp-agent a2a-hook <event>` subcommand ([`run_a2a_hook`]): the
-//!   subcommand reads the run's inbox, marks the messages injected and prints
-//!   the hook output so the message lands in the model's context at the next
-//!   boundary (nothing is killed).
-//!
-//! The `tool_result` channel lives in [`crate::mcp_a2a`] (the harness-owned
-//! MCP server appends the queued messages to its tool results and
-//! `wait_message` is a blocking receive). The `idle_turn` and `interrupt`
-//! channels are the phase-2 delivery ladder.
-//!
-//! The hook output formats are the contract of the `hook` channel (design
-//! §7.14): the Claude Code events PostToolUse and UserPromptSubmit return
-//! `{"hookSpecificOutput":{"hookEventName":..,"additionalContext":..}}`,
-//! Stop returns `{"decision":"block","reason":..}` so a session about to end
-//! its turn continues with the message instead; agy's verified native
-//! `pre-invocation` (the agy plugin `PreInvocation` hook, which runs before
-//! every model call) returns
-//! `{"injectSteps":[{"systemMessage":{"systemMessage":..}}]}`.
+//! Hook formats: Claude PostToolUse/UserPromptSubmit return
+//! `hookSpecificOutput.additionalContext`, Stop returns
+//! `{"decision":"block",...}` (the session continues with the message); agy
+//! `pre-invocation` returns `injectSteps` (or `{}` when empty),
+//! `post-invocation` adds `terminationBehavior: force_continue` (the agy
+//! `idle_turn` channel) and `stop` returns `{"decision":"continue",...}`.
 
 use std::io::Write;
 
@@ -60,9 +45,14 @@ pub fn join_framed(messages: &[QueuedMessage]) -> String {
 /// - agy `pre-invocation`: the native agy plugin `PreInvocation` hook (runs
 ///   before every model call, so right after each tool result); its stdout
 ///   `injectSteps` system message is put into the model's context.
+/// - agy `post-invocation`: re-enters the loop with `injectSteps` plus
+///   `terminationBehavior: force_continue` (the agy `idle_turn` channel).
+/// - agy `stop`: `decision: continue` with the messages as the `reason`
+///   (the agy idle-turn channel at the Stop boundary).
 ///
 /// An unknown event is an error (the contract events are the design's three
-/// Claude Code events plus agy's verified `pre-invocation`).
+/// Claude Code events plus agy's verified `pre-invocation`/`post-invocation`/
+/// `stop`).
 pub fn hook_json(event: &str, framed: &str) -> Result<serde_json::Value, String> {
     match event {
         "PostToolUse" | "UserPromptSubmit" => Ok(serde_json::json!({
@@ -80,31 +70,62 @@ pub fn hook_json(event: &str, framed: &str) -> Result<serde_json::Value, String>
                 { "systemMessage": { "systemMessage": framed } }
             ]
         })),
+        "post-invocation" => Ok(serde_json::json!({
+            "injectSteps": [
+                { "systemMessage": { "systemMessage": framed } }
+            ],
+            "terminationBehavior": "force_continue",
+        })),
+        "stop" => Ok(serde_json::json!({
+            "decision": "continue",
+            "reason": framed,
+        })),
         other => Err(format!(
-            "unknown a2a-hook event '{other}' (expected PostToolUse, UserPromptSubmit, Stop or pre-invocation)"
+            "unknown a2a-hook event '{other}' (expected PostToolUse, UserPromptSubmit, Stop, pre-invocation, post-invocation or stop)"
         )),
     }
 }
 
+/// The injection channel a hook event delivers through (the inbox marker's
+/// `channel` field). The mid-turn hooks (PostToolUse, UserPromptSubmit,
+/// agy's PreInvocation) are the `hook` channel; the turn-boundary hooks that
+/// re-enter the loop (Claude Code's Stop, agy's PostInvocation/Stop) are the
+/// `idle_turn` channel.
+fn event_channel(event: &str) -> &'static str {
+    match event {
+        "Stop" | "post-invocation" | "stop" => InjectChannel::IdleTurn.as_str(),
+        _ => InjectChannel::Hook.as_str(),
+    }
+}
+
+/// Whether an event is an agy native plugin hook: agy expects a JSON object
+/// on stdout for every invocation, so an empty inbox prints `{}` (which
+/// injects nothing) instead of no output.
+fn is_agy_event(event: &str) -> bool {
+    matches!(event, "pre-invocation" | "post-invocation" | "stop")
+}
+
 /// The `kubeadp-agent a2a-hook <PostToolUse|UserPromptSubmit|Stop|
-/// pre-invocation>` subcommand (the `hook` channel, design HL-113 §7.14):
-/// reads the run's inbox directory (named by `KUBEADP_A2A_INBOX_DIR`), marks
-/// the queued messages injected through the hook channel and prints the hook
-/// JSON to stdout.
+/// pre-invocation|post-invocation|stop>` subcommand (the `hook` channel,
+/// design HL-113 §7.14): reads the run's inbox directory (named by
+/// `KUBEADP_A2A_INBOX_DIR`), marks the queued messages injected through the
+/// event's channel and prints the hook JSON to stdout.
 ///
-/// Empty inbox (or no inbox directory configured): no output, exit 0 -- a
-/// hook that prints nothing injects nothing and the engine proceeds
-/// normally. An unknown event or a write error: the reason on stderr, exit 2.
+/// Claude Code events print nothing and exit 0 on an empty inbox (a hook
+/// that prints nothing injects nothing). The agy native plugin events print
+/// `{}` on an empty inbox (agy parses the stdout of every invocation; `{}`
+/// injects nothing). An unknown event or a write error: the reason on
+/// stderr, exit 2.
 pub fn run_a2a_hook(args: &[String]) -> i32 {
     let Some(event) = args.first() else {
         eprintln!(
-            "usage: kubeadp-agent a2a-hook <PostToolUse|UserPromptSubmit|Stop|pre-invocation>"
+            "usage: kubeadp-agent a2a-hook <PostToolUse|UserPromptSubmit|Stop|pre-invocation|post-invocation|stop>"
         );
         return 2;
     };
     if args.len() > 1 {
         eprintln!(
-            "usage: kubeadp-agent a2a-hook <PostToolUse|UserPromptSubmit|Stop|pre-invocation>"
+            "usage: kubeadp-agent a2a-hook <PostToolUse|UserPromptSubmit|Stop|pre-invocation|post-invocation|stop>"
         );
         return 2;
     }
@@ -112,21 +133,31 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
     // usage error even when nothing is queued.
     if !matches!(
         event.as_str(),
-        "PostToolUse" | "UserPromptSubmit" | "Stop" | "pre-invocation"
+        "PostToolUse" | "UserPromptSubmit" | "Stop" | "pre-invocation" | "post-invocation" | "stop"
     ) {
         eprintln!(
-            "kubeadp-agent (a2a-hook): unknown event '{event}' (expected PostToolUse, UserPromptSubmit, Stop or pre-invocation)"
+            "kubeadp-agent (a2a-hook): unknown event '{event}' (expected PostToolUse, UserPromptSubmit, Stop, pre-invocation, post-invocation or stop)"
         );
         return 2;
     }
     let Some(inbox) = Inbox::from_env() else {
         // No inbox for this run (KUBEADP_A2A_INBOX_DIR unset): nothing to
-        // inject, the hook is a no-op.
-        return 0;
+        // inject. The agy events still print `{}` (agy parses the stdout of
+        // every hook invocation).
+        return if is_agy_event(event) {
+            print_agy_empty()
+        } else {
+            0
+        };
     };
-    let messages = inbox.drain_capped(InjectChannel::Hook.as_str(), MAX_INJECT_BYTES);
+    let channel = event_channel(event);
+    let messages = inbox.drain_capped(channel, MAX_INJECT_BYTES);
     if messages.is_empty() {
-        return 0;
+        return if is_agy_event(event) {
+            print_agy_empty()
+        } else {
+            0
+        };
     }
     let framed = join_framed(&messages);
     match hook_json(event, &framed) {
@@ -149,6 +180,24 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
         }
         Err(e) => {
             eprintln!("kubeadp-agent (a2a-hook): {e}");
+            2
+        }
+    }
+}
+
+/// Prints the empty agy hook object (`{}`): agy parses the stdout of every
+/// plugin hook invocation, and `{}` injects nothing.
+fn print_agy_empty() -> i32 {
+    let mut out = std::io::stdout();
+    match (writeln!(out, "{{}}"), out.flush()) {
+        (Ok(()), Ok(())) => 0,
+        (e, f) => {
+            if e.is_err() {
+                eprintln!("kubeadp-agent (a2a-hook): failed to write the hook output: {e:?}");
+            }
+            if f.is_err() {
+                eprintln!("kubeadp-agent (a2a-hook): failed to flush stdout: {f:?}");
+            }
             2
         }
     }
@@ -213,8 +262,27 @@ mod tests {
                 ]
             })
         );
+        // agy post-invocation: injectSteps plus the force_continue
+        // termination behavior (the agy idle-turn channel).
+        let v = hook_json("post-invocation", "MSG").unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "injectSteps": [
+                    { "systemMessage": { "systemMessage": "MSG" } }
+                ],
+                "terminationBehavior": "force_continue",
+            })
+        );
+        // agy stop: decision continue with the messages as the reason.
+        let v = hook_json("stop", "MSG").unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "decision": "continue", "reason": "MSG" })
+        );
         // An unknown event is an error, never a guessed shape.
         assert!(hook_json("PreToolUse", "MSG").is_err());
+        assert!(hook_json("SessionStart", "MSG").is_err());
     }
 
     #[test]
@@ -238,7 +306,7 @@ mod tests {
     fn run_a2a_hook_is_silent_on_an_empty_or_absent_inbox() {
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // No inbox configured at all.
+        // No inbox configured at all: the Claude events print nothing.
         std::env::remove_var(crate::core::a2a::inbox::INBOX_ENV);
         assert_eq!(run_a2a_hook(&["Stop".to_string()]), 0);
         // An existing, empty inbox.
@@ -256,5 +324,24 @@ mod tests {
         assert_eq!(bad_event, 2);
         assert_eq!(bad_args, 2);
         assert_eq!(no_args, 2);
+    }
+
+    #[test]
+    fn run_a2a_hook_marks_injected_through_the_events_channel() {
+        // The mid-turn hooks (PostToolUse, UserPromptSubmit, agy's
+        // pre-invocation) inject through the `hook` channel; the
+        // turn-boundary hooks that re-enter the loop (Claude's Stop, agy's
+        // post-invocation/stop) inject through the `idle_turn` channel.
+        assert_eq!(event_channel("PostToolUse"), "hook");
+        assert_eq!(event_channel("UserPromptSubmit"), "hook");
+        assert_eq!(event_channel("pre-invocation"), "hook");
+        assert_eq!(event_channel("Stop"), "idle_turn");
+        assert_eq!(event_channel("post-invocation"), "idle_turn");
+        assert_eq!(event_channel("stop"), "idle_turn");
+        assert!(!is_agy_event("Stop"));
+        assert!(!is_agy_event("PostToolUse"));
+        for event in ["pre-invocation", "post-invocation", "stop"] {
+            assert!(is_agy_event(event), "{event}");
+        }
     }
 }

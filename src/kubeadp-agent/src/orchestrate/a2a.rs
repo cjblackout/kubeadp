@@ -9,17 +9,36 @@
 //!   - `Backoff` -> `Working`
 //!   - `Stopped` -> `Completed` (or `Canceled` if paused/controlled)
 //!   - `Failed` -> `Failed`
-//! - `list_tasks` lists sessions (matching optional context_id and state filters)
-//! - `get_task` returns the session as an `A2aTask`
-//! - `cancel_task` stops the session (reusing the stop path)
+//!   - an inbound message queued in the session's inbox -> `Submitted`
+//!     (the sender's task state while the message waits for a boundary;
+//!     design HL-113 §7.14)
+//! - `list_tasks`/`get_task`/`cancel_task`: list, lookup, stop the session.
+//!
+//! Inbound delivery is the escalation ladder of design §7.14 (phase 2,
+//! [`crate::core::a2a::delivery`]): an accepted message is enqueued into the
+//! session's durable inbox (queued -> sender task `submitted`), the hook
+//! channel (the session's Claude Code hook settings,
+//! [`crate::orchestrate::claude_config::ensure_a2a_hooks`]) injects it at the
+//! next tool call / prompt / turn boundary, and the ladder escalates to the
+//! `idle_turn` step (the queued PTY input) after `a2a_ack_secs` with the
+//! session running and to the `interrupt` step immediately for
+//! `interrupt: true` or past `a2a_force_secs`. Default: never kill (nothing
+//! is killed on the session path; a PTY write queues the input).
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use crate::core::a2a::delivery::{sender_task_state, LadderConfig, LadderStep, SenderTaskState};
+use crate::core::a2a::inbox::{Inbox, QueuedMessage};
+use crate::core::a2a::inject::join_framed;
+use crate::core::a2a::DeliveryMeta;
 use crate::core::a2a::{
     advertised_url, pod_name, role_description, role_skills, A2AError, A2aModel, A2aTask,
     AuthVerifier, TaskBackend, ROLE_ORCHESTRATOR,
 };
+use crate::engine::capability::InjectChannel;
 use crate::orchestrate::sessions_api;
 use a2a::TaskState;
 use axum::Router;
@@ -27,21 +46,35 @@ use axum::Router;
 use crate::orchestrate::session_control::{set_paused, SessionControlRegistry};
 use crate::orchestrate::state::{SessionState, SessionStatus, SupervisorState};
 
+/// How often the escalation-ladder watcher re-evaluates a session's inbox.
+const LADDER_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Backend implementing [`TaskBackend`] over supervisor sessions.
 pub struct SupervisorTaskBackend {
     supervisor_state: Arc<std::sync::Mutex<SupervisorState>>,
     controls: SessionControlRegistry,
+    /// Root under which each session's durable inbox lives (the sender's
+    /// task-state mapping: queued messages mean `submitted`, an expiry
+    /// marker fails the task). Shared with the message sink.
+    a2a_inbox_root: PathBuf,
 }
 
 impl SupervisorTaskBackend {
     pub fn new(
         supervisor_state: Arc<std::sync::Mutex<SupervisorState>>,
         controls: SessionControlRegistry,
+        a2a_inbox_root: PathBuf,
     ) -> Self {
         Self {
             supervisor_state,
             controls,
+            a2a_inbox_root,
         }
+    }
+
+    /// The session's durable inbox directory.
+    fn inbox_dir(&self, session: &str) -> PathBuf {
+        crate::core::a2a::inbox::inbox_dir_for(&self.a2a_inbox_root, session)
     }
 
     fn session_to_a2a_task(&self, sess: &SessionState) -> A2aTask {
@@ -50,16 +83,33 @@ impl SupervisorTaskBackend {
             .as_ref()
             .is_some_and(|c| c.paused.load(Ordering::SeqCst));
 
-        let state = map_session_status(sess.status, paused);
+        let mut state = map_session_status(sess.status, paused);
         let status_message = sess
             .last_health_result
             .clone()
             .or_else(|| sess.last_exit_reason.clone());
-        let error = if sess.status == SessionStatus::Failed {
+        let mut error = if sess.status == SessionStatus::Failed {
             sess.last_exit_reason.clone()
         } else {
             None
         };
+
+        // The escalation ladder (design HL-113 §7.14, phase 2): while an
+        // inbound message is queued for the session the sender's task is
+        // `submitted`; once injected the normal mapping applies; a durable
+        // expiry marker fails the task with its clear reason.
+        {
+            let inbox = Inbox::new(self.inbox_dir(&sess.name));
+            let expiry = crate::core::a2a::delivery::read_expiry(&self.inbox_dir(&sess.name));
+            match sender_task_state(inbox.pending_count(), expiry.as_ref()) {
+                SenderTaskState::Submitted => state = TaskState::Submitted,
+                SenderTaskState::Failed { reason } => {
+                    state = TaskState::Failed;
+                    error = Some(reason);
+                }
+                SenderTaskState::Working => {}
+            }
+        }
 
         A2aTask {
             id: sess.name.clone(),
@@ -163,51 +213,216 @@ impl TaskBackend for SupervisorTaskBackend {
     }
 }
 
-/// A2A `SendMessage` sink that delivers text into a supervised session via
-/// the shared [`crate::orchestrate::sessions_api::deliver_message`] core, so
-/// the A2A path and the REST `POST /api/v1/sessions/{name}/message` path
-/// share the same session lookup, bracketed-paste writing and per-session
-/// rate budget.
+/// A2A `SendMessage` sink: the message is enqueued into the session's
+/// durable inbox and delivered by the escalation ladder (design §7.14,
+/// phase 2). The hook settings inject at the next boundary; the watcher
+/// escalates to the queued PTY input past `a2a_ack_secs` with the session
+/// running, or immediately for `interrupt: true` / past `a2a_force_secs`.
+/// Nothing is killed.
 struct SessionMessageSink {
     state: Arc<sessions_api::SessionsApiState>,
+    /// Root under which each session's durable inbox lives.
+    inbox_root: PathBuf,
+    /// The escalation-ladder configuration.
+    ladder: LadderConfig,
+    /// The escalation-ladder watchers (one per session).
+    ladders: Mutex<HashMap<String, Arc<()>>>,
 }
 
 impl SessionMessageSink {
-    fn new(state: Arc<sessions_api::SessionsApiState>) -> Self {
-        Self { state }
+    fn new(
+        state: Arc<sessions_api::SessionsApiState>,
+        inbox_root: PathBuf,
+        ladder: LadderConfig,
+    ) -> Self {
+        Self {
+            state,
+            inbox_root,
+            ladder,
+            ladders: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The session's durable inbox directory.
+    fn inbox_dir(&self, session: &str) -> PathBuf {
+        crate::core::a2a::inbox::inbox_dir_for(&self.inbox_root, session)
+    }
+
+    /// One ladder pass for the session: computes the step for the oldest
+    /// pending message and applies it (the queued PTY input). A free function
+    /// over the shared state pieces so the watcher thread needs no handle on
+    /// the sink.
+    fn ladder_pass(
+        state: &sessions_api::SessionsApiState,
+        inbox_root: &std::path::Path,
+        ladder: &LadderConfig,
+        session: &str,
+        interrupt: bool,
+    ) -> LadderStep {
+        let inbox_dir = crate::core::a2a::inbox::inbox_dir_for(inbox_root, session);
+        // An already-expired message is never delivered (the marker decides).
+        if let Some(record) = crate::core::a2a::delivery::read_expiry(&inbox_dir) {
+            return LadderStep::Expired {
+                reason: record.reason,
+            };
+        }
+        // The inbox is read WITHOUT its own TTL filter: the ladder applies
+        // the TTL itself so the expiry marker is recorded first.
+        let inbox = Inbox::with_ttl(&inbox_dir, u64::MAX);
+        let pending = inbox.pending();
+        if pending.is_empty() {
+            return LadderStep::Injected;
+        }
+        let running = {
+            let st = state
+                .supervisor_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            st.sessions
+                .get(session)
+                .is_some_and(|s| s.status == SessionStatus::Running)
+        };
+        let step =
+            crate::core::a2a::delivery::next_step(&crate::core::a2a::delivery::LadderInput {
+                now: crate::core::a2a::inbox::now_unix(),
+                queued_at: pending[0].queued_at,
+                interrupt,
+                idle_turn_available: running,
+                expired: false,
+                config: ladder,
+            });
+        match step {
+            LadderStep::Expired { reason } => {
+                crate::core::a2a::delivery::record_expiry(
+                    &inbox_dir,
+                    &pending[0].message_id,
+                    &reason,
+                );
+                LadderStep::Expired { reason }
+            }
+            LadderStep::IdleTurn | LadderStep::Interrupt => {
+                // The queued PTY input (design §7.14: "queued PTY input or
+                // the Stop hook"). A bracketed paste queues the message as
+                // the next user input; nothing is killed. NotRunning / a
+                // throttled budget keeps the message queued.
+                let joined = join_framed(&pending);
+                let channel = match step {
+                    LadderStep::Interrupt => InjectChannel::Interrupt,
+                    _ => InjectChannel::IdleTurn,
+                };
+                if let sessions_api::DeliverOutcome::Accepted { .. } =
+                    sessions_api::deliver_message(state, session, &pending[0].sender, &joined)
+                {
+                    inbox.drain(channel.as_str());
+                }
+                step
+            }
+            other => other,
+        }
+    }
+
+    /// Ensures the ladder watcher is running for the session (one per
+    /// session; the watcher exits when the inbox drains or expires).
+    fn ensure_ladder(&self, session: &str) {
+        let mut ladders = self.ladders.lock().expect("ladders lock poisoned");
+        ladders.retain(|_, guard| Arc::strong_count(guard) > 1);
+        if ladders.contains_key(session) {
+            return;
+        }
+        let guard = Arc::new(());
+        ladders.insert(session.to_string(), Arc::clone(&guard));
+        drop(ladders);
+        let state = Arc::clone(&self.state);
+        let inbox_root = self.inbox_root.clone();
+        let ladder = self.ladder;
+        let name = session.to_string();
+        let _ = std::thread::Builder::new()
+            .name(format!("a2a-ladder-{name}"))
+            .spawn(move || {
+                loop {
+                    let step =
+                        Self::ladder_pass(state.as_ref(), &inbox_root, &ladder, &name, false);
+                    match step {
+                        LadderStep::Injected | LadderStep::Expired { .. } => break,
+                        _ => std::thread::sleep(LADDER_POLL),
+                    }
+                }
+                drop(guard);
+            });
     }
 }
 
 impl crate::core::a2a::MessageSink for SessionMessageSink {
-    fn deliver(
+    fn deliver_with_meta(
         &self,
         task_id: &str,
         sender: &str,
         text: &str,
-        _message_id: &str,
+        message_id: &str,
+        meta: DeliveryMeta,
     ) -> Result<(), a2a::A2AError> {
         use a2a::A2AError;
         // Runs on the tokio blocking pool (the handler wraps the call in
-        // spawn_blocking), so the deadline-bounded PTY write never occupies a
-        // worker thread. Shares the same state/rate limiter as the REST path.
-        // The session path deduplicates on (session, sender) budget, not on the
-        // A2A message id, so `message_id` is not used here.
-        match sessions_api::deliver_message(&self.state, task_id, sender, text) {
-            sessions_api::DeliverOutcome::Accepted { .. } => Ok(()),
-            sessions_api::DeliverOutcome::NotFound => Err(A2AError::task_not_found(task_id)),
-            sessions_api::DeliverOutcome::Empty => {
-                Err(A2AError::invalid_params("message text must not be empty"))
+        // spawn_blocking). The session path deduplicates on (session, sender)
+        // budget in the PTY-write escalation, not on the A2A message id; the
+        // durable inbox is the dedupe store.
+        {
+            let st = self
+                .state
+                .supervisor_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !st.sessions.contains_key(task_id) {
+                return Err(A2AError::task_not_found(task_id));
             }
-            sessions_api::DeliverOutcome::TooLarge => {
-                Err(A2AError::invalid_params("message text is too large"))
-            }
-            sessions_api::DeliverOutcome::RateLimited { .. } => {
-                Err(A2AError::invalid_params("session message budget exhausted"))
-            }
-            sessions_api::DeliverOutcome::NotRunning => Err(A2AError::invalid_params(
-                "session is not running and has no live input",
-            )),
         }
+
+        // The shared per-(session, sender) message budget (the SAME limiter
+        // the REST POST .../message path uses) is charged at the acceptance
+        // point: a throttled delivery is rejected and the sender retries.
+        {
+            let mut limits = self
+                .state
+                .message_limits
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(_retry_after) = limits.record(task_id, sender, std::time::Instant::now()) {
+                return Err(A2AError::invalid_params("session message budget exhausted"));
+            }
+        }
+
+        // Enqueue into the session's durable inbox. A fresh delivery
+        // supersedes an expiry recorded for an earlier message.
+        let inbox_dir = self.inbox_dir(task_id);
+        crate::core::a2a::delivery::clear_expiry(&inbox_dir);
+        Inbox::new(&inbox_dir)
+            .enqueue(QueuedMessage {
+                message_id: message_id.to_string(),
+                sender: sender.to_string(),
+                hop: meta.hop,
+                context_id: None,
+                task_id: None,
+                framed: text.to_string(),
+                queued_at: crate::core::a2a::inbox::now_unix(),
+            })
+            .map(|_| ())
+            .map_err(|e| {
+                A2AError::internal(format!(
+                    "failed to enqueue the A2A message into the session inbox: {e}"
+                ))
+            })?;
+
+        // The explicit escalation (interrupt: true): the PTY input now.
+        if meta.interrupt {
+            let inbox = Inbox::with_ttl(&inbox_dir, u64::MAX);
+            let joined = join_framed(&inbox.pending());
+            let _ = sessions_api::deliver_message(&self.state, task_id, sender, &joined);
+            inbox.drain(InjectChannel::Interrupt.as_str());
+            return Ok(());
+        }
+
+        self.ensure_ladder(task_id);
+        Ok(())
     }
 }
 
@@ -223,6 +438,8 @@ pub fn a2a_router(
     api_state: Arc<sessions_api::SessionsApiState>,
     auth: Option<AuthVerifier>,
     jobset: Option<crate::core::a2a::JobsetCred>,
+    a2a_inbox_root: PathBuf,
+    ladder: LadderConfig,
 ) -> Router {
     // The agent card identifies the RUNNING POD (not the retired
     // agent-orchestrate image): the name is the pod's own name, the
@@ -238,8 +455,12 @@ pub fn a2a_router(
         url: advertised_url(&format!("http://{listen}")),
     };
 
-    let sink = Arc::new(SessionMessageSink::new(api_state));
-    let backend = Arc::new(SupervisorTaskBackend::new(state, controls));
+    let sink = Arc::new(SessionMessageSink::new(
+        api_state,
+        a2a_inbox_root.clone(),
+        ladder,
+    ));
+    let backend = Arc::new(SupervisorTaskBackend::new(state, controls, a2a_inbox_root));
     crate::core::a2a::a2a_router_with_jobset(model, backend, Some(sink), auth, jobset)
 }
 
@@ -300,7 +521,11 @@ mod tests {
             },
         )));
 
-        let backend = Arc::new(SupervisorTaskBackend::new(st.clone(), controls.clone()));
+        let backend = Arc::new(SupervisorTaskBackend::new(
+            st.clone(),
+            controls.clone(),
+            std::path::PathBuf::from("/tmp/test-a2a-inbox-root-0"),
+        ));
         (backend, st, controls)
     }
 
@@ -432,6 +657,8 @@ mod tests {
                 api_state,
                 None,
                 None,
+                std::path::PathBuf::from("/tmp/test-a2a-inbox-root-1"),
+                Default::default(),
             )
         };
 
@@ -513,6 +740,8 @@ mod tests {
             api_state,
             Some(auth_verifier),
             None,
+            std::path::PathBuf::from("/tmp/test-a2a-inbox-root-2"),
+            Default::default(),
         );
 
         // Agent card is public even with auth configured
@@ -583,7 +812,15 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .put(pty.master);
 
-        let app = a2a_router(st.clone(), controls.clone(), api_state.clone(), None, None);
+        let app = a2a_router(
+            st.clone(),
+            controls.clone(),
+            api_state.clone(),
+            None,
+            None,
+            std::path::PathBuf::from("/tmp/test-a2a-inbox-root-3"),
+            Default::default(),
+        );
 
         let send = |id: u32| -> String {
             format!(

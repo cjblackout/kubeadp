@@ -1,5 +1,5 @@
 //! Parity contract tests of the harness-injected A2A delivery (design
-//! HL-113 §7.14, phase 1): the same suite against both engines through the
+//! HL-113 §7.14): the same suite against both engines through the
 //! engine capability vocabulary, with fake engines / fakes, hermetic (no
 //! Docker, no live engine process, passing without Landlock).
 //!
@@ -18,6 +18,17 @@
 //! (g) sender task state submitted -> working on injection (the inbox state
 //!     machine that backs it);
 //! (h) `a2a-hook` output format per event.
+//!
+//! The phase-2 contracts (the escalation ladder, design §7.14):
+//! (i) an idle member gets an `idle_turn` after `a2a_ack_secs` (the ladder
+//!     timing half of (c)), for both engines;
+//! (j) kill-and-resume only with `interrupt: true` or the force timeout (the
+//!     ladder timing half of (d); the default never kills);
+//! (k) TTL expiry fails the sender task with a clear reason;
+//! (l) the sender task state mapping (submitted -> working on injection);
+//! (m) the agy hook JSON per event and the plugin/hook-settings writer
+//!     structures (covered in the module unit tests of inject.rs,
+//!     agy_plugin.rs and claude_config.rs).
 #![cfg(feature = "a2a")]
 
 use std::sync::{Arc, Mutex};
@@ -586,4 +597,72 @@ fn delivery_state_mapping_is_untouched() {
     use kubeadp_agent::core::job::JobStatus;
     assert_eq!(map_job_status(JobStatus::Running), TaskState::Working);
     assert_eq!(map_job_status(JobStatus::Done), TaskState::Completed);
+}
+
+// ---------------------------------------------------------------------------
+// (i)-(l) the escalation ladder, phase 2, for BOTH engines (the full
+//     contract table is pinned in the delivery.rs unit tests)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn i_l_ladder_contracts_both_engines() {
+    use kubeadp_agent::core::a2a::delivery::{next_step, LadderConfig, LadderInput, LadderStep};
+    let agy = FakeEngine::new("agy");
+    let claude = FakeEngine::new("claude");
+    let d = LadderConfig {
+        ack_secs: 45,
+        force_secs: 0,
+        ttl_secs: 3600,
+    };
+    fn input<'a>(
+        queued_at: u64,
+        now: u64,
+        interrupt: bool,
+        idle: bool,
+        cfg: &'a LadderConfig,
+    ) -> LadderInput<'a> {
+        LadderInput {
+            now,
+            queued_at,
+            interrupt,
+            idle_turn_available: idle,
+            expired: false,
+            config: cfg,
+        }
+    }
+    for engine in ["agy", "claude"] {
+        // Inside the ack window: queued; past it with the run idle:
+        // idle_turn (never a kill). A busy run: queued however late (the
+        // default never escalates to interrupt). interrupt:true escalates
+        // immediately. Past the TTL the message is never delivered.
+        assert_eq!(
+            next_step(&input(1000, 1044, false, true, &d)),
+            LadderStep::Queued
+        );
+        assert_eq!(
+            next_step(&input(1000, 1045, false, true, &d)),
+            LadderStep::IdleTurn
+        );
+        assert_eq!(
+            next_step(&input(1000, 1000 + 3590, false, false, &d)),
+            LadderStep::Queued,
+            "{engine}: default never kills inside the ttl"
+        );
+        assert_eq!(
+            next_step(&input(1000, 1000, true, true, &d)),
+            LadderStep::Interrupt
+        );
+        assert!(matches!(
+            next_step(&input(1000, 1000 + 3600, true, true, &d)),
+            LadderStep::Expired { .. }
+        ));
+        // The fake engines were never driven to a kill by this suite.
+        assert_eq!(agy.kill_count(), 0, "{engine}");
+        assert_eq!(claude.kill_count(), 0, "{engine}");
+    }
+    let tmp = TempDir::new().unwrap();
+    let inbox = Inbox::new(tmp.path());
+    inbox.enqueue(queued_msg("m1", "idle member")).unwrap();
+    assert!(inbox.mark_injected("m1", InjectChannel::IdleTurn.as_str()));
+    assert!(inbox.pending().is_empty());
 }

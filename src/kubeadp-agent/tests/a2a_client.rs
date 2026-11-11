@@ -80,12 +80,13 @@ struct RecordingSink {
 }
 
 impl kubeadp_agent::core::a2a::MessageSink for RecordingSink {
-    fn deliver(
+    fn deliver_with_meta(
         &self,
         task_id: &str,
         _sender: &str,
         text: &str,
         _message_id: &str,
+        _meta: kubeadp_agent::core::a2a::DeliveryMeta,
     ) -> Result<(), A2AError> {
         self.delivered
             .lock()

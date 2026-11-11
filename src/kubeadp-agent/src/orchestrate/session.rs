@@ -499,6 +499,20 @@ fn run_session_iteration(
         );
     }
 
+    // 1b. Merge the A2A hooks into the session settings (design HL-113
+    // §7.14, phase 2): PostToolUse / UserPromptSubmit / Stop pointing at
+    // `kubeadp-agent a2a-hook`, so the hook channel injects queued messages
+    // at the next tool call / prompt / turn boundary. Existing hook entries
+    // are kept; the merge is idempotent. FAIL-OPEN: on error, log and start
+    // the session without the hooks (the ladder's escalation steps still
+    // deliver).
+    if let Err(e) = crate::orchestrate::claude_config::ensure_a2a_hooks(settings_path) {
+        log_event(
+            &session.name,
+            &format!("Failed to merge the a2a hook settings: {}", e),
+        );
+    }
+
     // 2. Wait until Claude is installed and logged in
     {
         let mut st = shared_state.lock().unwrap_or_else(|e| e.into_inner());

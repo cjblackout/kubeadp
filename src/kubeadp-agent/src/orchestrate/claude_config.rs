@@ -158,6 +158,121 @@ fn update_settings_map(map: &mut serde_json::Map<String, Value>) {
     }
 }
 
+/// The A2A hook command for one Claude Code event (design HL-113 §7.14,
+/// phase 2): the absolute launcher binary path plus the a2a-hook event. The
+/// hooks print the Claude formats (`hookSpecificOutput.additionalContext` for
+/// PostToolUse/UserPromptSubmit, `decision: block` for Stop).
+fn a2a_hook_command(event: &str) -> String {
+    let exe = crate::sandbox::find_launcher_exe();
+    format!("{} a2a-hook {}", exe.to_string_lossy(), event)
+}
+
+/// Merges the A2A hooks (PostToolUse, UserPromptSubmit, Stop pointing at
+/// `kubeadp-agent a2a-hook`) into the session's Claude Code settings file
+/// (design §7.14, phase 2) WITHOUT clobbering existing settings: existing
+/// hook entries are kept untouched, only a MISSING A2A event entry is
+/// inserted (idempotent: when all three are present the file is not written
+/// at all), and the structure is the Claude Code settings hooks format.
+/// Never fatal for the caller's session loop (the error is logged; the
+/// ladder's escalation steps still deliver).
+pub fn ensure_a2a_hooks(settings_path: &Path) -> Result<(), String> {
+    let _lock = CONFIG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let map: serde_json::Map<String, Value> = if settings_path.is_file() {
+        fs::read_to_string(settings_path)
+            .ok()
+            .and_then(|content| serde_json::from_str(&content).ok())
+            .and_then(|val| match val {
+                Value::Object(m) => Some(m),
+                _ => None,
+            })
+            .unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+    if a2a_hooks_satisfied(&map) {
+        return Ok(());
+    }
+    let mut map = map;
+    update_a2a_hooks(&mut map);
+    let content = serde_json::to_string_pretty(&Value::Object(map))
+        .map_err(|e| format!("failed to serialize the a2a hook settings: {e}"))?;
+    write_atomic_preserving_mode(settings_path, &content)
+}
+
+/// Whether every A2A hook event entry is already present (the exact command
+/// for each event), so the file need not be rewritten.
+fn a2a_hooks_satisfied(map: &serde_json::Map<String, Value>) -> bool {
+    let Some(Value::Object(hooks)) = map.get("hooks") else {
+        return false;
+    };
+    for event in ["PostToolUse", "UserPromptSubmit", "Stop"] {
+        if !hook_entry_present(hooks, event, &a2a_hook_command(event)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `hooks` already carries a handler for `event` with exactly
+/// `command` (any handler-group shape: flat `command` handlers or the
+/// Claude `matcher`/`hooks` nesting).
+fn hook_entry_present(hooks: &serde_json::Map<String, Value>, event: &str, command: &str) -> bool {
+    let Some(Value::Array(entries)) = hooks.get(event) else {
+        return false;
+    };
+    entries.iter().any(|entry| match entry {
+        Value::Object(group) => {
+            if group.get("command").and_then(Value::as_str) == Some(command) {
+                return true;
+            }
+            group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|inner| {
+                    inner
+                        .iter()
+                        .any(|h| h.get("command").and_then(Value::as_str) == Some(command))
+                })
+        }
+        _ => false,
+    })
+}
+
+/// Inserts the missing A2A hook entries into the settings map, preserving
+/// every existing key and hook entry (only a MISSING event entry is added).
+fn update_a2a_hooks(map: &mut serde_json::Map<String, Value>) {
+    if !map.contains_key("hooks") || !map["hooks"].is_object() {
+        map.insert("hooks".to_string(), json!({}));
+    }
+    let Some(Value::Object(ref mut hooks)) = map.get_mut("hooks") else {
+        return;
+    };
+    // PostToolUse carries a matcher (the hook fires for every tool result);
+    // UserPromptSubmit and Stop fire at the prompt/turn boundaries.
+    for (event, matcher) in [
+        ("PostToolUse", true),
+        ("UserPromptSubmit", false),
+        ("Stop", false),
+    ] {
+        let command = a2a_hook_command(event);
+        if hook_entry_present(hooks, event, &command) {
+            continue;
+        }
+        let handler = json!({ "type": "command", "command": command });
+        let entry = if matcher {
+            json!({ "matcher": "*", "hooks": [handler] })
+        } else {
+            json!({ "hooks": [handler] })
+        };
+        match hooks.get_mut(event) {
+            Some(Value::Array(entries)) => entries.push(entry),
+            _ => {
+                hooks.insert(event.to_string(), json!([entry]));
+            }
+        }
+    }
+}
+
 /// Ensures ~/.claude.json and ~/.claude/settings.json exist with necessary onboarding,
 /// theme, workspace trust, and bypass permissions so Claude runs headlessly without prompts.
 ///
@@ -566,5 +681,91 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    // ---- A2A hook settings writer (design HL-113 §7.14, phase 2) ----------
+
+    #[test]
+    fn a2a_hooks_create_and_merge_without_clobbering() {
+        // Fresh settings: the three events, PostToolUse with a matcher, the
+        // boundary events without one, the command an absolute binary path.
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join(".claude").join("settings.json");
+        ensure_a2a_hooks(&settings_path).unwrap();
+        let settings: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let hooks = settings["hooks"].as_object().unwrap();
+        for event in ["PostToolUse", "UserPromptSubmit", "Stop"] {
+            let entries = hooks[event].as_array().unwrap();
+            assert_eq!(entries.len(), 1, "{event}: {settings}");
+            assert!(
+                entries[0]["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!(" a2a-hook {event}")),
+                "{event}: {settings}"
+            );
+        }
+        assert_eq!(hooks["PostToolUse"][0]["matcher"], "*");
+        assert!(hooks["UserPromptSubmit"][0].get("matcher").is_none());
+        assert!(hooks["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .starts_with('/'));
+
+        // Merge into existing settings: the operator's own hooks and every
+        // other key are kept; only a MISSING A2A event entry is added; the
+        // existing A2A-satisfying Stop entry is not duplicated.
+        let existing = temp.path().join("existing.json");
+        fs::write(
+            &existing,
+            r#"{
+  "permissions": {"defaultMode": "bypassPermissions", "allow": ["Bash(ls:*)"]},
+  "unrelated": {"keep": true},
+  "hooks": {
+    "Stop": [{"hooks": [{"type": "command", "command": "/usr/bin/operator-hook"}]}],
+    "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/bin/pre"}]}]
+  }
+}"#,
+        )
+        .unwrap();
+        ensure_a2a_hooks(&existing).unwrap();
+        let settings: Value =
+            serde_json::from_str(&fs::read_to_string(&existing).unwrap()).unwrap();
+        assert_eq!(
+            settings["hooks"]["Stop"][0]["hooks"][0]["command"], "/usr/bin/operator-hook",
+            "the operator's Stop hook is kept: {settings}"
+        );
+        assert!(
+            settings["hooks"]["PreToolUse"].is_array(),
+            "unrelated entries kept"
+        );
+        assert!(settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" a2a-hook PostToolUse"));
+        assert!(
+            settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with(" a2a-hook UserPromptSubmit")
+        );
+        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
+        assert_eq!(settings["permissions"]["allow"][0], "Bash(ls:*)");
+        assert_eq!(settings["unrelated"]["keep"], true);
+
+        // Idempotent: a satisfied settings file is not rewritten (mtime kept).
+        let before = fs::read_to_string(&settings_path).unwrap();
+        #[cfg(unix)]
+        let mtime = fs::metadata(&settings_path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        ensure_a2a_hooks(&settings_path).unwrap();
+        assert_eq!(fs::read_to_string(&settings_path).unwrap(), before);
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&settings_path).unwrap().modified().unwrap(),
+            mtime,
+            "a satisfied settings file is not rewritten"
+        );
     }
 }

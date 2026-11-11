@@ -68,6 +68,19 @@ pub fn a2a_rate_limited(msg: impl Into<String>) -> A2AError {
     A2AError::invalid_params(msg)
 }
 
+/// Trusted delivery metadata the ingress extracted from a `SendMessage`
+/// request (design HL-113 §7.14, phase 2): the receiver-verified hop count
+/// and the `interrupt: true` escalation request. Never derived from the
+/// framed content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeliveryMeta {
+    /// The hop count of the incoming message (0..=MAX_HOP).
+    pub hop: u32,
+    /// Whether the message requests the explicit `interrupt` escalation
+    /// (kill-and-resume) instead of waiting for a boundary.
+    pub interrupt: bool,
+}
+
 /// Destination for a `SendMessage` payload.
 ///
 /// The orchestrator delivers into the live session PTY (bracketed paste); the
@@ -76,23 +89,32 @@ pub fn a2a_rate_limited(msg: impl Into<String>) -> A2AError {
 /// blocking pool (a PTY write or a job interrupt/resume is blocking), so it
 /// never occupies a worker thread.
 pub trait MessageSink: Send + Sync {
-    /// Deliver `text` to the task (session) identified by `task_id`, charged
-    /// to the `sender` (the claimed `a2a.sender`) for the per-(session, sender)
-    /// message budget.
-    ///
-    /// `message_id` is the A2A message id; a sink that deduplicates on it
-    /// applies a repeated id only once (idempotency).
-    ///
-    /// Returning `Err` means the text was NOT delivered (e.g. the task is gone,
-    /// killed by the operator, the sender's budget is exhausted, or the delivery
-    /// was rate-limited).
+    /// Deliver with the trusted delivery metadata the ingress extracted: the
+    /// verified hop count and the `interrupt: true` request (design §7.14).
+    /// Never derived from the framed content. `message_id` is the A2A message
+    /// id; a sink that deduplicates on it applies a repeated id only once.
+    /// Returning `Err` means the text was NOT delivered (the task is gone,
+    /// killed by the operator, the budget exhausted, or rate-limited).
+    fn deliver_with_meta(
+        &self,
+        task_id: &str,
+        sender: &str,
+        text: &str,
+        message_id: &str,
+        meta: DeliveryMeta,
+    ) -> Result<(), A2AError>;
+
+    /// Deliver without the trusted metadata (zero hop, no interrupt); the
+    /// default delegates to [`MessageSink::deliver_with_meta`].
     fn deliver(
         &self,
         task_id: &str,
         sender: &str,
         text: &str,
         message_id: &str,
-    ) -> Result<(), A2AError>;
+    ) -> Result<(), A2AError> {
+        self.deliver_with_meta(task_id, sender, text, message_id, DeliveryMeta::default())
+    }
 }
 
 /// A2A request handler directly over a [`TaskBackend`] and an optional
@@ -167,21 +189,27 @@ impl RequestHandler for ServerRequestHandler {
         let task = task_from_backend_blocking(self.backend.clone(), task_id.to_string()).await?;
 
         #[cfg(feature = "a2a")]
-        let (sender, text_to_deliver) = {
+        let (sender, text_to_deliver, delivery_meta) = {
             // Validates the WHOLE message (all parts: empty, size and hop) and
-            // frames it with a per-message nonce delimiter.
+            // frames it with a per-message nonce delimiter. The hop and the
+            // interrupt request are trusted metadata (never the framed
+            // content).
             let ingress = process_ingress(&req.message.parts, req.message.metadata.as_ref())?;
-            (ingress.claimed_sender, ingress.framed_text)
+            let meta = DeliveryMeta {
+                hop: ingress.hop,
+                interrupt: ingress.interrupt,
+            };
+            (ingress.claimed_sender, ingress.framed_text, meta)
         };
         #[cfg(not(feature = "a2a"))]
-        let (sender, text_to_deliver) = {
+        let (sender, text_to_deliver, delivery_meta) = {
             let text = req.message.text().map(str::trim).unwrap_or("").to_string();
             if text.is_empty() {
                 return Err(A2AError::invalid_params("message text must not be empty"));
             }
             // No ingress in the non-a2a build, so there is no claimed sender:
             // deliver under the same "unknown" identity ingress would use.
-            (String::from("unknown"), text)
+            (String::from("unknown"), text, DeliveryMeta::default())
         };
 
         // The sink does a (deadline-bounded) blocking PTY write; run it on the
@@ -193,11 +221,12 @@ impl RequestHandler for ServerRequestHandler {
         let delivery_text = text_to_deliver.clone();
         let delivery_message_id = req.message.message_id.clone();
         tokio::task::spawn_blocking(move || {
-            sink.deliver(
+            sink.deliver_with_meta(
                 &delivery_task,
                 &delivery_sender,
                 &delivery_text,
                 &delivery_message_id,
+                delivery_meta,
             )
         })
         .await

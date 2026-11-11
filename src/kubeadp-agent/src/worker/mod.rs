@@ -2,6 +2,7 @@
 //! (former `agent-run-api` modules, except its `main`).
 
 pub mod agy_home;
+pub mod agy_plugin;
 pub mod entry;
 pub mod server;
 pub mod supervisor;

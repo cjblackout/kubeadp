@@ -52,6 +52,9 @@ pub mod inbox;
 pub mod inject;
 
 #[cfg(feature = "a2a")]
+pub mod delivery;
+
+#[cfg(feature = "a2a")]
 pub mod client;
 
 pub use auth::A2aAuthLayer;
@@ -60,7 +63,7 @@ pub use card::{
     advertised_url, pod_name, role_description, role_skills, A2aModel, A2A_URL_ENV,
     ROLE_ORCHESTRATOR, ROLE_WORKER, WELL_KNOWN_AGENT_CARD_PATH,
 };
-pub use handler::{a2a_rate_limited, MessageSink, ServerRequestHandler};
+pub use handler::{a2a_rate_limited, DeliveryMeta, MessageSink, ServerRequestHandler};
 
 use std::sync::Arc;
 

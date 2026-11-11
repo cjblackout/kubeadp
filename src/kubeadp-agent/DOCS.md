@@ -228,10 +228,10 @@ Incoming messages delivered via `POST /message:send` pass through strict ingress
   --- END CONTENT (<nonce>) ---
   ```
 - **Receiving Behavior**:
-  - **Orchestrator**: Writes framed content directly to the session PTY using bracketed paste (`ESC[200~ ... ESC[201~`) followed by a newline.
-  - **Worker (live)**: When `[worker] a2a_live_stdin` is on and the job is a member of a real A2A mesh (started into a jobset), a meshed job runs in live mode (`--print "" --input-format stream-json`): its `agy` process reads NDJSON from a stdin pipe and an incoming message is delivered to the RUNNING process as a single `{"event":"user","message":{"content":"..."}}` line — no kill, no restart, the same conversation continues. The pipe is closed (EOF, letting agy finish and the job go `Done`) when the job ends or after `[worker] a2a_live_idle_secs` of no delivery and no log output (`0` = never close).
-  - **Worker (interrupt-and-resume)**: For a job without a live channel (or when live delivery fails/becomes stale), the worker interrupts the active execution turn cleanly (via process group SIGTERM), appends the message to the conversation history, and restarts execution.
-  - **Rate Limiting**: Delivery is metered per (session, sender) pair at 30 messages per minute. Throttled requests receive HTTP 429 with `Retry-After`.
+  - **Orchestrator**: An inbound message is enqueued into the session's durable inbox and delivered by the escalation ladder (§4.6); the queued PTY input (bracketed paste `ESC[200~ ... ESC[201~`, followed by a newline) is the `idle_turn`/`interrupt` escalation step, applied only past `a2a_ack_secs` with the session running (or immediately for `interrupt: true` / past `a2a_force_secs`). Nothing is killed.
+  - **Worker (live stdin, idle turn only)**: A RUNNING agy that was launched in live mode (a real A2A mesh member, `[worker] a2a_live_stdin` on) reads its next turn from a stdin pipe; the ladder's `idle_turn` step writes the message into that pipe as a single `{"event":"user","message":{"content":"..."}}` NDJSON line — no kill, no restart, the same conversation continues. The live stdin path stays off otherwise.
+  - **Worker (interrupt-and-resume)**: The explicit last resort only (`interrupt: true` messages or a message still queued past `a2a_force_secs`, default 0 = never): the worker interrupts the active execution turn cleanly (via process group SIGTERM), appends the message to the conversation history, and restarts execution.
+  - **Rate Limiting**: Session delivery is metered per (session, sender) pair at 30 messages per minute. Throttled requests receive HTTP 429 with `Retry-After`.
 
 ### 4.5 Outbound A2A via `mcp-a2a`
 
@@ -243,14 +243,45 @@ The `kubeadp-agent mcp-a2a` stdio server exposes tools for outbound communicatio
 
 When `[worker] a2a_mcp_enabled = true` is configured, worker jobs automatically register `mcp-a2a` inside their local `~/.gemini/config/mcp_config.json`. Outbound sender identities default to `<A2A_SELF_PREFIX>/<job_id>`.
 
-### 4.6 Harness-injected A2A delivery (HL-113, phase 1)
+### 4.6 Harness-injected A2A delivery (HL-113)
 
-Incoming A2A messages for a run land in a durable per-run inbox (`core/a2a/inbox.rs`): one JSON file per message under `<state_root>/a2a-inbox/<run_id>/`, states `queued -> injected`, bounded (8 messages / 8 KiB, oldest dropped with a durable note) with a 1 h TTL. The harness — never the model — puts each message into the run's model context at the earliest safe boundary through one of the engine's injection channels (capability `a2a.inject`: both engines `tool_result` + `idle_turn`, Claude Code additionally `hook`); the injection IS the acknowledgement, and the model never has to decide to read its messages. Nothing is killed by default.
+Incoming A2A messages for a run land in a durable per-run inbox (`core/a2a/inbox.rs`): one JSON file per message under `<state_root>/a2a-inbox/<run_id>/`, states `queued -> injected`, bounded (8 messages / 8 KiB, oldest dropped with a durable note) with a TTL (`a2a_inbox_ttl_secs`, default 1 h). The harness — never the model — puts each message into the run's model context at the earliest safe boundary through one of the engine's injection channels (capability `a2a.inject`: both engines list `hook` + `tool_result` + `idle_turn`); the injection IS the acknowledgement, and the model never has to decide to read its messages. Nothing is killed by default.
 
 - **`tool_result` (both engines)**: the `mcp-a2a` server appends the queued messages (full framed text, untrusted data, size-capped) to the result of every one of its tool calls, and `wait_message {timeout_s}` is a blocking receive whose result is the message (returns the moment one is queued; capped at 25 s). There is no model-driven `inbox` read tool.
-- **`hook` (both engines)**: `kubeadp-agent a2a-hook <event>` reads the inbox and prints the hook JSON for the engine's native hook: Claude Code `PostToolUse`/`UserPromptSubmit` (`additionalContext`) and `Stop` (`decision: block` + `reason`, so a session about to end its turn continues with the message); agy's verified native plugin `PreInvocation` hook (`pre-invocation`, stdout `injectSteps` system message put into the model's context before every model call). Silent, exit 0, when nothing is queued. The plugin install, the hook settings writer and the `idle_turn`/`interrupt` (escalation ladder) wiring are phase 2.
+- **`hook` (both engines)**: `kubeadp-agent a2a-hook <event>` reads the inbox and prints the hook JSON for the engine's native hook: Claude Code `PostToolUse`/`UserPromptSubmit` (`additionalContext`) and `Stop` (`decision: block` + `reason`, so a session about to end its turn continues with the message); agy's verified native plugin hooks `pre-invocation` (stdout `injectSteps` system message put into the model's context before every model call), `post-invocation` (`injectSteps` + `terminationBehavior: force_continue`) and `stop` (`decision: continue` + `reason`). Claude Code events print nothing, exit 0, when nothing is queued; the agy events print `{}` (agy parses the stdout of every hook invocation).
+- **`idle_turn` / `interrupt`**: the escalation ladder (`core/a2a/delivery.rs`), below.
 
 The launcher grants each sandboxed job/session its inbox directory automatically (read for messages, write for the `injected/` markers only) and names it in `KUBEADP_A2A_INBOX_DIR`. Exactly once by message id across all channels: the inbox is the dedupe store, and a message another channel injected first is never delivered twice.
+
+#### 4.6.1 The escalation ladder (`core/a2a/delivery.rs`)
+
+One state machine, shared by the worker job path (agy) and the orchestrator session path (Claude Code):
+
+```text
+queued -> injection at the next boundary of any available channel (the hook
+          channel; `tool_result`/`wait_message` drain in parallel)
+       -> uninjected past `a2a_ack_secs` (45) and the run idle: `idle_turn`
+          (the harness starts the next turn with the message; no kill)
+       -> `interrupt: true` or past `a2a_force_secs` (0 = never): `interrupt`
+          (the explicit last resort: the kill-and-resume of §4.4)
+       -> TTL expiry (`a2a_inbox_ttl_secs`): the sender task fails with a clear reason
+```
+
+- The sender's task state follows the message: `submitted` while queued, `working` once injected, `failed` with the durable expiry reason after the TTL.
+- **agy (worker)**: the `idle_turn` step writes the message into a RUNNING live-mode job's stdin pipe (the §7.11 live path, off unless the idle turn needs it); a finished job is resumed with the message as the next turn. The `interrupt` step is the existing kill-and-resume.
+- **Claude Code (orchestrator)**: the `idle_turn`/`interrupt` steps write the message as queued PTY input (bracketed paste) into the running session; the Stop hook re-enters the loop at the turn boundary. Nothing is killed on the session path.
+- **Config keys** (`[worker]` of the agent-run config file; the same file serves the orchestrator):
+
+| Key | Env | Default | Meaning |
+|---|---|---|---|
+| `a2a_ack_secs` | `AGENT_RUN_A2A_ACK_SECS` | `45` | How long a message may stay queued before the ladder escalates to `idle_turn` (only with the run idle). `0` = escalate the moment the run is idle. |
+| `a2a_force_secs` | `AGENT_RUN_A2A_FORCE_SECS` | `0` (never) | How long a message may stay queued before the ladder escalates to the `interrupt` (kill-and-resume) step. |
+| `a2a_inbox_ttl_secs` | `AGENT_RUN_A2A_INBOX_TTL_SECS` | `3600` | TTL for uninjected messages (floor 10 s): past it the message stops being served and the sender task fails with a clear reason. |
+
+#### 4.6.2 The agy plugin and the Claude Code hook settings
+
+- **agy**: the worker installs a NATIVE agy plugin (`worker/agy_plugin.rs`, `agy plugin install <dir>` into the job's agy home; never touches the user's other plugins). The plugin root holds `.antigravity-plugin/plugin.json` plus `hooks.json` AT THE PLUGIN ROOT with flat handler lists: `{"a2a":{"PreInvocation":[{"type":"command","command":"<abs> a2a-hook pre-invocation"}],"PostInvocation":[...],"Stop":[...]}}`. Hook commands run via `sh -c` with cwd = the plugin dir, so the binary path is absolute. Install is best effort (logged, never fatal); the hook channel then simply never fires and `tool_result` still delivers.
+- **Claude Code**: the supervisor merges the A2A hooks into the session settings (`~/.claude/settings.json`, `orchestrate/claude_config.rs`): `PostToolUse`, `UserPromptSubmit` and `Stop` entries pointing at `<abs> a2a-hook <event>`, keeping every existing hook entry and setting (idempotent: when all three are present the file is not rewritten).
 
 ---
 

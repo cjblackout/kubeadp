@@ -23,6 +23,23 @@ pub const DEFAULT_STALL_MINUTES: u64 = 20;
 /// interrupt is younger than this is rejected as rate-limited (in addition to
 /// the per-jobset hop-token budget). `0` disables the interval.
 pub const DEFAULT_A2A_INTERRUPT_MIN_SECS: u64 = 20;
+/// How long (seconds) an inbound A2A message may stay queued in the run's
+/// inbox before the escalation ladder escalates to the `idle_turn` step
+/// (design HL-113 §7.14, phase 2) -- and only when the run is idle at a turn
+/// boundary. Below that the hook channel delivers at the next boundary.
+pub const DEFAULT_A2A_ACK_SECS: u64 = 45;
+/// How long (seconds) an inbound A2A message may stay queued before the
+/// escalation ladder escalates to the explicit `interrupt` step (the
+/// kill-and-resume of §7.11). `0` (default) = never kill.
+pub const DEFAULT_A2A_FORCE_SECS: u64 = 0;
+/// TTL (seconds) for uninjected inbound A2A messages in a run's inbox: past
+/// it the message stops being served and the sender's task fails with a
+/// clear reason.
+pub const DEFAULT_A2A_INBOX_TTL_SECS: u64 = 3600;
+/// Floor for a non-zero [`config::a2a_inbox_ttl_secs`]: a TTL below this
+/// would expire every message almost instantly (dropping all delivery), so
+/// values below the floor are clamped up.
+pub const MIN_A2A_INBOX_TTL_SECS: u64 = 10;
 /// Whether a meshed job is launched in live mode: its `agy` process gets a
 /// pipe as stdin (`--print "" --input-format stream-json`) and A2A messages
 /// are delivered to the RUNNING job as NDJSON lines over that pipe instead of
@@ -127,6 +144,19 @@ pub struct ConfigFile {
     /// (see [`DEFAULT_A2A_LIVE_IDLE_SECS`]); `0` = never close.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub a2a_live_idle_secs: Option<u64>,
+    /// Escalation-ladder ack window (seconds) for inbound A2A messages
+    /// (see [`DEFAULT_A2A_ACK_SECS`]). Serves the worker job path and the
+    /// orchestrator session path alike (the same file/env).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a2a_ack_secs: Option<u64>,
+    /// Escalation-ladder force timeout (seconds, `0` = never kill) for
+    /// inbound A2A messages (see [`DEFAULT_A2A_FORCE_SECS`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a2a_force_secs: Option<u64>,
+    /// Inbox TTL (seconds) for uninjected inbound A2A messages
+    /// (see [`DEFAULT_A2A_INBOX_TTL_SECS`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a2a_inbox_ttl_secs: Option<u64>,
 }
 
 /// Fully resolved, layered runtime configuration for the agent-run engine.
@@ -219,6 +249,19 @@ pub struct Config {
     /// classifier. `0` means never close. Non-zero values below
     /// [`MIN_A2A_LIVE_IDLE_SECS`] are clamped up.
     pub a2a_live_idle_secs: u64,
+    /// Escalation-ladder ack window (seconds) for inbound A2A messages: how
+    /// long a message may stay queued before the ladder escalates to
+    /// `idle_turn` (only with the run idle at a turn boundary). Below it the
+    /// hook channel delivers at the next boundary (design §7.14, phase 2).
+    pub a2a_ack_secs: u64,
+    /// Escalation-ladder force timeout (seconds, `0` = never): how long a
+    /// message may stay queued before the ladder escalates to the explicit
+    /// `interrupt` step (the kill-and-resume of §7.11).
+    pub a2a_force_secs: u64,
+    /// TTL (seconds) for uninjected inbound A2A messages in a run's inbox:
+    /// past it the message stops being served and the sender's task fails
+    /// with a clear reason.
+    pub a2a_inbox_ttl_secs: u64,
 }
 
 impl Default for Config {
@@ -263,6 +306,9 @@ impl Default for Config {
             a2a_interrupt_min_secs: DEFAULT_A2A_INTERRUPT_MIN_SECS,
             a2a_live_stdin: DEFAULT_A2A_LIVE_STDIN,
             a2a_live_idle_secs: DEFAULT_A2A_LIVE_IDLE_SECS,
+            a2a_ack_secs: DEFAULT_A2A_ACK_SECS,
+            a2a_force_secs: DEFAULT_A2A_FORCE_SECS,
+            a2a_inbox_ttl_secs: DEFAULT_A2A_INBOX_TTL_SECS,
         }
     }
 }
@@ -558,6 +604,75 @@ impl Config {
             }
         };
 
+        // 10e4. Resolve a2a_ack_secs: the ladder's ack window (design §7.14).
+        // `0` is valid (escalate the moment the run is idle); anything
+        // unparseable falls back with a warning.
+        let a2a_ack_secs = if let Some(env_val) = env_vars
+            .get("AGENT_RUN_A2A_ACK_SECS")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            match env_val.parse::<u64>() {
+                Ok(secs) => secs,
+                _ => {
+                    eprintln!(
+                        "agent-run: ignoring invalid AGENT_RUN_A2A_ACK_SECS value {env_val:?}; using the default"
+                    );
+                    file_cfg.a2a_ack_secs.unwrap_or(DEFAULT_A2A_ACK_SECS)
+                }
+            }
+        } else {
+            file_cfg.a2a_ack_secs.unwrap_or(DEFAULT_A2A_ACK_SECS)
+        };
+
+        // 10e5. Resolve a2a_force_secs: the ladder's force timeout. `0` (the
+        // deliberate default: never kill) is valid; anything unparseable
+        // falls back with a warning.
+        let a2a_force_secs = if let Some(env_val) = env_vars
+            .get("AGENT_RUN_A2A_FORCE_SECS")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            match env_val.parse::<u64>() {
+                Ok(secs) => secs,
+                _ => {
+                    eprintln!(
+                        "agent-run: ignoring invalid AGENT_RUN_A2A_FORCE_SECS value {env_val:?}; using the default"
+                    );
+                    file_cfg.a2a_force_secs.unwrap_or(DEFAULT_A2A_FORCE_SECS)
+                }
+            }
+        } else {
+            file_cfg.a2a_force_secs.unwrap_or(DEFAULT_A2A_FORCE_SECS)
+        };
+
+        // 10e6. Resolve a2a_inbox_ttl_secs: the TTL for uninjected inbound
+        // A2A messages. Values below the floor are clamped up (a tiny TTL
+        // would drop all delivery); anything unparseable falls back.
+        let a2a_inbox_ttl_secs = if let Some(env_val) = env_vars
+            .get("AGENT_RUN_A2A_INBOX_TTL_SECS")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            match env_val.parse::<u64>() {
+                Ok(secs) => secs.max(MIN_A2A_INBOX_TTL_SECS),
+                _ => {
+                    eprintln!(
+                        "agent-run: ignoring invalid AGENT_RUN_A2A_INBOX_TTL_SECS value {env_val:?}; using the default"
+                    );
+                    file_cfg
+                        .a2a_inbox_ttl_secs
+                        .unwrap_or(DEFAULT_A2A_INBOX_TTL_SECS)
+                        .max(MIN_A2A_INBOX_TTL_SECS)
+                }
+            }
+        } else {
+            file_cfg
+                .a2a_inbox_ttl_secs
+                .unwrap_or(DEFAULT_A2A_INBOX_TTL_SECS)
+                .max(MIN_A2A_INBOX_TTL_SECS)
+        };
+
         // 10f. Resolve max_runtime (the server-wide DEFAULT job runtime).
         // UNSET BY DEFAULT: absent/empty means no default limit, jobs run
         // unbounded -- unlike the settings above there is NO fallback value,
@@ -849,6 +964,9 @@ impl Config {
             a2a_interrupt_min_secs,
             a2a_live_stdin,
             a2a_live_idle_secs,
+            a2a_ack_secs,
+            a2a_force_secs,
+            a2a_inbox_ttl_secs,
         })
     }
 }
@@ -957,6 +1075,43 @@ mod tests {
         assert_eq!(cfg.hindsight_path, PathBuf::from("hindsight"));
         assert_eq!(cfg.a2a_live_stdin, DEFAULT_A2A_LIVE_STDIN);
         assert_eq!(cfg.a2a_live_idle_secs, DEFAULT_A2A_LIVE_IDLE_SECS);
+        assert_eq!(cfg.a2a_ack_secs, DEFAULT_A2A_ACK_SECS);
+        assert_eq!(cfg.a2a_force_secs, DEFAULT_A2A_FORCE_SECS);
+        assert_eq!(cfg.a2a_inbox_ttl_secs, DEFAULT_A2A_INBOX_TTL_SECS);
+    }
+
+    #[test]
+    fn test_a2a_ladder_keys_env_and_fallback() {
+        // Ack window: parsed as-is (0 = escalate the moment the run is idle).
+        let env = env_with(&[("AGENT_RUN_A2A_ACK_SECS", "0")]);
+        let cfg = Config::load_with_env(&env).expect("load ack 0");
+        assert_eq!(cfg.a2a_ack_secs, 0);
+        let env = env_with(&[("AGENT_RUN_A2A_ACK_SECS", "120")]);
+        let cfg = Config::load_with_env(&env).expect("load ack 120");
+        assert_eq!(cfg.a2a_ack_secs, 120);
+        let env = env_with(&[("AGENT_RUN_A2A_ACK_SECS", "soon")]);
+        let cfg = Config::load_with_env(&env).expect("load invalid ack");
+        assert_eq!(cfg.a2a_ack_secs, DEFAULT_A2A_ACK_SECS);
+
+        // Force timeout: 0 = never kill (the default).
+        let env = env_with(&[("AGENT_RUN_A2A_FORCE_SECS", "300")]);
+        let cfg = Config::load_with_env(&env).expect("load force 300");
+        assert_eq!(cfg.a2a_force_secs, 300);
+        let env = env_with(&[("AGENT_RUN_A2A_FORCE_SECS", "soon")]);
+        let cfg = Config::load_with_env(&env).expect("load invalid force");
+        assert_eq!(cfg.a2a_force_secs, DEFAULT_A2A_FORCE_SECS);
+
+        // Inbox TTL: a sub-floor value is clamped up (a tiny TTL would drop
+        // all delivery); an unparseable value falls back to the default.
+        let env = env_with(&[("AGENT_RUN_A2A_INBOX_TTL_SECS", "1")]);
+        let cfg = Config::load_with_env(&env).expect("load ttl 1");
+        assert_eq!(cfg.a2a_inbox_ttl_secs, MIN_A2A_INBOX_TTL_SECS);
+        let env = env_with(&[("AGENT_RUN_A2A_INBOX_TTL_SECS", "7200")]);
+        let cfg = Config::load_with_env(&env).expect("load ttl 7200");
+        assert_eq!(cfg.a2a_inbox_ttl_secs, 7200);
+        let env = env_with(&[("AGENT_RUN_A2A_INBOX_TTL_SECS", "soon")]);
+        let cfg = Config::load_with_env(&env).expect("load invalid ttl");
+        assert_eq!(cfg.a2a_inbox_ttl_secs, DEFAULT_A2A_INBOX_TTL_SECS);
     }
 
     #[test]

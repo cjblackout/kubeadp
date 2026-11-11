@@ -117,6 +117,9 @@ pub struct IngressMessage {
     pub claimed_sender: String,
     /// Complete framed text ready for delivery to the sink.
     pub framed_text: String,
+    /// Whether the message requests the explicit `interrupt` escalation
+    /// (trusted request metadata `a2a.interrupt`, never the framed content).
+    pub interrupt: bool,
 }
 
 /// Sanitizes a claimed sender string:
@@ -661,6 +664,7 @@ pub fn process_ingress(
         hop,
         claimed_sender,
         framed_text,
+        interrupt: super::delivery::interrupt_requested(metadata),
     })
 }
 
@@ -741,6 +745,7 @@ pub fn process_ingress_guarded(
             hop: hop_info.hop,
             claimed_sender,
             framed_text,
+            interrupt: super::delivery::interrupt_requested(metadata),
         },
         hop_info,
     ))

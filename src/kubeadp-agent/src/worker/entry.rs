@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use super::{agy_home, server, supervisor};
+use super::{agy_home, agy_plugin, server, supervisor};
 use crate::core::auth::AuthManager;
 use crate::core::config::Config;
 use crate::core::runner::mark_child_subreaper;
@@ -41,6 +41,19 @@ pub async fn run() -> Result<()> {
     let mcp_source = std::env::var_os("AGENT_RUN_AGY_MCP_SOURCE").map(std::path::PathBuf::from);
     if let Err(e) = agy_home::prepare_agy_home(&home, mcp_source.as_deref()) {
         eprintln!("agent-run-api: ERROR: agy home setup: {e}");
+    }
+
+    // The A2A hook channel (HL-113 phase 2): install the NATIVE agy plugin
+    // (flat PreInvocation/PostInvocation/Stop handler lists) via `agy plugin
+    // install`. The content is run-independent (each hook reads the run's
+    // inbox from the environment), so one install covers every run; it never
+    // touches the user's other plugins. Best effort, never fatal.
+    match agy_plugin::install(&config.state_root, &config.agy_path, &home) {
+        Ok(()) => eprintln!(
+            "agent-run-api: a2a agy plugin installed ({}), hook channel armed",
+            agy_plugin::plugin_dir_for(&config.state_root).display()
+        ),
+        Err(e) => eprintln!("agent-run-api: warning: a2a agy plugin install: {e}"),
     }
 
     // Process-wide orphan-reparenting target for agy's own `cmd &` children

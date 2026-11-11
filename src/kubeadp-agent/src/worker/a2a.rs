@@ -8,12 +8,18 @@
 //!   - `Done` -> `TaskState::Completed`
 //!   - `Failed`, `Incomplete`, `QuotaExhausted` -> `TaskState::Failed`
 //!   - `SelfTerminated`, `Killed` -> `TaskState::Canceled`
+//!   - an inbound message queued in the run's inbox -> `TaskState::Submitted`
+//!     (the sender's task state while the message waits; design HL-113 §7.14)
 //! - Artifacts: the job's final response text (if present), plus the git diff
 //!   text (if available and cheap).
-//! - `ListTasks`: lists jobs, optionally filtered by contextId (matching job_id)
-//!   and/or A2A TaskState.
-//! - `GetTask`: returns one task by exact job ID.
-//! - `CancelTask`: kills the job via `crate::core::commands::kill::run_exact`.
+//! - `ListTasks`/`GetTask`/`CancelTask`: list, exact-id lookup, kill.
+//!
+//! Inbound delivery is the escalation ladder of design §7.14 (phase 2,
+//! [`crate::core::a2a::delivery`]): the message is enqueued into the run's
+//! durable inbox (queued -> sender task `submitted`), the hook channel
+//! injects it at the next model-call boundary, and the ladder escalates to
+//! `idle_turn` after `a2a_ack_secs` with the run idle and to the explicit
+//! `interrupt` only for `interrupt: true` / past `a2a_force_secs`.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -30,17 +36,19 @@ use a2a::{Artifact, Part, TaskState};
 // The `MessageSink` trait (and its helpers) return the SDK's `a2a::A2AError`,
 // a distinct type from the backend `A2AError` (string `code`) used above for
 // the `TaskBackend` methods.
+use crate::core::a2a::delivery::{
+    sender_task_state as map_sender_task_state, LadderConfig, LadderStep, SenderTaskState,
+};
+use crate::core::a2a::inbox::{Inbox, QueuedMessage};
+use crate::core::a2a::inject::join_framed;
+use crate::core::a2a::DeliveryMeta;
+use crate::engine::capability::InjectChannel;
 use a2a::A2AError as SdkA2AError;
 
-/// Maximum number of in-memory (coalesced) pending messages held per job while
-/// a resume is in flight; overflow drops the oldest (bounded, no persistent
-/// inbox).
-const MAX_COALESCE_MSGS: usize = 8;
-/// Maximum combined bytes of the per-job in-memory pending buffer.
-const MAX_COALESCE_BYTES: usize = 8 * 1024;
 /// Bound on the sink's global idempotency cache of delivered message ids.
 const SEEN_CACHE_CAP: usize = 4096;
-
+/// How often the escalation-ladder watcher re-evaluates a job's inbox.
+const LADDER_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 /// TaskBackend implementation that operates on agent-core's SQLite job store and worktrees.
 pub struct JobTaskBackend {
     config: Arc<Config>,
@@ -54,11 +62,28 @@ impl JobTaskBackend {
     /// Converts a [`JobMetadata`] row into an [`A2aTask`] with state and artifacts.
     fn job_to_task(&self, meta: &JobMetadata) -> A2aTask {
         let status = compute_status(meta, &self.config.state_root);
-        let state = map_job_status(status);
+        let mut state = map_job_status(status);
 
         let mut status_message = None;
         let mut error = None;
         let mut artifacts_vec = Vec::new();
+
+        // The ladder (design §7.14): queued == the sender's task is
+        // `submitted`; a durable expiry marker fails the task.
+        {
+            let inbox_dir =
+                crate::core::a2a::inbox::inbox_dir_for(&self.config.state_root, &meta.job_id);
+            let inbox = Inbox::new(&inbox_dir);
+            let expiry = crate::core::a2a::delivery::read_expiry(&inbox_dir);
+            match map_sender_task_state(inbox.pending_count(), expiry.as_ref()) {
+                SenderTaskState::Submitted => state = TaskState::Submitted,
+                SenderTaskState::Failed { reason } => {
+                    state = TaskState::Failed;
+                    error = Some(reason);
+                }
+                SenderTaskState::Working => {}
+            }
+        }
 
         // 1. Final response from job log (if any)
         let log_path = JobMetadata::log_path(&self.config.state_root, &meta.job_id);
@@ -79,10 +104,12 @@ impl JobTaskBackend {
             }
         }
 
-        // Error message for failed/terminal states
-        if status == JobStatus::Failed
+        // Error message for failed/terminal states (an inbox expiry reason
+        // already occupies the error slot).
+        if (status == JobStatus::Failed
             || status == JobStatus::Incomplete
-            || status == JobStatus::QuotaExhausted
+            || status == JobStatus::QuotaExhausted)
+            && error.is_none()
         {
             error = Some(format!("Job ended with status: {status}"));
         }
@@ -191,13 +218,11 @@ impl TaskBackend for JobTaskBackend {
     }
 }
 
-/// Per-job resume state: a `gate` mutex that serialises at most one resume at
-/// a time for the job, the bounded coalesced `pending` buffer (messages that
-/// queued while a resume was in flight), and the `last_interrupt` timestamp
-/// (the per-job storm limit). Never persisted (there is no inbox).
+/// Per-job state: a `gate` mutex serialising at most one resume at a time
+/// and the `last_interrupt` timestamp (the per-job storm limit). The durable
+/// per-run inbox replaced the in-memory coalesce buffer (design §7.14).
 struct JobSlot {
     gate: Mutex<()>,
-    pending: Mutex<VecDeque<String>>,
     last_interrupt: Mutex<Option<Instant>>,
 }
 
@@ -205,34 +230,28 @@ impl JobSlot {
     fn new() -> Self {
         Self {
             gate: Mutex::new(()),
-            pending: Mutex::new(VecDeque::new()),
             last_interrupt: Mutex::new(None),
         }
     }
 }
 
-/// A2A `SendMessage` sink for the worker: an incoming A2A message is injected
-/// as the NEXT conversation turn of the addressed job (interrupt-and-resume).
-///
-/// - A RUNNING job's `agy` process is stopped cleanly (SIGTERM group, grace,
-///   SIGKILL) exactly like `kill` does, then the same conversation is resumed
-///   with the framed message as a follow-up turn through the retry code path
-///   (NOT marked user-killed or failed).
-/// - A FINISHED job (done/failed/incomplete/self-terminated, not cleaned or
-///   discarded) is resumed the same way (a fresh follow-up turn).
-/// - An operator-KILLED job is never woken: delivery is refused with a clear
-///   error. Unknown / cleaned / discarded jobs answer `TASK_NOT_FOUND`.
-///
-/// Concurrency: at most one resume is in flight per job; concurrent messages
-/// coalesce in memory into the next resume prompt (bounded, oldest dropped).
-/// A per-job minimum interval (`a2a_interrupt_min_secs`, 0 = off) plus the
-/// caller's existing per-jobset hop-token budget rate-limit message storms; a
-/// throttled delivery is rejected with a rate-limit error. A repeated A2A
-/// message id is applied at most once (idempotency).
+/// A2A `SendMessage` sink for the worker: the message is enqueued into the
+/// job's durable inbox and delivered by the escalation ladder (design §7.14,
+/// phase 2). The hook channel injects at the next model-call boundary; the
+/// watcher (one per job) escalates to `idle_turn` past `a2a_ack_secs` with
+/// the run idle (a RUNNING live-mode job over its stdin pipe, the §7.11 live
+/// path; a finished job is resumed) and to `interrupt` only for
+/// `interrupt: true` / past `a2a_force_secs` (0 = never). An operator-KILLED
+/// job is never woken; unknown / cleaned / discarded jobs answer
+/// `TASK_NOT_FOUND`. At most one resume in flight per job; a repeated
+/// message id is applied at most once.
 pub struct JobMessageSink {
     config: Arc<Config>,
     slots: Mutex<HashMap<String, Arc<JobSlot>>>,
     seen: Mutex<VecDeque<String>>,
+    /// The ladder watchers (one per job; a finished one's guard drops to
+    /// count 1, so a later delivery spawns a fresh watcher).
+    ladders: Mutex<HashMap<String, Arc<()>>>,
 }
 
 impl JobMessageSink {
@@ -241,12 +260,12 @@ impl JobMessageSink {
             config,
             slots: Mutex::new(HashMap::new()),
             seen: Mutex::new(VecDeque::new()),
+            ladders: Mutex::new(HashMap::new()),
         }
     }
 
-    /// The per-job slot, creating it on first use. The global lock is held only
-    /// long enough to look up / insert the `Arc`; the job's own `gate`
-    /// (acquired by the caller) is what serialises a resume for that job.
+    /// The per-job slot, creating it on first use; the job's own `gate`
+    /// (acquired by the caller) serialises a resume for that job.
     fn slot(&self, task_id: &str) -> Arc<JobSlot> {
         let mut map = self.slots.lock().expect("slots lock poisoned");
         map.entry(task_id.to_string())
@@ -267,40 +286,176 @@ impl JobMessageSink {
         }
         false
     }
-}
 
-impl JobMessageSink {
-    /// Enqueue `msg` into the per-job coalesce buffer, dropping the oldest with
-    /// a note to stay within the bounds. Returns `Err` if a single message
-    /// alone exceeds the byte cap (it would never fit and must be refused).
-    fn push_coalesced(pending: &mut VecDeque<String>, msg: String) -> Result<(), SdkA2AError> {
-        if msg.len() > MAX_COALESCE_BYTES {
-            return Err(SdkA2AError::invalid_params("message text is too large"));
+    /// The run's inbox for a job (the ladder's queue and dedupe store).
+    fn inbox(&self, task_id: &str) -> Inbox {
+        Inbox::new(crate::core::a2a::inbox::inbox_dir_for(
+            &self.config.state_root,
+            task_id,
+        ))
+    }
+
+    /// Enqueues `text` into the job's durable inbox (a fresh delivery
+    /// supersedes an earlier expiry).
+    fn enqueue(
+        &self,
+        task_id: &str,
+        sender: &str,
+        text: &str,
+        message_id: &str,
+        meta: DeliveryMeta,
+    ) -> Result<(), SdkA2AError> {
+        let inbox = self.inbox(task_id);
+        crate::core::a2a::delivery::clear_expiry(inbox.dir());
+        inbox
+            .enqueue(QueuedMessage {
+                message_id: message_id.to_string(),
+                sender: sender.to_string(),
+                hop: meta.hop,
+                context_id: None,
+                task_id: None,
+                framed: text.to_string(),
+                queued_at: crate::core::a2a::inbox::now_unix(),
+            })
+            .map(|_| ())
+            .map_err(|e| {
+                SdkA2AError::internal(format!(
+                    "failed to enqueue the A2A message into the run inbox: {e}"
+                ))
+            })
+    }
+
+    /// Ensures the ladder watcher is running for the job (it exits when the
+    /// inbox drains or the message expires).
+    fn ensure_ladder(&self, task_id: &str) {
+        let mut ladders = self.ladders.lock().expect("ladders lock poisoned");
+        ladders.retain(|_, guard| Arc::strong_count(guard) > 1);
+        if ladders.contains_key(task_id) {
+            return;
         }
-        pending.push_back(msg);
-        let mut dropped = false;
-        // Enforce the byte bound (drop oldest, keep newest).
-        while pending.iter().map(|s| s.len()).sum::<usize>() > MAX_COALESCE_BYTES
-            && pending.len() > 1
-        {
-            pending.pop_front();
-            dropped = true;
+        let guard = Arc::new(());
+        ladders.insert(task_id.to_string(), Arc::clone(&guard));
+        drop(ladders);
+        let config = Arc::clone(&self.config);
+        let job_id = task_id.to_string();
+        let _ = std::thread::Builder::new()
+            .name(format!("a2a-ladder-{job_id}"))
+            .spawn(move || {
+                loop {
+                    let step = Self::ladder_pass(&config, &job_id, false);
+                    match step {
+                        LadderStep::Injected | LadderStep::Expired { .. } => break,
+                        _ => std::thread::sleep(LADDER_POLL),
+                    }
+                }
+                drop(guard);
+            });
+    }
+
+    /// The ladder configuration for this worker.
+    fn ladder_config(config: &Config) -> LadderConfig {
+        LadderConfig {
+            ack_secs: config.a2a_ack_secs,
+            force_secs: config.a2a_force_secs,
+            ttl_secs: config.a2a_inbox_ttl_secs,
         }
-        // Enforce the count bound.
-        while pending.len() > MAX_COALESCE_MSGS {
-            pending.pop_front();
-            dropped = true;
-        }
-        // A single drop note records that overflow happened (bounded, so at most
-        // one; the note is appended after the trims and is itself tiny).
-        if dropped {
-            pending
-                .push_back("[note] earlier message(s) dropped by the delivery buffer".to_string());
-            while pending.len() > MAX_COALESCE_MSGS {
-                pending.pop_front();
+    }
+
+    /// Whether the `idle_turn` step is available (the run is idle at a turn
+    /// boundary): a finished job is idle; a RUNNING job only with a live
+    /// stdin channel (the §7.11 live path, off unless the idle turn needs it).
+    fn idle_turn_available(config: &Config, job_id: &str) -> bool {
+        match JobMetadata::resolve(&config.state_root, job_id) {
+            Ok(meta) => {
+                if compute_status(&meta, &config.state_root) != JobStatus::Running {
+                    return true;
+                }
+                config.a2a_live_stdin && crate::core::a2a_live::lookup(job_id).is_some()
             }
+            Err(_) => false,
         }
-        Ok(())
+    }
+
+    /// Applies the `idle_turn` step: a RUNNING live-channel job gets the
+    /// message over the pipe; a finished job is resumed (no kill). Returns
+    /// `true` when the message was handed to the run.
+    fn apply_idle_turn(config: &Config, job_id: &str, joined: &str) -> bool {
+        match JobMetadata::resolve(&config.state_root, job_id) {
+            Ok(meta) => {
+                let running = compute_status(&meta, &config.state_root) == JobStatus::Running;
+                if !running {
+                    return Self::resume_with(config, &meta, joined).is_ok();
+                }
+                if !config.a2a_live_stdin {
+                    return false;
+                }
+                if let Some(channel) = crate::core::a2a_live::lookup(job_id) {
+                    if channel.is_alive_for(meta.pid, meta.pid_start_time) {
+                        if channel.deliver_line(joined).is_ok() {
+                            channel.touch();
+                            return true;
+                        }
+                        crate::core::a2a_live::close_for(job_id);
+                    }
+                }
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// One ladder pass for the job: computes the step for the oldest pending
+    /// message and applies it; the caller re-polls on a non-terminal step.
+    fn ladder_pass(config: &Config, job_id: &str, interrupt: bool) -> LadderStep {
+        let ladder_cfg = Self::ladder_config(config);
+        let inbox_dir = crate::core::a2a::inbox::inbox_dir_for(&config.state_root, job_id);
+        // An already-expired message is never delivered (the marker decides).
+        if let Some(record) = crate::core::a2a::delivery::read_expiry(&inbox_dir) {
+            return LadderStep::Expired {
+                reason: record.reason,
+            };
+        }
+        let inbox = Inbox::with_ttl(&inbox_dir, u64::MAX);
+        let pending = inbox.pending();
+        if pending.is_empty() {
+            return LadderStep::Injected;
+        }
+        let step =
+            crate::core::a2a::delivery::next_step(&crate::core::a2a::delivery::LadderInput {
+                now: crate::core::a2a::inbox::now_unix(),
+                queued_at: pending[0].queued_at,
+                interrupt,
+                idle_turn_available: Self::idle_turn_available(config, job_id),
+                expired: false,
+                config: &ladder_cfg,
+            });
+        match step {
+            LadderStep::Expired { reason } => {
+                crate::core::a2a::delivery::record_expiry(
+                    &inbox_dir,
+                    &pending[0].message_id,
+                    &reason,
+                );
+                LadderStep::Expired { reason }
+            }
+            LadderStep::IdleTurn => {
+                let joined = join_framed(&pending);
+                if Self::apply_idle_turn(config, job_id, &joined) {
+                    inbox.drain(InjectChannel::IdleTurn.as_str());
+                }
+                step
+            }
+            LadderStep::Interrupt => {
+                let joined = join_framed(&pending);
+                if let Ok(meta) = JobMetadata::resolve(&config.state_root, job_id) {
+                    if Self::resume_with(config, &meta, &joined).is_ok() {
+                        inbox.drain(InjectChannel::Interrupt.as_str());
+                    }
+                }
+                step
+            }
+            other => other,
+        }
     }
 
     /// Resume the job's conversation with `prompt` as the next turn. For a
@@ -367,138 +522,13 @@ impl JobMessageSink {
         Ok(())
     }
 
-    /// Drives the per-job resume loop under the held gate (F7): drains the
-    /// coalesced `pending` buffer, resumes with (the coalesced messages plus)
-    /// `text` on the first pass, then keeps draining and resuming until
-    /// `pending` is empty. A message that arrives during an in-flight resume
-    /// therefore still gets delivered on the next pass instead of being
-    /// stranded. Stops at the first resume error and returns it.
-    fn drain_and_resume<F>(job: &JobSlot, text: &str, resume: &F) -> Result<(), SdkA2AError>
-    where
-        F: Fn(&str) -> Result<(), SdkA2AError>,
-    {
-        let mut result = Ok(());
-        let mut first = true;
-        loop {
-            let mut msgs: Vec<String> = {
-                let mut pending = job.pending.lock().expect("pending lock poisoned");
-                pending.drain(..).collect()
-            };
-            if first {
-                msgs.push(text.to_string());
-                first = false;
-            }
-            if msgs.is_empty() {
-                break;
-            }
-            result = resume(&join_prompts(&msgs));
-            if result.is_err() {
-                break;
-            }
-        }
-        result
-    }
-}
-
-impl MessageSink for JobMessageSink {
-    fn deliver(
-        &self,
-        task_id: &str,
-        _sender: &str,
-        text: &str,
-        message_id: &str,
-    ) -> Result<(), SdkA2AError> {
-        // Idempotency: the same A2A message id is applied at most once. A
-        // duplicate of an already-delivered id is accepted as a no-op (the
-        // sender gets success, not an error), so a retry is harmless.
-        if self.mark_seen(message_id) {
-            return Ok(());
-        }
-
-        // Unknown job (or a cleaned/discarded row): TASK_NOT_FOUND. The handler
-        // already validated existence, but the row can vanish (gc/clean) between
-        // that check and delivery.
-        let meta = match JobMetadata::resolve(&self.config.state_root, task_id) {
-            Ok(m) => m,
-            Err(_) => return Err(SdkA2AError::task_not_found(task_id)),
-        };
-
-        // An operator-killed job is never woken.
-        if meta.status == Some(JobStatus::Killed) {
-            return Err(SdkA2AError::invalid_params(format!(
-                "job '{}' was killed by the operator and cannot be resumed with a message",
-                task_id
-            )));
-        }
-
-        // Worktree already gone (cleaned/discarded): TASK_NOT_FOUND.
-        if !meta.worktree_path.exists() {
-            return Err(SdkA2AError::task_not_found(task_id));
-        }
-
-        // Live fast path: a RUNNING job that was launched in live mode (an A2A
-        // mesh member, `[worker] a2a_live_stdin` on) reads its messages from a
-        // stdin pipe, so the message is delivered to the RUNNING process as one
-        // NDJSON line -- no kill, no resume, the same conversation continues.
-        // The channel holds the process identity it was registered with, so a
-        // recycled pid can never be written into. A missing / stale / dead
-        // channel (or a write failure) unregisters it and falls through to the
-        // interrupt-and-resume path unchanged; the per-job gate is taken for
-        // the write so a live delivery never interleaves with a resume or
-        // another live delivery.
-        if self.config.a2a_live_stdin {
-            if let Some(channel) = crate::core::a2a_live::lookup(task_id) {
-                if channel.is_alive_for(meta.pid, meta.pid_start_time)
-                    && compute_status(&meta, &self.config.state_root) == JobStatus::Running
-                {
-                    let job = self.slot(task_id);
-                    // The per-job gate serialises the write against a concurrent
-                    // resume; a live delivery that cannot take it immediately
-                    // falls through to the coalesce path.
-                    let gate = job.gate.try_lock();
-                    if let Ok(gate) = gate {
-                        match channel.deliver_line(text) {
-                            Ok(()) => {
-                                channel.touch();
-                                drop(gate);
-                                return Ok(());
-                            }
-                            Err(_) => {
-                                // The pipe broke: unregister the channel so the
-                                // fallback resume path takes over from a clean
-                                // state.
-                                drop(gate);
-                                crate::core::a2a_live::close_for(task_id);
-                            }
-                        }
-                    }
-                } else {
-                    // The process is gone or its identity changed (a retry has
-                    // since claimed the row): drop the stale channel.
-                    crate::core::a2a_live::close_for(task_id);
-                }
-            }
-        }
-
-        // The per-job gate serialises at most one resume at a time for this
-        // job (and only this job -- other jobs are unaffected). A delivery that
-        // cannot take the gate immediately means a resume is already in flight:
-        // coalesce the message into the pending buffer and return success (it
-        // rides the next resume). Coalescing is cheap (bounded deque), so it
-        // never blocks a worker thread.
+    /// The explicit `interrupt` escalation (design §7.14, last resort): the
+    /// kill-and-resume of §7.11. Applies the per-job storm limit
+    /// (`a2a_interrupt_min_secs`, 0 = off), then resumes with the joined
+    /// pending messages, marked injected through the `interrupt` channel.
+    fn escalate_interrupt(&self, task_id: &str, joined: &str) -> Result<(), SdkA2AError> {
         let job = self.slot(task_id);
-        let gate = match job.gate.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                let mut pending = job.pending.lock().expect("pending lock poisoned");
-                return Self::push_coalesced(&mut pending, text.to_string());
-            }
-        };
-
-        // Per-job storm limit: refuse a second interrupt younger than the
-        // configured interval. The per-jobset hop-token budget (charged by the
-        // caller's ingress) is an independent, coarser cap on the whole
-        // jobset's message rate.
+        let gate = job.gate.lock().expect("gate lock poisoned");
         let min_secs = self.config.a2a_interrupt_min_secs;
         if min_secs > 0 {
             let last = *job
@@ -509,59 +539,75 @@ impl MessageSink for JobMessageSink {
                 let since = last.elapsed().as_secs();
                 if since < min_secs {
                     let retry_after = min_secs.saturating_sub(since).max(1);
+                    drop(gate);
                     return Err(a2a_rate_limited(format!(
                         "interrupt rate limit: this job was interrupted {since}s ago; retry in {retry_after}s",
                     )));
                 }
             }
         }
-
-        // Drain any messages that queued (coalesced) while a previous resume
-        // was in flight, in order, ahead of the current one, and bound the
-        // combined prompt (oldest dropped first) so a burst cannot exceed the
-        // argv prompt limit. After each resume completes, drain AGAIN and keep
-        // resuming until the pending buffer is empty: a message that arrived
-        // while THIS resume held the gate coalesced into `pending` (its
-        // `deliver` could not take the gate), and without the post-resume
-        // drain it would be stranded indefinitely. The buffer is bounded and
-        // the per-job/per-jobset rate limits bound the rest, so the loop
-        // terminates.
-        let result = Self::drain_and_resume(&job, text, &|prompt| {
-            *job.last_interrupt
-                .lock()
-                .expect("last_interrupt lock poisoned") = Some(Instant::now());
-            Self::resume_with(&self.config, &meta, prompt)
-        });
+        *job.last_interrupt
+            .lock()
+            .expect("last_interrupt lock poisoned") = Some(Instant::now());
+        let meta = JobMetadata::resolve(&self.config.state_root, task_id)
+            .map_err(|_| SdkA2AError::task_not_found(task_id))?;
+        let result = Self::resume_with(&self.config, &meta, joined);
+        if result.is_ok() {
+            self.inbox(task_id).drain(InjectChannel::Interrupt.as_str());
+        }
         drop(gate);
         result
     }
 }
 
-/// Joins the coalesced messages into a single next-turn prompt, bounding the
-/// combined length (oldest dropped first) so a burst cannot exceed the argv
-/// prompt limit. A single message longer than the cap is kept as-is (retry
-/// will refuse it with the standard prompt-size error).
-fn join_prompts(msgs: &[String]) -> String {
-    const MAX: usize = crate::core::runner::PROMPT_ARGV_MAX_BYTES;
-    if msgs.len() == 1 {
-        return msgs[0].clone();
-    }
-    let mut out: Vec<String> = Vec::new();
-    let mut bytes = 0usize;
-    // Newest-first so the newest (most relevant) is kept; then reverse.
-    for m in msgs.iter().rev() {
-        if out.is_empty() {
-            out.push(m.clone());
-            bytes = m.len();
-        } else if bytes + m.len() + 2 <= MAX {
-            out.push(m.clone());
-            bytes += m.len() + 2;
-        } else {
-            break;
+impl MessageSink for JobMessageSink {
+    fn deliver_with_meta(
+        &self,
+        task_id: &str,
+        sender: &str,
+        text: &str,
+        message_id: &str,
+        meta: DeliveryMeta,
+    ) -> Result<(), SdkA2AError> {
+        // Idempotency: a repeated A2A message id is a no-op success; the
+        // durable inbox is the dedupe store.
+        if self.mark_seen(message_id) {
+            return Ok(());
         }
+
+        let meta_job = match JobMetadata::resolve(&self.config.state_root, task_id) {
+            Ok(m) => m,
+            Err(_) => return Err(SdkA2AError::task_not_found(task_id)),
+        };
+
+        if meta_job.status == Some(JobStatus::Killed) {
+            return Err(SdkA2AError::invalid_params(format!(
+                "job '{}' was killed by the operator and cannot be resumed with a message",
+                task_id
+            )));
+        }
+
+        if !meta_job.worktree_path.exists() {
+            return Err(SdkA2AError::task_not_found(task_id));
+        }
+
+        // The explicit last resort (interrupt: true, trusted metadata): the
+        // storm limit applies before the enqueue, then escalate immediately.
+        if meta.interrupt {
+            self.enqueue(task_id, sender, text, message_id, meta)?;
+            let joined = {
+                let inbox = self.inbox(task_id);
+                join_framed(&inbox.pending())
+            };
+            return self.escalate_interrupt(task_id, &joined);
+        }
+
+        // The default path: enqueue into the durable inbox -- the hooks
+        // inject at the next boundary and the ladder escalates.
+        self.enqueue(task_id, sender, text, message_id, meta)?;
+        self.ensure_ladder(task_id);
+        Ok(())
     }
-    out.reverse();
-    out.join("\n")
 }
 
 #[cfg(test)]
@@ -985,7 +1031,7 @@ mod tests {
         crate::core::job::ensure_state_store(&config.state_root).unwrap();
         let sink = JobMessageSink::new(Arc::new(config));
         let err = sink
-            .deliver("nope", "sender", "hello", "msg-1")
+            .deliver_with_meta("nope", "sender", "hello", "msg-1", DeliveryMeta::default())
             .unwrap_err();
         assert_eq!(err.code, a2a::error_code::TASK_NOT_FOUND);
     }
@@ -1039,7 +1085,13 @@ mod tests {
 
         let sink = JobMessageSink::new(Arc::new(config));
         let err = sink
-            .deliver("killed", "sender", "hello", "msg-1")
+            .deliver_with_meta(
+                "killed",
+                "sender",
+                "hello",
+                "msg-1",
+                DeliveryMeta::default(),
+            )
             .unwrap_err();
         assert_eq!(err.code, a2a::error_code::INVALID_PARAMS);
         assert!(
@@ -1097,7 +1149,7 @@ mod tests {
 
         let sink = JobMessageSink::new(Arc::new(config));
         let err = sink
-            .deliver("ghost", "sender", "hello", "msg-1")
+            .deliver_with_meta("ghost", "sender", "hello", "msg-1", DeliveryMeta::default())
             .unwrap_err();
         assert_eq!(err.code, a2a::error_code::TASK_NOT_FOUND);
     }
@@ -1109,14 +1161,18 @@ mod tests {
         write_fake_agy(&config.agy_path, &worktree);
         let sink = JobMessageSink::new(Arc::new(config));
 
-        // First interrupt: no recent interrupt, so it resumes.
+        let interrupt = DeliveryMeta {
+            hop: 1,
+            interrupt: true,
+        };
         assert!(
-            sink.deliver("ratelimit", "sender", "first", "m1").is_ok(),
+            sink.deliver_with_meta("ratelimit", "sender", "first", "m1", interrupt)
+                .is_ok(),
             "the first interrupt must resume the job"
         );
         // A second interrupt within the configured interval is rate-limited.
         let err = sink
-            .deliver("ratelimit", "sender", "second", "m2")
+            .deliver_with_meta("ratelimit", "sender", "second", "m2", interrupt)
             .unwrap_err();
         assert_eq!(err.code, a2a::error_code::INVALID_PARAMS);
         assert!(
@@ -1134,58 +1190,65 @@ mod tests {
         let state_root = config.state_root.clone();
         let sink = JobMessageSink::new(Arc::new(config));
 
-        assert!(sink.deliver("idem", "sender", "hello", "m1").is_ok());
-        // The same A2A message id delivered again is a no-op (not re-applied).
+        let plain = DeliveryMeta::default();
+        assert!(sink
+            .deliver_with_meta("idem", "sender", "hello", "m1", plain)
+            .is_ok());
+        // The same A2A message id delivered again is a no-op (not re-queued).
         assert!(
-            sink.deliver("idem", "sender", "hello", "m1").is_ok(),
+            sink.deliver_with_meta("idem", "sender", "hello", "m1", plain)
+                .is_ok(),
             "a duplicate message id must be accepted as a no-op"
         );
-        // Only ONE resume was launched: retry_count bumped exactly once.
+        // Exactly ONE message sits in the run's durable inbox (the dedupe
+        // store) and nothing was resumed yet (the ladder escalates only past
+        // the ack window).
+        assert_eq!(sink.inbox("idem").pending().len(), 1);
         let after = JobMetadata::load(&state_root, "idem").unwrap();
         assert_eq!(
-            after.retry_count, 1,
-            "a duplicated message id must not launch a second turn, retry_count = {}",
+            after.retry_count, 0,
+            "a plain delivery must not resume anything yet, retry_count = {}",
             after.retry_count
         );
     }
 
     #[test]
-    fn sink_coalesce_buffer_is_bounded() {
-        let mut pending = VecDeque::new();
-        // 20 small messages must be capped at MAX_COALESCE_MSGS (8) with a note.
-        for i in 0..20 {
-            JobMessageSink::push_coalesced(&mut pending, format!("msg-{i}")).unwrap();
-        }
-        assert!(
-            pending.len() <= MAX_COALESCE_MSGS,
-            "the coalesce buffer must stay within {} entries, got {}",
-            MAX_COALESCE_MSGS,
-            pending.len()
-        );
-        assert!(
-            pending.iter().any(|s| s.contains("dropped")),
-            "overflow must be recorded with a drop note"
-        );
-        // A single oversized message is refused outright.
-        let mut one = VecDeque::new();
-        let big = "x".repeat(MAX_COALESCE_BYTES + 1);
-        assert!(JobMessageSink::push_coalesced(&mut one, big).is_err());
-    }
-
-    #[test]
-    fn sink_deliver_resumes_done_job_as_followup_turn() {
+    fn sink_deliver_queues_and_the_ladder_resumes_done_job_at_the_idle_turn() {
         let temp = TempDir::new().unwrap();
         let (config, worktree) = save_resumable_done_job(&temp, "e2e", 0);
+        // A 1 s ack window so the ladder escalates immediately; force_secs
+        // stays 0 (never kill).
+        let config = Config {
+            a2a_ack_secs: 1,
+            ..config
+        };
         let agy = config.agy_path.clone();
         write_fake_agy(&agy, &worktree);
         let state_root = config.state_root.clone();
         let sink = JobMessageSink::new(Arc::new(config));
 
-        assert!(
-            sink.deliver("e2e", "other-agent", "please fix the flake", "m1")
-                .is_ok(),
-            "a message to a done job must resume it"
+        // Deliver: the message is queued (sender task submitted), nothing is
+        // resumed yet.
+        assert!(sink
+            .deliver_with_meta(
+                "e2e",
+                "other-agent",
+                "please fix the flake",
+                "m1",
+                DeliveryMeta::default()
+            )
+            .is_ok());
+        assert_eq!(sink.inbox("e2e").pending().len(), 1);
+
+        // Age past the ack window: the ladder escalates to the idle turn (the
+        // job is done, so the next turn is a fresh resume) and the injection
+        // is the ack. force_secs=0: never an interrupt.
+        age_pending_message(&sink.inbox("e2e"), 2);
+        assert_eq!(
+            JobMessageSink::ladder_pass(&sink.config, "e2e", false),
+            LadderStep::IdleTurn
         );
+        assert!(sink.inbox("e2e").pending().is_empty());
 
         // The row moved to a new attempt carrying the message as the follow-up
         // prompt, and the conversation id is preserved (the same conversation
@@ -1224,134 +1287,56 @@ mod tests {
         }
     }
 
-    #[test]
-    fn join_prompts_bounds_the_combined_length() {
-        assert_eq!(join_prompts(&["only".to_string()]), "only");
-        let mut msgs = Vec::new();
-        let pad = "y".repeat(2000);
-        for i in 0..100 {
-            let mut s = format!("m{i}:");
-            s.push_str(&pad);
-            msgs.push(s);
+    /// Ages every pending message past `seconds` (rewrites the stored
+    /// `queued_at`; the file name is derived the same way the inbox does).
+    fn age_pending_message(inbox: &Inbox, seconds: u64) {
+        for msg in inbox.pending() {
+            let hex: String = crate::core::crypto::sha256(msg.message_id.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let path = inbox.dir().join(format!("m-{hex}.json"));
+            let mut m = msg;
+            m.queued_at = crate::core::a2a::inbox::now_unix().saturating_sub(seconds);
+            std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
         }
-        let joined = join_prompts(&msgs);
-        assert!(
-            joined.len() <= crate::core::runner::PROMPT_ARGV_MAX_BYTES,
-            "the joined prompt must stay within the argv limit"
-        );
-        // The newest message is always kept.
-        assert!(joined.contains("m99:"));
     }
 
     #[test]
-    fn message_arriving_during_inflight_resume_is_not_stranded() {
-        // F7: a message that arrives while a resume is in flight (its `deliver`
-        // cannot take the per-job gate, so it coalesces into `pending`) must be
-        // drained and delivered once the in-flight resume finishes, instead of
-        // being stranded. The in-flight window is created by parking the job
-        // monitor's post-spawn hook (which blocks PID recording, keeping the
-        // gate held until the test releases it).
-        use crate::core::runner::{clear_test_hooks, register_test_post_spawn_hook};
-        use std::sync::{Condvar, Mutex};
-
+    fn ladder_expires_the_sender_task_after_the_ttl() {
         let temp = TempDir::new().unwrap();
-        let (config, worktree) = save_resumable_done_job(&temp, "e2e", 0);
-        let agy = config.agy_path.clone();
-        write_fake_agy(&agy, &worktree);
-        let state_root = config.state_root.clone();
-        let sink = Arc::new(JobMessageSink::new(Arc::new(config)));
+        let (config, worktree) = save_resumable_done_job(&temp, "expire", 0);
+        // A 1 s ack window and a short TTL (floor 10 s) for the test.
+        let config = Config {
+            a2a_ack_secs: 1,
+            a2a_inbox_ttl_secs: 10,
+            ..config
+        };
+        write_fake_agy(&config.agy_path, &worktree);
+        let sink = JobMessageSink::new(Arc::new(config.clone()));
 
-        let arrived = Arc::new((Mutex::new(0u32), Condvar::new()));
-        let go = Arc::new((Mutex::new(false), Condvar::new()));
-        {
-            let arrived = Arc::clone(&arrived);
-            let go = Arc::clone(&go);
-            register_test_post_spawn_hook("e2e", move || {
-                // Park the monitor of the FIRST spawn only (so PID recording --
-                // and thus the held gate -- is delayed until the test releases
-                // it); the resumed turn's own retry monitor passes through.
-                let is_first = {
-                    let (m, c) = &*arrived;
-                    let mut n = m.lock().unwrap();
-                    if *n == 0 {
-                        *n += 1;
-                        c.notify_all();
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if is_first {
-                    let (m, c) = &*go;
-                    let mut g = m.lock().unwrap();
-                    while !*g {
-                        g = c.wait(g).unwrap();
-                    }
-                }
-            });
-        }
-
-        // Thread A: resume "first" and hold the gate while the monitor parks.
-        let job = Arc::clone(&sink);
-        let a = std::thread::spawn(move || {
-            job.deliver("e2e", "other-agent", "please fix the flake", "m1")
-        });
-
-        // Wait until the first resume's monitor is parked (gate held).
-        {
-            let (m, c) = &*arrived;
-            let mut n = m.lock().unwrap();
-            while *n == 0 {
-                n = c.wait(n).unwrap();
-            }
-        }
-
-        // Thread B: arrives mid-flight, cannot take the gate, must coalesce.
-        let job = Arc::clone(&sink);
-        let b = std::thread::spawn(move || {
-            job.deliver("e2e", "other-agent", "and the second one too", "m2")
-        });
-        let b_ok = b.join().unwrap();
-        assert!(
-            b_ok.is_ok(),
-            "a message arriving during an in-flight resume must coalesce and succeed, got: {b_ok:?}"
-        );
-
-        // Release the parked monitor; the drain loop must now pick up "m2"
-        // and resume again.
-        *go.0.lock().unwrap() = true;
-        go.1.notify_all();
-        assert!(
-            a.join().unwrap().is_ok(),
-            "the in-flight resume must succeed"
-        );
-        clear_test_hooks("e2e");
-
-        // Both messages were delivered: two attempts claimed, two SUCCESS
-        // lines in the log (one per resume), and no stranded pending message.
-        let after = JobMetadata::load(&state_root, "e2e").unwrap();
+        // A BUSY (running) job: the idle turn is unavailable, force_secs is
+        // 0 (never kill) -- queued until the TTL expires it.
+        save_running_job(&config, "expire", &worktree);
+        sink.deliver_with_meta(
+            "expire",
+            "sender",
+            "busy member message",
+            "m1",
+            DeliveryMeta::default(),
+        )
+        .unwrap();
+        age_pending_message(&sink.inbox("expire"), 9);
         assert_eq!(
-            after.retry_count, 2,
-            "both deliveries must claim an attempt (second ride the post-resume drain), got retry_count={}",
-            after.retry_count
+            JobMessageSink::ladder_pass(&sink.config, "expire", false),
+            LadderStep::Queued,
+            "busy run inside the ttl: queued"
         );
-        let log_path = JobMetadata::log_path(&state_root, "e2e");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        loop {
-            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-            if log.matches("SUCCESS").count() >= 2 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the second (drained) resume never ran agy; log: {log}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(
-            sink.slot("e2e").pending.lock().unwrap().is_empty(),
-            "the pending buffer must be fully drained"
-        );
+        age_pending_message(&sink.inbox("expire"), 20);
+        assert!(matches!(
+            JobMessageSink::ladder_pass(&sink.config, "expire", false),
+            LadderStep::Expired { .. }
+        ));
     }
 
     // ---- Live stdin delivery ---------------------------------------------
@@ -1481,6 +1466,7 @@ mod tests {
                 agy_path: temp.path().join("fake-agy"),
                 a2a_interrupt_min_secs: 0,
                 a2a_live_stdin: true,
+                a2a_ack_secs: 1,
                 ..Default::default()
             };
             let meta = save_running_job(&config, "livedel", &worktree);
@@ -1488,11 +1474,23 @@ mod tests {
             let mut reader = register_live_channel_for_test(&config, "livedel", &meta, &worktree);
 
             let sink = JobMessageSink::new(Arc::new(config));
-            assert!(
-                sink.deliver("livedel", "peer", "please live-deliver", "m1")
-                    .is_ok(),
-                "a message to a live RUNNING job must be delivered over stdin"
+            assert!(sink
+                .deliver_with_meta(
+                    "livedel",
+                    "peer",
+                    "please live-deliver",
+                    "m1",
+                    DeliveryMeta::default()
+                )
+                .is_ok());
+            // Age past the ack window: the idle_turn step writes the stdin
+            // line into the RUNNING process.
+            age_pending_message(&sink.inbox("livedel"), 2);
+            assert_eq!(
+                JobMessageSink::ladder_pass(&sink.config, "livedel", false),
+                LadderStep::IdleTurn
             );
+            assert!(sink.inbox("livedel").pending().is_empty());
             // The running process actually received the framed user line.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
@@ -1507,7 +1505,6 @@ mod tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            // The line is the NDJSON `user` envelope, one line.
             let content = std::fs::read_to_string(worktree.join("received.txt")).unwrap();
             for line in content.lines() {
                 let v: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -1517,103 +1514,15 @@ mod tests {
             let after = JobMetadata::load(&state_root, "livedel").unwrap();
             assert_eq!(
                 after.retry_count, 0,
-                "live delivery must not claim a resume attempt"
+                "the live stdin delivery must not claim a resume attempt"
             );
             // Idempotency still applies to a repeated message id.
-            assert!(sink.deliver("livedel", "peer", "dup", "m1").is_ok());
+            assert!(sink
+                .deliver_with_meta("livedel", "peer", "dup", "m1", DeliveryMeta::default())
+                .is_ok());
             let _ = reader.kill();
             let _ = reader.wait();
             crate::core::a2a_live::close_for("livedel");
         });
-    }
-
-    #[test]
-    fn sink_live_stale_channel_falls_back_to_resume() {
-        crate::core::a2a_live::with_isolated_live(|| {
-            let temp = TempDir::new().unwrap();
-            // A DONE job (clean resume target) with a leftover live channel
-            // registered for a DIFFERENT pid: `is_alive_for` fails, the stale
-            // channel is unregistered, and the message falls through to the
-            // interrupt-and-resume path.
-            let (config, worktree) = save_resumable_done_job(&temp, "livemiss", 0);
-            let config = Config {
-                a2a_live_stdin: true,
-                ..config
-            };
-            write_fake_agy(&config.agy_path, &worktree);
-            // Register a stale channel pointing at a dead pid (999999) so the
-            // registry looks live while the process identity does not match.
-            let mut cat = register_live_channel_stale(&config, "livemiss", 999999);
-
-            let sink = JobMessageSink::new(Arc::new(config));
-            assert!(
-                sink.deliver("livemiss", "peer", "must resume", "m2")
-                    .is_ok(),
-                "with no matching live channel the message must resume via retry"
-            );
-            let after = JobMetadata::load(&temp.path().join("state"), "livemiss").unwrap();
-            assert_eq!(
-                after.retry_count, 1,
-                "the fallback must claim a resume attempt"
-            );
-            // The stale channel must have been unregistered.
-            assert!(crate::core::a2a_live::lookup("livemiss").is_none());
-            let _ = cat.kill();
-            let _ = cat.wait();
-        });
-    }
-
-    #[test]
-    fn sink_live_disabled_forces_resume() {
-        crate::core::a2a_live::with_isolated_live(|| {
-            let temp = TempDir::new().unwrap();
-            let (config, worktree) = save_resumable_done_job(&temp, "liveoff", 0);
-            let config = Config {
-                a2a_live_stdin: false,
-                ..config
-            };
-            write_fake_agy(&config.agy_path, &worktree);
-            // A live channel EXISTS but the config is off: resume path. Since
-            // the job is Done (pid None), a stale channel is irrelevant, but
-            // the config gate alone must already force the resume.
-            let mut cat = register_live_channel_stale(&config, "liveoff", 999999);
-
-            let sink = JobMessageSink::new(Arc::new(config));
-            assert!(
-                sink.deliver("liveoff", "peer", "resume anyway", "m3")
-                    .is_ok(),
-                "with a2a_live_stdin=false the message must resume"
-            );
-            let after = JobMetadata::load(&temp.path().join("state"), "liveoff").unwrap();
-            assert_eq!(
-                after.retry_count, 1,
-                "live disabled must claim a resume attempt"
-            );
-            crate::core::a2a_live::close_for("liveoff");
-            let _ = cat.kill();
-            let _ = cat.wait();
-        });
-    }
-
-    /// Registers a live channel for `job_id` holding a real `/bin/cat` stdin
-    /// but carrying an arbitrary (possibly stale) pid, so tests can simulate a
-    /// channel whose process identity doesn't match the job row. The spawned
-    /// cat is returned for cleanup.
-    fn register_live_channel_stale(config: &Config, job_id: &str, pid: u32) -> std::process::Child {
-        let mut child = std::process::Command::new("/bin/cat")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn cat");
-        let stdin = child.stdin.take().expect("piped stdin");
-        crate::core::a2a_live::register(
-            job_id,
-            pid,
-            Some(1),
-            stdin,
-            JobMetadata::log_path(&config.state_root, job_id),
-        );
-        child
     }
 }

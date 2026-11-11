@@ -53,6 +53,16 @@ pub fn build_router(
     let auth = Arc::new(crate::core::auth::AuthManager::new());
     let rc_state = RemoteControlState::default();
     let state_root = core_config.state_root.clone();
+    // The escalation ladder (design HL-113 §7.14, phase 2): the session
+    // inboxes live under the shared agent-run state root, and the ladder
+    // knobs are the shared a2a_ack_secs / a2a_force_secs / inbox TTL keys
+    // (captured before the config moves into the core router).
+    #[cfg(feature = "a2a")]
+    let a2a_ladder = crate::core::a2a::delivery::LadderConfig {
+        ack_secs: core_config.a2a_ack_secs,
+        force_secs: core_config.a2a_force_secs,
+        ttl_secs: core_config.a2a_inbox_ttl_secs,
+    };
     let base = router_with_rc(Arc::new(core_config), auth, rc_state);
 
     let api_state = SessionsApiState::new(state.clone(), controls.clone(), session_logs);
@@ -96,6 +106,8 @@ pub fn build_router(
         api_state,
         a2a_auth,
         a2a_jobset,
+        state_root.clone(),
+        a2a_ladder,
     );
 
     let ready = {
