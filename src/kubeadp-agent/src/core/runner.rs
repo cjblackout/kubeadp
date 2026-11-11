@@ -2624,10 +2624,29 @@ mod tests {
 
     #[test]
     fn test_boundary_race_never_leaves_orphaned_agy() {
-        // (c) the boundary race: force the interleaving where the monitor spawns
-        // right as the window elapses and assert the outcome is EITHER (Ok(pid) and
-        // a live agy) OR (Err and no agy), never (Err and live agy) -- run that test
-        // in a loop (200 iterations with tiny sleeps) so the race would be caught.
+        // (c) the boundary race, made deterministic. The original version raced
+        // a launch against a cancellation 200 times (tiny sleeps in the pre-spawn
+        // hook) and ASSERTED both outcomes occurred at least once -- a
+        // probabilistic requirement on timing: on a slow or loaded runner one
+        // outcome is absent although the code is correct. Here each outcome is
+        // instead driven explicitly via the test hooks and a bare Barrier (no
+        // sleeps as the mechanism), and each scenario runs a fixed small number
+        // of times. The INVARIANT is checked on every iteration:
+        //
+        //   Ok : launcher returns Ok(pid)   => agy alive, row holds the pid.
+        //   Err: launcher returns Err       => no agy ever stays alive (no
+        //                                      orphan), row holds no pid.
+        //
+        // Err arm: a pre-spawn hook parks the monitor (via a Barrier) before it
+        // can spawn anything. The launcher's confirmation window always expires
+        // PENDING->CANCELLED -- the monitor is parked and writes no PID, so
+        // whatever the thread interleaving, the launcher wins the CAS and the
+        // monitor, once released, observes CANCELLED and never spawns agy.
+        // Ok arm: a post-spawn hook parks the monitor right after agy is spawned,
+        // before the CAS. The test waits until agy has confirmed itself (its
+        // pidfile appears, i.e. the PID is real), THEN releases the monitor so it
+        // wins the CAS and records the row; with a wide launcher window the PID is
+        // always confirmed before the cancellation could land.
         let tmp = tempdir().unwrap();
         let state_root = tmp.path().join("state");
         let workspace_root = tmp.path().join("ws");
@@ -2645,110 +2664,141 @@ mod tests {
             ..Default::default()
         };
 
-        let mut ok_count = 0;
-        let mut err_count = 0;
-
-        for i in 0..200 {
-            let job_id = format!("race_{}_{}", std::process::id(), i);
-            let wt = tmp.path().join(format!("wt_{}", i));
+        // ------------------------------------------------------------------
+        // Err arm: cancellation always wins; agy is never spawned.
+        // ------------------------------------------------------------------
+        const ERR_ITERATIONS: usize = 20;
+        for i in 0..ERR_ITERATIONS {
+            let job_id = format!("raceerr{}_{}", std::process::id(), i);
+            let wt = tmp.path().join(format!("wterr_{}", i));
             fs::create_dir_all(&wt).unwrap();
             let mut meta = test_meta_overrides();
             meta.job_id = job_id.clone();
             meta.worktree_path = wt.clone();
 
-            // Vary pre-spawn delay between 0ms and 24ms around a 12ms timeout window.
-            let delay_ms = (i % 25) as u64;
+            // Park the monitor before it can spawn agy; the test releases it
+            // only after the launcher has already returned Err.
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let gate_hook = Arc::clone(&gate);
             register_test_pre_spawn_hook(&job_id, move || {
-                if delay_ms > 0 {
-                    thread::sleep(Duration::from_millis(delay_ms));
-                }
+                let _ = gate_hook.wait();
             });
 
-            let res = launch_background_job_with_timeout(
-                &config,
-                &mut meta,
-                Duration::from_millis(12),
-                Duration::from_millis(2),
+            let job_config = config.clone();
+            let launcher = std::thread::spawn(move || {
+                let res = launch_background_job_with_timeout(
+                    &job_config,
+                    &mut meta,
+                    Duration::from_millis(200),
+                    Duration::from_millis(20),
+                );
+                (res, meta)
+            });
+
+            // The confirmation window elapses while the monitor is parked: the
+            // launcher wins PENDING->CANCELLED, so the launch is Err.
+            let (res, meta) = launcher.join().unwrap();
+            let err = res.expect_err("a launch with the monitor parked past the window must fail");
+            assert!(
+                err.to_string().contains("did not confirm a PID"),
+                "unexpected error message: {err}"
+            );
+            assert!(meta.pid.is_none(), "failed launch must not set meta.pid");
+
+            // Release the monitor: it must observe CANCELLED and skip the spawn.
+            let _ = gate.wait();
+            assert!(
+                wait_until(std::time::Instant::now() + Duration::from_secs(8), || {
+                    fs::read_to_string(JobMetadata::log_path(&state_root, &job_id))
+                        .map(|l| l.contains("agy was not spawned"))
+                        .unwrap_or(false)
+                }),
+                "the cancelled monitor must report in the job log that agy was not spawned"
             );
 
-            let pidfile = wt.join("agy.pid");
-
-            match res {
-                Ok(pid) => {
-                    ok_count += 1;
-                    assert!(pid > 1);
-                    assert_eq!(meta.pid, Some(pid));
-
-                    // agy MUST be alive
-                    assert!(
-                        crate::core::job::is_pid_alive(pid),
-                        "successful launch (Ok) must have a live agy process"
-                    );
-
-                    // Row must record the PID
-                    let row = JobMetadata::load(&state_root, &job_id).unwrap();
-                    assert_eq!(row.pid, Some(pid));
-
-                    // Clean up the live process
-                    let _ = crate::core::commands::kill::send_signal(pid, "KILL");
-                    let _ = wait_until(std::time::Instant::now() + Duration::from_secs(1), || {
-                        !crate::core::job::is_pid_alive(pid)
-                    });
-                }
-                Err(err) => {
-                    err_count += 1;
-                    assert!(
-                        err.to_string().contains("did not confirm a PID"),
-                        "unexpected error message: {err}"
-                    );
-                    assert!(meta.pid.is_none(), "failed launch must not set meta.pid");
-
-                    // If agy was spawned before or during the cancellation, its PID was written
-                    // to pidfile, but monitor must have killed it and reaped it upon CAS failure.
-                    // It must NEVER remain alive!
-                    let _ = wait_until(std::time::Instant::now() + Duration::from_secs(2), || {
-                        if pidfile.exists() {
-                            if let Ok(s) = fs::read_to_string(&pidfile) {
-                                if let Ok(pid) = s.trim().parse::<u32>() {
-                                    return !crate::core::job::is_pid_alive(pid);
-                                }
-                            }
-                        }
-                        true
-                    });
-
-                    if pidfile.exists() {
-                        if let Ok(s) = fs::read_to_string(&pidfile) {
-                            if let Ok(agy_pid) = s.trim().parse::<u32>() {
-                                assert!(
-                                    !crate::core::job::is_pid_alive(agy_pid),
-                                    "race invariant violated: launcher returned Err, but agy PID {agy_pid} is still alive (ORPHAN!)"
-                                );
-                            }
-                        }
-                    }
-
-                    // Row must NOT have a PID
-                    if let Ok(row) = JobMetadata::load(&state_root, &job_id) {
-                        assert!(
-                            row.pid.is_none(),
-                            "failed launch must not record a PID in the row"
-                        );
-                    }
-                }
-            }
+            // Invariants: no agy process may remain (never spawned) and the row
+            // must not carry a PID.
+            assert_eq!(
+                count_processes_with_cmdline(&agy.to_string_lossy()),
+                0,
+                "no agy process may remain after a cancelled launch"
+            );
+            let row = JobMetadata::load(&state_root, &job_id).unwrap_or_else(|_| meta.clone());
+            assert!(
+                row.pid.is_none(),
+                "a cancelled launch must not record a PID in the row"
+            );
 
             clear_test_hooks(&job_id);
         }
 
-        assert!(
-            ok_count > 0,
-            "expected at least one Ok outcome in 200 race iterations, got 0"
-        );
-        assert!(
-            err_count > 0,
-            "expected at least one Err outcome in 200 race iterations, got 0"
-        );
+        // ------------------------------------------------------------------
+        // Ok arm: the PID is always confirmed before the cancellation lands.
+        // ------------------------------------------------------------------
+        const OK_ITERATIONS: usize = 20;
+        for i in 0..OK_ITERATIONS {
+            let job_id = format!("raceok{}_{}", std::process::id(), i);
+            let wt = tmp.path().join(format!("wtok_{}", i));
+            fs::create_dir_all(&wt).unwrap();
+            let mut meta = test_meta_overrides();
+            meta.job_id = job_id.clone();
+            meta.worktree_path = wt.clone();
+
+            // Park the monitor right after agy is spawned, before the CAS: the
+            // test confirms the PID first, then releases it to record the row.
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let gate_hook = Arc::clone(&gate);
+            register_test_post_spawn_hook(&job_id, move || {
+                let _ = gate_hook.wait();
+            });
+
+            let job_config = config.clone();
+            let launcher = std::thread::spawn(move || {
+                let res = launch_background_job_with_timeout(
+                    &job_config,
+                    &mut meta,
+                    Duration::from_secs(10),
+                    Duration::from_millis(20),
+                );
+                (res, meta)
+            });
+
+            // Wait until agy has actually started (its pidfile appears), then
+            // release the monitor to win the CAS and record the PID.
+            let pidfile = wt.join("agy.pid");
+            assert!(
+                wait_until(std::time::Instant::now() + Duration::from_secs(8), || {
+                    pidfile.exists()
+                }),
+                "fake agy should have started and recorded its pidfile"
+            );
+            let _ = gate.wait();
+
+            let (res, meta) = launcher.join().unwrap();
+            let pid = res.expect("a PID confirmed before the window must make the launch succeed");
+            assert!(pid > 1);
+            assert_eq!(meta.pid, Some(pid), "Ok launch must record the PID on meta");
+
+            // Invariants: agy MUST be alive and the row MUST hold the PID.
+            assert!(
+                crate::core::job::is_pid_alive(pid),
+                "successful launch (Ok) must have a live agy process"
+            );
+            let row = JobMetadata::load(&state_root, &job_id).unwrap();
+            assert_eq!(
+                row.pid,
+                Some(pid),
+                "Ok launch must record the PID in the row"
+            );
+
+            // Clean up the live process.
+            let _ = crate::core::commands::kill::send_signal(pid, "KILL");
+            let _ = wait_until(std::time::Instant::now() + Duration::from_secs(1), || {
+                !crate::core::job::is_pid_alive(pid)
+            });
+
+            clear_test_hooks(&job_id);
+        }
     }
 
     #[test]
