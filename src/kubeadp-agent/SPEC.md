@@ -572,6 +572,13 @@ file (`KUBEADP_API_TOKEN_FILE`) and jobset root key file
 - Hidden **regular files** (token/root key) are overmounted by binding
   `/dev/null` over them (mountpoint must be a directory) → reads return EOF; a
   file hide with preserved children fails closed.
+- **Nested rw under ro (gvisor)**: a policy `rw` path nested under a policy
+  `ro` path (e.g. `.../a2a-inbox/<job>/injected` under a read-only inbox) stays
+  writable. After every ro bind-remount the gvisor backend re-binds each such
+  nested `rw` path onto itself and remounts it without `MS_RDONLY`
+  (keeping `nosuid`/`nodev`), ordered shallowest-first so a deeper path is
+  applied after its parent; fail-closed (125) like every mount. A `rw` path not
+  under any `ro` path needs no extra mount.
 - Kata/Landlock: hidden paths are structurally absent (default-deny). The
   ServiceAccount dir `/var/run/secrets/kubernetes.io` is never granted unless the
   `serviceaccount` grant lifts it read-only; write access refused unconditionally;
@@ -580,6 +587,9 @@ file (`KUBEADP_API_TOKEN_FILE`) and jobset root key file
   (`size=64m,nr_inodes=65536,mode=0700`) in unprivileged user and mount namespaces
   prior to Landlock enforcement, granting Landlock read-write access to `/dev/shm`.
   The private shm disappears with the session and leaves no files on the pod filesystem.
+  Landlock rules are additive: a `rw` child under a `ro` parent is granted
+  independently (write on the child, read on the parent), so the kata/runc
+  backends need no writable-rescue mount for nested rw paths.
 - The operator token file may be re-exposed only by an explicit single-file
   `ro_paths` grant (Landlock session policies only).
 

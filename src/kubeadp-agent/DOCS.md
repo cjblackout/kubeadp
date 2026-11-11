@@ -132,6 +132,18 @@ Every sandboxed policy automatically applies access restrictions to host credent
 - **Jobset Root Key File (`KUBEADP_JOBSET_ROOT_KEY_FILE`)**: Hidden via mount overmounting. Derived secrets are supplied exclusively via private file descriptors.
 - **Secret Channel**: Temporary credentials pass into the sandbox via an inherited file descriptor (`secret.fd`), written to a mode `0400` private file inside the agent's private temporary directory.
 
+#### Writable paths nested under read-only paths (gVisor)
+
+A policy `rw` path nested under a policy `ro` path -- e.g. the A2A
+`.../a2a-inbox/<job>/injected` marker directory under a read-only inbox -- stays
+writable. The gVisor backend re-binds each such nested `rw` path onto itself
+after every read-only remount and remounts it without `MS_RDONLY`, keeping
+`nosuid`/`nodev`, ordered shallowest-first so a deeper path is applied after
+its parent. The mount is fail-closed (exit 125) like every other mount; a `rw`
+path not under any `ro` path gets no extra mount. The kata/runc-Landlock
+backends need nothing extra: their Landlock rules are additive, so a `rw` child
+under a `ro` parent is granted independently.
+
 #### Private `/dev/shm`
 
 For tools requiring POSIX shared memory or semaphores (e.g. Ansible, Python multiprocessing), sandboxed Kata sessions create an isolated per-session `/dev/shm` tmpfs (`size=64m,nr_inodes=65536,mode=0700`) inside a private mount namespace before Landlock restricts filesystem access. The private tmpfs disappears with the session, leaves no files on the pod filesystem, and is granted read-write access under Landlock. It is best effort: where unprivileged user namespaces or the tmpfs mount are not available, the session still starts with a warning and `/dev/shm` stays read-only (the shared guest `/dev/shm` is never opened up).

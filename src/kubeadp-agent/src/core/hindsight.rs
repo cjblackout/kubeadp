@@ -11,7 +11,13 @@ use crate::core::proxy::apply_proxy;
 
 /// Builds the argument list for `hindsight memory recall`.
 ///
-/// Pattern: `<hindsight_path> -o json memory recall <bank> "<query>" [--tags <tag>]`
+/// Pattern: `<hindsight_path> -o json memory recall <bank> [--tags <tag>] -- "<query>"`
+///
+/// All options come BEFORE the query and the query is passed AFTER a `--`
+/// separator, so a query that begins with a dash (e.g. an inbound A2A frame
+/// such as `--- A2A INCOMING MESSAGE ...` or a literal `--help`) is treated as
+/// a positional VALUE, never parsed as a flag by the hindsight CLI's clap
+/// parser (`--` ends option parsing).
 pub fn build_recall_args(bank: &str, query: &str, tag: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "-o".to_string(),
@@ -19,18 +25,23 @@ pub fn build_recall_args(bank: &str, query: &str, tag: Option<&str>) -> Vec<Stri
         "memory".to_string(),
         "recall".to_string(),
         bank.to_string(),
-        query.to_string(),
     ];
     if let Some(t) = tag {
         args.push("--tags".to_string());
         args.push(t.to_string());
     }
+    args.push("--".to_string());
+    args.push(query.to_string());
     args
 }
 
 /// Builds the argument list for `hindsight memory retain`.
 ///
-/// Pattern: `<hindsight_path> -o json memory retain <bank> "<finding>" --document-tags <tag> --context "<context>" --async`
+/// Pattern: `<hindsight_path> -o json memory retain <bank> --document-tags <tag> --context "<context>" --async -- "<finding>"`
+///
+/// All options come BEFORE the finding and the finding is passed AFTER a `--`
+/// separator so free text that begins with a dash is treated as a positional
+/// VALUE, never parsed as a flag (same clap `--` safeguard as recall).
 pub fn build_retain_args(
     bank: &str,
     finding: &str,
@@ -44,12 +55,13 @@ pub fn build_retain_args(
         "memory".to_string(),
         "retain".to_string(),
         bank.to_string(),
-        finding.to_string(),
         "--document-tags".to_string(),
         doc_tag.to_string(),
         "--context".to_string(),
         context.to_string(),
         "--async".to_string(),
+        "--".to_string(),
+        finding.to_string(),
     ]
 }
 
@@ -555,9 +567,10 @@ mod tests {
                 "memory",
                 "recall",
                 "my-bank",
-                "Fix bug in api",
                 "--tags",
-                "project:homelab"
+                "project:homelab",
+                "--",
+                "Fix bug in api"
             ]
         );
     }
@@ -573,8 +586,49 @@ mod tests {
                 "memory",
                 "recall",
                 "my-bank",
+                "--",
                 "Fix bug in api"
             ]
+        );
+    }
+
+    // HL-113: a recall query that starts with a dash (e.g. an inbound A2A
+    // frame `--- A2A INCOMING MESSAGE ...`, or a literal `--help`) must be
+    // passed as a positional VALUE after the `--` separator, never parsed as a
+    // flag by the hindsight CLI (which would exit status 2 with
+    // `unexpected argument`).
+    #[test]
+    fn test_build_recall_args_dash_prefixed_query_after_separator() {
+        let query = "--- A2A INCOMING MESSAGE (claimed sender: task-1) ---\nhello";
+        let args = build_recall_args("my-bank", query, Some("project:homelab"));
+        let dash_pos = args
+            .iter()
+            .position(|a| a.starts_with("---"))
+            .expect("the dash-prefixed query must be present");
+        // The query is a value, so it must come AFTER the `--` separator (and
+        // everything before the separator is options).
+        let sep_pos = args.iter().position(|a| a == "--").unwrap();
+        assert!(
+            sep_pos < dash_pos,
+            "the query must follow the '--' separator: {args:?}"
+        );
+        // The query is passed verbatim as a single argv element, and it is the
+        // ONLY argument after the separator (it may begin with a dash - that
+        // is exactly what `--` exists to protect).
+        assert_eq!(args[sep_pos + 1], query);
+        assert_eq!(
+            args.len(),
+            sep_pos + 2,
+            "exactly one value after the separator"
+        );
+
+        // A literal `--help` query is a value, not a help invocation.
+        let help_args = build_recall_args("my-bank", "--help", None);
+        let help_pos = help_args.iter().position(|a| a == "--help").unwrap();
+        let sep_pos = help_args.iter().position(|a| a == "--").unwrap();
+        assert!(
+            sep_pos < help_pos,
+            "'--help' as a query must follow the '--' separator: {help_args:?}"
         );
     }
 
@@ -645,15 +699,18 @@ mod tests {
                 "memory",
                 "retain",
                 "my-bank",
-                "finding text",
                 "--document-tags",
                 "project:custom",
                 "--context",
                 "context info",
                 "--async",
+                "--",
+                "finding text",
             ]
         );
         assert!(args.contains(&"--async".to_string()));
+        // The finding is the only positional value, after the separator.
+        assert_eq!(args[args.len() - 1], "finding text");
     }
 
     #[test]
@@ -667,15 +724,38 @@ mod tests {
                 "memory",
                 "retain",
                 "my-bank",
-                "finding text",
                 "--document-tags",
                 "agent-run",
                 "--context",
                 "context info",
                 "--async",
+                "--",
+                "finding text",
             ]
         );
         assert!(args.contains(&"--async".to_string()));
+        assert_eq!(args[args.len() - 1], "finding text");
+    }
+
+    // HL-113: a retain finding that begins with a dash must be passed as a
+    // positional VALUE after the `--` separator (same clap safeguard as
+    // recall).
+    #[test]
+    fn test_build_retain_args_dash_prefixed_finding_after_separator() {
+        let finding = "--- A2A INCOMING MESSAGE (claimed sender: task-1) ---";
+        let args = build_retain_args("my-bank", finding, None, "context info");
+        let finding_pos = args
+            .iter()
+            .position(|a| a.starts_with("---"))
+            .expect("the dash-prefixed finding must be present");
+        let sep_pos = args.iter().position(|a| a == "--").unwrap();
+        assert!(
+            sep_pos < finding_pos,
+            "the finding must follow the '--' separator: {args:?}"
+        );
+        // The finding is the single positional value (last element).
+        assert_eq!(args.iter().filter(|a| **a == finding).count(), 1);
+        assert_eq!(args[args.len() - 1], finding);
     }
 
     #[test]

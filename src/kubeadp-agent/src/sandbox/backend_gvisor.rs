@@ -10,8 +10,12 @@
 //!   bind-remounts for every `ro` path, and an empty-tmpfs overmount of every
 //!   `hide` dir (policy-driven, including the derived state root, the agent
 //!   job-dir root and the bare-repo root) that preserves the agent's own `rw`
-//!   sub-paths. EVERY mount is fail-closed: any failure aborts the sandbox
-//!   with exit code 125.
+//!   sub-paths. A policy `rw` path nested under a `ro` path (e.g. an
+//!   `a2a-inbox/<job>/injected` marker dir under a read-only inbox) stays
+//!   writable: after every ro bind-remount the plan re-binds each such nested
+//!   `rw` path onto itself as its own writable mount, ordered by path depth so
+//!   a deeper path is applied after its parent. EVERY mount is fail-closed:
+//!   any failure aborts the sandbox with exit code 125.
 //! - PID 1 = small init shim (reaps zombies, forwards SIGTERM/SIGINT, propagates exit code, kills descendants).
 //! - Sets `PR_SET_NO_NEW_PRIVS`.
 //! - Writes secret from fd to `<tmp>/<dest>` mode 0400.
@@ -418,6 +422,14 @@ pub enum MountOp {
     BindRec { src: PathBuf, target: PathBuf },
     /// Remount the filesystem at `target` read-only (must follow a bind).
     RemountRo { target: PathBuf },
+    /// Rebinds `target` (a policy `rw` path nested under a `ro` path) onto
+    /// itself as its own writable mount and remounts it read-write, so the
+    /// agent keeps write access to it even though a `ro` ancestor was
+    /// remounted read-only. `nosuid`/`nodev` are preserved by the remount so
+    /// the re-opened mount is never less restricted than its parent.
+    /// (Must follow the `ro` remounts of every ancestor, so a deeper path is
+    /// always applied after its parent.)
+    RemountRw { target: PathBuf },
     /// Bind-mount the real `src` into a staging mountpoint `stage` (used to
     /// preserve an `rw` path that lives inside a hidden directory).
     PreserveBind { src: PathBuf, stage: PathBuf },
@@ -667,6 +679,36 @@ pub fn plan_mounts(spec: &MountSpec) -> (Vec<MountOp>, Option<PathBuf>) {
         }
     }
 
+    // 6. Writable-path rescue: a policy `rw` path nested under a `ro` path
+    //    (e.g. `.../a2a-inbox/<job>/injected` under a read-only inbox dir)
+    //    ends up inside a read-only bind-remount -- either the section-4
+    //    self-bind of an unrelated `ro` path or the section-5 hide-preservation
+    //    remount of an `ro` source that shadows it. The rw declaration is
+    //    explicit policy, so the nested path must stay WRITABLE: rebind it
+    //    onto itself as its own mount and remount it without MS_RDONLY
+    //    (keeping nosuid/nodev). Applied shallowest-first so a deeper path is
+    //    mounted on top of its re-opened parent. A rw path not under any ro
+    //    path needs no extra mount (nothing read-only was applied to it).
+    let nested_rw: Vec<PathBuf> = {
+        let norm = |p: &Path| spec.policy.normalize_policy_path(p, private_tmp.as_deref());
+        let ro_roots: Vec<PathBuf> = spec.policy.ro.iter().map(|p| norm(p)).collect();
+        let mut out: Vec<PathBuf> = Vec::new();
+        for rw in spec.policy.rw.iter() {
+            let r = norm(rw);
+            let under_ro = ro_roots.iter().any(|ro| r != *ro && r.starts_with(ro));
+            if under_ro && !out.contains(&r) {
+                out.push(r);
+            }
+        }
+        // Shallowest first: the parent's writable bind must precede any mount
+        // under it, so the deeper bind lands on top of the re-opened parent.
+        out.sort_by_key(|p| p.components().count());
+        out
+    };
+    for rw in &nested_rw {
+        plan.push(MountOp::RemountRw { target: rw.clone() });
+    }
+
     (plan, private_tmp)
 }
 
@@ -805,6 +847,56 @@ fn apply_mount_op(op: &MountOp) -> Result<(), String> {
                 {
                     return Err(format!(
                         "remount read-only {} failed: {}",
+                        target.display(),
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+        }
+        MountOp::RemountRw { target } => {
+            // Ensure the mountpoint exists on the current (already remounted)
+            // tree: the writable dirs were created by `ensure_writable_dirs`
+            // before the plan ran, but on a path under a ro/hide ancestor the
+            // overmount may hide a pre-existing dir -- re-creating it on the
+            // ro tree is a no-op that never leaks (and a failure must fail
+            // closed, matching every other mount).
+            fs::create_dir_all(target)
+                .map_err(|e| format!("prepare writable mount target {target:?}: {e}"))?;
+            let target_c = cstr(target)?;
+            // Rebind the path onto itself as its own mount so the read/write
+            // remount below only ever touches this mount, never the (ro)
+            // ancestor's filesystem.
+            unsafe {
+                if libc::mount(
+                    target_c.as_ptr(),
+                    target_c.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND | libc::MS_REC,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    return Err(format!(
+                        "bind {} onto itself failed: {}",
+                        target.display(),
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            // Remount without MS_RDONLY to re-open the write path, keeping the
+            // bind's nosuid/nodev so a writable nested path is never less
+            // restricted than its ro parent (fail closed on any error).
+            let data = CString::new("nosuid,nodev").map_err(|e| e.to_string())?;
+            unsafe {
+                if libc::mount(
+                    std::ptr::null(),
+                    target_c.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV,
+                    data.as_ptr() as *const libc::c_void,
+                ) != 0
+                {
+                    return Err(format!(
+                        "remount read-write {} failed: {}",
                         target.display(),
                         std::io::Error::last_os_error()
                     ));
@@ -1306,6 +1398,151 @@ mod tests {
         assert!(
             ro.contains(&PathBuf::from("/usr")),
             "an unrelated ro path must still be remounted ro: {ro:?}"
+        );
+    }
+
+    fn rw_rescue_targets(plan: &[MountOp]) -> Vec<PathBuf> {
+        plan.iter()
+            .filter_map(|op| match op {
+                MountOp::RemountRw { target } => Some(target.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // HL-113: a policy `rw` path nested under a `ro` path would stay inside a
+    // read-only bind-remount (the section-4 self-bind or the section-5
+    // hide-preservation remount). The rw declaration is explicit policy, so a
+    // nested rw path must be re-opened writable by the plan.
+    #[test]
+    fn test_plan_reopens_nested_rw_under_ro_after_ro_remount() {
+        // The a2a-inbox shape: the inbox dir is ro, the `injected` marker dir
+        // is a rw CHILD of it.
+        let policy = SandboxPolicy {
+            ro: vec![PathBuf::from("/home/agent/.agent-run/a2a-inbox/job1")],
+            rw: vec![PathBuf::from(
+                "/home/agent/.agent-run/a2a-inbox/job1/injected",
+            )],
+            ..Default::default()
+        };
+        let (plan, _) = plan_mounts(&spec(policy));
+        // The nested rw path gets a writable rescue mount...
+        let rescue = rw_rescue_targets(&plan);
+        assert_eq!(
+            rescue,
+            vec![PathBuf::from(
+                "/home/agent/.agent-run/a2a-inbox/job1/injected"
+            )],
+            "nested rw must be re-opened writable: {rescue:?}"
+        );
+        // ...and it is emitted AFTER the ro remount of the inbox (the parent),
+        // so the writable bind lands on top of the read-only mount.
+        let ro_pos = match plan.iter().position(|op| {
+            matches!(op, MountOp::RemountRo { target } if target == Path::new("/home/agent/.agent-run/a2a-inbox/job1"))
+        }) {
+            Some(p) => p,
+            None => {
+                // The inbox ro path may be preserved through the state-root
+                // hide (see test below); accept either an explicit RemountRo
+                // or a Hide-op remount that shadows it.
+                let pos = plan.iter().position(|op| {
+                    matches!(op, MountOp::Hide { target, .. } if target == Path::new("/home/agent/.agent-run"))
+                });
+                pos.expect("the ro inbox must be enforced one way or another")
+            }
+        };
+        let rw_pos = plan
+            .iter()
+            .position(|op| {
+                matches!(op, MountOp::RemountRw { target } if target == Path::new("/home/agent/.agent-run/a2a-inbox/job1/injected"))
+            })
+            .unwrap();
+        assert!(
+            ro_pos < rw_pos,
+            "the ro enforcement ({ro_pos}) must precede the writable rescue ({rw_pos})"
+        );
+    }
+
+    #[test]
+    fn test_plan_rw_not_under_ro_produces_no_rescue_mount() {
+        // A rw path with no ro ancestor (the normal worktree case) must NOT
+        // get an extra writable mount: nothing was remounted read-only over it.
+        let policy = SandboxPolicy {
+            ro: vec![PathBuf::from("/usr"), PathBuf::from("/opt/tools")],
+            rw: vec![PathBuf::from("/workspace/homelab")],
+            ..Default::default()
+        };
+        let (plan, _) = plan_mounts(&spec(policy));
+        assert!(
+            rw_rescue_targets(&plan).is_empty(),
+            "a non-nested rw path must not get a rescue mount: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn test_plan_two_levels_of_nesting_ordered_by_depth() {
+        // Two nested rw paths under the same ro root: the shallowest is
+        // re-opened first, the deeper one after it (so the deeper bind mounts
+        // on top of the re-opened parent).
+        let policy = SandboxPolicy {
+            ro: vec![PathBuf::from("/data/ro-root")],
+            rw: vec![
+                PathBuf::from("/data/ro-root/a"),
+                PathBuf::from("/data/ro-root/a/b"),
+            ],
+            ..Default::default()
+        };
+        let (plan, _) = plan_mounts(&spec(policy));
+        let rescue = rw_rescue_targets(&plan);
+        assert_eq!(
+            rescue,
+            vec![
+                PathBuf::from("/data/ro-root/a"),
+                PathBuf::from("/data/ro-root/a/b"),
+            ],
+            "nested rw rescues must be ordered shallowest-first: {rescue:?}"
+        );
+    }
+
+    #[test]
+    fn test_plan_nested_rw_under_hide_preserved_ro_gets_rescue() {
+        // The a2a shape in a derived-root hide (the live failure): the state
+        // root is auto-hidden, the inbox ro path is preserved through the
+        // hide and re-mounted read-only, and the nested `injected` rw path
+        // must then be re-opened writable AFTER that ro remount.
+        let policy = SandboxPolicy {
+            rw: vec![PathBuf::from(
+                "/home/agent/.agent-run/a2a-inbox/job1/injected",
+            )],
+            ro: vec![PathBuf::from("/home/agent/.agent-run/a2a-inbox/job1")],
+            ..Default::default()
+        };
+        let (plan, _) = plan_mounts(&spec(policy));
+        // The ro inbox is preserved through the state-root hide and remounted
+        // read-only (the section-5 RemountRo path).
+        let preserved_ro = plan.iter().any(|op| {
+            matches!(op, MountOp::RemountRo { target } if target == Path::new("/home/agent/.agent-run/a2a-inbox/job1"))
+        });
+        assert!(
+            preserved_ro,
+            "the preserved ro inbox must be remounted read-only: {plan:?}"
+        );
+        // The nested rw path is rescued AFTER that remount.
+        let ro_pos = plan
+            .iter()
+            .position(|op| {
+                matches!(op, MountOp::RemountRo { target } if target == Path::new("/home/agent/.agent-run/a2a-inbox/job1"))
+            })
+            .unwrap();
+        let rw_pos = plan
+            .iter()
+            .position(|op| {
+                matches!(op, MountOp::RemountRw { target } if target == Path::new("/home/agent/.agent-run/a2a-inbox/job1/injected"))
+            })
+            .unwrap();
+        assert!(
+            ro_pos < rw_pos,
+            "the preserved-ro remount ({ro_pos}) must precede the writable rescue ({rw_pos})"
         );
     }
 

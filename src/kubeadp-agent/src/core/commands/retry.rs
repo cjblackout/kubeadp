@@ -1473,7 +1473,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
         assert!(
-            query.ends_with(format!("bank-h {PROMPT}\n").as_str()),
+            query.ends_with(format!("bank-h -- {PROMPT}\n").as_str()),
             "recall must operate on the new prompt text, got: {query:?}"
         );
 
@@ -1710,7 +1710,7 @@ mod tests {
 
         let query = recorded_recall_query(&config);
         assert!(
-            query.ends_with("bank-h stored query\n"),
+            query.ends_with("bank-h -- stored query\n"),
             "the stored query (not the follow-up text) must be the recall query, got: {query:?}"
         );
         assert!(
@@ -1740,7 +1740,7 @@ mod tests {
 
         let query = recorded_recall_query(&config);
         assert!(
-            query.ends_with("bank-h new query\n"),
+            query.ends_with("bank-h -- new query\n"),
             "the explicit (trimmed) query must win over the stored one, got: {query:?}"
         );
 

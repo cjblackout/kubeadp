@@ -1757,7 +1757,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(
-            query.ends_with("bank-q short query\n"),
+            query.ends_with("bank-q -- short query\n"),
             "the trimmed explicit query (not the prompt) must be the recall query, got: {query:?}"
         );
         assert!(
