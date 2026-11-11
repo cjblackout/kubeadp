@@ -960,6 +960,17 @@ pub fn apply_landlock_domain(
     //    starts with less access: isolation is unaffected, whereas aborting
     //    would crash-loop the whole session over one optional path. The base
     //    policy above stays fatal.
+    //
+    //    Path grants may be directories or single files: `access_flags_for_path`
+    //    picks the directory set (READ_DIR + file flags) for a directory and the
+    //    file-only set for a regular file. A single-file grant exposes exactly
+    //    that file: path lookup and `stat` are not Landlock-restricted, so the
+    //    session reads, stats and names the file through its parent, but listing
+    //    the parent needs READ_DIR on it and is NOT granted (Landlock has no
+    //    metadata-only directory access; a partial parent grant would expose
+    //    sibling names). Granting the directory is the supported way for tools
+    //    that list the parent; the supervisor warns when a file grant's parent
+    //    holds other entries.
     if let Some(ref g) = policy.grants {
         let grant = |what: &str, r: Result<(), String>| {
             if let Err(e) = r {
@@ -1614,6 +1625,30 @@ mod tests {
         assert!(grant_apply_blocker(&file).is_none());
     }
 
+    // The operator API token file stays hidden from every sandboxed agent by
+    // default; a single-FILE grant naming it explicitly (the documented
+    // re-expose path) is NOT blocked by the kata deny checks, while the
+    // ServiceAccount token dir keeps its deny.
+    #[test]
+    fn test_single_file_token_grant_not_denied() {
+        let token_file = PathBuf::from("/var/run/kubeadp/api-token");
+        assert!(
+            !is_denied_path(&token_file, &[], false),
+            "a single-file grant naming the token file must not be denied"
+        );
+        // A grant that CONTAINS the ServiceAccount dir stays denied.
+        assert!(is_denied_path(
+            &PathBuf::from("/var/run/secrets"),
+            &[],
+            false
+        ));
+        assert!(is_denied_path(
+            &PathBuf::from(K8S_SERVICEACCOUNT_TOKEN_DIR),
+            &[],
+            false
+        ));
+    }
+
     // HL-117 (behavioral): a session with a grant whose path does not exist
     // still gets its domain applied -- the grant is dropped with a warning,
     // never fatal.
@@ -1654,6 +1689,73 @@ mod tests {
         assert!(
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "a nonexistent grant path must not abort the domain application"
+        );
+    }
+
+    // HL-113 (behavioral): a single-FILE ro grant lets the child read and stat
+    // the exact file through its parent (path lookup and stat are not
+    // Landlock-restricted), while listing the parent stays denied -- the
+    // documented gap that makes a directory grant the supported way for tools
+    // that list the parent. Skipped (counts as pass) where the domain cannot
+    // be applied at all (a kernel without Landlock).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_file_grant_reads_and_stats_file_parent_list_denied() {
+        use crate::sandbox::policy::{GrantsConfig, PolicyRole};
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("secret-dir");
+        std::fs::create_dir_all(&parent).unwrap();
+        let file = parent.join("config");
+        std::fs::write(&file, b"content").unwrap();
+        // A sibling the file grant must NOT expose.
+        std::fs::write(parent.join("sibling"), b"sibling").unwrap();
+
+        let policy = SandboxPolicy {
+            role: PolicyRole::Session,
+            grants: Some(GrantsConfig {
+                ro_paths: vec![file.clone()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let res = apply_landlock_domain(&policy, KATA_MIN_LANDLOCK_ABI, None);
+            let applied = match res {
+                Ok(()) => true,
+                // No Landlock (or too old an ABI) in this environment: the
+                // domain cannot be created, nothing to assert here.
+                Err(e) => !e.contains("landlock_create_ruleset failed"),
+            };
+            if !applied {
+                unsafe { libc::_exit(0) };
+            }
+            // The file itself is readable by path through its parent.
+            let content = std::fs::read_to_string(&file).unwrap_or_default();
+            if content != "content" {
+                unsafe { libc::_exit(1) };
+            }
+            // stat of the file works (stat is not Landlock-restricted).
+            let stat_ok = matches!(std::fs::metadata(&file), Ok(m) if m.is_file());
+            if !stat_ok {
+                unsafe { libc::_exit(1) };
+            }
+            // Listing the parent is denied: a file grant never widens to the
+            // parent directory (sibling names stay hidden).
+            if std::fs::read_dir(&parent).is_ok() {
+                unsafe { libc::_exit(1) };
+            }
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "a single-file grant must read and stat the file while the parent list stays denied"
         );
     }
 

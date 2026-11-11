@@ -30,11 +30,16 @@ pub struct GrantsConfig {
     #[serde(default)]
     pub serviceaccount: bool,
 
-    /// Absolute paths granted read-only.
+    /// Absolute paths granted read-only. Entries may be directories (the grant
+    /// covers their contents recursively) or single regular files. Must not be
+    /// `/`, under `/proc` or `/dev`, contain `..`, or be empty.
     #[serde(default)]
     pub ro_paths: Vec<PathBuf>,
 
-    /// Absolute paths granted read-write.
+    /// Absolute paths granted read-write; same shape rules as `ro_paths`. A
+    /// missing entry is created as a directory at launch; an entry that
+    /// already exists as a regular file is a valid single-file grant and is
+    /// kept as-is (never created or replaced).
     #[serde(default)]
     pub rw_paths: Vec<PathBuf>,
 
@@ -205,7 +210,7 @@ impl SandboxPolicy {
     /// Fails closed (returns Err) if:
     /// - `net` is not one of the accepted values (`host`, `shared`, `relay`).
     /// - `role` is `Worker` but `grants` is set (worker jobs can never have grants).
-    /// - Any grant path is non-absolute, root `/`, `/proc`, `/dev`, or contains traversal `..`.
+    /// - Any grant path is non-absolute, empty, root `/`, `/proc`, `/dev`, or contains traversal `..`.
     /// - Any grant env name is invalid.
     pub fn validate(&self) -> Result<(), String> {
         validate_net(&self.net)?;
@@ -377,6 +382,13 @@ impl SandboxPolicy {
         }
         if let Some(ref g) = self.grants {
             for p in &g.rw_paths {
+                // A granted rw path may be a directory (created when missing,
+                // the launch still fails closed when it cannot be) or a single
+                // regular file: an existing file is a valid file grant and is
+                // kept as-is -- never created, replaced or rejected here.
+                if std::fs::metadata(p).is_ok() {
+                    continue;
+                }
                 std::fs::create_dir_all(p).map_err(|e| {
                     format!(
                         "sandbox policy granted rw path {} cannot be created: {e}",
@@ -474,6 +486,12 @@ pub fn jobset_root_key_file_path() -> Option<PathBuf> {
 /// Validates that a granted path in a sandbox policy is absolute, not root or forbidden system dirs,
 /// and has no path traversal components ('..').
 fn validate_policy_grant_path(path: &Path, field: &str) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err(format!(
+            "Sandbox policy error: field 'grants.{}' contains an empty path entry",
+            field
+        ));
+    }
     if !path.is_absolute() {
         return Err(format!(
             "Sandbox policy error: field 'grants.{}' contains non-absolute path '{}'",
@@ -930,5 +948,120 @@ mod tests {
         assert!(policy.is_env_allowed("VIKUNJA_API_TOKEN"));
         assert!(policy.is_env_allowed("GH_TOKEN"));
         assert!(!policy.is_env_allowed("OTHER_SECRET"));
+    }
+
+    // Grants entries may be files or directories: a single regular file (e.g. a
+    // kubeconfig inside a mounted-secret directory) validates like a directory.
+    #[test]
+    fn test_grant_paths_may_be_files_or_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config");
+        std::fs::write(&file, b"kubeconfig").unwrap();
+        let subdir = dir.path().join("secrets");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let policy = SandboxPolicy::for_session(
+            "s-files",
+            Path::new("/tmp"),
+            Some(GrantsConfig {
+                ro_paths: vec![file.clone(), subdir.clone()],
+                rw_paths: vec![file.clone()],
+                ..Default::default()
+            }),
+        );
+        assert!(
+            policy.validate().is_ok(),
+            "file and directory grants must both validate"
+        );
+    }
+
+    // An empty grant entry is rejected with a clear error (never silently
+    // normalized into `/` or a wildcard).
+    #[test]
+    fn test_grant_empty_path_entry_rejected() {
+        let policy = SandboxPolicy::for_session(
+            "s-empty",
+            Path::new("/tmp"),
+            Some(GrantsConfig {
+                ro_paths: vec![PathBuf::from("")],
+                ..Default::default()
+            }),
+        );
+        let err = policy.validate().unwrap_err();
+        assert!(
+            err.contains("empty path entry"),
+            "error must name the empty entry: {err}"
+        );
+
+        let mut policy2 = SandboxPolicy::for_session("s-empty2", Path::new("/tmp"), None);
+        policy2.grants = Some(GrantsConfig {
+            rw_paths: vec![PathBuf::from("")],
+            ..Default::default()
+        });
+        let err2 = policy2.validate().unwrap_err();
+        assert!(err2.contains("empty path entry"), "error was: {err2}");
+    }
+
+    // F-grants: `ensure_writable_dirs` keeps a granted rw FILE as-is (never
+    // creates or replaces it), creates a missing directory grant, and keeps an
+    // existing directory grant untouched.
+    #[test]
+    fn test_ensure_writable_dirs_keeps_single_file_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_grant = dir.path().join("mounted-secret/config");
+        std::fs::create_dir_all(file_grant.parent().unwrap()).unwrap();
+        std::fs::write(&file_grant, b"secret").unwrap();
+        let dir_grant = dir.path().join("created/dir");
+
+        let policy = SandboxPolicy::for_session(
+            "s-filegrant",
+            Path::new("/tmp"),
+            Some(GrantsConfig {
+                rw_paths: vec![file_grant.clone(), dir_grant.clone()],
+                ..Default::default()
+            }),
+        );
+        policy
+            .ensure_writable_dirs(None)
+            .expect("a file grant and a creatable dir grant must both succeed");
+        // The file grant was neither replaced by a directory nor dropped.
+        assert!(
+            file_grant.is_file(),
+            "granted file must stay a regular file"
+        );
+        assert!(
+            dir_grant.is_dir(),
+            "missing directory grant must be created"
+        );
+    }
+
+    // The operator API token file stays hidden from every sandboxed agent by
+    // default; it may be re-exposed ONLY by a single-file ro_paths grant naming
+    // it explicitly (existing behaviour), which must keep validating.
+    #[test]
+    fn test_operator_token_file_hidden_and_single_file_grant_reexposes() {
+        if let Some(token) = operator_token_file_path() {
+            let policy = SandboxPolicy::for_session("s-tok", Path::new("/tmp"), None)
+                .hide_operator_token_file();
+            assert!(
+                policy.hide.iter().any(|h| h == &token),
+                "the token file must be hidden by default"
+            );
+        }
+        // A single-file grant naming the token file (the documented re-expose
+        // path) is a valid session policy.
+        let explicit = SandboxPolicy::for_session(
+            "s-tok2",
+            Path::new("/tmp"),
+            Some(GrantsConfig {
+                ro_paths: vec![PathBuf::from("/var/run/kubeadp/api-token")],
+                ..Default::default()
+            }),
+        );
+        assert!(
+            explicit.validate().is_ok(),
+            "a single-file grant of the token file must validate"
+        );
+        assert!(explicit.hide_operator_token_file().validate().is_ok());
     }
 }

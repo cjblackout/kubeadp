@@ -548,14 +548,17 @@ JSON, snake_case keys, no renames; unknown keys are a hard parse error
 | `net` | `host`/`shared`/`relay` | `host` | `shared` = legacy alias of `host` |
 
 `grants` (`GrantsConfig`): `serviceaccount` (bool, default false), `ro_paths`,
-`rw_paths`, `env` (globs).
+`rw_paths` (entries may be directories -- granted recursively, read-only for
+`ro_paths` -- or single regular files), `env` (globs).
 
 Validation (every load from file/stdin), fails closed: `net` valid; `worker`
 role with `grants` → error (workers can never grant); grant paths absolute, not
-`/`, not under `/proc`, not under `/dev`, no `..`; grant env names ASCII
+empty, not `/`, not under `/proc`, not under `/dev`, no `..`; grant env names ASCII
 alnum+`_`, trailing `*` prefix glob only. `ensure_writable_dirs`: every
-rw/shared_rw/private-tmp/grant-rw path must be a real directory or launch fails
-closed (125).
+rw/shared_rw/private-tmp path must be a real directory and a missing grant-rw
+path is created as a directory, or launch fails closed (125); a granted rw
+path that already exists as a regular file is a valid single-file grant and is
+kept as-is.
 
 ### 6.5 Path hiding and secret channel
 Every sandboxed policy (job, session, hand-run) must hide the operator token
@@ -593,9 +596,17 @@ environment is at most `KUBEADP_JOBSET_ID`, `KUBEADP_JOBSET_EPOCH`,
 - Grants are trusted supervisor config (validated at load), never a runtime API.
 - `serviceaccount: true` = read-only `/var/run/secrets/kubernetes.io`; write
   always denied.
+- `ro_paths`/`rw_paths` entries may be directories or single files. A directory
+  grant covers its contents recursively (read-only for `ro_paths`) and is the
+  supported way to grant a whole mounted-secret directory; a single-file grant
+  exposes exactly that file (path lookup and `stat` are not Landlock-restricted,
+  listing the parent is not granted). A `grant` warning names every single-file
+  grant whose parent directory contains other entries (dot-entries of a secret
+  volume are not counted).
 - An environmental grant rule failure (kernel rejection, not a policy violation)
   is dropped with a warning (session starts with less access); a real policy
-  violation aborts.
+  violation aborts. A granted path that does not exist at session start is
+  dropped with a `sandbox grant dropped` warning, never fatal.
 - Worker grants are impossible: policy validation rejects worker+grants, and the
   gvisor backend refuses grants outright. The only grant-capable path is a
   session policy on kata or runc-Landlock.

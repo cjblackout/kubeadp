@@ -188,6 +188,54 @@ impl SessionGrants {
                     false
                 }
             });
+        warnings.extend(self.file_grant_parent_warnings(session_name));
+        warnings
+    }
+
+    /// One warning per single-FILE grant whose parent directory holds other
+    /// entries. A file grant exposes exactly that file: on the Landlock
+    /// backends the session can read and stat the file and name it through its
+    /// parent (path lookup and `stat` are not restricted), but listing the
+    /// parent fails -- Landlock cannot expose a directory's metadata without
+    /// its listing, so a file grant never widens to the parent. A directory
+    /// grant (`ro_paths`/`rw_paths` accept directory paths and cover the
+    /// contents recursively) is the supported way to grant a whole
+    /// mounted-secret directory. Dot-entries (the `..data` symlink pair of a
+    /// Kubernetes secret volume) are not counted as other entries, so a
+    /// one-file secret mount stays quiet.
+    fn file_grant_parent_warnings(&self, session_name: &str) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for p in self.ro_paths.iter().chain(self.rw_paths.iter()) {
+            let Ok(meta) = std::fs::metadata(p) else {
+                // A missing grant path is not an error: the sandbox backend
+                // drops the grant with a warning at session start.
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let Some(parent) = p.parent() else {
+                continue;
+            };
+            let Ok(entries) = std::fs::read_dir(parent) else {
+                continue;
+            };
+            let granted = p.file_name().map(|n| n.to_os_string());
+            let has_sibling = entries.flatten().map(|e| e.file_name()).any(|name| {
+                Some(name.clone()) != granted && !name.to_string_lossy().starts_with('.')
+            });
+            if has_sibling {
+                warnings.push(format!(
+                    "grant path '{}' in session '{}' is a single file; its parent directory '{}' \
+                     contains other entries that the grant does not expose -- tools that list the \
+                     parent fail with 'Permission denied'; grant the directory instead \
+                     (ro_paths/rw_paths accept directories)",
+                    p.display(),
+                    session_name,
+                    parent.display()
+                ));
+            }
+        }
         warnings
     }
 
@@ -209,6 +257,12 @@ impl SessionGrants {
 /// Validates that a granted path is absolute, not root or forbidden system dirs,
 /// and has no path traversal components.
 fn validate_grant_path(path: &Path, field: &str, session_name: &str) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err(format!(
+            "Configuration error: field 'grants.{}' in session '{}' contains an empty path entry",
+            field, session_name
+        ));
+    }
     if !path.is_absolute() {
         return Err(format!(
             "Configuration error: field 'grants.{}' in session '{}' contains non-absolute path '{}'",
@@ -1174,5 +1228,93 @@ mod sandbox_flag_tests {
             .any(|w| w.contains("forbidden path '/dev/shm'")));
         assert!(warnings.iter().any(|w| w.contains("parent traversal")));
         assert!(warnings.iter().any(|w| w.contains("non-absolute path")));
+    }
+
+    // An empty grant entry is rejected with a clear error (validate) and
+    // dropped with a "grant dropped:" warning (sanitize); the session starts.
+    #[test]
+    fn test_grant_empty_path_entry_rejected() {
+        let json = r#"{
+            "name": "sess",
+            "workdir": "/w",
+            "session_id": "s",
+            "grants": {
+                "ro_paths": ["", "/opt/tools"],
+                "rw_paths": ["", "/workspace"],
+                "env": [""]
+            }
+        }"#;
+        let mut s: SessionConfig = serde_json::from_str(json).unwrap();
+        assert!(s.validate_durations().is_ok());
+        let g = s.grants.as_ref().unwrap();
+        let err = g.validate("sess").unwrap_err();
+        assert!(
+            err.contains("empty path entry"),
+            "error must name the empty entry: {err}"
+        );
+        let warnings = s.grants.as_mut().unwrap().sanitize("sess");
+        let g = s.grants.unwrap();
+        assert_eq!(g.ro_paths, vec![PathBuf::from("/opt/tools")]);
+        assert_eq!(g.rw_paths, vec![PathBuf::from("/workspace")]);
+        assert!(g.env.is_empty());
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings.iter().all(|w| w.starts_with("grant dropped:")));
+        assert!(warnings.iter().any(|w| w.contains("empty path entry")));
+    }
+
+    // A single-file grant whose parent directory holds other entries produces
+    // a warning naming the directory grant as the supported way; a one-file
+    // secret mount (only dot-entries beside the file) stays quiet, and a
+    // directory grant never warns. A missing granted path is NOT an error at
+    // config load (the backend drops the grant with a warning at session
+    // start).
+    #[test]
+    fn test_file_grant_parent_warning() {
+        let mk = |ro: Vec<PathBuf>, rw: Vec<PathBuf>| -> SessionConfig {
+            let mut s: SessionConfig =
+                serde_json::from_str(r#"{"name":"sess","workdir":"/w","session_id":"s"}"#).unwrap();
+            s.grants = Some(SessionGrants {
+                ro_paths: ro,
+                rw_paths: rw,
+                ..Default::default()
+            });
+            s
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("secret-dir");
+        std::fs::create_dir_all(&parent).unwrap();
+        let file = parent.join("config");
+        std::fs::write(&file, b"content").unwrap();
+
+        // Sibling present: one warning per file grant (ro_paths here).
+        std::fs::write(parent.join("sibling"), b"x").unwrap();
+        let mut s = mk(vec![file.clone()], vec![]);
+        let warnings = s.grants.as_mut().unwrap().sanitize("sess-warn");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("grant the directory instead"),
+            "warning must point at the directory grant: {}",
+            warnings[0]
+        );
+        assert!(warnings[0].contains(&file.display().to_string()));
+
+        // Kubernetes secret-volume shape (dot-entries only beside the file):
+        // no warning.
+        let quiet_dir = dir.path().join("one-file-dir");
+        std::fs::create_dir_all(&quiet_dir).unwrap();
+        let quiet_file = quiet_dir.join("config");
+        std::fs::write(&quiet_file, b"content").unwrap();
+        std::fs::write(quiet_dir.join(".hidden"), b"x").unwrap();
+        let mut s = mk(vec![quiet_file.clone()], vec![]);
+        let warnings = s.grants.as_mut().unwrap().sanitize("sess-quiet");
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // A directory grant and a missing path never warn.
+        let mut s = mk(
+            vec![quiet_dir.clone(), dir.path().join("no-such-path")],
+            vec![],
+        );
+        let warnings = s.grants.as_mut().unwrap().sanitize("sess-dir");
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }

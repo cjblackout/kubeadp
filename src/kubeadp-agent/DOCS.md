@@ -143,13 +143,15 @@ Orchestrator sessions running under sandbox isolation can receive scoped access 
 | Grant Key | Type | Description |
 |---|---|---|
 | `serviceaccount` | boolean | Grants read-only access to `/var/run/secrets/kubernetes.io`. Write access is unconditionally denied. |
-| `ro_paths` | array of strings | Absolute paths granted read-only. Must not be `/`, `/proc`, `/dev`, or contain `..`. |
-| `rw_paths` | array of strings | Absolute paths granted read-write. Must not be `/`, `/proc`, `/dev`, or contain `..`. |
+| `ro_paths` | array of strings | Absolute paths granted read-only. Entries may be directories (the grant covers their contents recursively) or single regular files. Must not be `/`, `/proc`, `/dev`, contain `..`, or be empty. |
+| `rw_paths` | array of strings | Absolute paths granted read-write; same shape rules as `ro_paths`. A missing entry is created as a directory at launch; an entry that already exists as a regular file is a valid single-file grant and is kept as-is. |
 | `env` | array of strings | Allowed environment variables. Supports exact names or trailing wildcards (e.g., `VIKUNJA_*`). |
 
 Worker jobs cannot declare grants. Any attempt to supply grants to a worker job fails closed.
 
-A forbidden or failing session grant is dropped, never fatal: an entry that fails validation (relative path, `..`, `/`, `/proc`, `/dev/...`, bad env name) is removed with a `grant dropped:` warning when the supervisor config is loaded, and a grant the backend cannot apply at launch — the kata backend refuses it, the kernel rejects the rule, or the path does not exist or cannot be opened — is dropped with `sandbox grant dropped (...)`; on the gVisor backend (no Landlock) the path grants are dropped the same way while `env` grants still apply. The session and every other session still start, with strictly less access; isolation is unchanged because a grant only ever adds access. The base sandbox policy (system roots, Landlock itself, no-new-privs) stays fail-closed.
+**Files vs directories.** A directory grant (`ro_paths`/`rw_paths` accept directory paths) covers the directory's contents recursively -- read-only for `ro_paths` -- and is the supported way to grant a whole mounted-secret directory without enumerating files. A single-file grant exposes exactly that file: on the Landlock backends the session reads, stats and names the file through its parent (path lookup and `stat` are not restricted), but listing the parent fails with `Permission denied` -- Landlock has no metadata-only directory access, so a file grant never widens to the parent. Grant the directory whenever tools list the parent or re-resolve paths through it. The supervisor warns when a single-file grant's parent directory holds other entries (dot-entries of a Kubernetes secret volume are not counted), so a directory grant is the better shape is visible at config load.
+
+A forbidden or failing session grant is dropped, never fatal: an entry that fails validation (relative path, `..`, empty entry, `/`, `/proc`, `/dev/...`, bad env name) is removed with a `grant dropped:` warning when the supervisor config is loaded, and a grant the backend cannot apply at launch — the kata backend refuses it, the kernel rejects the rule, or the path does not exist or cannot be opened — is dropped with `sandbox grant dropped (...)`: a granted path that does not exist at session start is warned about, never fatal. On the gVisor backend (no Landlock) the path grants are dropped the same way while `env` grants still apply. The session and every other session still start, with strictly less access; isolation is unchanged because a grant only ever adds access. The base sandbox policy (system roots, Landlock itself, no-new-privs) stays fail-closed.
 
 ---
 
