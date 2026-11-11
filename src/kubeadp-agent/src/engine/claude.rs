@@ -191,9 +191,10 @@ fn spawn_job(
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     crate::core::runner::detached_session(&mut cmd);
-    let mut child = cmd.spawn().map_err(|e| {
-        EngineError::Internal(format!("failed to spawn claude job '{run_id}': {e}"))
-    })?;
+    let mut child =
+        crate::core::spawn::spawn_command_tracked(&mut cmd, "claude job").map_err(|e| {
+            EngineError::Internal(format!("failed to spawn claude job '{run_id}': {e}"))
+        })?;
 
     let stdin = child
         .stdin

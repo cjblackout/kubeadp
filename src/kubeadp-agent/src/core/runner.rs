@@ -1066,7 +1066,9 @@ pub fn run_internal_runner(
         }
     }
 
-    let mut child = match spawn_cmd.stdout(log_file).stderr(err_file).spawn() {
+    spawn_cmd.stdout(log_file);
+    spawn_cmd.stderr(err_file);
+    let mut child = match crate::core::spawn::spawn_command_tracked(&mut spawn_cmd, "agy") {
         Ok(c) => c,
         Err(e) => {
             // Make the failure visible to status classification: the log gets

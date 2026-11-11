@@ -134,8 +134,7 @@ pub fn install(state_root: &Path, agy_path: &Path, agy_home: &Path) -> Result<()
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let child = cmd
-        .spawn()
+    let child = crate::core::spawn::spawn_command_tracked(&mut cmd, "agy plugin install")
         .map_err(|e| format!("failed to run `agy plugin install {dir:?}`: {e}"))?;
     match wait_with_timeout(child, INSTALL_TIMEOUT) {
         Ok(status) if status.success() => Ok(()),

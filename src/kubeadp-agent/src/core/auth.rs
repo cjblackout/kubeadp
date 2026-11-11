@@ -255,12 +255,13 @@ impl AuthManager {
         // Own session + process group (same pattern as the job runner's
         // detached spawn) so the deadline kills reach the whole child tree.
         crate::core::runner::detached_session(&mut cmd);
-        let mut child = cmd.spawn().with_context(|| {
-            format!(
-                "Failed to spawn agy for the auth flow (configured path: {})",
-                config.agy_path.display()
-            )
-        })?;
+        let mut child =
+            crate::core::spawn::spawn_command_tracked(&mut cmd, "agy").with_context(|| {
+                format!(
+                    "Failed to spawn agy for the auth flow (configured path: {})",
+                    config.agy_path.display()
+                )
+            })?;
         // Register the child with the in-server zombie reaper for the whole
         // auth flow: while it is alive the reaper's guard pass steps aside,
         // and if it exits inside the tiny scan-then-drain TOCTOU window the

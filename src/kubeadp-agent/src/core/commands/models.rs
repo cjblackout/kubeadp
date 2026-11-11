@@ -53,8 +53,7 @@ fn run_agy_models(config: &Config) -> Result<(String, String)> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     crate::core::proxy::apply_proxy(&mut cmd, Some(config), None);
-    let mut child = cmd
-        .spawn()
+    let mut child = crate::core::spawn::spawn_command_tracked(&mut cmd, "`agy models`")
         .with_context(|| format!("failed to spawn `{agy} models`"))?;
     // Register the child so the in-server zombie reaper (PID 1) can never
     // steal this helper's exit status between the `try_wait()` polls; on the
@@ -161,14 +160,12 @@ pub fn run(config: &Config, args: &ModelsArgs) -> Result<CommandOutput> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
     fn write_fake_agy(dir: &std::path::Path, script: &str) -> std::path::PathBuf {
         let agy = dir.join("agy");
-        fs::write(&agy, script).unwrap();
-        fs::set_permissions(&agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::core::spawn::write_executable_script(&agy, script).unwrap();
         agy
     }
 

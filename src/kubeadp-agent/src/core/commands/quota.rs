@@ -156,8 +156,7 @@ pub fn fetch_quota(
     crate::core::proxy::apply_proxy(&mut cmd, Some(config), None);
 
     let started = Instant::now();
-    let mut child = cmd
-        .spawn()
+    let mut child = crate::core::spawn::spawn_command_tracked(&mut cmd, "agy")
         .with_context(|| format!("could not spawn agy at {}", config.agy_path.display()))?;
     // Register the child so the in-server zombie reaper (PID 1) can never
     // steal this helper's exit status between the `try_wait()` polls; on the
@@ -404,7 +403,6 @@ pub fn run(config: &Config, args: &QuotaArgs) -> Result<CommandOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     /// Real abbreviated agy `/usage` sample (2026-09-30, one line per bucket).
@@ -433,8 +431,7 @@ mod tests {
         }
         script.push_str(&format!("cat '{}'\n", body_path.display()));
         let path = dir.join(name);
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::core::spawn::write_executable_script(&path, &script).unwrap();
         path
     }
 
@@ -724,8 +721,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         let fail = dir.join("fake-agy-fail");
-        std::fs::write(&fail, "#!/bin/sh\necho '   quota blew up   ' >&2\nexit 1\n").unwrap();
-        std::fs::set_permissions(&fail, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::core::spawn::write_executable_script(
+            &fail,
+            "#!/bin/sh\necho '   quota blew up   ' >&2\nexit 1\n",
+        )
+        .unwrap();
         let config = test_config(&dir, &fail);
 
         let err = run(&config, &QuotaArgs { fresh: true }).unwrap_err();
@@ -739,8 +739,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         let sleeper = dir.join("fake-agy-slow");
-        std::fs::write(&sleeper, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        std::fs::set_permissions(&sleeper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::core::spawn::write_executable_script(&sleeper, "#!/bin/sh\nexec sleep 30\n")
+            .unwrap();
         let config = test_config(&dir, &sleeper);
 
         // Short bound via the timeout parameter of the inner fn (the 60 s
@@ -764,16 +764,12 @@ mod tests {
         // prints the usage JSON.
         let env_file = dir.join("child.env");
         let fake = dir.join("fake-agy-proxy");
-        std::fs::write(
-            &fake,
-            format!(
-                "#!/bin/sh\necho \"HTTP_PROXY=${{HTTP_PROXY}}\" > '{env}'\necho \"HTTPS_PROXY=${{HTTPS_PROXY}}\" >> '{env}'\necho \"NO_PROXY=${{NO_PROXY}}\" >> '{env}'\ncat '{body}'\n",
-                env = env_file.display(),
-                body = body.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = format!(
+            "#!/bin/sh\necho \"HTTP_PROXY=${{HTTP_PROXY}}\" > '{env}'\necho \"HTTPS_PROXY=${{HTTPS_PROXY}}\" >> '{env}'\necho \"NO_PROXY=${{NO_PROXY}}\" >> '{env}'\ncat '{body}'\n",
+            env = env_file.display(),
+            body = body.display()
+        );
+        crate::core::spawn::write_executable_script(&fake, &script).unwrap();
         let mut config = test_config(&dir, &fake);
         config.http_proxy = Some("http://quota-proxy:8080".to_string());
         config.https_proxy = Some("http://quota-proxy:8443".to_string());

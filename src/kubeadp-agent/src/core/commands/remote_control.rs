@@ -161,7 +161,7 @@ fn execute_agy(config: &Config, args: &[String], timeout: Duration) -> Result<(S
         .stderr(std::process::Stdio::piped());
     crate::core::proxy::apply_proxy(&mut cmd, Some(config), None);
 
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = crate::core::spawn::spawn_command_tracked(&mut cmd, &agy).map_err(|e| {
         AgentRunError::internal(
             "remote_control_failed",
             format!("failed to spawn `{agy}`: {e}"),

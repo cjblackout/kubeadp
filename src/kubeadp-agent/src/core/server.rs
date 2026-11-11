@@ -2713,8 +2713,6 @@ mod tests {
 
     // -- auth routes (fake agy scripts; HOME pointed at temp dirs) --------
 
-    use std::os::unix::fs::PermissionsExt;
-
     /// The auth tests below mutate the process `HOME` env var; serialize
     /// them (the other suite tests don't read HOME).
     static AUTH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2755,48 +2753,32 @@ mod tests {
     /// briefly (like the real agy's post-exchange `--print` prompt)
     /// before exiting 0.
     fn write_fake_agy_success(path: &std::path::Path) {
-        std::fs::write(
-            path,
-            "#!/bin/sh\necho 'Opening the browser for authentication...'\necho 'Please visit https://antigravity.google/auth?session=fake123 and sign in'\necho 'After authenticating, copy the code displayed in the browser and paste it below:'\nread code\necho 'Completing authentication...'\necho 'authentication completed successfully'\nmkdir -p \"$HOME/.gemini/antigravity-cli\"\nprintf '{\"refresh_token\":\"rt-fake\",\"access_token\":\"at-fake\"}' > \"$HOME/.gemini/oauth_creds.json\"\nprintf '[{\"email\":\"dev@example.com\"}]' > \"$HOME/.gemini/google_accounts.json\"\nprintf 'token-fake-bytes' > \"$HOME/.gemini/antigravity-cli/antigravity-oauth-token\"\nsleep 0.2\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = "#!/bin/sh\necho 'Opening the browser for authentication...'\necho 'Please visit https://antigravity.google/auth?session=fake123 and sign in'\necho 'After authenticating, copy the code displayed in the browser and paste it below:'\nread code\necho 'Completing authentication...'\necho 'authentication completed successfully'\nmkdir -p \"$HOME/.gemini/antigravity-cli\"\nprintf '{\"refresh_token\":\"rt-fake\",\"access_token\":\"at-fake\"}' > \"$HOME/.gemini/oauth_creds.json\"\nprintf '[{\"email\":\"dev@example.com\"}]' > \"$HOME/.gemini/google_accounts.json\"\nprintf 'token-fake-bytes' > \"$HOME/.gemini/antigravity-cli/antigravity-oauth-token\"\nsleep 0.2\nexit 0\n";
+        crate::core::spawn::write_executable_script(path, script).unwrap();
     }
 
     /// Fake `agy` that prints the URL, reads the code, prints an error, and
     /// exits 1.
     fn write_fake_agy_failure(path: &std::path::Path) {
-        std::fs::write(
-            path,
-            "#!/bin/sh\necho 'Please visit https://antigravity.google/auth?session=fail123 and sign in'\nread code\necho 'ERROR: the code was rejected'\nexit 1\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = "#!/bin/sh\necho 'Please visit https://antigravity.google/auth?session=fail123 and sign in'\nread code\necho 'ERROR: the code was rejected'\nexit 1\n";
+        crate::core::spawn::write_executable_script(path, script).unwrap();
     }
 
     /// Fake `agy` that only sleeps (never prints a URL) and records its
     /// own PID first (the tests assert the kill actually reached it).
     fn write_fake_agy_sleeper(path: &std::path::Path, pid_file: &std::path::Path) {
-        std::fs::write(
-            path,
-            format!("#!/bin/sh\necho $$ > {}\nsleep 30\n", pid_file.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = format!("#!/bin/sh\necho $$ > {}\nsleep 30\n", pid_file.display());
+        crate::core::spawn::write_executable_script(path, &script).unwrap();
     }
 
     /// Fake `agy` that prints the URL, records its PID, and sleeps
     /// (ignoring stdin) -- the in-progress conflict / code-timeout paths.
     fn write_fake_agy_url_sleeper(path: &std::path::Path, pid_file: &std::path::Path) {
-        std::fs::write(
-            path,
-            format!(
-                "#!/bin/sh\necho 'Please visit https://antigravity.google/auth?session=sleep123 and sign in'\necho $$ > {}\nsleep 30\n",
-                pid_file.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = format!(
+            "#!/bin/sh\necho 'Please visit https://antigravity.google/auth?session=sleep123 and sign in'\necho $$ > {}\nsleep 30\n",
+            pid_file.display()
+        );
+        crate::core::spawn::write_executable_script(path, &script).unwrap();
     }
 
     /// Takes `AUTH_TEST_LOCK` for the duration of the calling test, so the
@@ -3182,8 +3164,7 @@ mod tests {
 
         // Fake agy that never prints a URL.
         let agy = tmp.path().join("fake-agy");
-        std::fs::write(&agy, "#!/bin/sh\nsleep 30\n").unwrap();
-        std::fs::set_permissions(&agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::core::spawn::write_executable_script(&agy, "#!/bin/sh\nsleep 30\n").unwrap();
         let auth = Arc::new(AuthManager::with_timeouts(
             std::time::Duration::from_millis(500),
             std::time::Duration::from_secs(5),

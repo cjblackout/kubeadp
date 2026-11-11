@@ -37,6 +37,7 @@ pub mod reaper;
 pub mod repos;
 pub mod reposync;
 pub mod runner;
+pub mod spawn;
 
 #[cfg(feature = "server")]
 pub mod server;

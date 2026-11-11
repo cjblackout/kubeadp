@@ -615,7 +615,6 @@ mod tests {
     use super::*;
     use crate::core::job::{open_state_db, JobStatus};
     use http_body_util::BodyExt;
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     fn test_config(dir: &TempDir) -> Config {
@@ -946,15 +945,11 @@ mod tests {
 
     /// A fake agy that records its argv and prints a structured SUCCESS.
     fn write_fake_agy(bin: &std::path::Path, worktree: &std::path::Path) {
-        std::fs::write(
-            bin,
-            format!(
-                "#!/bin/sh\n{{ printf '%s\\n' \"$@\" > {argv}; echo '{{\"status\":\"SUCCESS\",\"response\":\"ok\"}}'\n}}\n",
-                argv = worktree.join("argv.txt").display(),
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = format!(
+            "#!/bin/sh\n{{ printf '%s\\n' \"$@\" > {argv}; echo '{{\"status\":\"SUCCESS\",\"response\":\"ok\"}}'\n}}\n",
+            argv = worktree.join("argv.txt").display(),
+        );
+        crate::core::spawn::write_executable_script(bin, &script).unwrap();
     }
 
     /// Saves a DONE job (exit 0 + structured SUCCESS + a conversation id) whose
@@ -1346,24 +1341,20 @@ mod tests {
     /// line), then prints a structured SUCCESS and exits. Used to verify the
     /// live fast path wrote directly into a RUNNING process.
     fn write_fake_agy_live(bin: &std::path::Path, worktree: &std::path::Path) {
-        std::fs::write(
-            bin,
-            format!(
-                "#!/bin/sh\n\
-                 {{\n\
-                 \x20 printf '%s\\n' \"$@\" > {argv}\n\
-                 \x20 while IFS= read -r line; do\n\
-                 \x20\x20 printf '%s\\n' \"$line\" >> {received}\n\
-                 \x20 done\n\
-                 \x20 echo '{{\"status\":\"SUCCESS\",\"response\":\"ok\",\"conversation_id\":\"{conv}\"}}'\n\
-                 }}\n",
-                argv = worktree.join("argv.txt").display(),
-                received = worktree.join("received.txt").display(),
-                conv = CONV,
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = format!(
+            "#!/bin/sh\n\
+             {{\n\
+             \x20 printf '%s\\n' \"$@\" > {argv}\n\
+             \x20 while IFS= read -r line; do\n\
+             \x20\x20 printf '%s\\n' \"$line\" >> {received}\n\
+             \x20 done\n\
+             \x20 echo '{{\"status\":\"SUCCESS\",\"response\":\"ok\",\"conversation_id\":\"{conv}\"}}'\n\
+             }}\n",
+            argv = worktree.join("argv.txt").display(),
+            received = worktree.join("received.txt").display(),
+            conv = CONV,
+        );
+        crate::core::spawn::write_executable_script(bin, &script).unwrap();
     }
 
     /// Saves a RUNNING job row (live pid, matching start time via `this`
