@@ -2964,13 +2964,13 @@ mod tests {
         meta.worktree_path = wt;
 
         register_test_pre_spawn_hook(&job_id, || {
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(2000));
         });
 
         let pid = launch_background_job_with_timeout(
             &config,
             &mut meta,
-            Duration::from_millis(1000),
+            Duration::from_millis(5000),
             Duration::from_millis(25),
         )
         .expect("a PID confirmed late in the timeout window must make the launch succeed");

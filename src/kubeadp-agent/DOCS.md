@@ -261,6 +261,8 @@ When `[worker] a2a_mcp_enabled = true` is configured, worker jobs automatically 
 
 Incoming A2A messages for a run land in a durable per-run inbox (`core/a2a/inbox.rs`): one JSON file per message under `<state_root>/a2a-inbox/<run_id>/`, states `queued -> injected`, bounded (8 messages / 8 KiB, oldest dropped with a durable note) with a TTL (`a2a_inbox_ttl_secs`, default 1 h). The harness — never the model — puts each message into the run's model context at the earliest safe boundary through one of the engine's injection channels (capability `a2a.inject`: both engines list `hook` + `tool_result` + `idle_turn`); the injection IS the acknowledgement, and the model never has to decide to read its messages. Nothing is killed by default.
 
+`state_root` here is the agent-run state root, resolved by the ONE shared helper `core::a2a::inbox::inbox_state_root()` (the same resolution `http_server.rs` applies to the agent-run `Config`; `AGENT_RUN_STATE_ROOT` > config file > built-in `~/.agent-run`) that BOTH sides of a run's inbox use — the A2A sink (`orchestrate/a2a.rs` / `http_server.rs`, and `worker/a2a.rs`) and the launcher that names the run's inbox in `KUBEADP_A2A_INBOX_DIR` and grants it to the sandbox (`orchestrate/session.rs` via `SupervisorConfig::a2a_inbox_root()`, `core/runner.rs`). The session side never derives the inbox from the supervisor `state_file`'s parent (the default state file lives in `/tmp`, which the sink never writes and the pod wipes at every restart).
+
 - **`tool_result` (both engines)**: the `mcp-a2a` server appends the queued messages (full framed text, untrusted data, size-capped) to the result of every one of its tool calls, and `wait_message {timeout_s}` is a blocking receive whose result is the message (returns the moment one is queued; capped at 25 s). There is no model-driven `inbox` read tool.
 - **`hook` (both engines)**: `kubeadp-agent a2a-hook <event>` reads the inbox and prints the hook JSON for the engine's native hook: Claude Code `PostToolUse`/`UserPromptSubmit` (`additionalContext`) and `Stop` (`decision: block` + `reason`, so a session about to end its turn continues with the message); agy's verified native plugin hooks `pre-invocation` (stdout `injectSteps` system message put into the model's context before every model call), `post-invocation` (`injectSteps` + `terminationBehavior: force_continue`) and `stop` (`decision: continue` + `reason`). Claude Code events print nothing, exit 0, when nothing is queued; the agy events print `{}` (agy parses the stdout of every hook invocation).
 - **`idle_turn` / `interrupt`**: the escalation ladder (`core/a2a/delivery.rs`), below.
@@ -393,7 +395,7 @@ Global options:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `state_file` | `/tmp/claude-supervisor-state.json` | Path of the atomic JSON state file. |
+| `state_file` | `/tmp/claude-supervisor-state.json` | DEPRECATED. Only used as the one-time import path: a legacy JSON state file found at this path at start is imported into the state database once and renamed to `*.migrated`. The supervisor state itself lives in the per-pod SQLite state database (see below). |
 | `heartbeat_interval_secs` | `2.0` | Heartbeat write interval. |
 | `stale_heartbeat_secs` | `15.0` | Age after which the heartbeat is considered stale by the `status` probe. |
 | `shutdown_grace_secs` | `5.0` | Grace period before SIGKILL on supervisor shutdown. |
@@ -421,7 +423,9 @@ Per-session backoff, retry, and supervision options:
 
 Restart delay is `min(base_backoff_secs * 2^n, max_backoff_secs)` where `n` is the restarts already in the window (the first restart in the window uses `base_backoff_secs`), with +0..+25% jitter applied on top.
 
-The `agent-orchestrate status` probe exits `0` (healthy), `1` (heartbeat stale), `2` (a session is `failed` or a session thread died), `3` (state file unreadable), or `4` (supervisor stopped or a session is `stopped`).
+The supervisor and per-session state (pid, heartbeat, status, restart counts, last exit reason, engine) is stored in the shared per-pod SQLite state database `<state_root>/state.sqlite` (the same database that holds the `jobs` table, one db per pod): a single `supervisor_state` row (pid, started, heartbeat, status, schema version) plus one `session_state` row per session. Writes are transactional and only the supervisor process writes; readers (`agent-orchestrate status`) use read-only connections with `synchronous=NORMAL` keeping the heartbeat cadence from hammering the disk. The state survives a pod restart: at start the supervisor restores the previous session state (crash accounting, last exit reason) from the database. The legacy JSON state file (`state_file`, `/tmp/claude-supervisor-state.json` — `/tmp` is wiped at every pod restart) is imported once at start and renamed to `*.migrated`. The schema evolves through the numbered, additive migrations in `src/core/migrations.rs` (tracked by `PRAGMA user_version`).
+
+The `agent-orchestrate status` probe exits `0` (healthy), `1` (heartbeat stale), `2` (a session is `failed` or a session thread died), `3` (supervisor state unreadable / no state in the database), or `4` (supervisor stopped or a session is `stopped`). It prints the same state JSON document as before.
 
 ---
 

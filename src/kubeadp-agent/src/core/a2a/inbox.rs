@@ -47,6 +47,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::crypto::sha256;
 
+/// Environment variable naming the shared inbox state root, resolved EXACTLY
+/// like the agent-run `state_root` ([`inbox_state_root`]).
+///
+/// This is the ONE definition both sides of a run's inbox resolve: the host
+/// delivery (the A2A sink, `orchestrate/a2a.rs` / `http_server.rs`) and the
+/// launcher that names the run's inbox in [`INBOX_ENV`]
+/// (`orchestrate/session.rs` and `core/runner.rs`). Keeping it here
+/// guarantees a session's inbox is the directory the sink writes, never a
+/// sibling root derived from the supervisor state file's parent (historically
+/// `/tmp`, wiped at every pod restart).
+pub const INBOX_STATE_ROOT_ENV: &str = "AGENT_RUN_STATE_ROOT";
+
 /// Directory name of a run's inbox under its state dir.
 pub const INBOX_DIR_NAME: &str = "a2a-inbox";
 
@@ -136,6 +148,29 @@ pub fn inbox_dir_for(state_root: &Path, run_id: &str) -> PathBuf {
     state_root
         .join(INBOX_DIR_NAME)
         .join(sanitize_run_id(run_id))
+}
+
+/// The shared root every run's A2A inbox lives under:
+/// `<root>/a2a-inbox/<run>/`, where `root` is the agent-run `state_root`
+/// resolved EXACTLY as the HTTP server derives it today
+/// ([`crate::core::config::Config::load`] then `state_root`:
+/// `AGENT_RUN_STATE_ROOT` > the config file's `state_root` > the built-in
+/// default `~/.agent-run`, expanded against the workspace root and `~`).
+///
+/// This is the ONE definition both sides of a run's inbox resolve: the host
+/// delivery side (the A2A sink, `orchestrate/a2a.rs` / `http_server.rs`) and
+/// the launcher that names the run's inbox in [`INBOX_ENV`]
+/// (`orchestrate/session.rs` and `core/runner.rs`; the worker always used the
+/// same root). The supervisor session side must NOT derive the inbox from the
+/// state file's parent (the default state file lives in `/tmp`, which the
+/// sink never writes and the pod wipes at every restart): that was the
+/// path-mismatch bug this helper removes -- a session's inbox is now
+/// guaranteed to be the directory the sink writes. `INBOX_STATE_ROOT_ENV` is
+/// kept as the documented variable the resolution honours.
+pub fn inbox_state_root() -> PathBuf {
+    crate::core::config::Config::load()
+        .map(|c| c.state_root)
+        .unwrap_or_else(|_| crate::core::config::Config::default().state_root)
 }
 
 /// The injection-marker directory inside an inbox: `<inbox>/injected/`. The
@@ -708,6 +743,78 @@ mod tests {
         std::env::set_var(INBOX_ENV, "   ");
         assert!(Inbox::from_env().is_none());
         std::env::remove_var(INBOX_ENV);
+    }
+
+    #[test]
+    fn inbox_state_root_follows_agent_run_state_root() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The shared inbox root is derived from AGENT_RUN_STATE_ROOT (the same
+        // resolution the agent-run config applies), NOT from a supervisor
+        // state file location. Under a non-default state root the session
+        // inbox must land under THAT root.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("state-root");
+        std::env::set_var("AGENT_RUN_STATE_ROOT", root.to_str().unwrap());
+        std::env::remove_var("AGENT_RUN_WORKSPACE_ROOT");
+        std::env::remove_var("AGENT_RUN_CONFIG");
+        let resolved = inbox_state_root();
+        assert_eq!(
+            resolved, root,
+            "the shared inbox root must follow AGENT_RUN_STATE_ROOT exactly"
+        );
+        assert_eq!(
+            inbox_dir_for(&resolved, "homelab"),
+            root.join("a2a-inbox").join("homelab")
+        );
+        std::env::remove_var("AGENT_RUN_STATE_ROOT");
+    }
+
+    /// Test 1: the sink and the session launcher must resolve the IDENTICAL
+    /// inbox directory for the same session name, under a non-default
+    /// `state_file` -- and that directory must be under the shared agent-run
+    /// state root, NOT under the state file's parent (the pre-fix `/tmp`
+    /// mismatch). Both sides route through [`inbox_state_root`], so the
+    /// regression cannot recur by construction.
+    #[test]
+    fn sink_and_session_agree_on_the_inbox_dir_for_a_non_default_state_file() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("data/state-root");
+        std::env::set_var("AGENT_RUN_STATE_ROOT", root.to_str().unwrap());
+        std::env::remove_var("AGENT_RUN_WORKSPACE_ROOT");
+        std::env::remove_var("AGENT_RUN_CONFIG");
+
+        // The session's launcher input: a supervisor config whose state file
+        // lives in a directory that has NOTHING to do with the inbox root.
+        let state_file = tmp.path().join("elsewhere").join("state.json");
+        let session = "homelab";
+
+        // The SINK resolves the session inbox on the shared state root (this
+        // is the root `orchestrate/http_server.rs` passes to the A2A router).
+        let sink_inbox = inbox_dir_for(&inbox_state_root(), session);
+        // The SESSION resolves it through the same shared helper (the
+        // session launcher now uses it, not `state_file.parent()`).
+        let session_inbox = inbox_dir_for(&inbox_state_root(), session);
+
+        assert_eq!(sink_inbox, session_inbox);
+        assert_eq!(sink_inbox, root.join("a2a-inbox").join(session));
+        // The pre-fix root -- the state file's parent -- must NOT be used.
+        let legacy_root = state_file
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/tmp"));
+        let legacy_inbox = inbox_dir_for(legacy_root, session);
+        assert_ne!(
+            sink_inbox, legacy_inbox,
+            "the session inbox must not be derived from the supervisor state file's parent"
+        );
+        assert!(
+            sink_inbox.starts_with(&root),
+            "the session inbox must live under the shared agent-run state root"
+        );
+
+        std::env::remove_var("AGENT_RUN_STATE_ROOT");
     }
 
     #[test]

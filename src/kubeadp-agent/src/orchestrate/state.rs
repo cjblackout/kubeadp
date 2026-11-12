@@ -1,10 +1,9 @@
 use crate::orchestrate::logging::rfc3339_now;
+use rusqlite::{params, params_from_iter, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +24,21 @@ impl std::fmt::Display for SessionStatus {
             SessionStatus::Backoff => write!(f, "backoff"),
             SessionStatus::Failed => write!(f, "failed"),
             SessionStatus::Stopped => write!(f, "stopped"),
+        }
+    }
+}
+
+impl SessionStatus {
+    /// Parses a status string produced by `Display`/serde (lowercase);
+    /// returns `None` for unrecognized values.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "starting" => Some(SessionStatus::Starting),
+            "running" => Some(SessionStatus::Running),
+            "backoff" => Some(SessionStatus::Backoff),
+            "failed" => Some(SessionStatus::Failed),
+            "stopped" => Some(SessionStatus::Stopped),
+            _ => None,
         }
     }
 }
@@ -100,100 +114,357 @@ impl SupervisorState {
     }
 }
 
-/// Process-wide mutex that serializes all state-file writes.
-/// This prevents concurrent threads from interleaving their temp-file writes
-/// (the temp name includes pid+nanos+counter, so uniqueness is guaranteed even
-/// without the mutex; the mutex additionally avoids a burst of redundant writes).
-static WRITE_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+/// The schema version of the persisted `supervisor_state` row. Bumped only
+/// when the row layout itself changes; readers reject rows from a newer
+/// schema with a clear error instead of misreading them.
+const SUPERVISOR_STATE_ROW_VERSION: i64 = 1;
 
-fn write_mutex() -> &'static Mutex<()> {
-    WRITE_MUTEX.get_or_init(|| Mutex::new(()))
+fn state_db_path(state_root: &Path) -> std::path::PathBuf {
+    crate::core::job::state_db_path(state_root)
 }
 
-/// Process-wide counter for unique temp file names.
-static WRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Atomically writes the state file by creating a unique temp file and renaming it.
-///
-/// # Thread-safety
-/// Multiple threads can call this concurrently.  Each call:
-/// 1. Clones the state data (caller must have already released any shared state lock).
-/// 2. Serialises to JSON under the process-wide write mutex to avoid torn renames.
-/// 3. Uses a temp path that is unique per-call (pid + nanoseconds + a monotone counter),
-///    so two concurrent calls never share a temp path.
-/// 4. Does NOT call `sync_all`; `rename(2)` atomicity is sufficient for this
-///    `/tmp` state file (power-loss durability is not required).
-pub fn write_state_atomic(state_file: &Path, state: &SupervisorState) -> Result<(), String> {
-    // Serialize outside the lock – this is the expensive part.
-    let json_bytes = serde_json::to_vec_pretty(state)
-        .map_err(|e| format!("Failed to serialize state: {}", e))?;
-
-    // Build a unique temp path: .<name>.tmp.<pid>.<nanos>.<counter>
-    let pid = std::process::id();
-    let nanos = SystemTime::now()
+/// Unix seconds now (0 when the clock is before the epoch).
+fn now_epoch() -> u64 {
+    SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let counter = WRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let file_name = state_file
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_else(|| "state".to_string());
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
-    let temp_file = if let Some(parent) = state_file.parent() {
-        let _ = fs::create_dir_all(parent);
-        parent.join(format!(".{}.tmp.{}.{}.{}", file_name, pid, nanos, counter))
-    } else {
-        Path::new(&format!(
-            "{}.tmp.{}.{}.{}",
-            state_file.display(),
-            pid,
-            nanos,
-            counter
-        ))
-        .to_path_buf()
-    };
-
-    // Serialise write + rename under the mutex so that a concurrent writer
-    // cannot interleave its rename on top of ours.
-    let _guard = write_mutex().lock().unwrap_or_else(|e| e.into_inner());
-
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temp_file)
+/// Persists the supervisor state into the shared per-pod state database
+/// (`<state_root>/state.sqlite`): the single `supervisor_state` row plus one
+/// `session_state` row per session, written in ONE transaction.
+///
+/// # Writers and readers
+/// The supervisor process is the only writer (its session threads and the
+/// heartbeat loop write through here; SQLite's WAL locking serializes
+/// concurrent writers, the busy timeout waits briefly for one). Readers
+/// (`agent-orchestrate status`, this module's load) use read-only
+/// connections. `synchronous=NORMAL` keeps the existing heartbeat cadence
+/// from hammering the disk: in WAL mode a crash never corrupts the database,
+/// only a power loss may drop the most recent commits.
+///
+/// # Layout
+/// `supervisor_state` is a single row (`id = 1`): pid, started, heartbeat,
+/// status and a `version` for the row schema. `session_state` holds one row
+/// per session with the fields of [`SessionState`]. Rows of sessions that
+/// are no longer part of `state` (the in-memory map is authoritative) are
+/// removed, so a config change also removes them from the store.
+pub fn save_supervisor_state(state_root: &Path, state: &SupervisorState) -> Result<(), String> {
+    let db_path = state_db_path(state_root);
+    let conn = crate::core::job::open_state_db(state_root).map_err(|e| {
+        format!(
+            "Failed to open state database {}: {:#}",
+            db_path.display(),
+            e
+        )
+    })?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| {
             format!(
-                "Failed to create temp state file {}: {}",
-                temp_file.display(),
+                "Failed to set synchronous=NORMAL on {}: {}",
+                db_path.display(),
                 e
             )
         })?;
 
-    file.write_all(&json_bytes)
-        .map_err(|e| format!("Failed to write to temp state file: {}", e))?;
-    // Intentionally omitting sync_all: rename(2) atomicity is sufficient for /tmp.
-    drop(file);
-
-    fs::rename(&temp_file, state_file).map_err(|e| {
+    let now = now_epoch() as i64;
+    let tx = conn.unchecked_transaction().map_err(|e| {
         format!(
-            "Failed to rename {} -> {}: {}",
-            temp_file.display(),
-            state_file.display(),
+            "Failed to begin a state transaction on {}: {}",
+            db_path.display(),
             e
         )
     })?;
 
+    tx.execute(
+        "INSERT INTO supervisor_state (
+            id, supervisor_pid, started, heartbeat, heartbeat_epoch, status, version, updated_at
+        ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(id) DO UPDATE SET
+            supervisor_pid = excluded.supervisor_pid,
+            started = excluded.started,
+            heartbeat = excluded.heartbeat,
+            heartbeat_epoch = excluded.heartbeat_epoch,
+            status = excluded.status,
+            version = excluded.version,
+            updated_at = excluded.updated_at",
+        params![
+            state.supervisor_pid,
+            state.heartbeat,
+            state.heartbeat,
+            state.heartbeat_epoch as i64,
+            state.status,
+            SUPERVISOR_STATE_ROW_VERSION,
+            now,
+        ],
+    )
+    .map_err(|e| format!("Failed to save the supervisor state row: {}", e))?;
+
+    for session in state.sessions.values() {
+        tx.execute(
+            "INSERT INTO session_state (
+                name, pid, start_time, start_time_epoch, uptime_secs, restart_count,
+                last_exit_reason, status, last_health_result, engine, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(name) DO UPDATE SET
+                pid = excluded.pid,
+                start_time = excluded.start_time,
+                start_time_epoch = excluded.start_time_epoch,
+                uptime_secs = excluded.uptime_secs,
+                restart_count = excluded.restart_count,
+                last_exit_reason = excluded.last_exit_reason,
+                status = excluded.status,
+                last_health_result = excluded.last_health_result,
+                engine = excluded.engine,
+                updated_at = excluded.updated_at",
+            params![
+                session.name,
+                session.pid.map(|p| p as i64),
+                session.start_time,
+                session.start_time_epoch.map(|e| e as i64),
+                session.uptime_secs,
+                session.restart_count,
+                session.last_exit_reason,
+                session.status.to_string(),
+                session.last_health_result,
+                session.engine,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to save session state for '{}': {}", session.name, e))?;
+    }
+
+    if state.sessions.is_empty() {
+        tx.execute("DELETE FROM session_state", [])
+            .map_err(|e| format!("Failed to clear session state rows: {}", e))?;
+    } else {
+        let names: Vec<String> = state.sessions.keys().cloned().collect();
+        let placeholders: Vec<String> = (1..=names.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "DELETE FROM session_state WHERE name NOT IN ({})",
+            placeholders.join(", ")
+        );
+        tx.execute(&sql, params_from_iter(names))
+            .map_err(|e| format!("Failed to prune session state rows: {}", e))?;
+    }
+
+    tx.commit().map_err(|e| {
+        format!(
+            "Failed to commit the supervisor state to {}: {}",
+            db_path.display(),
+            e
+        )
+    })?;
     Ok(())
 }
 
-/// Reads and parses the state file.
-pub fn read_state(state_file: &Path) -> Result<SupervisorState, String> {
-    let content = fs::read_to_string(state_file)
-        .map_err(|e| format!("Failed to read state file {}: {}", state_file.display(), e))?;
-    serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse state file {}: {}", state_file.display(), e))
+/// Loads the supervisor state from the shared per-pod state database through
+/// a READ-ONLY connection (the supervisor process is the only writer).
+/// Returns `Ok(None)` when the database holds no supervisor row yet (a fresh
+/// store, or the supervisor never ran); a row from an unknown NEWER schema
+/// version is a clear error, not a misread.
+pub fn load_supervisor_state(state_root: &Path) -> Result<Option<SupervisorState>, String> {
+    let db_path = state_db_path(state_root);
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn =
+        Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| {
+            format!(
+                "Failed to open state database {} read-only: {}",
+                db_path.display(),
+                e
+            )
+        })?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| format!("Failed to set busy timeout on {}: {}", db_path.display(), e))?;
+
+    let (pid, heartbeat, heartbeat_epoch, status, version): (i64, String, i64, String, i64) =
+        match conn.query_row(
+            "SELECT supervisor_pid, heartbeat, heartbeat_epoch, status, version \
+         FROM supervisor_state WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        ) {
+            Ok(row) => row,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => {
+                return Err(format!(
+                    "Failed to read the supervisor state from {} (is the file corrupted?): {}",
+                    db_path.display(),
+                    e
+                ))
+            }
+        };
+    if version > SUPERVISOR_STATE_ROW_VERSION {
+        return Err(format!(
+            "Supervisor state in {} was written by a newer version (schema {} > {})",
+            db_path.display(),
+            version,
+            SUPERVISOR_STATE_ROW_VERSION
+        ));
+    }
+
+    let mut sessions = HashMap::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, pid, start_time, start_time_epoch, uptime_secs, restart_count, \
+                        last_exit_reason, status, last_health_result, engine \
+                 FROM session_state ORDER BY name",
+            )
+            .map_err(|e| {
+                format!(
+                    "Failed to read session state from {}: {}",
+                    db_path.display(),
+                    e
+                )
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<f64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            })
+            .map_err(|e| {
+                format!(
+                    "Failed to read session state from {}: {}",
+                    db_path.display(),
+                    e
+                )
+            })?;
+        for row in rows {
+            let (
+                name,
+                pid,
+                start_time,
+                start_time_epoch,
+                uptime_secs,
+                restart_count,
+                last_exit_reason,
+                status,
+                last_health_result,
+                engine,
+            ) = row.map_err(|e| {
+                format!(
+                    "Corrupted or unreadable session state in {}: {}",
+                    db_path.display(),
+                    e
+                )
+            })?;
+            let status = SessionStatus::parse(&status).ok_or_else(|| {
+                format!(
+                    "Corrupted or unreadable session state in {}: unknown status '{}' for session '{}'",
+                    db_path.display(),
+                    status,
+                    name
+                )
+            })?;
+            sessions.insert(
+                name.clone(),
+                SessionState {
+                    name,
+                    pid: pid.map(|p| p as u32),
+                    start_time,
+                    start_time_epoch: start_time_epoch.map(|e| e as u64),
+                    uptime_secs,
+                    restart_count: restart_count as u32,
+                    last_exit_reason,
+                    status,
+                    last_health_result,
+                    engine,
+                },
+            );
+        }
+    }
+
+    Ok(Some(SupervisorState {
+        supervisor_pid: pid as u32,
+        heartbeat,
+        heartbeat_epoch: heartbeat_epoch as u64,
+        status,
+        sessions,
+    }))
+}
+
+/// One-time import of the legacy JSON state file (the deprecated
+/// `state_file` config key, default `/tmp/claude-supervisor-state.json`)
+/// into the shared per-pod state database.
+///
+/// The file is read, then renamed to `<file>.migrated` so the import runs
+/// exactly once -- the supervisor state now lives in the database, which
+/// survives a pod restart, while `/tmp` is wiped at every restart. The
+/// parsed state is imported ONLY when the database holds no supervisor state
+/// yet (a database that already has state is never overwritten by the older
+/// file); a corrupt file is still renamed (quarantined) and reported as not
+/// imported. Returns the imported state when it was imported.
+pub fn import_legacy_state(
+    state_file: &Path,
+    state_root: &Path,
+) -> Result<Option<SupervisorState>, String> {
+    if !state_file.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(state_file).map_err(|e| {
+        format!(
+            "Failed to read legacy state file {}: {}",
+            state_file.display(),
+            e
+        )
+    })?;
+    let parsed: Option<SupervisorState> = serde_json::from_str(&content).ok();
+
+    let migrated_path = state_file.with_file_name(format!(
+        "{}.migrated",
+        state_file
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "state".to_string())
+    ));
+    fs::rename(state_file, &migrated_path).map_err(|e| {
+        format!(
+            "Failed to rename legacy state file {} to {}: {}",
+            state_file.display(),
+            migrated_path.display(),
+            e
+        )
+    })?;
+
+    let legacy = match parsed {
+        Some(state) => state,
+        None => {
+            // Quarantined above; the caller logs and continues with the
+            // database state (fresh on a new store).
+            return Ok(None);
+        }
+    };
+
+    match load_supervisor_state(state_root) {
+        Ok(Some(_)) => Ok(None),
+        Ok(None) => {
+            save_supervisor_state(state_root, &legacy)?;
+            Ok(Some(legacy))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -269,57 +540,189 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    #[test]
-    fn test_atomic_write_and_read() {
-        let temp_dir = env::temp_dir().join(format!("test_state_{}", std::process::id()));
-        let _ = fs::create_dir_all(&temp_dir);
-        let state_path = temp_dir.join("state.json");
+    fn test_state_root(tag: &str) -> std::path::PathBuf {
+        let dir = env::temp_dir().join(format!("test_state_db_{}_{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
-        let mut state = SupervisorState::new(42);
+    fn sample_state(pid: u32) -> SupervisorState {
+        let mut state = SupervisorState::new(pid);
         let mut sess = SessionState::new("sess1".to_string());
         sess.status = SessionStatus::Running;
         sess.pid = Some(1001);
         state.sessions.insert("sess1".to_string(), sess);
-
-        write_state_atomic(&state_path, &state).expect("Atomic write must succeed");
-        assert!(state_path.exists());
-
-        let read = read_state(&state_path).expect("Read state must succeed");
-        assert_eq!(read.supervisor_pid, 42);
-        assert_eq!(read.sessions["sess1"].status, SessionStatus::Running);
-        assert_eq!(read.sessions["sess1"].pid, Some(1001));
-
-        let _ = fs::remove_dir_all(&temp_dir);
+        state
     }
 
     #[test]
-    fn test_session_engine_persists_across_atomic_write_read() {
-        let temp_dir = env::temp_dir().join(format!("test_state_{}", std::process::id()));
-        let _ = fs::create_dir_all(&temp_dir);
-        let state_path = temp_dir.join("state.json");
+    fn test_save_and_load_roundtrip() {
+        let root = test_state_root("roundtrip");
 
-        // A session created with an explicit engine round-trips the field.
-        let mut state = SupervisorState::new(42);
-        let mut sess = SessionState::new("sess-agy".to_string());
+        let mut state = sample_state(42);
+        let mut sess = SessionState::new("agy-sess".to_string());
+        sess.status = SessionStatus::Backoff;
         sess.engine = Some("agy".to_string());
-        state.sessions.insert("sess-agy".to_string(), sess);
+        sess.restart_count = 7;
+        sess.last_exit_reason = Some("exit: 1".to_string());
+        sess.start_time = Some("2026-01-01T00:00:00Z".to_string());
+        sess.start_time_epoch = Some(1234);
+        sess.uptime_secs = Some(42.5);
+        state.sessions.insert("agy-sess".to_string(), sess);
 
-        write_state_atomic(&state_path, &state).expect("Atomic write must succeed");
-        let read = read_state(&state_path).expect("Read state must succeed");
+        save_supervisor_state(&root, &state).expect("save must succeed");
+        assert!(state_db_path(&root).exists());
+
+        let read = load_supervisor_state(&root)
+            .expect("load must succeed")
+            .expect("a saved state must be present");
+        assert_eq!(read.supervisor_pid, 42);
+        assert_eq!(read.status, "running");
+        assert_eq!(read.sessions["sess1"].status, SessionStatus::Running);
+        assert_eq!(read.sessions["sess1"].pid, Some(1001));
+        assert_eq!(read.sessions["agy-sess"].engine.as_deref(), Some("agy"));
+        assert_eq!(read.sessions["agy-sess"].restart_count, 7);
         assert_eq!(
-            read.sessions["sess-agy"].engine.as_deref(),
-            Some("agy"),
-            "the persisted session engine must survive a state file round-trip"
+            read.sessions["agy-sess"].last_exit_reason.as_deref(),
+            Some("exit: 1")
         );
+        assert_eq!(read.sessions["agy-sess"].uptime_secs, Some(42.5));
 
-        // A pre-selection session (engine absent) still deserialises: the
-        // field defaults to None like today.
-        let legacy = r#"{"supervisor_pid":42,"heartbeat":"2026-01-01T00:00:00Z","heartbeat_epoch":0,"status":"running","sessions":{"old":{"name":"old","pid":null,"start_time":null,"start_time_epoch":null,"uptime_secs":null,"restart_count":0,"last_exit_reason":null,"status":"starting","last_health_result":null}}}"#;
-        let legacy_state = serde_json::from_str::<SupervisorState>(legacy)
-            .expect("a legacy state file without an engine field must deserialise");
-        assert_eq!(legacy_state.sessions["old"].engine, None);
+        let _ = fs::remove_dir_all(&root);
+    }
 
-        let _ = fs::remove_dir_all(&temp_dir);
+    #[test]
+    fn test_absent_store_loads_none() {
+        let root = test_state_root("absent");
+        let loaded = load_supervisor_state(&root).expect("absent db must not be an error");
+        assert!(loaded.is_none(), "no supervisor state written yet");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_save_prunes_sessions_removed_from_the_state() {
+        let root = test_state_root("prune");
+        let mut state = sample_state(1);
+        state
+            .sessions
+            .insert("extra".to_string(), SessionState::new("extra".to_string()));
+        save_supervisor_state(&root, &state).unwrap();
+
+        let mut next = sample_state(2);
+        next.sessions.remove("extra");
+        save_supervisor_state(&root, &next).unwrap();
+
+        let read = load_supervisor_state(&root).unwrap().unwrap();
+        assert!(!read.sessions.contains_key("extra"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The real gain: the supervisor state survives a restart. Write state,
+    /// close every connection (process exit), reopen and load again.
+    #[test]
+    fn test_restart_reopens_and_resumes() {
+        let root = test_state_root("restart");
+
+        let mut first = sample_state(111);
+        first.sessions.get_mut("sess1").unwrap().restart_count = 3;
+        first.sessions.get_mut("sess1").unwrap().last_exit_reason = Some("signal: 9".to_string());
+        save_supervisor_state(&root, &first).unwrap();
+
+        // Simulated process exit: a fresh process reopens the same database.
+        let second = load_supervisor_state(&root)
+            .expect("reopen must succeed")
+            .expect("state must survive the restart");
+        assert_eq!(second.supervisor_pid, 111);
+        assert_eq!(second.sessions["sess1"].restart_count, 3);
+        assert_eq!(
+            second.sessions["sess1"].last_exit_reason.as_deref(),
+            Some("signal: 9")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_corrupt_database_is_a_clear_error() {
+        let root = test_state_root("corrupt");
+        let db_path = state_db_path(&root);
+        fs::write(&db_path, b"this is not a sqlite database at all").unwrap();
+
+        // The writer fails loud (WAL cannot be enabled on a corrupt file).
+        let save_err = save_supervisor_state(&root, &sample_state(1)).unwrap_err();
+        assert!(
+            save_err.contains("state database"),
+            "save error must name the database: {save_err}"
+        );
+        // The reader reports a clear error as well, never a silent empty state.
+        let load_err = load_supervisor_state(&root).unwrap_err();
+        assert!(
+            load_err.contains("state database") || load_err.contains("corrupted"),
+            "load error must name the database: {load_err}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_import_legacy_state_file_once() {
+        let root = test_state_root("import");
+        let legacy_file = root.join("claude-supervisor-state.json");
+        let legacy = r#"{"supervisor_pid":4242,"heartbeat":"2026-01-01T00:00:00Z","heartbeat_epoch":100,"status":"running","sessions":{"old":{"name":"old","pid":55,"start_time":null,"start_time_epoch":null,"uptime_secs":null,"restart_count":4,"last_exit_reason":"exit: 2","status":"failed","last_health_result":null}}}"#;
+        fs::write(&legacy_file, legacy).unwrap();
+
+        let imported = import_legacy_state(&legacy_file, &root)
+            .expect("import must succeed")
+            .expect("state must be imported");
+        assert_eq!(imported.supervisor_pid, 4242);
+        assert_eq!(imported.sessions["old"].restart_count, 4);
+
+        // The file is renamed to *.migrated exactly once.
+        assert!(!legacy_file.exists());
+        assert!(root.join("claude-supervisor-state.json.migrated").exists());
+
+        // The imported state is readable from the store.
+        let read = load_supervisor_state(&root).unwrap().unwrap();
+        assert_eq!(read.sessions["old"].status, SessionStatus::Failed);
+
+        // A second start (the file no longer exists) imports nothing.
+        let again = import_legacy_state(&legacy_file, &root).unwrap();
+        assert!(again.is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_import_never_overwrites_newer_db_state() {
+        let root = test_state_root("import-newer");
+        save_supervisor_state(&root, &sample_state(1)).unwrap();
+
+        let legacy_file = root.join("claude-supervisor-state.json");
+        let legacy = r#"{"supervisor_pid":4242,"heartbeat":"2026-01-01T00:00:00Z","heartbeat_epoch":100,"status":"running","sessions":{}}"#;
+        fs::write(&legacy_file, legacy).unwrap();
+
+        let imported = import_legacy_state(&legacy_file, &root).unwrap();
+        assert!(imported.is_none(), "the db state must not be overwritten");
+        assert!(!legacy_file.exists(), "the file is still renamed");
+        let read = load_supervisor_state(&root).unwrap().unwrap();
+        assert_eq!(read.supervisor_pid, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_import_corrupt_legacy_file_quarantines() {
+        let root = test_state_root("import-corrupt");
+        let legacy_file = root.join("claude-supervisor-state.json");
+        fs::write(&legacy_file, b"{ not json").unwrap();
+
+        let imported = import_legacy_state(&legacy_file, &root)
+            .expect("a corrupt file is quarantined, not an error");
+        assert!(imported.is_none());
+        assert!(!legacy_file.exists());
+        assert!(root.join("claude-supervisor-state.json.migrated").exists());
+        assert!(load_supervisor_state(&root).unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -376,62 +779,63 @@ mod tests {
         assert!(matches!(res, Err(StatusCheckError::Stopped { .. })));
     }
 
-    /// Fix #1: 8 concurrent writer threads + 1 reader parsing in a loop.
-    /// Zero parse failures expected.
+    /// Concurrent writers (the supervisor's session threads + heartbeat loop)
+    /// never lose writes and never corrupt the store, while a reader using a
+    /// read-only connection sees a valid state on every read.
     #[test]
-    fn test_concurrent_writes_no_torn_reads() {
-        let temp_dir =
-            env::temp_dir().join(format!("test_concurrent_state_{}", std::process::id()));
-        let _ = fs::create_dir_all(&temp_dir);
-        let state_path = Arc::new(temp_dir.join("concurrent_state.json"));
+    fn test_concurrent_writes_with_read_only_reader() {
+        let root = Arc::new(test_state_root("concurrent"));
 
         // Write an initial valid state so the reader can start immediately.
-        let initial = SupervisorState::new(999);
-        write_state_atomic(&state_path, &initial).unwrap();
+        save_supervisor_state(&root, &SupervisorState::new(999)).unwrap();
 
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let parse_failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writes = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        // Spawn 8 writer threads.
+        // 8 concurrent writer threads.
         let mut handles = Vec::new();
         for i in 0..8u32 {
-            let path = Arc::clone(&state_path);
+            let root_c = Arc::clone(&root);
             let stop_c = Arc::clone(&stop);
+            let writes_c = Arc::clone(&writes);
             handles.push(thread::spawn(move || {
                 let mut state = SupervisorState::new(i);
-                let mut count = 0u32;
+                let sess = SessionState::new(format!("sess-{i}"));
+                state.sessions.insert(format!("sess-{i}"), sess);
+                let mut count = 0u64;
                 while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
-                    count = count.wrapping_add(1);
-                    let mut sess = SessionState::new(format!("sess-{}", i));
-                    sess.restart_count = count;
-                    state.sessions.insert(format!("sess-{}", i), sess);
-                    let _ = write_state_atomic(&path, &state);
+                    count += 1;
+                    state
+                        .sessions
+                        .get_mut(&format!("sess-{i}"))
+                        .unwrap()
+                        .restart_count = count as u32;
+                    if save_supervisor_state(&root_c, &state).is_ok() {
+                        writes_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }));
         }
 
-        // Reader thread: parse state in a tight loop for ~200ms.
-        let path_r = Arc::clone(&state_path);
+        // Reader thread: load through a read-only connection in a loop.
+        let root_r = Arc::clone(&root);
         let stop_r = Arc::clone(&stop);
-        let failures = Arc::clone(&parse_failures);
+        let failures_c = Arc::clone(&failures);
         let reader = thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
             while std::time::Instant::now() < deadline
                 && !stop_r.load(std::sync::atomic::Ordering::Relaxed)
             {
-                if let Ok(content) = fs::read_to_string(path_r.as_ref()) {
-                    if !content.trim().is_empty()
-                        && serde_json::from_str::<SupervisorState>(&content).is_err()
-                    {
-                        failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+                // An errored load during concurrent writes counts as a failure.
+                if load_supervisor_state(&root_r).is_err() {
+                    failures_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 thread::sleep(std::time::Duration::from_millis(1));
             }
         });
 
-        // Let the test run for ~200ms then stop writers.
-        thread::sleep(std::time::Duration::from_millis(210));
+        thread::sleep(std::time::Duration::from_millis(310));
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
 
         for h in handles {
@@ -439,13 +843,22 @@ mod tests {
         }
         let _ = reader.join();
 
-        let failures = parse_failures.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            failures, 0,
-            "Expected zero JSON parse failures from concurrent writes, got {}",
-            failures
+            failures.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a read-only reader must never see an error during concurrent writes"
+        );
+        assert!(
+            writes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "concurrent writers must have made progress"
         );
 
-        let _ = fs::remove_dir_all(&temp_dir);
+        // After the writers stop, the store is readable and holds the last
+        // writer's session (each write replaces the session set, so exactly
+        // one remains).
+        let final_state = load_supervisor_state(&root).unwrap().unwrap();
+        assert_eq!(final_state.sessions.len(), 1);
+
+        let _ = fs::remove_dir_all(&*root);
     }
 }

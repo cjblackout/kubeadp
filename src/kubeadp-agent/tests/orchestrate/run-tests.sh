@@ -92,6 +92,16 @@ s.close()
 EOF
 }
 
+# The supervisor state JSON: read from the per-pod SQLite state database
+# (<home>/.agent-run/state.sqlite, next to the jobs table) through the
+# `status` subcommand, which prints the same document the old JSON state
+# file carried. The legacy `state_file` config key and the `--state-file`
+# flag are accepted but ignored.
+# Args: tdir holding config.json and home/.
+state_json() {
+    HOME="$1/home" "$BIN" status --config "$1/config.json" 2>/dev/null || true
+}
+
 # ==============================================================================
 # T01: Start args (fresh start passes --session-id)
 # ==============================================================================
@@ -521,15 +531,15 @@ EOF
     ACTIVE_PIDS+=("$spid")
 
     for _ in $(seq 1 80); do
-        if grep -q '"status": "failed"' "$state_file" 2>/dev/null; then break; fi
+        if state_json "$tdir" | grep -q '"status": "failed"'; then break; fi
         sleep 0.05
     done
 
-    local status_fail=$(grep -A 8 '"failing_session"' "$state_file" 2>/dev/null | grep '"status"' | tr -d '", ' | cut -d: -f2 || true)
-    local status_ok=$(grep -A 8 '"healthy_session"' "$state_file" 2>/dev/null | grep '"status"' | tr -d '", ' | cut -d: -f2 || true)
+    local status_fail=$(state_json "$tdir" | grep -A 8 '"failing_session"' | grep '"status"' | tr -d '", ' | cut -d: -f2 || true)
+    local status_ok=$(state_json "$tdir" | grep -A 8 '"healthy_session"' | grep '"status"' | tr -d '", ' | cut -d: -f2 || true)
 
     local probe_rc=0
-    "$BIN" status --state-file "$state_file" >/dev/null 2>&1 || probe_rc=$?
+    HOME="$tdir/home" "$BIN" status --config "$cfg_file" >/dev/null 2>&1 || probe_rc=$?
 
     # Remove the failure trigger so the retry succeeds
     rm -f "$tdir/control_fail/action_exit1"
@@ -537,7 +547,7 @@ EOF
     # Wait for cooldown to expire (~1.0s) and retry to happen
     local retried=0
     for _ in $(seq 1 60); do
-        local cur_status=$(grep -A 8 '"failing_session"' "$state_file" 2>/dev/null | grep '"status"' | tr -d '", ' | cut -d: -f2 || true)
+        local cur_status=$(state_json "$tdir" | grep -A 8 '"failing_session"' | grep '"status"' | tr -d '", ' | cut -d: -f2 || true)
         if [ "$cur_status" = "starting" ] || [ "$cur_status" = "running" ]; then
             retried=1
             break
@@ -593,10 +603,10 @@ EOF
     local spid=$!
     ACTIVE_PIDS+=("$spid")
 
-    # Wait for hang detection to trigger and record in state_file (signal: 15 reaped by kill_process_group_with_grace)
+    # Wait for hang detection to trigger and record in the state db (signal: 15 reaped by kill_process_group_with_grace)
     local detected=0
     for _ in $(seq 1 60); do
-        if grep -q '"last_exit_reason": "signal: 15"' "$state_file" 2>/dev/null; then
+        if state_json "$tdir" | grep -q '"last_exit_reason": "signal: 15"'; then
             detected=1
             break
         fi
@@ -671,7 +681,7 @@ EOF
         if [ -n "$child_pid" ] && ! kill -0 "$child_pid" 2>/dev/null; then
             killed_before_stop=1
         fi
-        if grep -q 'signal: 9' "$state_file" 2>/dev/null; then
+        if state_json "$tdir" | grep -q 'signal: 9'; then
             has_sig9_record=1
         fi
         local count=$(count_lines "$log_file")
@@ -737,7 +747,7 @@ EOF
     local exit_code=0
     wait "$spid" || exit_code=$?
 
-    local state_status=$(grep '"status":' "$state_file" 2>/dev/null | head -n 1 | tr -d '", ' | cut -d: -f2 || true)
+    local state_status=$(state_json "$tdir" | grep '"status":' | head -n 1 | tr -d '", ' | cut -d: -f2 || true)
 
     if [ "$exit_code" -eq 0 ] && [ "$state_status" = "stopped" ]; then
         rec "T10" "PASS" "supervisor cleanly exited 0 and updated state to stopped"
@@ -807,17 +817,16 @@ EOF
 }
 
 # ==============================================================================
-# T12: State file valid JSON and heartbeat advancing
+# T12: Supervisor state written to the db and heartbeat advancing
 # ==============================================================================
 test_t12() {
     local tdir="${TEST_TMP}/t12"
     mkdir -p "$tdir/home" "$tdir/work" "$tdir/control"
-    local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
 
     cat <<EOF > "$cfg_file"
 {
-    "state_file": "$state_file",
+    "state_file": "$tdir/state.json",
     "heartbeat_interval_secs": 0.2,
     "sessions": [
         {
@@ -837,94 +846,125 @@ EOF
     ACTIVE_PIDS+=("$spid")
 
     for _ in $(seq 1 40); do
-        if [ -s "$state_file" ]; then break; fi
+        if [ -n "$(state_json "$tdir")" ]; then break; fi
         sleep 0.05
     done
 
-    local hb1=$(grep '"heartbeat_epoch"' "$state_file" 2>/dev/null | tr -d '", ' | cut -d: -f2 || true)
+    local hb1=$(state_json "$tdir" | grep '"heartbeat_epoch"' | tr -d '", ' | cut -d: -f2 || true)
     sleep 1.1
-    local hb2=$(grep '"heartbeat_epoch"' "$state_file" 2>/dev/null | tr -d '", ' | cut -d: -f2 || true)
+    local hb2=$(state_json "$tdir" | grep '"heartbeat_epoch"' | tr -d '", ' | cut -d: -f2 || true)
 
     stop_supervisor "$spid"
 
     if [ -n "$hb1" ] && [ -n "$hb2" ] && [ "$hb2" -gt "$hb1" ]; then
-        rec "T12" "PASS" "state file heartbeat is actively advancing (hb1=$hb1, hb2=$hb2)"
+        rec "T12" "PASS" "supervisor state heartbeat is actively advancing (hb1=$hb1, hb2=$hb2)"
     else
         rec "T12" "FAIL" "heartbeat check failed (hb1=$hb1, hb2=$hb2)"
     fi
 }
 
 # ==============================================================================
-# T13: Status subcommand exit codes (ok, stale heartbeat, failed session)
+# T13: Status subcommand exit codes (ok, stale heartbeat, failed session).
+# The state lives in the per-pod SQLite db, so the states are produced by a
+# real supervisor run: a healthy running supervisor (0), a SIGKILLed one with
+# a stale heartbeat (1), and a crashing session marked failed (2).
 # ==============================================================================
 test_t13() {
     local tdir="${TEST_TMP}/t13"
-    mkdir -p "$tdir"
-    local state_file="$tdir/state.json"
-    local now=$(date +%s)
+    mkdir -p "$tdir/home" "$tdir/work" "$tdir/control"
+    local log_file="$tdir/fake-claude.log"
+    local cfg_file="$tdir/config.json"
 
-    # 1. Healthy state
-    cat <<EOF > "$state_file"
+    cat <<EOF > "$cfg_file"
 {
-    "supervisor_pid": 1234,
-    "heartbeat": "2026-10-01T07:00:00Z",
-    "heartbeat_epoch": $now,
-    "status": "running",
-    "sessions": {
-        "sess": {
-            "name": "sess",
-            "pid": 1235,
-            "start_time": null,
-            "start_time_epoch": null,
-            "uptime_secs": 10.0,
-            "restart_count": 0,
-            "last_exit_reason": null,
-            "status": "running",
-            "last_health_result": "ok"
+    "state_file": "$tdir/state.json",
+    "heartbeat_interval_secs": 0.2,
+    "sessions": [
+        {
+            "name": "sess13",
+            "workdir": "$tdir/work",
+            "session_id": "status-013",
+            "claude_binary": "$FAKE_CLAUDE",
+            "base_backoff_secs": 0.05,
+            "max_backoff_secs": 0.1,
+            "max_crashes": 1,
+            "crash_window_secs": 10.0,
+            "failed_cooldown_secs": 300.0,
+            "readiness_poll_secs": 0.2,
+            "env": {
+                "FAKE_CLAUDE_LOG": "$log_file",
+                "FAKE_CLAUDE_CONTROL_DIR": "$tdir/control"
+            }
         }
-    }
+    ]
 }
 EOF
+
+    # 1. Healthy state: the supervisor is running, session starting/running.
+    HOME="$tdir/home" "$BIN" run --config "$cfg_file" >/dev/null 2>&1 &
+    local spid=$!
+    ACTIVE_PIDS+=("$spid")
+
+    for _ in $(seq 1 40); do
+        if [ -s "$log_file" ]; then break; fi
+        sleep 0.05
+    done
     local rc_ok=0
-    "$BIN" status --state-file "$state_file" --stale-threshold-secs 10 >/dev/null 2>&1 || rc_ok=$?
+    HOME="$tdir/home" "$BIN" status --config "$cfg_file" >/dev/null 2>&1 || rc_ok=$?
 
-    # 2. Stale heartbeat (epoch 100)
-    cat <<EOF > "$state_file"
-{
-    "supervisor_pid": 1234,
-    "heartbeat": "1970-01-01T00:01:40Z",
-    "heartbeat_epoch": 100,
-    "status": "running",
-    "sessions": {}
-}
-EOF
+    # 2. Stale heartbeat: SIGKILL the supervisor (no final heartbeat write);
+    # the last heartbeat goes stale after the threshold. PDEATHSIG kills the
+    # session child with the supervisor.
+    kill -KILL "$spid" 2>/dev/null || true
+    sleep 1.6
     local rc_stale=0
-    "$BIN" status --state-file "$state_file" --stale-threshold-secs 5 >/dev/null 2>&1 || rc_stale=$?
+    HOME="$tdir/home" "$BIN" status --config "$cfg_file" --stale-threshold-secs 1 >/dev/null 2>&1 || rc_stale=$?
 
-    # 3. Failed session
-    cat <<EOF > "$state_file"
+    # 3. Failed session: a fresh supervisor whose only session crashes once
+    # (max_crashes=1) and stays failed during the cooldown.
+    local tdir2="${TEST_TMP}/t13b"
+    mkdir -p "$tdir2/home" "$tdir2/work" "$tdir2/control"
+    local log_file2="$tdir2/fake-claude.log"
+    local cfg_file2="$tdir2/config.json"
+    touch "$tdir2/control/action_exit1"
+
+    cat <<EOF > "$cfg_file2"
 {
-    "supervisor_pid": 1234,
-    "heartbeat": "2026-10-01T07:00:00Z",
-    "heartbeat_epoch": $now,
-    "status": "running",
-    "sessions": {
-        "bad_sess": {
-            "name": "bad_sess",
-            "pid": null,
-            "start_time": null,
-            "start_time_epoch": null,
-            "uptime_secs": null,
-            "restart_count": 5,
-            "last_exit_reason": "exit: 1",
-            "status": "failed",
-            "last_health_result": "ok"
+    "state_file": "$tdir2/state.json",
+    "heartbeat_interval_secs": 0.2,
+    "sessions": [
+        {
+            "name": "bad_sess13",
+            "workdir": "$tdir2/work",
+            "session_id": "status-013b",
+            "claude_binary": "$FAKE_CLAUDE",
+            "base_backoff_secs": 0.05,
+            "max_backoff_secs": 0.1,
+            "max_crashes": 1,
+            "crash_window_secs": 10.0,
+            "failed_cooldown_secs": 300.0,
+            "readiness_poll_secs": 0.2,
+            "env": {
+                "FAKE_CLAUDE_LOG": "$log_file2",
+                "FAKE_CLAUDE_CONTROL_DIR": "$tdir2/control"
+            }
         }
-    }
+    ]
 }
 EOF
+
+    HOME="$tdir2/home" "$BIN" run --config "$cfg_file2" >/dev/null 2>&1 &
+    local spid2=$!
+    ACTIVE_PIDS+=("$spid2")
+
+    for _ in $(seq 1 80); do
+        if state_json "$tdir2" | grep -q '"status": "failed"'; then break; fi
+        sleep 0.05
+    done
     local rc_fail=0
-    "$BIN" status --state-file "$state_file" --stale-threshold-secs 10 >/dev/null 2>&1 || rc_fail=$?
+    HOME="$tdir2/home" "$BIN" status --config "$cfg_file2" >/dev/null 2>&1 || rc_fail=$?
+
+    stop_supervisor "$spid2"
 
     if [ "$rc_ok" -eq 0 ] && [ "$rc_stale" -eq 1 ] && [ "$rc_fail" -eq 2 ]; then
         rec "T13" "PASS" "status subcommand exit codes correct (ok=0, stale=1, failed=2)"
@@ -1099,7 +1139,7 @@ EOF
     sleep 1.2
 
     local count=$(count_lines "$log_file")
-    local status=$(grep -A 8 '"sess16_silent"' "$state_file" 2>/dev/null | grep '"status"' | tr -d '", ' | cut -d: -f2 || true)
+    local status=$(state_json "$tdir" | grep -A 8 '"sess16_silent"' | grep '"status"' | tr -d '", ' | cut -d: -f2 || true)
 
     stop_supervisor "$spid"
 
@@ -1342,7 +1382,7 @@ EOF
     local has_sig9=0
     for _ in $(seq 1 50); do
         local count=$(count_lines "$log_file")
-        local reason=$(grep '"last_exit_reason"' "$state_file" 2>/dev/null || true)
+        local reason=$(state_json "$tdir" | grep '"last_exit_reason"' || true)
         if echo "$reason" | grep -q "signal: 9"; then
             has_sig9=1
         fi
@@ -1350,7 +1390,7 @@ EOF
         sleep 0.05
     done
 
-    local exit_reason=$(grep '"last_exit_reason"' "$state_file" 2>/dev/null || true)
+    local exit_reason=$(state_json "$tdir" | grep '"last_exit_reason"' || true)
     if grep -q "signal=9" "$stderr_file" 2>/dev/null; then
         has_sig9=1
     fi
@@ -1377,11 +1417,13 @@ EOF
 # Field of the sess_panic entry of a state file (the sessions map has no fixed
 # order and also holds the default session).
 t21_session_field() {
-    python3 -c 'import json,sys
+    # Args: tdir, field. Reads the supervisor state from the per-pod SQLite
+    # db through the `status` subcommand and prints sessions.sess_panic.<field>.
+    state_json "$1" | python3 -c 'import json,sys
 try:
-    print(json.load(open(sys.argv[1]))["sessions"]["sess_panic"][sys.argv[2]])
+    print(json.load(sys.stdin)["sessions"]["sess_panic"][sys.argv[1]])
 except Exception:
-    print("")' "$1" "$2" 2>/dev/null
+    print("")' "$2" 2>/dev/null
 }
 
 test_t21() {
@@ -1427,8 +1469,8 @@ EOF
     # read by name.
     for _ in $(seq 1 200); do
         if [ ! -f "$panic_trigger" ] \
-            && [ "$(t21_session_field "$state_file" status)" = "running" ] \
-            && [ "$(t21_session_field "$state_file" restart_count)" -ge 1 ] 2>/dev/null; then
+            && [ "$(t21_session_field "$tdir" status)" = "running" ] \
+            && [ "$(t21_session_field "$tdir" restart_count)" -ge 1 ] 2>/dev/null; then
             local count=$(count_lines "$log_file")
             if [ "$count" -ge 1 ]; then break; fi
         fi
@@ -1445,7 +1487,7 @@ EOF
     if [ ! -f "$panic_trigger" ]; then
         trigger_gone=1
     fi
-    local restarts=$(t21_session_field "$state_file" restart_count)
+    local restarts=$(t21_session_field "$tdir" restart_count)
 
     if [ "$caught_panic" -eq 1 ] && [ "$trigger_gone" -eq 1 ] && [ "${restarts:-0}" -ge 1 ]; then
         rec "T21" "PASS" "forced session panic was caught, logged, counted as crash, and recovered to healthy running"
@@ -1487,10 +1529,10 @@ EOF
     local spid=$!
     ACTIVE_PIDS+=("$spid")
 
-    # Wait for coordinator to mark session failed in state file
+    # Wait for coordinator to mark session failed in the state db
     local failed=0
     for _ in $(seq 1 50); do
-        if grep -q '"status": "failed"' "$state_file" 2>/dev/null; then
+        if state_json "$tdir" | grep -q '"status": "failed"'; then
             failed=1
             break
         fi
@@ -1499,7 +1541,7 @@ EOF
 
     # Probe status command
     local status_rc=0
-    "$BIN" status --state-file "$state_file" >/dev/null 2>&1 || status_rc=$?
+    HOME="$tdir/home" "$BIN" status --config "$cfg_file" >/dev/null 2>&1 || status_rc=$?
 
     stop_supervisor "$spid"
 
@@ -1767,7 +1809,7 @@ EOF
         local launches=$(grep -c "argv=" "$log_file" 2>/dev/null | tail -n 1 || true)
         launches="${launches:-0}"
         if [ "$launches" -gt "$crashes_seen" ]; then
-            if grep -A 8 '"sess27_unlimited"' "$state_file" 2>/dev/null | grep -q '"status": "running"'; then
+            if state_json "$tdir" | grep -A 8 '"sess27_unlimited"' | grep -q '"status": "running"'; then
                 break
             fi
         fi
@@ -1776,10 +1818,10 @@ EOF
 
     # Probe status command
     local status_rc=0
-    "$BIN" status --state-file "$state_file" >/dev/null 2>&1 || status_rc=$?
+    HOME="$tdir/home" "$BIN" status --config "$cfg_file" >/dev/null 2>&1 || status_rc=$?
 
-    local final_status=$(grep -A 8 '"sess27_unlimited"' "$state_file" 2>/dev/null | grep '"status"' | tr -d '", ' | cut -d: -f2 || true)
-    local restart_count=$(grep -A 8 '"sess27_unlimited"' "$state_file" 2>/dev/null | grep '"restart_count"' | tr -d '", ' | cut -d: -f2 || true)
+    local final_status=$(state_json "$tdir" | grep -A 8 '"sess27_unlimited"' | grep '"status"' | tr -d '", ' | cut -d: -f2 || true)
+    local restart_count=$(state_json "$tdir" | grep -A 8 '"sess27_unlimited"' | grep '"restart_count"' | tr -d '", ' | cut -d: -f2 || true)
 
     stop_supervisor "$spid"
 
@@ -1936,7 +1978,7 @@ EOF
     for _ in $(seq 1 60); do
         local count=$(count_lines "$log_file")
         if [ "$count" -ge 2 ]; then
-            if grep -q '"last_exit_reason": "signal: 15"' "$state_file" 2>/dev/null; then
+            if state_json "$tdir" | grep -q '"last_exit_reason": "signal: 15"'; then
                 has_sig15=1
             fi
             break
@@ -2010,7 +2052,7 @@ EOF
     for _ in $(seq 1 60); do
         local count=$(count_lines "$log_file")
         if [ "$count" -ge 2 ]; then
-            if grep -q '"last_exit_reason": "signal: 9"' "$state_file" 2>/dev/null; then
+            if state_json "$tdir" | grep -q '"last_exit_reason": "signal: 9"'; then
                 has_sig9=1
             fi
             break
@@ -2211,56 +2253,109 @@ EOF
 }
 
 # ==============================================================================
-# T35: Status command exits 4 when state is stopped or any session is stopped
+# T35: Status command exits 4 when the supervisor state is stopped or any
+# session is stopped. The state lives in the per-pod SQLite db, so both
+# states are produced by a real supervisor run: a clean SIGTERM shutdown
+# persists supervisor status "stopped"; POST /stop persists the session
+# status "stopped" while the supervisor is still running.
 # ==============================================================================
 test_t35() {
+    # 1. Supervisor status is "stopped" after a clean shutdown.
     local tdir="${TEST_TMP}/t35"
-    mkdir -p "$tdir"
-    local state_file="$tdir/state.json"
-    local now=$(date +%s)
+    mkdir -p "$tdir/home" "$tdir/work" "$tdir/control"
+    local log_file="$tdir/fake-claude.log"
+    local cfg_file="$tdir/config.json"
 
-    # 1. Supervisor status is "stopped"
-    cat <<EOF > "$state_file"
+    cat <<EOF > "$cfg_file"
 {
-    "supervisor_pid": 1234,
-    "heartbeat": "2026-10-01T07:00:00Z",
-    "heartbeat_epoch": $now,
-    "status": "stopped",
-    "sessions": {}
-}
-EOF
-    local rc_stopped=0
-    "$BIN" status --state-file "$state_file" >/dev/null 2>&1 || rc_stopped=$?
-
-    # 2. A session is in "stopped" status
-    cat <<EOF > "$state_file"
-{
-    "supervisor_pid": 1234,
-    "heartbeat": "2026-10-01T07:00:00Z",
-    "heartbeat_epoch": $now,
-    "status": "running",
-    "sessions": {
-        "sess_stop": {
-            "name": "sess_stop",
-            "pid": null,
-            "start_time": null,
-            "start_time_epoch": null,
-            "uptime_secs": null,
-            "restart_count": 0,
-            "last_exit_reason": null,
-            "status": "stopped",
-            "last_health_result": "ok"
+    "state_file": "$tdir/state.json",
+    "heartbeat_interval_secs": 0.2,
+    "sessions": [
+        {
+            "name": "sess35",
+            "workdir": "$tdir/work",
+            "session_id": "stopped-035",
+            "claude_binary": "$FAKE_CLAUDE",
+            "readiness_poll_secs": 0.2,
+            "env": {
+                "FAKE_CLAUDE_LOG": "$log_file",
+                "FAKE_CLAUDE_CONTROL_DIR": "$tdir/control"
+            }
         }
-    }
+    ]
 }
 EOF
-    local rc_sess_stopped=0
-    "$BIN" status --state-file "$state_file" >/dev/null 2>&1 || rc_sess_stopped=$?
 
-    if [ "$rc_stopped" -eq 4 ] && [ "$rc_sess_stopped" -eq 4 ]; then
+    HOME="$tdir/home" "$BIN" run --config "$cfg_file" >/dev/null 2>&1 &
+    local spid=$!
+    ACTIVE_PIDS+=("$spid")
+
+    for _ in $(seq 1 40); do
+        if [ -s "$log_file" ]; then break; fi
+        sleep 0.05
+    done
+
+    stop_supervisor "$spid"
+    local rc_stopped=0
+    HOME="$tdir/home" "$BIN" status --config "$cfg_file" >/dev/null 2>&1 || rc_stopped=$?
+
+    # 2. A session is in "stopped" status (POST /stop on the sessions API).
+    local tdir2="${TEST_TMP}/t35b"
+    mkdir -p "$tdir2/home" "$tdir2/work" "$tdir2/control"
+    local log_file2="$tdir2/fake-claude.log"
+    local cfg_file2="$tdir2/config.json"
+    local listen="`port_alloc`"
+
+    cat <<EOF > "$cfg_file2"
+{
+    "state_file": "$tdir2/state.json",
+    "heartbeat_interval_secs": 0.2,
+    "sessions": [
+        {
+            "name": "sess_stop35",
+            "workdir": "$tdir2/work",
+            "session_id": "stopped-035b",
+            "claude_binary": "$FAKE_CLAUDE",
+            "readiness_poll_secs": 0.2,
+            "env": {
+                "FAKE_CLAUDE_LOG": "$log_file2",
+                "FAKE_CLAUDE_CONTROL_DIR": "$tdir2/control"
+            }
+        }
+    ]
+}
+EOF
+
+    HOME="$tdir2/home" AGENT_ORCHESTRATE_LISTEN="127.0.0.1:$listen" \
+        "$BIN" run --config "$cfg_file2" >/dev/null 2>&1 &
+    local spid2=$!
+    ACTIVE_PIDS+=("$spid2")
+
+    for _ in $(seq 1 40); do
+        if [ -s "$log_file2" ]; then break; fi
+        sleep 0.05
+    done
+
+    curl -s -X POST "http://127.0.0.1:$listen/api/v1/sessions/sess_stop35/stop" >/dev/null 2>&1 || true
+
+    local sess_stopped=0
+    for _ in $(seq 1 40); do
+        if state_json "$tdir2" | grep -A 8 '"sess_stop35"' | grep -q '"status": "stopped"'; then
+            sess_stopped=1
+            break
+        fi
+        sleep 0.05
+    done
+
+    local rc_sess_stopped=0
+    HOME="$tdir2/home" "$BIN" status --config "$cfg_file2" >/dev/null 2>&1 || rc_sess_stopped=$?
+
+    stop_supervisor "$spid2"
+
+    if [ "$rc_stopped" -eq 4 ] && [ "$sess_stopped" -eq 1 ] && [ "$rc_sess_stopped" -eq 4 ]; then
         rec "T35" "PASS" "status exits 4 when state is stopped or any session is stopped"
     else
-        rec "T35" "FAIL" "status stopped exit code failed (rc_stopped=$rc_stopped, rc_sess_stopped=$rc_sess_stopped)"
+        rec "T35" "FAIL" "status stopped exit code failed (rc_stopped=$rc_stopped, sess_stopped=$sess_stopped, rc_sess_stopped=$rc_sess_stopped)"
     fi
 }
 
@@ -2500,7 +2595,7 @@ EOF
     local exit_code=0
     wait "$spid" || exit_code=$?
 
-    local state_status=$(grep '"status"' "$state_file" 2>/dev/null | head -n 1 | tr -d '", ' | cut -d: -f2 || true)
+    local state_status=$(state_json "$tdir" | grep '"status"' | head -n 1 | tr -d '", ' | cut -d: -f2 || true)
 
     if [ "$exit_code" -eq 0 ] && [ "$state_status" = "stopped" ]; then
         rec "T41" "PASS" "SIGHUP cleanly shut down supervisor with status stopped (rc=0)"
@@ -3108,7 +3203,7 @@ EOF
     # Wait for session to reach 'failed' status after 2 pty-closed killed crashes
     local is_failed=0
     for _ in $(seq 1 80); do
-        if grep -q '"status": "failed"' "$state_file" 2>/dev/null; then
+        if state_json "$tdir" | grep -q '"status": "failed"'; then
             is_failed=1
             break
         fi
@@ -3117,7 +3212,7 @@ EOF
 
     # Probe check should exit 2 when session is failed
     local probe_rc=0
-    "$BIN" status --state-file "$state_file" >/dev/null 2>&1 || probe_rc=$?
+    HOME="$tdir/home" "$BIN" status --config "$cfg_file" >/dev/null 2>&1 || probe_rc=$?
 
     stop_supervisor "$spid"
 
@@ -3229,7 +3324,7 @@ test_t53() {
     local log_file="$tdir/fake-claude.log"
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"
@@ -3286,7 +3381,7 @@ test_t54() {
     local log_file="$tdir/fake-claude.log"
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"
@@ -3343,7 +3438,7 @@ test_t55() {
     local log_file="$tdir/fake-claude.log"
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"
@@ -3413,7 +3508,7 @@ test_t56() {
     local log_file="$tdir/fake-claude.log"
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"
@@ -3470,7 +3565,7 @@ test_t57() {
     local log_file="$tdir/fake-claude.log"
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"
@@ -3555,7 +3650,7 @@ test_t58() {
     local log_file="$tdir/fake-claude.log"
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"
@@ -3645,7 +3740,7 @@ test_t59() {
     local stdin_log="$tdir/stdin.log"
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"
@@ -3739,7 +3834,7 @@ test_t60() {
     local stdin_log="$tdir/stdin.log"
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"
@@ -3825,7 +3920,7 @@ test_t61() {
     local stdin_log="$tdir/stdin.log"
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"
@@ -3910,7 +4005,7 @@ test_t62() {
     local log_file="$tdir/fake-claude.log"
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"
@@ -3974,7 +4069,7 @@ test_t63() {
     local log_file="$tdir/fake-claude.log"
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"
@@ -4044,7 +4139,7 @@ test_t64() {
     local log_file="$tdir/fake-claude.log"
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"
@@ -4098,7 +4193,7 @@ test_t65() {
     local log_file="$tdir/fake-claude.log"
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"
@@ -4175,7 +4270,7 @@ test_t66() {
     local log_file="$tdir/fake-claude.log"
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"
@@ -4249,7 +4344,7 @@ test_t67() {
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
     local token_file="$tdir/token"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
     printf 'sekret-token\n' > "$token_file"
 
@@ -4315,7 +4410,7 @@ test_t68() {
     local state_file="$tdir/state.json"
     local cfg_file="$tdir/config.json"
     local sup_log="$tdir/supervisor.log"
-    local port=$(port_alloc)
+    local port=`port_alloc`
     local listen="127.0.0.1:${port}"
 
     cat <<EOF > "$cfg_file"

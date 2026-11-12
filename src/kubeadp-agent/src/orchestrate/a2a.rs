@@ -871,4 +871,116 @@ mod tests {
             "error body: {body_str}"
         );
     }
+
+    /// Test 2 (HL-113 path-mismatch fix): end-to-end through the real sink
+    /// backend to the session hook reader. The sink (`SessionMessageSink`,
+    /// the same backend `http_server.rs` wires to the A2A router) and the
+    /// session launcher resolve the inbox from the SAME shared root
+    /// (`inbox_state_root()`, the agent-run `state_root` -- the session
+    /// launcher's `KUBEADP_A2A_INBOX_DIR` now names this exact directory, not
+    /// `state_file.parent()`). Enqueue through the sink's backend, then run
+    /// the `a2a-hook` reader pointed at the session's
+    /// `KUBEADP_A2A_INBOX_DIR`: it must see the message (and mark it
+    /// injected), proving a delivered A2A message reaches the session's
+    /// receive side. Runs under a non-default `state_file` too: the sink and
+    /// the session agree on a directory under the agent-run state root, never
+    /// under the state file's parent.
+    #[test]
+    fn sink_backend_to_session_hook_sees_the_message() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state-root");
+        // A non-default agent-run state root (the orchestrator pod sets
+        // AGENT_RUN_STATE_ROOT or relies on the default ~/.agent-run; here
+        // the test forces a fresh root so the assertion is hermetic). The
+        // default HOME could otherwise point at a real ~/.agent-run.
+        std::env::set_var("AGENT_RUN_STATE_ROOT", root.to_str().unwrap());
+        std::env::remove_var("AGENT_RUN_WORKSPACE_ROOT");
+        std::env::remove_var("AGENT_RUN_CONFIG");
+
+        // A supervisor config whose state file lives somewhere unrelated to
+        // the inbox root (the pre-fix session side would have derived the
+        // inbox from this parent).
+        let supervisor_config = crate::orchestrate::config::SupervisorConfig {
+            state_file: tmp.path().join("elsewhere").join("state.json"),
+            ..Default::default()
+        };
+        let session = "homelab";
+        // The ONE shared root: the sink's `a2a_router` input and the session
+        // launcher's `supervisor_config.a2a_inbox_root()` agree by
+        // construction (both route through inbox_state_root(); asserted in
+        // the inbox.rs unit test too). The session's launcher names
+        // KUBEADP_A2A_INBOX_DIR with this exact directory.
+        assert_eq!(
+            supervisor_config.a2a_inbox_root(),
+            crate::core::a2a::inbox::inbox_state_root()
+        );
+        let inbox_root = supervisor_config.a2a_inbox_root();
+        let inbox_dir = crate::core::a2a::inbox::inbox_dir_for(&inbox_root, session);
+
+        // A running session so the sink accepts the delivery.
+        let mut state = SupervisorState::new(100);
+        let mut s = SessionState::new(session.to_string());
+        s.status = SessionStatus::Running;
+        state.sessions.insert(session.to_string(), s);
+        let st = Arc::new(std::sync::Mutex::new(state));
+        let controls = SessionControlRegistry::new();
+        let api_state = sessions_api::SessionsApiState::new(
+            st,
+            controls,
+            Arc::new(crate::orchestrate::session_log::SessionLogs::from_env()),
+        );
+
+        // The sink backend, rooted at the SHARED inbox root (exactly what
+        // a2a_router builds from http_server's inbox_state_root()): it
+        // derives each session's inbox as <root>/a2a-inbox/<session>.
+        let sink = SessionMessageSink::new(api_state, inbox_root.clone(), Default::default());
+        crate::core::a2a::MessageSink::deliver(
+            &sink,
+            session,
+            "peer-agent",
+            "hello from the sink",
+            "msg-1",
+        )
+        .expect("sink accepts the delivery");
+
+        // The message is queued in the session's inbox directory (the one the
+        // sink writes, under the agent-run state root).
+        let inbox = Inbox::new(&inbox_dir);
+        let pending = inbox.pending();
+        assert_eq!(pending.len(), 1, "exactly one queued message");
+        assert!(pending[0].framed.contains("hello from the sink"));
+        assert!(
+            inbox_dir.starts_with(&root),
+            "the session inbox must live under the shared agent-run state root"
+        );
+        assert_ne!(
+            inbox_dir,
+            crate::core::a2a::inbox::inbox_dir_for(
+                supervisor_config
+                    .state_file
+                    .parent()
+                    .unwrap_or(std::path::Path::new("/tmp")),
+                session
+            ),
+            "the session inbox must not be derived from the state file's parent"
+        );
+
+        // The hook/inbox reader pointed at the session's KUBEADP_A2A_INBOX_DIR
+        // (the env the session launcher sets on the final command): it sees
+        // the message the sink wrote and marks it injected.
+        std::env::set_var(
+            crate::core::a2a::inbox::INBOX_ENV,
+            inbox_dir.to_str().unwrap(),
+        );
+        let hook = crate::core::a2a::inject::run_a2a_hook(&["PostToolUse".to_string()]);
+        std::env::remove_var(crate::core::a2a::inbox::INBOX_ENV);
+        assert_eq!(hook, 0, "the hook reader runs clean");
+        assert!(inbox.injected("msg-1"), "the hook acknowledged the message");
+        assert!(inbox.pending().is_empty(), "nothing stays queued");
+
+        std::env::remove_var("AGENT_RUN_STATE_ROOT");
+    }
 }

@@ -150,6 +150,13 @@ pub fn build_router(
     // REST and A2A message paths compete for one budget per (session, sender).
     #[cfg(feature = "a2a")]
     let a2a_jobset = crate::core::a2a::JobsetCred::from_host();
+    // The session inbox root is the shared agent-run state root: the ONE
+    // definition both the sink and the session launcher resolve
+    // (`core::a2a::inbox::inbox_state_root`, derived exactly like the
+    // agent-run config's `state_root` above). The session's
+    // `KUBEADP_A2A_INBOX_DIR` therefore points at this exact root, so a
+    // delivered message lands in the directory the session's hook/mcp-a2a
+    // reader and sandbox grant cover.
     #[cfg(feature = "a2a")]
     let a2a_routes = crate::orchestrate::a2a::a2a_router(
         state.clone(),
@@ -157,7 +164,7 @@ pub fn build_router(
         api_state,
         a2a_auth,
         a2a_jobset,
-        state_root.clone(),
+        crate::core::a2a::inbox::inbox_state_root(),
         a2a_ladder,
     );
 

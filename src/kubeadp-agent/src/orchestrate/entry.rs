@@ -17,7 +17,8 @@ use crate::orchestrate::pty::signal_process_group;
 use crate::orchestrate::session::run_session_loop;
 use crate::orchestrate::session_control::{take_restart, SessionControl, SessionControlRegistry};
 use crate::orchestrate::state::{
-    check_status, read_state, write_state_atomic, SessionStatus, StatusCheckError, SupervisorState,
+    check_status, import_legacy_state, load_supervisor_state, save_supervisor_state, SessionState,
+    SessionStatus, StatusCheckError, SupervisorState,
 };
 use crate::orchestrate::stdout_writer::StdoutWriter;
 
@@ -134,21 +135,35 @@ pub fn run() {
 
 fn check_supervisor_status(
     config_path: Option<PathBuf>,
-    state_file_override: Option<PathBuf>,
+    _state_file_override: Option<PathBuf>,
     stale_thresh_override: Option<f64>,
 ) {
     let cfg = load_base_config(config_path);
-    let state_file = state_file_override.unwrap_or(cfg.state_file);
     let stale_threshold = stale_thresh_override.unwrap_or(cfg.stale_heartbeat_secs);
 
-    let state = match read_state(&state_file) {
-        Ok(s) => s,
+    // The supervisor state lives in the shared per-pod state database
+    // (`<state_root>/state.sqlite`, next to the jobs table); the deprecated
+    // `--state-file` flag and the `state_file` config key are accepted but
+    // ignored. The state root comes from the shared core config resolution
+    // (AGENT_RUN_STATE_ROOT / config.toml / default).
+    let state_root = match crate::core::config::Config::load() {
+        Ok(c) => c.state_root,
         Err(e) => {
+            eprintln!("Failed to resolve the supervisor state store: {:#}", e);
+            std::process::exit(3);
+        }
+    };
+    let state = match load_supervisor_state(&state_root) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
             eprintln!(
-                "Failed to read supervisor state file {}: {}",
-                state_file.display(),
-                e
+                "Failed to read supervisor state from {}: no supervisor state in the state database (is the supervisor running?)",
+                crate::core::job::state_db_path(&state_root).display()
             );
+            std::process::exit(3);
+        }
+        Err(e) => {
+            eprintln!("Failed to read supervisor state: {}", e);
             std::process::exit(3);
         }
     };
@@ -257,16 +272,19 @@ fn print_supervisor_config(config_path: Option<PathBuf>) {
 /// Spawns a single session thread, returning the join handle (or `None` on
 /// spawn failure). `control` provides the paused flag the session loop
 /// watches; its `running`/`restart` flags are set on respawn paths.
+#[allow(clippy::too_many_arguments)]
 fn spawn_session_thread(
     name: &str,
     session: crate::orchestrate::config::SessionConfig,
     config: &SupervisorConfig,
+    state_root: &Path,
     state: &Arc<Mutex<SupervisorState>>,
     shutdown_flag: &Arc<AtomicBool>,
     control: &SessionControl,
     stdout_writer: &StdoutWriter,
 ) -> Option<thread::JoinHandle<()>> {
     let cfg_clone = config.clone();
+    let state_root_clone = state_root.to_path_buf();
     let state_clone = Arc::clone(state);
     let shut_clone = Arc::clone(shutdown_flag);
     let paused_flag = control.paused.clone();
@@ -280,6 +298,7 @@ fn spawn_session_thread(
             run_session_loop(
                 session,
                 cfg_clone,
+                state_root_clone,
                 state_clone,
                 shut_clone,
                 paused_flag,
@@ -324,33 +343,101 @@ fn run_supervisor(config_path: Option<PathBuf>) {
     );
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let state = Arc::new(Mutex::new(SupervisorState::new(std::process::id())));
+
+    // The shared per-pod state root: the state database that holds the jobs
+    // table AND the supervisor/session state next to it (one db per pod).
+    // The supervisor is the only writer of the supervisor/session rows.
+    // Loaded once; a store that cannot be opened (corrupt database, bad core
+    // config) is a clear fatal error instead of silent state loss.
+    let core_config = match crate::core::config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("Failed to open the state store: {e:#}");
+            eprintln!("{msg}");
+            log_event("supervisor", &msg);
+            std::process::exit(1);
+        }
+    };
+    let state_root = core_config.state_root.clone();
 
     // Initialize session states. Each session records the engine it resolved
     // (per-session `engine` > `default_session_engine` > "claude", HL-91 E5)
     // so the sessions API and a restart keep the engine stable. The default
     // may come from the supervisor config OR the worker-side core config file
     // (the same resolution `run_session_iteration` applies at spawn time).
-    let default_session_engine = config.default_session_engine.clone().or_else(|| {
-        crate::core::config::Config::load()
-            .ok()
-            .and_then(|c| c.default_session_engine)
-    });
-    {
-        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-        for sess in &config.sessions {
-            let mut session_state = crate::orchestrate::state::SessionState::new(sess.name.clone());
-            session_state.engine = Some(sess.effective_engine(default_session_engine.as_deref()));
-            st.sessions.insert(sess.name.clone(), session_state);
+    let default_session_engine = config
+        .default_session_engine
+        .clone()
+        .or_else(|| core_config.default_session_engine.clone());
+
+    // One-time import of the legacy JSON state file (the deprecated
+    // `state_file` config key): imported once into the state db, then
+    // renamed to `*.migrated`.
+    match import_legacy_state(&config.state_file, &state_root) {
+        Ok(Some(_)) => {
+            log_event(
+                "supervisor",
+                "Imported the legacy JSON state file into the state database",
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            log_event("supervisor", &format!("Legacy state import skipped: {}", e));
         }
     }
 
-    // Write initial state file
+    let state = {
+        // Base state: restore the previous supervisor/session state (the
+        // state survives a pod restart -- the real gain over the wiped /tmp
+        // JSON file) or start fresh.
+        let mut restored = match load_supervisor_state(&state_root) {
+            Ok(Some(prev)) => {
+                log_event(
+                    "supervisor",
+                    "Restored the previous session state from the state database",
+                );
+                prev
+            }
+            Ok(None) => SupervisorState::new(std::process::id()),
+            Err(e) => {
+                let msg = format!("Failed to read the supervisor state: {}", e);
+                eprintln!("{msg}");
+                log_event("supervisor", &msg);
+                std::process::exit(1);
+            }
+        };
+        // Refresh the supervisor identity and heartbeat for THIS run; each
+        // configured session keeps its crash accounting (restart counts, last
+        // exit reason) but gets a fresh attempt (no child process in this pod
+        // yet, status Starting until its thread moves it forward).
+        restored.supervisor_pid = std::process::id();
+        restored.update_heartbeat();
+        restored.status = "running".to_string();
+        restored
+            .sessions
+            .retain(|name, _| config.sessions.iter().any(|s| &s.name == name));
+        for sess in &config.sessions {
+            let session_state = restored
+                .sessions
+                .entry(sess.name.clone())
+                .or_insert_with(|| SessionState::new(sess.name.clone()));
+            session_state.pid = None;
+            session_state.start_time = None;
+            session_state.start_time_epoch = None;
+            session_state.uptime_secs = None;
+            session_state.last_health_result = None;
+            session_state.status = SessionStatus::Starting;
+            session_state.engine = Some(sess.effective_engine(default_session_engine.as_deref()));
+        }
+        Arc::new(Mutex::new(restored))
+    };
+
+    // Write initial state (into the state database)
     let st_snapshot = state.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if let Err(e) = write_state_atomic(&config.state_file, &st_snapshot) {
+    if let Err(e) = save_supervisor_state(&state_root, &st_snapshot) {
         log_event(
             "supervisor",
-            &format!("Failed to write initial state file: {}", e),
+            &format!("Failed to write initial supervisor state: {}", e),
         );
     }
 
@@ -374,13 +461,8 @@ fn run_supervisor(config_path: Option<PathBuf>) {
     // secret that the shared root key cannot derive, and no worker job of its
     // jobset can ever present a credential this process accepts.
     crate::core::jobset::register_self();
-    {
-        let jobset_state_root = crate::core::config::Config::load()
-            .unwrap_or_default()
-            .state_root;
-        if let Err(e) = crate::core::jobset::init_global_jobsets(&jobset_state_root) {
-            log_event("supervisor", &format!("jobset init failed: {e}"));
-        }
+    if let Err(e) = crate::core::jobset::init_global_jobsets(&state_root) {
+        log_event("supervisor", &format!("jobset init failed: {e}"));
     }
 
     // Live session threads, keyed by name.
@@ -392,6 +474,7 @@ fn run_supervisor(config_path: Option<PathBuf>) {
             &session.name,
             session.clone(),
             &config,
+            &state_root,
             &state,
             &shutdown_flag,
             &controls.get(&session.name).expect("control just seeded"),
@@ -458,7 +541,7 @@ fn run_supervisor(config_path: Option<PathBuf>) {
                     }
                 };
                 if let Some(st) = st_snapshot {
-                    let _ = write_state_atomic(&config.state_file, &st);
+                    let _ = save_supervisor_state(&state_root, &st);
                 }
                 handles.remove(&name);
                 control.running.store(false, Ordering::SeqCst);
@@ -474,6 +557,7 @@ fn run_supervisor(config_path: Option<PathBuf>) {
                     &name,
                     control.config.clone(),
                     &config,
+                    &state_root,
                     &state,
                     &shutdown_flag,
                     &fresh,
@@ -494,8 +578,8 @@ fn run_supervisor(config_path: Option<PathBuf>) {
                 st.update_heartbeat();
                 st.clone()
             };
-            if let Err(e) = write_state_atomic(&config.state_file, &st_snapshot) {
-                log_event("supervisor", &format!("Failed to write state file: {}", e));
+            if let Err(e) = save_supervisor_state(&state_root, &st_snapshot) {
+                log_event("supervisor", &format!("Failed to write state: {}", e));
             }
             last_heartbeat = Instant::now();
         }
@@ -586,7 +670,7 @@ fn run_supervisor(config_path: Option<PathBuf>) {
         st.update_heartbeat();
         st.clone()
     };
-    let _ = write_state_atomic(&config.state_file, &st_snapshot);
+    let _ = save_supervisor_state(&state_root, &st_snapshot);
 
     log_event("supervisor", "Shutdown complete. Clean exit.");
     std::process::exit(0);

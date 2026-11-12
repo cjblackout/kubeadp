@@ -170,53 +170,15 @@ fn serialize_proxy_redacted<S: serde::Serializer>(
     serde::Serialize::serialize(&redacted, ser)
 }
 
-/// Schema for the `jobs` table in the state database. `created_at` is stored as
-/// integer epoch nanoseconds so ordering is exact; booleans as 0/1.
-const JOBS_TABLE_SQL: &str = "
-CREATE TABLE IF NOT EXISTS jobs (
-    job_id TEXT PRIMARY KEY,
-    project TEXT NOT NULL,
-    prompt TEXT NOT NULL,
-    resolved_prompt TEXT NOT NULL,
-    model TEXT,
-    effort TEXT,
-    sandbox INTEGER NOT NULL,
-    mode TEXT NOT NULL,
-    add_dirs TEXT NOT NULL,
-    print_timeout TEXT,
-    created_at INTEGER NOT NULL,
-    worktree_path TEXT NOT NULL,
-    branch TEXT NOT NULL,
-    base_ref TEXT NOT NULL,
-    conversation_id TEXT,
-    retry_count INTEGER NOT NULL,
-    pid INTEGER,
-    exit_code INTEGER,
-    status TEXT,
-    hindsight INTEGER,
-    auto_recall INTEGER,
-    auto_retain INTEGER,
-    retry_prompt TEXT,
-    read_only INTEGER NOT NULL DEFAULT 0,
-    external_worktree INTEGER NOT NULL DEFAULT 0,
-    pid_start_time INTEGER,
-    hindsight_bank TEXT,
-    proxy TEXT,
-    max_runtime INTEGER,
-    started_at INTEGER,
-    hindsight_query TEXT,
-    sandbox_info TEXT,
-    engine TEXT
-)
-";
-
 /// Returns the path of the state database: `<state_root>/state.sqlite`.
 pub fn state_db_path(state_root: &Path) -> PathBuf {
     state_root.join("state.sqlite")
 }
 
 /// Opens the state database, creating the parent directory, the database file,
-/// and the `jobs` table if they do not exist yet.
+/// and the schema (via the numbered migrations in
+/// [`crate::core::migrations`], applied exactly once per database) if they do
+/// not exist yet.
 ///
 /// WAL journal mode is enabled so multiple concurrent `agent-run` processes
 /// (e.g. a running internal runner plus status/tail/kill commands) can safely
@@ -242,145 +204,12 @@ pub fn open_state_db(state_root: &Path) -> Result<Connection> {
                 path.display()
             )
         })?;
-    conn.execute_batch(JOBS_TABLE_SQL).with_context(|| {
+    crate::core::migrations::migrate(&conn).with_context(|| {
         format!(
-            "Failed to initialize jobs table in state database at {}",
+            "Failed to migrate state database at {} (is the file corrupted?)",
             path.display()
         )
     })?;
-    // Migrate databases created before the read_only / external_worktree
-    // columns existed (CREATE TABLE IF NOT EXISTS never alters an existing table).
-    let columns: Vec<String> = {
-        let mut stmt = conn
-            .prepare("PRAGMA table_info(jobs)")
-            .expect("PRAGMA table_info must not fail on an initialized jobs table");
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .expect("querying PRAGMA table_info must not fail");
-        rows.filter_map(|r| r.ok()).collect()
-    };
-    for col in ["read_only", "external_worktree"] {
-        if !columns.iter().any(|c| c == col) {
-            // A concurrent agent-run process may add the same column between
-            // the table_info check and this ALTER; that error is benign.
-            if let Err(e) = conn.execute_batch(&format!(
-                "ALTER TABLE jobs ADD COLUMN {} INTEGER NOT NULL DEFAULT 0;",
-                col
-            )) {
-                if !e.to_string().contains("duplicate column") {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "Failed to migrate state database at {} (missing column '{}')",
-                            path.display(),
-                            col
-                        )
-                    });
-                }
-            }
-        }
-    }
-    if !columns.iter().any(|c| c == "pid_start_time") {
-        if let Err(e) = conn.execute_batch("ALTER TABLE jobs ADD COLUMN pid_start_time INTEGER;") {
-            if !e.to_string().contains("duplicate column") {
-                return Err(e).with_context(|| {
-                    format!(
-                        "Failed to migrate state database at {} (missing column 'pid_start_time')",
-                        path.display()
-                    )
-                });
-            }
-        }
-    }
-    if !columns.iter().any(|c| c == "hindsight_bank") {
-        if let Err(e) = conn.execute_batch("ALTER TABLE jobs ADD COLUMN hindsight_bank TEXT;") {
-            if !e.to_string().contains("duplicate column") {
-                return Err(e).with_context(|| {
-                    format!(
-                        "Failed to migrate state database at {} (missing column 'hindsight_bank')",
-                        path.display()
-                    )
-                });
-            }
-        }
-    }
-    if !columns.iter().any(|c| c == "proxy") {
-        if let Err(e) = conn.execute_batch("ALTER TABLE jobs ADD COLUMN proxy TEXT;") {
-            if !e.to_string().contains("duplicate column") {
-                return Err(e).with_context(|| {
-                    format!(
-                        "Failed to migrate state database at {} (missing column 'proxy')",
-                        path.display()
-                    )
-                });
-            }
-        }
-    }
-    if !columns.iter().any(|c| c == "max_runtime") {
-        if let Err(e) = conn.execute_batch("ALTER TABLE jobs ADD COLUMN max_runtime INTEGER;") {
-            if !e.to_string().contains("duplicate column") {
-                return Err(e).with_context(|| {
-                    format!(
-                        "Failed to migrate state database at {} (missing column 'max_runtime')",
-                        path.display()
-                    )
-                });
-            }
-        }
-    }
-    if !columns.iter().any(|c| c == "started_at") {
-        if let Err(e) = conn.execute_batch("ALTER TABLE jobs ADD COLUMN started_at INTEGER;") {
-            if !e.to_string().contains("duplicate column") {
-                return Err(e).with_context(|| {
-                    format!(
-                        "Failed to migrate state database at {} (missing column 'started_at')",
-                        path.display()
-                    )
-                });
-            }
-        }
-    }
-    if !columns.iter().any(|c| c == "hindsight_query") {
-        if let Err(e) = conn.execute_batch("ALTER TABLE jobs ADD COLUMN hindsight_query TEXT;") {
-            if !e.to_string().contains("duplicate column") {
-                return Err(e).with_context(|| {
-                    format!(
-                        "Failed to migrate state database at {} (missing column 'hindsight_query')",
-                        path.display()
-                    )
-                });
-            }
-        }
-    }
-    if !columns.iter().any(|c| c == "sandbox_info") {
-        if let Err(e) = conn.execute_batch("ALTER TABLE jobs ADD COLUMN sandbox_info TEXT;") {
-            if !e.to_string().contains("duplicate column") {
-                return Err(e).with_context(|| {
-                    format!(
-                        "Failed to migrate state database at {} (missing column 'sandbox_info')",
-                        path.display()
-                    )
-                });
-            }
-        }
-    }
-    if !columns.iter().any(|c| c == "engine") {
-        // Engine selection (HL-91 E5): an optional TEXT column defaulting to
-        // NULL. NULL rows are the historical agy jobs (the agy engine was the
-        // only driver before engine selection existed) -- `engine` resolves to
-        // the configured/role default at read time, so NULL never changes
-        // status/retry behaviour. A concurrent process may add the same column
-        // between the table_info check and this ALTER; that error is benign.
-        if let Err(e) = conn.execute_batch("ALTER TABLE jobs ADD COLUMN engine TEXT;") {
-            if !e.to_string().contains("duplicate column") {
-                return Err(e).with_context(|| {
-                    format!(
-                        "Failed to migrate state database at {} (missing column 'engine')",
-                        path.display()
-                    )
-                });
-            }
-        }
-    }
     Ok(conn)
 }
 

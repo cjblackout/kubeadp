@@ -11,7 +11,9 @@ use crate::orchestrate::session_file::{
     classify_transcript, get_transcript_fingerprint, output_contains_resume_not_found,
     quarantine_corrupt_session_file, ResumeFailTracker, TranscriptStatus, RESUME_NOT_FOUND_ERROR,
 };
-use crate::orchestrate::state::{write_state_atomic, SessionState, SessionStatus, SupervisorState};
+use crate::orchestrate::state::{
+    save_supervisor_state, SessionState, SessionStatus, SupervisorState,
+};
 use crate::orchestrate::stdout_writer::StdoutSender;
 
 use std::os::unix::process::ExitStatusExt;
@@ -33,9 +35,11 @@ pub fn format_tail_utf8_safe(buf: &[u8], max_bytes: usize) -> String {
     String::from_utf8_lossy(slice).replace('\n', "\\n")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_session_loop(
     session: SessionConfig,
     supervisor_config: SupervisorConfig,
+    state_root: PathBuf,
     shared_state: Arc<Mutex<SupervisorState>>,
     shutdown: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -118,6 +122,7 @@ pub fn run_session_loop(
             run_session_iteration(
                 &session,
                 &supervisor_config,
+                &state_root,
                 &shared_state,
                 &shutdown,
                 &paused,
@@ -171,7 +176,7 @@ pub fn run_session_loop(
                     .unwrap_or(0.0);
                 let failed = crash_tracker.record_crash(now_epoch);
 
-                // Clone state, release lock, THEN write file (fix #1).
+                // Clone state, release lock, THEN write (fix #1).
                 let state_snapshot = {
                     let mut st = shared_state.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(sess_st) = st.sessions.get_mut(&session.name) {
@@ -186,13 +191,13 @@ pub fn run_session_loop(
                     }
                     st.clone()
                 };
-                let _ = write_state_atomic(&supervisor_config.state_file, &state_snapshot);
+                let _ = save_supervisor_state(&state_root, &state_snapshot);
 
                 if failed {
                     // Fix #3: failed cooldown instead of sleeping forever.
                     handle_failed_cooldown(
                         &session,
-                        &supervisor_config,
+                        &state_root,
                         &shared_state,
                         &shutdown,
                         &paused,
@@ -257,7 +262,7 @@ fn is_pid_alive_sys(pid: u32) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn handle_failed_cooldown(
     session: &SessionConfig,
-    supervisor_config: &SupervisorConfig,
+    state_root: &Path,
     shared_state: &Arc<Mutex<SupervisorState>>,
     shutdown: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
@@ -268,7 +273,7 @@ fn handle_failed_cooldown(
 ) {
     handle_failed_cooldown_custom(
         session,
-        supervisor_config,
+        state_root,
         shared_state,
         shutdown,
         paused,
@@ -283,7 +288,7 @@ fn handle_failed_cooldown(
 #[allow(clippy::too_many_arguments)]
 pub fn handle_failed_cooldown_custom<F>(
     session: &SessionConfig,
-    supervisor_config: &SupervisorConfig,
+    state_root: &Path,
     shared_state: &Arc<Mutex<SupervisorState>>,
     shutdown: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
@@ -370,7 +375,7 @@ pub fn handle_failed_cooldown_custom<F>(
         }
         st.clone()
     };
-    let _ = write_state_atomic(&supervisor_config.state_file, &state_snapshot);
+    let _ = save_supervisor_state(state_root, &state_snapshot);
 }
 
 /// Bounded escalation helper:
@@ -458,7 +463,7 @@ where
 
 struct SessionIterationContext<'a> {
     session: &'a SessionConfig,
-    supervisor_config: &'a SupervisorConfig,
+    state_root: &'a Path,
     shared_state: &'a Arc<Mutex<SupervisorState>>,
     shutdown: &'a Arc<AtomicBool>,
     paused: &'a Arc<AtomicBool>,
@@ -468,6 +473,7 @@ struct SessionIterationContext<'a> {
 fn run_session_iteration(
     session: &SessionConfig,
     supervisor_config: &SupervisorConfig,
+    state_root: &Path,
     shared_state: &Arc<Mutex<SupervisorState>>,
     shutdown: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
@@ -485,7 +491,7 @@ fn run_session_iteration(
 ) -> bool {
     let ctx = SessionIterationContext {
         session,
-        supervisor_config,
+        state_root,
         shared_state,
         shutdown,
         paused,
@@ -739,14 +745,11 @@ fn run_session_iteration(
     // directory read-only (messages) and its `injected/` subdirectory
     // read-write (the injection markers only). Nothing enqueues yet (phase 2
     // wires the delivery), so the receive side answers empty until then.
+    // Rooted at the shared per-pod state root (like the worker's inboxes),
+    // NOT the deprecated /tmp state file location: the inbox must survive a
+    // pod restart like the rest of the state.
     #[cfg(feature = "a2a")]
-    let a2a_inbox_dir = crate::core::a2a::inbox::inbox_dir_for(
-        supervisor_config
-            .state_file
-            .parent()
-            .unwrap_or(std::path::Path::new("/tmp")),
-        &session.name,
-    );
+    let a2a_inbox_dir = crate::core::a2a::inbox::inbox_dir_for(state_root, &session.name);
     // Under `test-hooks`, the process-global `sandbox_passthrough` switch also lets
     // tests run unwrapped on platforms without sandbox support.
     let wrap_in_sandbox = session.sandbox && {
@@ -965,7 +968,7 @@ fn run_session_iteration(
         }
         st.clone()
     };
-    let _ = write_state_atomic(&supervisor_config.state_file, &state_snapshot);
+    let _ = save_supervisor_state(state_root, &state_snapshot);
 
     // 7. PTY Output forwarder & hang detection loop
     let mut tail_buf: Vec<u8> = Vec::with_capacity(4096);
@@ -1296,7 +1299,7 @@ fn run_session_iteration(
         }
     }
 
-    // Fix #1: clone state, release lock, THEN write file.
+    // Fix #1: clone state, release lock, THEN write.
     let state_snapshot = {
         let mut st = shared_state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(sess_st) = st.sessions.get_mut(&session.name) {
@@ -1313,7 +1316,7 @@ fn run_session_iteration(
         }
         st.clone()
     };
-    let _ = write_state_atomic(&supervisor_config.state_file, &state_snapshot);
+    let _ = save_supervisor_state(state_root, &state_snapshot);
 
     if shutdown.load(Ordering::SeqCst) {
         let state_snapshot = {
@@ -1323,7 +1326,7 @@ fn run_session_iteration(
             }
             st.clone()
         };
-        let _ = write_state_atomic(&supervisor_config.state_file, &state_snapshot);
+        let _ = save_supervisor_state(state_root, &state_snapshot);
         return false;
     }
 
@@ -1339,7 +1342,7 @@ fn run_session_iteration(
             }
             st.clone()
         };
-        let _ = write_state_atomic(&supervisor_config.state_file, &state_snapshot);
+        let _ = save_supervisor_state(state_root, &state_snapshot);
         return false;
     }
 
@@ -1353,7 +1356,7 @@ fn run_session_iteration(
         }
         handle_failed_cooldown(
             session,
-            supervisor_config,
+            state_root,
             shared_state,
             shutdown,
             paused,
@@ -1399,12 +1402,12 @@ fn run_session_iteration(
                 }
                 st.clone()
             };
-            let _ = write_state_atomic(&supervisor_config.state_file, &state_snapshot);
+            let _ = save_supervisor_state(state_root, &state_snapshot);
 
             // Fix #3: cooldown + resume instead of sleeping forever.
             handle_failed_cooldown(
                 session,
-                supervisor_config,
+                state_root,
                 shared_state,
                 shutdown,
                 paused,
@@ -1433,7 +1436,7 @@ fn run_session_iteration(
         }
         st.clone()
     };
-    let _ = write_state_atomic(&supervisor_config.state_file, &state_snapshot);
+    let _ = save_supervisor_state(state_root, &state_snapshot);
 
     log_event(
         &session.name,
@@ -1462,7 +1465,7 @@ fn handle_spawn_error(
     reason: String,
 ) {
     let session = ctx.session;
-    let supervisor_config = ctx.supervisor_config;
+    let state_root = ctx.state_root;
     let shared_state = ctx.shared_state;
     let shutdown = ctx.shutdown;
     let paused = ctx.paused;
@@ -1488,13 +1491,13 @@ fn handle_spawn_error(
         }
         st.clone()
     };
-    let _ = write_state_atomic(&supervisor_config.state_file, &state_snapshot);
+    let _ = save_supervisor_state(state_root, &state_snapshot);
 
     if failed {
         // Fix #3: cooldown + resume.
         handle_failed_cooldown(
             session,
-            supervisor_config,
+            state_root,
             shared_state,
             shutdown,
             paused,
@@ -1659,18 +1662,16 @@ mod tests {
         let mut session = make_test_session("test-session");
         session.failed_cooldown_secs = 0.02;
 
-        let state_path = std::env::temp_dir().join(format!(
-            "test_state_{}_{}.json",
+        let state_root = std::env::temp_dir().join(format!(
+            "test_state_root_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let supervisor_config = SupervisorConfig {
-            state_file: state_path.clone(),
-            ..SupervisorConfig::default()
-        };
+        let _ = std::fs::remove_dir_all(&state_root);
+        std::fs::create_dir_all(&state_root).unwrap();
         let shared_state = Arc::new(Mutex::new(SupervisorState::new(std::process::id())));
         {
             let mut st = shared_state.lock().unwrap();
@@ -1688,7 +1689,7 @@ mod tests {
         let mut check_count = 0;
         handle_failed_cooldown_custom(
             &session,
-            &supervisor_config,
+            &state_root,
             &shared_state,
             &shutdown,
             &shutdown,
@@ -1709,6 +1710,6 @@ mod tests {
         let sess = st.sessions.get("test-session").unwrap();
         assert_eq!(sess.status, SessionStatus::Starting);
         assert_eq!(sess.pid, None);
-        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_dir_all(&state_root);
     }
 }

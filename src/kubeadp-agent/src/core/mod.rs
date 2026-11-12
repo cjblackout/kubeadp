@@ -31,6 +31,7 @@ pub mod hindsight;
 pub mod job;
 pub mod jobset;
 pub mod max_runtime;
+pub mod migrations;
 pub mod output;
 pub mod proxy;
 pub mod reaper;

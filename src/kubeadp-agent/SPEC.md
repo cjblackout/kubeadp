@@ -41,7 +41,7 @@ The library crate name is `kubeadp_agent`.
 | Module | Responsibility |
 |---|---|
 | `core` | job engine (SQLite state, Git worktrees, lifecycle, Hindsight) and, behind `server`, the shared `/api/v1` server (auth, events, run-control, A2A) |
-| `orchestrate` | session supervisor (PTY, backoff, readiness, state file, sessions API, A2A session backend) |
+| `orchestrate` | session supervisor (PTY, backoff, readiness, state db, sessions API, A2A session backend) |
 | `worker` | job daemon: entry, supervision, agy home, A2A job backend |
 | `cli` | remote CLI client modules for `agent-run` |
 | `engine` | `Engine` trait, capability tables, emulation (queue/compact/revert), run model, error mapping |
@@ -235,7 +235,8 @@ also the pause accumulator.
 ### 4.1 Responsibilities
 Supervises interactive sessions: each runs an engine (claude by default, agy
 requested per session or as the orchestrator default) in a PTY with crash
-handling, restart backoff, readiness tracking and a persistent state file.
+handling, restart backoff, readiness tracking and a persistent state store
+(the shared per-pod SQLite state database).
 The engine is per-session with the E5 precedence (session `engine` >
 `default_session_engine` > claude) and survives restarts via `SessionState`.
 Claude sessions use the `--remote-control` PTY transport with an injected
@@ -252,11 +253,13 @@ workspaces. The session file is JSON or TOML (by extension, same serde structs).
 Session grants are trusted supervisor configuration declared only here — never
 requested at runtime.
 
-Global options (defaults): `state_file` `/tmp/claude-supervisor-state.json`;
-`heartbeat_interval_secs` 2.0; `stale_heartbeat_secs` 15.0; `shutdown_grace_secs`
-5.0; `claude_config_dir` `$HOME/.claude`; `default_session_engine` unset
-(claude); `agy_path` unset (`AGENT_ORCHESTRATE_AGY_PATH`, the per-session
-`agy_binary`, then `PATH`).
+Global options (defaults): `state_file` `/tmp/claude-supervisor-state.json`
+(DEPRECATED: one-time import path only — a legacy JSON state file found there
+at start is imported into the state database once and renamed to
+`*.migrated`); `heartbeat_interval_secs` 2.0; `stale_heartbeat_secs` 15.0;
+`shutdown_grace_secs` 5.0; `claude_config_dir` `$HOME/.claude`;
+`default_session_engine` unset (claude); `agy_path` unset
+(`AGENT_ORCHESTRATE_AGY_PATH`, the per-session `agy_binary`, then `PATH`).
 
 Per-session options (defaults):
 | Key | Default | Meaning |
@@ -301,9 +304,20 @@ load: negative, non-finite or values above `MAX_DURATION_SECS` (30 days) rejecte
 - The PTY master is published so the sessions API and A2A can inject text (§4.5).
 
 ### 4.4 State and probes
-Heartbeat written every `heartbeat_interval_secs`, stale after
-`stale_heartbeat_secs`. `agent-orchestrate status` exit codes: `0` healthy, `1`
-stale heartbeat, `2` a session `failed`/thread died, `3` state file unreadable,
+The supervisor and per-session state (pid, heartbeat, status, restart counts,
+last exit reason, engine) lives in the shared per-pod SQLite state database
+`<state_root>/state.sqlite` (same database as the `jobs` table): one
+`supervisor_state` row (pid, started, heartbeat, status, schema version) plus
+one `session_state` row per session. Writes are transactional, one writer
+(the supervisor); readers use read-only connections; `synchronous=NORMAL`
+keeps the heartbeat cadence from hammering the disk. The state survives a
+pod restart (restored at start); the legacy JSON state file is imported once
+(`*.migrated`). Schema migrations are numbered and additive
+(`src/core/migrations.rs`, `PRAGMA user_version`). Heartbeat written every
+`heartbeat_interval_secs`, stale after `stale_heartbeat_secs`.
+`agent-orchestrate status` exit codes: `0` healthy, `1`
+stale heartbeat, `2` a session `failed`/thread died, `3` supervisor state
+unreadable / no state in the database,
 `4` supervisor stopped or a session stopped. `/healthz` → `200 {"status":"ok"}`;
 `/readyz` → `200 {"status":"ready"}` or `503 {"error":"not ready",
 "code":"not_ready"}` via a caller-supplied readiness closure. Both never auth.
@@ -921,6 +935,13 @@ no acknowledgement.
   records `injected_at` and the channel). Bounded queue (`MAX_QUEUED_MSGS` 8 / `MAX_QUEUED_BYTES` 8 KiB, oldest dropped, durable
   drop note) and a TTL for uninjected messages (1 h). The sender's task state is `submitted` while
   queued and `working` once injected. Exactly once by message id across all channels (the inbox is the dedupe store).
+  - `state_root` here is the agent-run `state_root` (from `core::config::Config::load`; `AGENT_RUN_STATE_ROOT` > config file >
+    built-in `~/.agent-run`), resolved by the ONE shared helper
+    `core::a2a::inbox::inbox_state_root()` that BOTH sides of a run's inbox use: the delivery side (the A2A sink,
+    `orchestrate/a2a.rs` / `http_server.rs`, and the worker `worker/a2a.rs`) and the launcher that names the run's inbox in
+    `KUBEADP_A2A_INBOX_DIR` and grants it to the sandbox (`orchestrate/session.rs`, `core/runner.rs`). The session side must
+    NOT derive the inbox from the supervisor `state_file`'s parent (the default state file lives in `/tmp`, which the sink
+    never writes and the pod wipes at every restart): that mismatch made sessions read a directory the sink never wrote.
 - **Injection channels** (capability `a2a.inject` lists what an engine supports):
   - `hook` (Claude Code): the supervisor configures hooks for the session (**phase 2**: the hook settings writer); `kubeadp-agent a2a-hook <event>`
      reads the inbox, marks the messages injected and prints the hook JSON: PostToolUse / UserPromptSubmit return
@@ -1292,7 +1313,7 @@ a2a,test-hooks`.
 - **`tests/orchestrate/` (~69 tests)**: drives `fake-claude.sh` action scripts.
   start/resume args, config rewrite idempotency, readiness, crash→restart with
   backoff, N crashes → failed while siblings keep running, hang→kill+restart,
-  SIGTERM-ignoring child→SIGKILL, drain on SIGTERM, no zombies, state file +
+  SIGTERM-ignoring child→SIGKILL, drain on SIGTERM, no zombies, state db +
   heartbeat, status exit codes, corrupt-session quarantine, session independence,
   bounded shutdown, raw mode + prefix, multi-byte TUI burst surviving SIGKILL,
   forced panic recovery, `--resume` paths, deterministic session ids, name

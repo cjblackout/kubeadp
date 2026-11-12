@@ -542,6 +542,22 @@ impl SupervisorConfig {
         validate_supervisor_duration("stale_heartbeat_secs", self.stale_heartbeat_secs)?;
         Ok(())
     }
+
+    /// The shared root every session's A2A inbox lives under
+    /// (`<root>/a2a-inbox/<session>/`), resolved exactly like the sink's
+    /// `state_root` (design HL-113 §7.14). This is the ONE definition both
+    /// sides of a session's inbox use -- the A2A sink (`orchestrate/a2a.rs`
+    /// / `http_server.rs`, which route each session's deliveries through
+    /// [`crate::core::a2a::inbox::inbox_dir_for`] on this root) and the
+    /// session launcher that names the inbox in `KUBEADP_A2A_INBOX_DIR` and
+    /// grants it to the sandbox. It must NOT follow `self.state_file.parent()`
+    /// (the default state file lives in `/tmp`, which the sink never writes
+    /// and the pod wipes at every restart); it resolves the agent-run state
+    /// root instead.
+    #[cfg(feature = "a2a")]
+    pub fn a2a_inbox_root(&self) -> PathBuf {
+        crate::core::a2a::inbox::inbox_state_root()
+    }
 }
 
 /// Derives the project slug for ~/.claude/projects/<slug> from a workdir path.
