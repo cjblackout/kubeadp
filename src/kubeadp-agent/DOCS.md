@@ -21,6 +21,8 @@ The `kubeadp-agent` system operates across three distinct operational contexts:
 
 The engine layer provides a unified interface (`Engine` trait) across underlying agent harnesses, abstracting jobs and interactive sessions into a consistent execution abstraction.
 
+This section describes the engine layer as shipped. The target contract (every endpoint works with every engine, no `501` because of the engine, the conformance suite) is SPEC.md §3 and §12.6; SPEC.md §13.2 lists what is still missing.
+
 ### 2.1 The Unified Run Model
 
 Every execution instance is tracked as a `Run` object:
@@ -171,6 +173,8 @@ A forbidden or failing session grant is dropped, never fatal: an entry that fail
 
 The system implements the A2A v1 protocol, allowing workers and orchestrators to communicate across Kubernetes services.
 
+This section describes messaging as shipped: one jobset per agent, the API bearer (called operator token below) accepted on A2A routes for requests without jobset headers, a claimed sender name, and file-based membership and inbox. The target model (several jobsets per agent, verified sender, no API bearer on A2A routes, membership, inbox and audit in `state.sqlite`) is SPEC.md §7; SPEC.md §13.3 lists what is still missing. It replaces the shipped behaviour in one release (SPEC.md §7.16).
+
 ### 4.1 Server Routes and Agent Card
 
 When built with `--features a2a`, the server exposes the standard A2A endpoints on port 8002:
@@ -218,7 +222,7 @@ Protected A2A routes enforce authentication **before** parsing request bodies:
 
 ### 4.3 Jobsets and Derived Secrets
 
-A *jobset* represents an isolated communication mesh spanning worker jobs and orchestrator sessions:
+A *jobset* represents an isolated messaging group spanning worker jobs and orchestrator sessions:
 - Members authenticate bi-directionally using a shared 256-bit secret.
 - **Root Key Derivation**: When `jobset_root_key_file` is configured, secrets are derived deterministically:
   ```
@@ -243,7 +247,7 @@ Incoming messages delivered via `POST /message:send` pass through strict ingress
   ```
 - **Receiving Behavior**:
   - **Orchestrator**: An inbound message is enqueued into the session's durable inbox and delivered by the escalation ladder (§4.6); the queued PTY input (claude: bracketed paste `ESC[200~ ... ESC[201~`, followed by a newline; agy: one `{"event":"user","message":{"content":"..."}}` NDJSON line plus Enter) is the `idle_turn`/`interrupt` escalation step, applied only past `a2a_ack_secs` with the session running (or immediately for `interrupt: true` / past `a2a_force_secs`). Nothing is killed.
-  - **Worker (live stdin, idle turn only)**: A RUNNING agy that was launched in live mode (a real A2A mesh member, `[worker] a2a_live_stdin` on) reads its next turn from a stdin pipe; the ladder's `idle_turn` step writes the message into that pipe as a single `{"event":"user","message":{"content":"..."}}` NDJSON line — no kill, no restart, the same conversation continues. The live stdin path stays off otherwise.
+  - **Worker (live stdin, idle turn only)**: A RUNNING agy that was launched in live mode (a jobset member, `[worker] a2a_live_stdin` on) reads its next turn from a stdin pipe; the ladder's `idle_turn` step writes the message into that pipe as a single `{"event":"user","message":{"content":"..."}}` NDJSON line — no kill, no restart, the same conversation continues. The live stdin path stays off otherwise.
   - **Worker (interrupt-and-resume)**: The explicit last resort only (`interrupt: true` messages or a message still queued past `a2a_force_secs`, default 0 = never): the worker interrupts the active execution turn cleanly (via process group SIGTERM), appends the message to the conversation history, and restarts execution.
   - **Rate Limiting**: Session delivery is metered per (session, sender) pair at 30 messages per minute. Throttled requests receive HTTP 429 with `Retry-After`.
 
@@ -284,7 +288,7 @@ queued -> injection at the next boundary of any available channel (the hook
 ```
 
 - The sender's task state follows the message: `submitted` while queued, `working` once injected, `failed` with the durable expiry reason after the TTL.
-- **agy (worker)**: the `idle_turn` step writes the message into a RUNNING live-mode job's stdin pipe (the §7.11 live path, off unless the idle turn needs it); a finished job is resumed with the message as the next turn. The `interrupt` step is the existing kill-and-resume.
+- **agy (worker)**: the `idle_turn` step writes the message into a RUNNING live-mode job's stdin pipe (the live stdin transport of SPEC.md §7.11/§7.14, used only by the idle turn); a finished job is resumed with the message as the next turn. The `interrupt` step is the existing kill-and-resume.
 - **Claude Code (orchestrator)**: the `idle_turn`/`interrupt` steps write the message as queued PTY input (bracketed paste) into the running claude session; the Stop hook re-enters the loop at the turn boundary. Nothing is killed on the session path. An agy session receives the same escalation as a single NDJSON user line (the engine-aware `deliver_message` picks the frame).
 - **Config keys** (`[worker]` of the agent-run config file; the same file serves the orchestrator):
 
