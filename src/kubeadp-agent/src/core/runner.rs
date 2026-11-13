@@ -309,8 +309,6 @@ pub fn build_command(
     // its inbox through the pod-local HTTP API, named by the
     // `KUBEADP_A2A_INBOX_DIR` env var and authenticated by the per-run token
     // set below.
-    #[cfg(feature = "a2a")]
-    let _inbox_dir = crate::core::a2a::inbox::inbox_dir_for(&config.state_root, &meta.job_id);
     // Jobset wiring: if this job is a jobset member (registered in the
     // process-wide registry before launch), its jobset secret rides the
     // sandbox `secret` channel (an inherited fd the sandbox turns into a 0400
@@ -391,7 +389,7 @@ pub fn build_command(
     // [`apply_a2a_self_name`]).
     apply_a2a_self_name(&mut cmd, &meta.job_id);
 
-    // HL-113 phase 1 (a2a builds): name the run's durable A2A inbox for the
+    // HL-113 (sqlite inbox): name the run's durable A2A inbox for the
     // injecting processes (the `mcp-a2a` receive side and the `a2a-hook`
     // subcommand). The var matches the default `KUBEADP_*` sandbox allow
     // pattern, so it passes through into the sandboxed job.

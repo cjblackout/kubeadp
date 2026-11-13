@@ -64,12 +64,9 @@
 //! <state_root>/state.sqlite   the shared per-pod db (migration v3)
 //! ```
 //!
-//! The legacy phase-1/2 per-run directory `<state_root>/a2a-inbox/<run_id>/`
-//! (files `m-<sha256(message_id)>.json`, `injected/`, `expired/`) is no
-//! longer written. When an inbox repo's database has no row for the run yet,
-//! a host opens a directory that still holds the legacy layout, its messages
-//! are migrated once and atomically into the database (not on the sandbox
-//! HTTP path -- the sandbox never serves a directory).
+//! The run's inbox dir `<state_root>/a2a-inbox/<run_id>/` is NOT a store any
+//! more: it survives only as the shared identity (the run key) both sides
+//! derive, and no message or marker is written to it.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -88,19 +85,17 @@ use serde::{Deserialize, Serialize};
 /// `/tmp`, wiped at every pod restart).
 pub const INBOX_STATE_ROOT_ENV: &str = "AGENT_RUN_STATE_ROOT";
 
-/// Directory name of a run's LEGACY inbox under its state root
-/// (`<state_root>/a2a-inbox/<run_id>/`). Kept for migration of phase-1/2
-/// directories; nothing writes here any more.
+/// Directory name of a run's inbox under its state root
+/// (`<state_root>/a2a-inbox/<run_id>/`): the shared identity both sides of a
+/// run's inbox derive. No message or marker is written here (the store is
+/// the shared database); the path survives only as the run key.
 pub const INBOX_DIR_NAME: &str = "a2a-inbox";
-
-/// Subdirectory holding the legacy injection markers (`injected_at`,
-/// channel). Migrated into the database with the messages.
-pub const INJECTED_DIR_NAME: &str = "injected";
 
 /// Environment variable naming the run's inbox for the injecting processes
 /// (the `mcp-a2a` server and the `a2a-hook` subcommand). Its value is the
 /// run's INBOX DIR (`<state_root>/a2a-inbox/<run>/`) exactly as before, so
-/// neither process changes; the difference is that a sandboxed process now
+/// neither process changes. The path is a run KEY / identity, not a writable
+/// directory grant: the store is the shared database and a sandboxed process
 /// reads through the local HTTP API ([`crate::core::a2a::http`]) keyed by
 /// this path, never the filesystem.
 pub const INBOX_ENV: &str = "KUBEADP_A2A_INBOX_DIR";
@@ -209,8 +204,8 @@ pub enum StorageKind {
 }
 
 /// The root of a run's inbox. A real repo resolves the SHARED agent-run
-/// state root; the legacy per-run dir is still materialized for the
-/// injection processes to key on ([`dir`]), but the store is the database.
+/// state root; the run's inbox dir ([`dir`]) is kept as the shared identity
+/// the injection processes key on, but the store is the database.
 #[derive(Debug, Clone)]
 pub struct Inbox {
     /// The run's inbox dir (`<state_root>/a2a-inbox/<run_id>/`), the identity
@@ -261,13 +256,6 @@ pub fn inbox_state_root() -> PathBuf {
     crate::core::config::Config::load()
         .map(|c| c.state_root)
         .unwrap_or_else(|_| crate::core::config::Config::default().state_root)
-}
-
-/// The injection-marker directory inside a LEGACY inbox: `<inbox>/injected/`.
-/// Kept for migration and because repository helpers still reference it;
-/// nothing is written here by the current implementation.
-pub fn injected_dir_for(inbox_dir: &Path) -> PathBuf {
-    inbox_dir.join(INJECTED_DIR_NAME)
 }
 
 /// Reduces a run id to a safe single path segment, collision-free for every
@@ -415,28 +403,6 @@ fn state_root_from_dir(dir: &Path) -> Option<PathBuf> {
     dir.parent()?.parent().map(Path::to_path_buf)
 }
 
-/// Whether `dir` still holds a phase-1/2 legacy inbox (message files and/or
-/// the `injected/` and `expired/` marker directories). Empty inbox dirs (the
-/// sandbox-visible run directory shape) and already-migrated ones return
-/// false.
-fn has_legacy_layout(dir: &Path) -> bool {
-    if !dir.is_dir() {
-        return false;
-    }
-    if dir.join(INJECTED_DIR_NAME).is_dir() || dir.join("expired").is_dir() {
-        return true;
-    }
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries.flatten().any(|e| {
-                let name = e.file_name();
-                let name = name.to_string_lossy();
-                name.starts_with("m-") && name.ends_with(".json")
-            })
-        })
-        .unwrap_or(false)
-}
-
 impl Inbox {
     /// An inbox rooted at `dir` with the default TTL. Resolves the shared
     /// state root when `dir` has the canonical `<root>/a2a-inbox/<run>` shape;
@@ -470,15 +436,10 @@ impl Inbox {
         Some(Self::new(PathBuf::from(trimmed)))
     }
 
-    /// The inbox directory (also the run key the HTTP API and the legacy
-    /// directory migration identify the run by).
+    /// The inbox directory (also the run key the HTTP API identifies the run
+    /// by).
     pub fn dir(&self) -> &Path {
         &self.dir
-    }
-
-    /// The injection-marker directory of a legacy inbox (migration only).
-    pub fn injected_dir(&self) -> PathBuf {
-        injected_dir_for(&self.dir)
     }
 
     /// The storage class of this inbox.
@@ -545,10 +506,6 @@ impl Inbox {
     /// durable note recorded). The host calls this; the injecting side never
     /// does.
     pub fn enqueue(&self, msg: QueuedMessage) -> Result<EnqueueOutcome, String> {
-        // Legacy directory migration is only possible for a real repo.
-        if !self.is_memory() {
-            self.with_conn(|c| self.migrate_legacy_dir(c))?;
-        }
         let (run_id, message_id) = self.key(&msg.message_id);
         self.with_conn(|conn| {
             conn.execute_batch("BEGIN IMMEDIATE")
@@ -1124,191 +1081,6 @@ impl Inbox {
     }
 }
 
-/// The legacy directory migration: moves a phase-1/2 per-run inbox directory
-/// (`m-*.json` messages, `injected/*.json` markers, `expired/*.json` markers)
-/// into the database, exactly once per run (idempotent against a partially
-/// migrated or empty directory). Runs inside the caller's transaction, so a
-/// crash mid-migration rolls back the whole import (no double-import, no
-/// half state).
-impl Inbox {
-    fn migrate_legacy_dir(&self, conn: &Connection) -> Result<(), String> {
-        // Only a real repo with the canonical layout is migratable.
-        if self.is_memory() {
-            return Ok(());
-        }
-        let _root = self
-            .state_root
-            .as_ref()
-            .ok_or_else(|| "cannot migrate a legacy inbox without a state root".to_string())?;
-        let dir = &self.dir;
-        if !has_legacy_layout(dir) {
-            // No legacy layout (or already migrated and cleaned): nothing to do.
-            return Ok(());
-        }
-        // The mailbox directory may still carry files. Guard against a run id
-        // that is not a single segment (can only be our own sanitization).
-        let run_id = self.run_id();
-        // Whether ANY row already exists for this run: if rows exist, the
-        // migration is done (or never started and the dir is stale) -- avoid
-        // re-importing.
-        let exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM a2a_message WHERE run_id=?1 AND fake=?2",
-                rusqlite::params![run_id, i64::from(self.fake)],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if exists > 0 {
-            return Ok(());
-        }
-        self.migrate_legacy_dir_impl(conn, &run_id)
-    }
-
-    fn migrate_legacy_dir_impl(&self, conn: &Connection, run_id: &str) -> Result<(), String> {
-        let dir = &self.dir;
-        // 1. Message files: `<dir>/m-<sha>.json`.
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !name.starts_with("m-") || !name.ends_with(".json") {
-                    continue;
-                }
-                let Ok(bytes) = std::fs::read(&path) else {
-                    continue;
-                };
-                let Ok(msg) = serde_json::from_slice::<QueuedMessage>(&bytes) else {
-                    continue;
-                };
-                conn.execute(
-                    "INSERT OR IGNORE INTO a2a_message
-                        (run_id, message_id, fake, sender, hop, context_id, task_id, framed, queued_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    rusqlite::params![
-                        run_id,
-                        msg.message_id,
-                        i64::from(self.fake),
-                        msg.sender,
-                        msg.hop,
-                        msg.context_id,
-                        msg.task_id,
-                        msg.framed,
-                        msg.queued_at
-                    ],
-                )
-                .map_err(|e| format!("failed to import a legacy A2A message: {e}"))?;
-            }
-        }
-        // 2. Injection markers: `<dir>/injected/<m-*.json>` (their presence
-        //    means the message was acknowledged -> `injected_at`).
-        let injected_dir = self.injected_dir();
-        if let Ok(entries) = std::fs::read_dir(&injected_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !name.starts_with("m-") || !name.ends_with(".json") {
-                    continue;
-                }
-                let Ok(bytes) = std::fs::read(&path) else {
-                    continue;
-                };
-                let Ok(marker) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-                    continue;
-                };
-                let mid = marker
-                    .get("message_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let channel = marker
-                    .get("channel")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("hook")
-                    .to_string();
-                let injected_at = marker
-                    .get("injected_at")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(now_unix());
-                if mid.is_empty() {
-                    continue;
-                }
-                // Mark the imported message injected (or insert an injected
-                // stub row if the message file is gone: the ack is durable).
-                conn.execute(
-                    "UPDATE a2a_message SET injected_at=?1, channel=?2
-                     WHERE run_id=?3 AND message_id=?4 AND fake=?5",
-                    rusqlite::params![injected_at, channel, run_id, mid, i64::from(self.fake)],
-                )
-                .map_err(|e| format!("failed to apply a legacy injection marker: {e}"))?;
-            }
-        }
-        // 3. Expiry markers: `<dir>/expired/expired-<sha>.json` -> a2a_expiry.
-        let expired_dir = dir.join(crate::core::a2a::delivery::EXPIRED_DIR_NAME);
-        if let Ok(entries) = std::fs::read_dir(&expired_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !name.starts_with("expired-") || !name.ends_with(".json") {
-                    continue;
-                }
-                let Ok(bytes) = std::fs::read(&path) else {
-                    continue;
-                };
-                let Ok(record) =
-                    serde_json::from_slice::<crate::core::a2a::delivery::ExpiryRecord>(&bytes)
-                else {
-                    continue;
-                };
-                conn.execute(
-                    "INSERT OR IGNORE INTO a2a_expiry
-                        (run_id, fake, message_id, reason, expired_at, expired_at_ns)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![
-                        run_id,
-                        i64::from(self.fake),
-                        record.message_id,
-                        record.reason,
-                        record.expired_at,
-                        record.expired_at_ns
-                    ],
-                )
-                .map_err(|e| format!("failed to import a legacy A2A expiry marker: {e}"))?;
-            }
-        }
-        // 4. Once imported, the directory is no longer the source of truth:
-        //    the host prunes the message files (best effort). The injected
-        //    and expired markers are pruned too.
-        self.prune_legacy_dir();
-        Ok(())
-    }
-
-    /// Best-effort removal of the migrated legacy directory files.
-    fn prune_legacy_dir(&self) {
-        let dir = &self.dir;
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if (name.starts_with("m-") && name.ends_with(".json")) || name.starts_with(".m-") {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-        for sub in [
-            self.injected_dir(),
-            dir.join(crate::core::a2a::delivery::EXPIRED_DIR_NAME),
-        ] {
-            if let Ok(entries) = std::fs::read_dir(&sub) {
-                for entry in entries.flatten() {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
-        // The directories themselves are left (the sandbox grants and the
-        // run directory shape expect them).
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1658,98 +1430,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_directory_migrates_once_into_the_db() {
-        let tmp = tempdir().unwrap();
-        let root = tmp.path().join("state-root");
-        let dir = inbox_dir_for(&root, "job-legacy");
-        // A legacy phase-1/2 directory with one queued message, its injected
-        // marker for another message, and an expiry marker.
-        std::fs::create_dir_all(dir.join("injected")).unwrap();
-        std::fs::create_dir_all(dir.join("expired")).unwrap();
-
-        let m1 = msg("m-legacy-1", "legacy queued");
-        let name1 = format!(
-            "m-{}.json",
-            hex(&crate::core::crypto::sha256(b"m-legacy-1"))
-        );
-        std::fs::write(dir.join(&name1), serde_json::to_vec(&m1).unwrap()).unwrap();
-        let m2 = msg("m-legacy-2", "legacy injected");
-        let name2 = format!(
-            "m-{}.json",
-            hex(&crate::core::crypto::sha256(b"m-legacy-2"))
-        );
-        std::fs::write(dir.join(&name2), serde_json::to_vec(&m2).unwrap()).unwrap();
-        // An injected marker for m2.
-        std::fs::write(
-            dir.join("injected").join(&name2),
-            serde_json::to_vec(&serde_json::json!({
-                "message_id": "m-legacy-2",
-                "injected_at": now_unix(),
-                "channel": "hook",
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        // An expiry marker for an unknown message.
-        std::fs::write(
-            dir.join("expired").join(format!(
-                "expired-{}.json",
-                hex(&crate::core::crypto::sha256(b"m-expired"))
-            )),
-            serde_json::to_vec(&crate::core::a2a::delivery::ExpiryRecord {
-                message_id: "m-expired".to_string(),
-                reason: "legacy ttl".to_string(),
-                expired_at: 1,
-                expired_at_ns: 0,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        let inbox = Inbox::new(dir.clone());
-        // A host enqueue triggers the migration (the run has no rows yet).
-        inbox.enqueue(msg("m-legacy-3", "fresh")).unwrap();
-
-        let pending = inbox.pending();
-        let ids: Vec<&str> = pending.iter().map(|m| m.message_id.as_str()).collect();
-        assert!(
-            ids.contains(&"m-legacy-1") && ids.contains(&"m-legacy-3"),
-            "legacy + fresh queued: {ids:?}"
-        );
-        assert!(
-            !ids.contains(&"m-legacy-2"),
-            "the injected legacy message is not queued: {ids:?}"
-        );
-        assert!(inbox.injected("m-legacy-2"), "the legacy marker honoured");
-        // The expiry marker landed in the DB.
-        let rec: Option<String> = inbox
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT reason FROM a2a_expiry WHERE run_id=?1 AND message_id='m-expired'",
-                    params![inbox.run_id()],
-                    |r| r.get(0),
-                )
-                .map_err(|e| format!("{e}"))
-            })
-            .ok()
-            .flatten();
-        assert_eq!(rec.as_deref(), Some("legacy ttl"));
-        // Idempotent: a second enqueue does not double-import.
-        inbox.enqueue(msg("m-legacy-4", "second")).unwrap();
-        let total: i64 = inbox
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM a2a_message WHERE run_id=?1",
-                    params![inbox.run_id()],
-                    |r| r.get(0),
-                )
-                .map_err(|e| format!("{e}"))
-            })
-            .unwrap();
-        assert!(total <= 9, "no duplicate import: {total}");
-    }
-
-    #[test]
     fn repo_messages_survive_a_reopen_and_honour_the_lease() {
         // A restart (a new `Inbox` handle / a reopened shared db) must see the
         // same rows: the per-run inbox is durable in `<state_root>/state.sqlite`,
@@ -1800,10 +1480,6 @@ mod tests {
             .unwrap();
         let fourth = Inbox::new(dir.clone());
         assert_eq!(fourth.pending().len(), 2, "the lease lapsed, back in queue");
-    }
-
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     #[test]

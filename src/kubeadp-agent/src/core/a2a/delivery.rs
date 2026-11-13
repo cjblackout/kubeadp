@@ -39,10 +39,6 @@ pub const DEFAULT_ACK_SECS: u64 = 45;
 /// message may stay queued before the ladder escalates to `interrupt`.
 pub const DEFAULT_FORCE_SECS: u64 = 0;
 
-/// Subdirectory of a run's inbox holding the durable expiry markers
-/// (`<inbox>/expired/`); host-only (the sandboxed side has no grant).
-pub const EXPIRED_DIR_NAME: &str = "expired";
-
 /// Metadata key requesting the explicit `interrupt` escalation
 /// (`interrupt: true`). Trusted request metadata, never the framed content.
 pub const META_INTERRUPT: &str = "a2a.interrupt";

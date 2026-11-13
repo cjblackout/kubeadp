@@ -739,12 +739,11 @@ fn run_session_iteration(
     // the sandbox `secret` channel inside the sandboxed branch below, so a
     // trusted session never receives a jobset secret fd.
     let mut session_secret_fd = None;
-    // HL-113 phase 1 (a2a builds): the session's durable A2A inbox directory.
-    // Named to the agent by the `KUBEADP_A2A_INBOX_DIR` env var (below, after
-    // the command is finalized); the sandboxed branch additionally grants the
-    // directory read-only (messages) and its `injected/` subdirectory
-    // read-write (the injection markers only). Nothing enqueues yet (phase 2
-    // wires the delivery), so the receive side answers empty until then.
+    // HL-113 (sqlite inbox): the session's durable A2A inbox. Named to the
+    // agent by the `KUBEADP_A2A_INBOX_DIR` env var (below, after the command
+    // is finalized); the inbox itself lives in the shared per-pod
+    // `state.sqlite` and the sandbox gets NO directory grant for it (requests
+    // go through the pod-local HTTP API, authenticated by the per-run token).
     // Rooted at the shared per-pod state root (like the worker's inboxes),
     // NOT the deprecated /tmp state file location: the inbox must survive a
     // pod restart like the rest of the state.
