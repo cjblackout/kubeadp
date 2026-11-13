@@ -455,6 +455,13 @@ impl Config {
             _ => expand_path(DEFAULT_REPOS_ROOT_TEMPLATE, &workspace_root),
         };
 
+        // 8c. Resolve agy_home (KUBEADP_AGY_HOME override)
+        let agy_home_raw = env_vars.get("KUBEADP_AGY_HOME").cloned();
+        let agy_home = agy_home_raw
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|s| expand_path(&s, &workspace_root));
+
         // 9. Resolve gc_max_age_days
         let gc_max_age_days = if let Some(env_val) = env_vars.get("AGENT_RUN_GC_MAX_AGE_DAYS") {
             let clean = env_val.trim();
@@ -950,10 +957,7 @@ impl Config {
             default_base_branch,
             state_root,
             repos_root,
-            // No config/env knob exists for this yet: production always
-            // resolves the home directory at use time (dirs::home_dir), so
-            // the override stays None outside of tests.
-            agy_home: None,
+            agy_home,
             sandbox_home: PathBuf::from("/home/agent"),
             gc_max_age_days,
             max_parallel,
@@ -1759,5 +1763,33 @@ no_proxy = "file-no-proxy"
         ]);
         let cfg = Config::load_with_env(&env_blank).unwrap();
         assert_eq!(cfg.default_engine, None);
+    }
+
+    #[test]
+    fn test_kubeadp_agy_home_env_knob() {
+        let temp_dir = tempdir().unwrap();
+        let state_root = temp_dir.path().join("state").to_str().unwrap().to_string();
+
+        // 1. Unset by default -> None
+        let env_unset = env_with(&[("AGENT_RUN_STATE_ROOT", &state_root)]);
+        let cfg = Config::load_with_env(&env_unset).unwrap();
+        assert_eq!(cfg.agy_home, None);
+
+        // 2. Set to path -> Some(PathBuf)
+        let custom_home = temp_dir.path().join("custom_agy_home");
+        let env_set = env_with(&[
+            ("AGENT_RUN_STATE_ROOT", &state_root),
+            ("KUBEADP_AGY_HOME", custom_home.to_str().unwrap()),
+        ]);
+        let cfg = Config::load_with_env(&env_set).unwrap();
+        assert_eq!(cfg.agy_home, Some(custom_home));
+
+        // 3. Whitespace-only -> None
+        let env_blank = env_with(&[
+            ("AGENT_RUN_STATE_ROOT", &state_root),
+            ("KUBEADP_AGY_HOME", "   "),
+        ]);
+        let cfg = Config::load_with_env(&env_blank).unwrap();
+        assert_eq!(cfg.agy_home, None);
     }
 }

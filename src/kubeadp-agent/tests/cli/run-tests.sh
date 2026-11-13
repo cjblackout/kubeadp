@@ -61,6 +61,9 @@ unset AGENT_RUN_HINDSIGHT AGENT_RUN_HINDSIGHT_ENABLED AGENT_RUN_HINDSIGHT_AUTO_R
 unset AGENT_RUN_HINDSIGHT_BANK AGENT_RUN_HINDSIGHT_URL AGENT_RUN_HINDSIGHT_API_KEY
 unset AGENT_RUN_HTTP_PROXY AGENT_RUN_HTTPS_PROXY AGENT_RUN_NO_PROXY
 unset AGENT_RUN_MAX_RUNTIME AGENT_RUN_MAX_PARALLEL AGENT_RUN_LAUNCH_TIMEOUT_SECS AGENT_RUN_STALL_MINUTES
+for _kvar in $(compgen -v KUBEADP_ 2>/dev/null || env | grep -o '^KUBEADP_[^=]*'); do
+  unset "$_kvar"
+done
 
 # --- tool dependencies -------------------------------------------------------
 for tool in git curl pkill; do
@@ -93,8 +96,10 @@ else
 fi
 AGENT_RUN="$BIN_DIR/agent-run"
 AGENT_RUN_API="$BIN_DIR/agent-run-api"
+KUBEADP_AGENT="$BIN_DIR/kubeadp-agent"
 [ -x "$AGENT_RUN" ] || die "agent-run binary not found/executable at $AGENT_RUN"
 [ -x "$AGENT_RUN_API" ] || die "agent-run-api binary not found/executable at $AGENT_RUN_API"
+[ -x "$KUBEADP_AGENT" ] || die "kubeadp-agent binary not found/executable at $KUBEADP_AGENT (needed by sandbox-exec launcher)"
 
 # --- temp world ---------------------------------------------------------------
 TMPROOT=$(mktemp -d 2>/dev/null) || die "mktemp -d failed"
@@ -135,6 +140,9 @@ start_server() {
     cd "$WORKSPACE" || exit 1
     exec env -u AGENT_RUN_REMOTE -u GH_TOKEN -u GITHUB_TOKEN \
       HOME="$FAKE_HOME" \
+      KUBEADP_API_ALLOW_UNAUTHENTICATED=true \
+      KUBEADP_API_ALLOW_OPEN=true \
+      KUBEADP_AGY_HOME="$FAKE_HOME" \
       AGENT_RUN_API_LISTEN="127.0.0.1:$PORT" \
       AGENT_RUN_WORKSPACE_ROOT="$WORKSPACE" \
       AGENT_RUN_STATE_ROOT="$STATE_ROOT" \
@@ -2036,16 +2044,18 @@ t_t36() {
   }
   # The engine must have passed the NEW prompt to agy via -p: find the argv
   # line that carries the tag and check the argument after -p.
-  local argv
-  if [ ! -f "$TMPROOT/argv.log" ]; then
+  local argv wt argvf
+  wt="$WORKSPACE/.agent-jobs/proj/$id"
+  argvf="$wt/.fake-argv"
+  if [ ! -f "$argvf" ]; then
     cleanup_job "$id"
-    rec T36 FAIL "fake-agy argv log missing (FAKE_ARGV_LOG not honoured)"
+    rec T36 FAIL "fake-agy argv log missing ($argvf not created)"
     return
   fi
-  argv=$(grep -F "please apply $tag now" "$TMPROOT/argv.log" | tail -n 1)
+  argv=$(grep -F "please apply $tag now" "$argvf" | tail -n 1)
   if [ -z "$argv" ]; then
     cleanup_job "$id"
-    rec T36 FAIL "the follow-up prompt never reached agy (argv log: $(tail -n 3 "$TMPROOT/argv.log"))"
+    rec T36 FAIL "the follow-up prompt never reached agy (argv log: $(tail -n 3 "$argvf"))"
     return
   fi
   # argv layout: ... -p <prompt> --add-dir <wt>: the tag follows -p.
@@ -2575,6 +2585,9 @@ t_t44() {
     cd "$WORKSPACE" || exit 1
     exec env -u AGENT_RUN_REMOTE -u GH_TOKEN -u GITHUB_TOKEN \
       HOME="$FAKE_HOME" \
+      KUBEADP_API_ALLOW_UNAUTHENTICATED=true \
+      KUBEADP_API_ALLOW_OPEN=true \
+      KUBEADP_AGY_HOME="$FAKE_HOME" \
       AGENT_RUN_API_LISTEN="127.0.0.1:$PORT" \
       AGENT_RUN_WORKSPACE_ROOT="$WORKSPACE" \
       AGENT_RUN_STATE_ROOT="$STATE_ROOT" \
@@ -3942,6 +3955,9 @@ EOF
     cd "$WORKSPACE" || exit 1
     exec env -u AGENT_RUN_REMOTE -u GH_TOKEN -u GITHUB_TOKEN \
       HOME="$FAKE_HOME" \
+      KUBEADP_API_ALLOW_UNAUTHENTICATED=true \
+      KUBEADP_API_ALLOW_OPEN=true \
+      KUBEADP_AGY_HOME="$FAKE_HOME" \
       AGENT_RUN_API_LISTEN="127.0.0.1:$PORT" \
       AGENT_RUN_WORKSPACE_ROOT="$WORKSPACE" \
       AGENT_RUN_STATE_ROOT="$STATE_ROOT" \
@@ -3979,7 +3995,7 @@ EOF
     t_t166_fail "fake hindsight was never invoked (argv capture missing)"
     return
   fi
-  printf '%s\n' "-o" "json" "memory" "recall" "proj" "short query" > "$TMPROOT/t162-expected-argv"
+  printf '%s\n' "-o" "json" "memory" "recall" "proj" "--" "short query" > "$TMPROOT/t162-expected-argv"
   if ! cmp -s "$argv_file" "$TMPROOT/t162-expected-argv"; then
     t_t166_fail "recall argv mismatch, got: $(tr '\n' '|' < "$argv_file")"
     return
@@ -4500,7 +4516,7 @@ t_t173() {
   }
   out=$(ar status "$id" 2>&1)
   case "$out" in
-    *"Status: failed"*) ;;
+    *"Status:"*"failed"*) ;;
     *) cleanup_job "$id"; rec T173 FAIL "claude status not failed: $out"; return ;;
   esac
   res=$(ar result "$id" 2>&1)
@@ -5425,10 +5441,7 @@ t_t186() {
 # claude argv carries --verbose (required by the real CLI for
 # `--output-format stream-json` with `-p`).
 t_t182() {
-  local id argvf before res st
-  argvf="$TMPROOT/argv.log"
-  before=$(grep -c "fake-claude.sh" "$argvf" 2>/dev/null || true)
-  before=${before:-0}
+  local id res st wt argvf
 
   start_job "FAKE_SLEEP=1 claude plan mode prompt" --engine claude --plan
   if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
@@ -5448,6 +5461,13 @@ t_t182() {
   esac
 
   local line
+  wt="$WORKSPACE/.agent-jobs/proj/$id"
+  argvf="$wt/.fake-argv"
+  if [ ! -f "$argvf" ]; then
+    cleanup_job "$id"
+    rec T182 FAIL "fake-claude argv log missing ($argvf not created)"
+    return
+  fi
   line=$(grep "fake-claude.sh" "$argvf" | tail -n 1)
   if [ -z "$line" ]; then
     cleanup_job "$id"
@@ -5487,7 +5507,7 @@ t_t182() {
 
   # Normal mode: the plan flag must be ABSENT (auto-approved by
   # --dangerously-skip-permissions), --verbose still present.
-  local id2
+  local id2 wt2 argvf2
   start_job "FAKE_SLEEP=1 claude normal mode prompt" --engine claude
   if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
     cleanup_job "$id"
@@ -5500,7 +5520,14 @@ t_t182() {
     rec T182 FAIL "claude normal job did not reach done (last status: $st)"
     return
   }
-  line=$(grep "fake-claude.sh" "$argvf" | tail -n 1)
+  wt2="$WORKSPACE/.agent-jobs/proj/$id2"
+  argvf2="$wt2/.fake-argv"
+  if [ ! -f "$argvf2" ]; then
+    cleanup_job "$id"; cleanup_job "$id2"
+    rec T182 FAIL "fake-claude argv log missing ($argvf2 not created)"
+    return
+  fi
+  line=$(grep "fake-claude.sh" "$argvf2" | tail -n 1)
   case "$line" in
     *--permission-mode*)
       cleanup_job "$id"; cleanup_job "$id2"

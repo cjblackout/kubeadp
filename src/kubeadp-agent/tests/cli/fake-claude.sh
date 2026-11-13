@@ -62,6 +62,12 @@
 set -u
 
 # --- argv logging for the black-box suite -------------------------------------
+{
+  printf '%s' "$0"
+  for a in "$@"; do printf '\t%s' "$a"; done
+  printf '\n'
+} >>.fake-argv 2>/dev/null || true
+
 if [ -n "${FAKE_ARGV_LOG:-}" ]; then
   {
     printf '%s' "$0"
