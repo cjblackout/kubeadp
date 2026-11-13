@@ -387,6 +387,55 @@ async fn d_no_channel_kills_by_default() {
 }
 
 // ---------------------------------------------------------------------------
+// (d2) an acknowledged message is never dropped by the response size bound
+// ---------------------------------------------------------------------------
+
+/// Draining acknowledges the messages, so the result that carries them must
+/// reach the model whatever its serialized size: a framed text that inflates
+/// under JSON escaping past the tool response bound used to be replaced by
+/// the oversize error AFTER the inbox had marked it injected (lost for good).
+#[tokio::test]
+async fn d2_acknowledged_messages_survive_the_response_size_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = Inbox::new(tmp.path());
+    // 4000 control characters serialize to 24000 bytes of `\u0001`.
+    let inflating = "\u{1}".repeat(4000);
+
+    inbox.enqueue(queued_msg("m1", &inflating)).unwrap();
+    let client = mcp_client(mcp_server_with_inbox(inbox.clone()).await).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("wait_message").with_arguments(
+                serde_json::json!({ "timeout_s": 0 })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("wait_message");
+    let value = result_json(&result);
+    assert_eq!(
+        value["count"], 1,
+        "the drained message is returned: {value}"
+    );
+    assert!(inbox.injected("m1"));
+
+    // The same through the tool_result channel of another tool.
+    inbox.enqueue(queued_msg("m2", &inflating)).unwrap();
+    let result = client
+        .call_tool(CallToolRequestParams::new("list_agents"))
+        .await
+        .expect("list_agents");
+    let value = result_json(&result);
+    assert!(
+        value["a2a_incoming"].as_str().is_some(),
+        "the tool result still carries the acknowledged message"
+    );
+    assert!(inbox.injected("m2"));
+}
+
+// ---------------------------------------------------------------------------
 // (e) exactly once under retries and concurrent senders
 // ---------------------------------------------------------------------------
 

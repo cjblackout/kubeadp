@@ -633,6 +633,24 @@ pub fn part_text(parts: &[Part]) -> String {
         .join("\n")
 }
 
+/// The message text as it is framed and delivered: control characters are
+/// removed (newline and tab are kept), then the text is trimmed.
+///
+/// The framed text reaches a terminal (the session PTY), a process argument
+/// (the resume prompt) and JSON tool results. An escape sequence, a NUL byte
+/// (which no process argument can carry, so every resume of the job would
+/// fail) or a carriage return that rewrites the frame header on a terminal
+/// has no place in agent-to-agent text, and control characters inflate
+/// six-fold under JSON escaping. Removing them here keeps every delivery
+/// channel on the same, harmless text.
+pub fn sanitize_text(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control() || matches!(*c, '\n' | '\t'))
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// Processes an incoming message: validates the WHOLE message text (all parts)
 /// against the size cap BEFORE framing (rejecting, never truncating, messages
 /// that would not fit the session PTY), validates hop, sanitizes sender, and
@@ -641,7 +659,7 @@ pub fn process_ingress(
     parts: &[Part],
     metadata: Option<&HashMap<String, Value>>,
 ) -> Result<IngressMessage, A2AError> {
-    let text = part_text(parts).trim().to_string();
+    let text = sanitize_text(&part_text(parts));
     if text.is_empty() {
         return Err(A2AError::invalid_params("message text must not be empty"));
     }
@@ -706,7 +724,7 @@ pub fn process_ingress_guarded(
     now: u64,
     guard: &HopGuard,
 ) -> Result<(IngressMessage, HopInfo), A2aReject> {
-    let text = part_text(parts).trim().to_string();
+    let text = sanitize_text(&part_text(parts));
     if text.is_empty() {
         return Err(A2aReject::from_msg("message text must not be empty"));
     }
@@ -754,6 +772,23 @@ pub fn process_ingress_guarded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_text_loses_control_characters_but_keeps_newline_and_tab() {
+        let parts = vec![Part::text(
+            "line one\r\n\tline\u{0} two \u{1b}[31mred\u{1b}[0m\u{7f}",
+        )];
+        let msg = process_ingress(&parts, None).expect("accepted");
+        assert!(msg
+            .framed_text
+            .contains("line one\n\tline two [31mred[0m\n"));
+        assert!(!msg.framed_text.contains('\u{1b}'));
+        assert!(!msg.framed_text.contains('\u{0}'));
+        assert!(!msg.framed_text.contains('\r'));
+        // A message of control characters only is empty.
+        let only = vec![Part::text("\u{0}\u{1b}\r")];
+        assert!(process_ingress(&only, None).is_err());
+    }
 
     #[test]
     fn test_sanitize_sender_absent_and_empty() {

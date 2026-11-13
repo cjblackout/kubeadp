@@ -246,6 +246,9 @@ pub async fn run() -> Result<()> {
         // running attempt cleanly, then continues the same conversation through
         // the retry follow-up path.
         let a2a_sink = Arc::new(crate::worker::a2a::JobMessageSink::new(state.clone()));
+        // Messages queued before a restart have no ladder watcher: start one
+        // per run that still holds an uninjected message.
+        a2a_sink.recover_pending();
         // The A2A surface sits behind the SAME operator token as /api/v1
         // (see auth_state above): the verifier hashes the presented bearer
         // credential and compares digests in constant time, exactly like the
@@ -267,7 +270,7 @@ pub async fn run() -> Result<()> {
         // own process under a per-run token, NEVER the operator bearer
         // (a sandboxed agent has no operator token). Mounted after the
         // bearer layer exactly like the A2A routes.
-        let state = crate::core::a2a::http::InboxHttpState::resolve()
+        let state = crate::core::a2a::http::InboxHttpState::resolve(state.state_root.clone())
             .map_err(|e| anyhow::anyhow!("failed to resolve the A2A inbox token key: {e}"))?;
         let a2a_inbox_http = crate::core::a2a::http::inbox_http_router(state);
         app.merge(a2a_routes).merge(a2a_inbox_http)

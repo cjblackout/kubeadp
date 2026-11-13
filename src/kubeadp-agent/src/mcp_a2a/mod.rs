@@ -210,6 +210,28 @@ impl A2aMcpServer {
         }
     }
 
+    /// A tool result with the queued messages appended (the `tool_result`
+    /// injection channel). The size bound applies to the tool's OWN value
+    /// (the untrusted peer response) BEFORE the messages are appended:
+    /// draining acknowledges the messages, so the result that carries them
+    /// must never be replaced by the oversize error afterwards -- that would
+    /// drop messages the inbox already counts as delivered. The appended
+    /// text is bounded on its own by [`MAX_INJECT_BYTES`].
+    fn injected_result(&self, value: serde_json::Value) -> String {
+        let own = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
+        let value = if own.len() <= MAX_RESPONSE_BYTES {
+            value
+        } else {
+            serde_json::json!({
+                "error": format!(
+                    "response exceeds {MAX_RESPONSE_BYTES} bytes; use get_task for more detail"
+                ),
+            })
+        };
+        serde_json::to_string(&self.with_tool_result_injection(value))
+            .unwrap_or_else(|_| "{}".to_string())
+    }
+
     /// The `tool_result` injection channel (design HL-113 §7.14): drains the
     /// queued messages (bounded so the tool result stays under
     /// [`MAX_RESPONSE_BYTES`]) and appends their FULL framed text (not a
@@ -227,6 +249,12 @@ impl A2aMcpServer {
         let messages = inbox.drain_capped(InjectChannel::ToolResult.as_str(), MAX_INJECT_BYTES);
         if messages.is_empty() {
             return value;
+        }
+        // The messages are acknowledged at this point, so they are always
+        // attached: a non-object tool value is wrapped instead of dropping
+        // them.
+        if !value.is_object() {
+            value = serde_json::json!({ "result": value });
         }
         if let Some(obj) = value.as_object_mut() {
             obj.insert(
@@ -270,10 +298,11 @@ impl A2aMcpServer {
         )
     )]
     pub async fn list_agents(&self, _args: Parameters<ListAgentsArgs>) -> CallToolResult {
-        let value = self.with_tool_result_injection(serde_json::json!({
-            "agents": self.ctx.list_agents()
-        }));
-        CallToolResult::success(vec![ContentBlock::text(self.bounded(&value))])
+        CallToolResult::success(vec![ContentBlock::text(self.injected_result(
+            serde_json::json!({
+                "agents": self.ctx.list_agents()
+            }),
+        ))])
     }
 
     #[tool(
@@ -294,7 +323,7 @@ impl A2aMcpServer {
         match tokio::time::timeout(CALL_TIMEOUT, fut).await {
             Ok(Ok(value)) => {
                 CallToolResult::success(vec![ContentBlock::text(
-                    self.bounded(&self.with_tool_result_injection(value)),
+                    self.injected_result(value),
                 )])
             }
             Ok(Err(e)) => CallToolResult::structured_error(self.with_tool_result_injection(
@@ -330,9 +359,9 @@ impl A2aMcpServer {
             .ctx
             .send_message(&p.to, &p.text, p.context_id, p.task_id, p.incoming_hop);
         match tokio::time::timeout(CALL_TIMEOUT, fut).await {
-            Ok(Ok(value)) => CallToolResult::success(vec![ContentBlock::text(
-                self.bounded(&self.with_tool_result_injection(value)),
-            )]),
+            Ok(Ok(value)) => {
+                CallToolResult::success(vec![ContentBlock::text(self.injected_result(value))])
+            }
             Ok(Err(e)) => CallToolResult::structured_error(self.with_tool_result_injection(
                 serde_json::json!({
                     "code": "a2a_reply_failed",
@@ -368,9 +397,9 @@ impl A2aMcpServer {
         let p = args.0;
         let fut = self.ctx.get_task(&p.agent, &p.task_id);
         match tokio::time::timeout(CALL_TIMEOUT, fut).await {
-            Ok(Ok(value)) => CallToolResult::success(vec![ContentBlock::text(
-                self.bounded(&self.with_tool_result_injection(value)),
-            )]),
+            Ok(Ok(value)) => {
+                CallToolResult::success(vec![ContentBlock::text(self.injected_result(value))])
+            }
             Ok(Err(e)) => CallToolResult::structured_error(self.with_tool_result_injection(
                 serde_json::json!({
                     "code": "a2a_gettask_failed",
@@ -422,13 +451,16 @@ impl A2aMcpServer {
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            tokio::time::sleep(WAIT_POLL).await;
+            tokio::time::sleep(inbox.poll_interval(WAIT_POLL)).await;
         }
         // Draining IS the acknowledgement: the messages are marked injected
         // (exactly once by message id) and are never returned again.
         let messages = inbox.drain_capped(InjectChannel::ToolResult.as_str(), MAX_INJECT_BYTES);
+        // Not passed through `bounded`: the messages were acknowledged by the
+        // drain above and are bounded by MAX_INJECT_BYTES; replacing the
+        // result with the oversize error would lose them.
         CallToolResult::success(vec![ContentBlock::text(
-            self.bounded(&Self::wait_result(&messages)),
+            Self::wait_result(&messages).to_string(),
         )])
     }
 }

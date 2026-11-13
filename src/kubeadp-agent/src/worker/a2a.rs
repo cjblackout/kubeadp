@@ -47,8 +47,6 @@ use a2a::A2AError as SdkA2AError;
 
 /// Bound on the sink's global idempotency cache of delivered message ids.
 const SEEN_CACHE_CAP: usize = 4096;
-/// How often the escalation-ladder watcher re-evaluates a job's inbox.
-const LADDER_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 /// TaskBackend implementation that operates on agent-core's SQLite job store and worktrees.
 pub struct JobTaskBackend {
     config: Arc<Config>,
@@ -254,9 +252,8 @@ pub struct JobMessageSink {
     config: Arc<Config>,
     slots: Mutex<HashMap<String, Arc<JobSlot>>>,
     seen: Mutex<VecDeque<String>>,
-    /// The ladder watchers (one per job; a finished one's guard drops to
-    /// count 1, so a later delivery spawns a fresh watcher).
-    ladders: Mutex<HashMap<String, Arc<()>>>,
+    /// The ladder watchers (one per job).
+    ladders: crate::core::a2a::delivery::LadderWatchers,
 }
 
 impl JobMessageSink {
@@ -265,7 +262,20 @@ impl JobMessageSink {
             config,
             slots: Mutex::new(HashMap::new()),
             seen: Mutex::new(VecDeque::new()),
-            ladders: Mutex::new(HashMap::new()),
+            ladders: crate::core::a2a::delivery::LadderWatchers::new(),
+        }
+    }
+
+    /// Restart recovery: the ladder watchers are in-memory threads, so the
+    /// messages that were queued when the previous process ended have no
+    /// watcher. Starts one for every run that still holds an uninjected
+    /// message (it escalates or expires them exactly like a fresh delivery)
+    /// and prunes the acknowledged rows past their retention. Called once
+    /// when the worker builds the sink.
+    pub fn recover_pending(&self) {
+        crate::core::a2a::inbox::sweep_retention(&self.config.state_root);
+        for run in crate::core::a2a::inbox::runs_with_uninjected(&self.config.state_root) {
+            self.ensure_ladder(&run);
         }
     }
 
@@ -278,26 +288,44 @@ impl JobMessageSink {
             .clone()
     }
 
-    /// True when this message id has already been delivered (idempotency).
-    /// On `true` it is not re-added.
-    fn mark_seen(&self, message_id: &str) -> bool {
+    /// The idempotency key of a delivery: the message id SCOPED to the
+    /// addressed job. An id seen for one job must not suppress the same id
+    /// addressed to another job.
+    fn seen_key(task_id: &str, message_id: &str) -> String {
+        format!("{task_id}\u{0}{message_id}")
+    }
+
+    /// True when this (job, message id) was already ACCEPTED (idempotency).
+    fn is_seen(&self, task_id: &str, message_id: &str) -> bool {
+        let key = Self::seen_key(task_id, message_id);
+        let seen = self.seen.lock().expect("seen lock poisoned");
+        seen.iter().any(|id| *id == key)
+    }
+
+    /// Records an accepted (job, message id). Called only AFTER the message
+    /// was stored: a delivery that was rejected (unknown or killed job, a
+    /// failed enqueue) must stay retryable under the same message id instead
+    /// of turning the sender's retry into a silent no-op success.
+    fn mark_seen(&self, task_id: &str, message_id: &str) {
+        let key = Self::seen_key(task_id, message_id);
         let mut seen = self.seen.lock().expect("seen lock poisoned");
-        if seen.iter().any(|id| id == message_id) {
-            return true;
+        if seen.iter().any(|id| *id == key) {
+            return;
         }
-        seen.push_back(message_id.to_string());
+        seen.push_back(key);
         while seen.len() > SEEN_CACHE_CAP {
             seen.pop_front();
         }
-        false
     }
 
-    /// The run's inbox for a job (the ladder's queue and dedupe store).
+    /// The run's inbox for a job (the ladder's queue and dedupe store). The
+    /// configured TTL is the one the enqueue-time prune applies, so it can
+    /// never disagree with the TTL the ladder expires messages at.
     fn inbox(&self, task_id: &str) -> Inbox {
-        Inbox::new(crate::core::a2a::inbox::inbox_dir_for(
-            &self.config.state_root,
-            task_id,
-        ))
+        Inbox::with_ttl(
+            crate::core::a2a::inbox::inbox_dir_for(&self.config.state_root, task_id),
+            self.config.a2a_inbox_ttl_secs,
+        )
     }
 
     /// Enqueues `text` into the job's durable inbox (a fresh delivery
@@ -331,37 +359,20 @@ impl JobMessageSink {
     }
 
     /// Ensures the ladder watcher is running for the job (it exits when the
-    /// inbox drains or the message expires).
+    /// run has no uninjected message left). The watcher drives the SAME
+    /// `ladder_pass` entry point as the manual/escalation path under the
+    /// job's gate, so every in-process escalation of one job is serialized
+    /// and there is exactly one code path through the ladder.
     fn ensure_ladder(&self, task_id: &str) {
-        let mut ladders = self.ladders.lock().expect("ladders lock poisoned");
-        ladders.retain(|_, guard| Arc::strong_count(guard) > 1);
-        if ladders.contains_key(task_id) {
-            return;
-        }
-        let guard = Arc::new(());
-        ladders.insert(task_id.to_string(), Arc::clone(&guard));
-        drop(ladders);
         let config = Arc::clone(&self.config);
         let job_id = task_id.to_string();
-        // The job's gate rides into the watcher thread: every in-process
-        // escalation of this job (watcher or manual) is serialized by it, so
-        // concurrent ladder passes can never both claim an attempt for the
-        // same message. The watcher drives the SAME `ladder_pass` entry point
-        // as the manual/escalation path (both take the pre-resolved job slot),
-        // so there is exactly one code path through the ladder.
         let slot = self.slot(task_id);
-        let _ = std::thread::Builder::new()
-            .name(format!("a2a-ladder-{job_id}"))
-            .spawn(move || {
-                loop {
-                    let step = Self::ladder_pass(&config, &slot, &job_id, false);
-                    match step {
-                        LadderStep::Injected | LadderStep::Expired { .. } => break,
-                        _ => std::thread::sleep(LADDER_POLL),
-                    }
-                }
-                drop(guard);
-            });
+        let idle_dir = crate::core::a2a::inbox::inbox_dir_for(&self.config.state_root, task_id);
+        self.ladders.ensure(
+            task_id,
+            move || Self::ladder_pass(&config, &slot, &job_id, false),
+            move || Inbox::new(&idle_dir).uninjected_count() == 0,
+        );
     }
 
     /// The ladder configuration for this worker.
@@ -454,16 +465,43 @@ impl JobMessageSink {
     fn ladder_pass_impl(config: &Config, job_id: &str, interrupt: bool) -> LadderStep {
         let ladder_cfg = Self::ladder_config(config);
         let inbox_dir = crate::core::a2a::inbox::inbox_dir_for(&config.state_root, job_id);
-        // An already-expired message is never delivered (the marker decides).
-        if let Some(record) = crate::core::a2a::delivery::read_expiry(&inbox_dir) {
-            return LadderStep::Expired {
-                reason: record.reason,
-            };
-        }
+        // The inbox is read WITHOUT its own TTL filter: the ladder applies
+        // the TTL itself so the expiry is recorded when a message lapses.
         let inbox = Inbox::with_ttl(&inbox_dir, u64::MAX);
         let pending = inbox.pending();
         if pending.is_empty() {
-            return LadderStep::Injected;
+            if inbox.uninjected_count() > 0 {
+                // A channel holds the rest under a claim lease: it either
+                // acknowledges them or the lease lapses and they come back.
+                return LadderStep::Queued;
+            }
+            // Nothing left to deliver: the run's last expiry (if any) is the
+            // terminal state the sender sees, else everything was injected.
+            return match crate::core::a2a::delivery::read_expiry(&inbox_dir) {
+                Some(record) => LadderStep::Expired {
+                    reason: record.reason,
+                },
+                None => LadderStep::Injected,
+            };
+        }
+        // A message must never wake a job the operator killed (the ingress
+        // refuses it up front, but the job can be killed while its message
+        // is still queued), and a job that no longer exists cannot receive
+        // it: fail the sender's task instead of resuming or waiting.
+        let undeliverable = match JobMetadata::resolve(&config.state_root, job_id) {
+            Ok(meta) if meta.status == Some(JobStatus::Killed) => Some(format!(
+                "A2A message not delivered: job '{job_id}' was killed by the operator"
+            )),
+            Ok(_) => None,
+            Err(_) => Some(format!(
+                "A2A message not delivered: job '{job_id}' no longer exists"
+            )),
+        };
+        if let Some(reason) = undeliverable {
+            for msg in &pending {
+                inbox.expire(&msg.message_id, &reason);
+            }
+            return LadderStep::Expired { reason };
         }
         let step =
             crate::core::a2a::delivery::next_step(&crate::core::a2a::delivery::LadderInput {
@@ -476,11 +514,10 @@ impl JobMessageSink {
             });
         match step {
             LadderStep::Expired { reason } => {
-                crate::core::a2a::delivery::record_expiry(
-                    &inbox_dir,
-                    &pending[0].message_id,
-                    &reason,
-                );
+                // Record the expiry AND remove the row: an expired message
+                // must not be served by a hook later, nor block the younger
+                // messages behind it (the watcher keeps going for those).
+                inbox.expire(&pending[0].message_id, &reason);
                 LadderStep::Expired { reason }
             }
             LadderStep::IdleTurn => {
@@ -656,7 +693,7 @@ impl MessageSink for JobMessageSink {
     ) -> Result<(), SdkA2AError> {
         // Idempotency: a repeated A2A message id is a no-op success; the
         // durable inbox is the dedupe store.
-        if self.mark_seen(message_id) {
+        if self.is_seen(task_id, message_id) {
             return Ok(());
         }
 
@@ -680,12 +717,21 @@ impl MessageSink for JobMessageSink {
         // storm limit applies before the enqueue, then escalate immediately.
         if meta.interrupt {
             self.enqueue(task_id, sender, text, message_id, meta)?;
-            return self.escalate_interrupt(task_id);
+            self.mark_seen(task_id, message_id);
+            let result = self.escalate_interrupt(task_id);
+            if result.is_err() {
+                // The interrupt did not apply (storm limit, failed resume)
+                // but the message IS queued: it must not sit unwatched, so
+                // the ladder delivers it at the next boundary / idle turn.
+                self.ensure_ladder(task_id);
+            }
+            return result;
         }
 
         // The default path: enqueue into the durable inbox -- the hooks
         // inject at the next boundary and the ladder escalates.
         self.enqueue(task_id, sender, text, message_id, meta)?;
+        self.mark_seen(task_id, message_id);
         self.ensure_ladder(task_id);
         Ok(())
     }
@@ -1501,6 +1547,120 @@ mod tests {
             JobMessageSink::ladder_pass(&sink.config, &slot, "expire", false),
             LadderStep::Expired { .. }
         ));
+    }
+
+    #[test]
+    fn rejected_delivery_stays_retryable_under_the_same_message_id() {
+        let temp = TempDir::new().unwrap();
+        let (config, worktree) = save_resumable_done_job(&temp, "retry", 0);
+        write_fake_agy(&config.agy_path, &worktree);
+        let sink = JobMessageSink::new(Arc::new(config));
+        let plain = DeliveryMeta::default();
+        // The first attempt addresses a job that does not exist: rejected,
+        // nothing stored.
+        assert!(sink
+            .deliver_with_meta("ghost", "sender", "hello", "m1", plain)
+            .is_err());
+        // The rejected attempt must not be remembered as delivered, and the
+        // idempotency key is scoped to the addressed job: the same message id
+        // for a real job is stored, not answered as a silent no-op.
+        sink.deliver_with_meta("retry", "sender", "hello", "m1", plain)
+            .unwrap();
+        assert_eq!(sink.inbox("retry").pending().len(), 1);
+    }
+
+    #[test]
+    fn ladder_never_wakes_a_job_killed_after_the_enqueue() {
+        let temp = TempDir::new().unwrap();
+        // The default ack window (45 s) keeps the background watcher from
+        // resuming the job before the kill below is recorded.
+        let (config, worktree) = save_resumable_done_job(&temp, "latekill", 0);
+        write_fake_agy(&config.agy_path, &worktree);
+        let state_root = config.state_root.clone();
+        let sink = JobMessageSink::new(Arc::new(config));
+        sink.deliver_with_meta("latekill", "sender", "hello", "m1", DeliveryMeta::default())
+            .unwrap();
+        // The operator kills the job while the message is still queued.
+        let mut meta = JobMetadata::load(&state_root, "latekill").unwrap();
+        meta.status = Some(JobStatus::Killed);
+        meta.save(&state_root).unwrap();
+        age_pending_message(&sink.inbox("latekill"), 100);
+
+        let slot = JobSlot::new();
+        assert!(matches!(
+            JobMessageSink::ladder_pass(&sink.config, &slot, "latekill", false),
+            LadderStep::Expired { .. }
+        ));
+        let after = JobMetadata::load(&state_root, "latekill").unwrap();
+        assert_eq!(after.retry_count, 0, "a killed job must not be resumed");
+        assert_eq!(sink.inbox("latekill").uninjected_count(), 0);
+        let inbox_dir = crate::core::a2a::inbox::inbox_dir_for(&state_root, "latekill");
+        assert!(crate::core::a2a::delivery::read_expiry(&inbox_dir).is_some());
+    }
+
+    #[test]
+    fn an_expired_message_is_removed_and_does_not_block_the_next_one() {
+        let temp = TempDir::new().unwrap();
+        let (config, worktree) = save_resumable_done_job(&temp, "unblock", 0);
+        let config = Config {
+            a2a_ack_secs: 1,
+            a2a_inbox_ttl_secs: 10,
+            ..config
+        };
+        write_fake_agy(&config.agy_path, &worktree);
+        let sink = JobMessageSink::new(Arc::new(config.clone()));
+        // A BUSY job: nothing is delivered, the message runs into the TTL.
+        save_running_job(&config, "unblock", &worktree);
+        let plain = DeliveryMeta::default();
+        sink.deliver_with_meta("unblock", "sender", "first", "m1", plain)
+            .unwrap();
+        age_pending_message(&sink.inbox("unblock"), 20);
+        let slot = JobSlot::new();
+        assert!(matches!(
+            JobMessageSink::ladder_pass(&sink.config, &slot, "unblock", false),
+            LadderStep::Expired { .. }
+        ));
+        // The expired row is gone: no hook / wait_message can still serve a
+        // message whose sender was told it failed.
+        assert_eq!(sink.inbox("unblock").uninjected_count(), 0);
+
+        // A fresh message is handled on its own age, not expired behind m1.
+        sink.deliver_with_meta("unblock", "sender", "second", "m2", plain)
+            .unwrap();
+        assert_eq!(
+            JobMessageSink::ladder_pass(&sink.config, &slot, "unblock", false),
+            LadderStep::Queued
+        );
+        assert_eq!(sink.inbox("unblock").pending().len(), 1);
+    }
+
+    #[test]
+    fn recover_pending_starts_a_watcher_for_messages_queued_before_a_restart() {
+        let temp = TempDir::new().unwrap();
+        let (config, worktree) = save_resumable_done_job(&temp, "recover", 0);
+        write_fake_agy(&config.agy_path, &worktree);
+        save_running_job(&config, "recover", &worktree);
+        // A message left in the durable inbox by the previous process.
+        let dir = crate::core::a2a::inbox::inbox_dir_for(&config.state_root, "recover");
+        Inbox::new(&dir)
+            .enqueue(QueuedMessage {
+                message_id: "m1".to_string(),
+                sender: "sender".to_string(),
+                hop: 0,
+                context_id: None,
+                task_id: None,
+                framed: "left over".to_string(),
+                queued_at: crate::core::a2a::inbox::now_unix(),
+            })
+            .unwrap();
+
+        let sink = JobMessageSink::new(Arc::new(config));
+        assert!(!sink.ladders.is_active("recover"));
+        sink.recover_pending();
+        assert!(
+            sink.ladders.is_active("recover"),
+            "a queued message must get a ladder watcher after a restart"
+        );
     }
 
     // ---- Live stdin delivery ---------------------------------------------

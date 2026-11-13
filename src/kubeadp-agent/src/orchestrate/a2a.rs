@@ -25,10 +25,9 @@
 //! `interrupt: true` or past `a2a_force_secs`. Default: never kill (nothing
 //! is killed on the session path; a PTY write queues the input).
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::core::a2a::delivery::{sender_task_state, LadderConfig, LadderStep, SenderTaskState};
 use crate::core::a2a::inbox::{Inbox, QueuedMessage};
@@ -45,9 +44,6 @@ use axum::Router;
 
 use crate::orchestrate::session_control::{set_paused, SessionControlRegistry};
 use crate::orchestrate::state::{SessionState, SessionStatus, SupervisorState};
-
-/// How often the escalation-ladder watcher re-evaluates a session's inbox.
-const LADDER_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Backend implementing [`TaskBackend`] over supervisor sessions.
 pub struct SupervisorTaskBackend {
@@ -226,7 +222,7 @@ struct SessionMessageSink {
     /// The escalation-ladder configuration.
     ladder: LadderConfig,
     /// The escalation-ladder watchers (one per session).
-    ladders: Mutex<HashMap<String, Arc<()>>>,
+    ladders: crate::core::a2a::delivery::LadderWatchers,
 }
 
 impl SessionMessageSink {
@@ -239,7 +235,19 @@ impl SessionMessageSink {
             state,
             inbox_root,
             ladder,
-            ladders: Mutex::new(HashMap::new()),
+            ladders: crate::core::a2a::delivery::LadderWatchers::new(),
+        }
+    }
+
+    /// Restart recovery: the ladder watchers are in-memory threads, so the
+    /// messages that were queued when the previous process ended have no
+    /// watcher. Starts one for every run that still holds an uninjected
+    /// message and prunes the acknowledged rows past their retention.
+    /// Called once when the router is built.
+    fn recover_pending(&self) {
+        crate::core::a2a::inbox::sweep_retention(&self.inbox_root);
+        for run in crate::core::a2a::inbox::runs_with_uninjected(&self.inbox_root) {
+            self.ensure_ladder(&run);
         }
     }
 
@@ -260,18 +268,24 @@ impl SessionMessageSink {
         interrupt: bool,
     ) -> LadderStep {
         let inbox_dir = crate::core::a2a::inbox::inbox_dir_for(inbox_root, session);
-        // An already-expired message is never delivered (the marker decides).
-        if let Some(record) = crate::core::a2a::delivery::read_expiry(&inbox_dir) {
-            return LadderStep::Expired {
-                reason: record.reason,
-            };
-        }
         // The inbox is read WITHOUT its own TTL filter: the ladder applies
-        // the TTL itself so the expiry marker is recorded first.
+        // the TTL itself so the expiry is recorded when a message lapses.
         let inbox = Inbox::with_ttl(&inbox_dir, u64::MAX);
         let pending = inbox.pending();
         if pending.is_empty() {
-            return LadderStep::Injected;
+            if inbox.uninjected_count() > 0 {
+                // A channel holds the rest under a claim lease: it either
+                // acknowledges them or the lease lapses and they come back.
+                return LadderStep::Queued;
+            }
+            // Nothing left to deliver: the session's last expiry (if any) is
+            // the terminal state the sender sees, else all was injected.
+            return match crate::core::a2a::delivery::read_expiry(&inbox_dir) {
+                Some(record) => LadderStep::Expired {
+                    reason: record.reason,
+                },
+                None => LadderStep::Injected,
+            };
         }
         let running = {
             let st = state
@@ -293,62 +307,64 @@ impl SessionMessageSink {
             });
         match step {
             LadderStep::Expired { reason } => {
-                crate::core::a2a::delivery::record_expiry(
-                    &inbox_dir,
-                    &pending[0].message_id,
-                    &reason,
-                );
+                // Record the expiry AND remove the row: an expired message
+                // must not be served by a hook later, nor block the younger
+                // messages behind it (the watcher keeps going for those).
+                inbox.expire(&pending[0].message_id, &reason);
                 LadderStep::Expired { reason }
             }
             LadderStep::IdleTurn | LadderStep::Interrupt => {
                 // The queued PTY input (design §7.14: "queued PTY input or
                 // the Stop hook"). A bracketed paste queues the message as
-                // the next user input; nothing is killed. NotRunning / a
-                // throttled budget keeps the message queued.
-                let joined = join_framed(&pending);
+                // the next user input; nothing is killed.
+                //
+                // The messages are CLAIMED atomically first and exactly the
+                // claimed ones are written and acknowledged: a message that
+                // arrives during the write is not marked injected without
+                // ever being written, and a message a hook claimed in the
+                // meantime is not written a second time. NotRunning / a
+                // throttled budget hands the claim back (still queued).
+                let claimed = inbox.claim_for_resume();
+                if claimed.is_empty() {
+                    return LadderStep::Queued;
+                }
+                let joined = join_framed(&claimed);
                 let channel = match step {
                     LadderStep::Interrupt => InjectChannel::Interrupt,
                     _ => InjectChannel::IdleTurn,
                 };
                 if let sessions_api::DeliverOutcome::Accepted { .. } =
-                    sessions_api::deliver_message(state, session, &pending[0].sender, &joined)
+                    sessions_api::deliver_message(state, session, &claimed[0].sender, &joined)
                 {
-                    inbox.drain(channel.as_str());
+                    for msg in &claimed {
+                        inbox.mark_injected(&msg.message_id, channel.as_str());
+                    }
+                    step
+                } else {
+                    for msg in &claimed {
+                        inbox.release_claim(&msg.message_id);
+                    }
+                    LadderStep::Queued
                 }
-                step
             }
             other => other,
         }
     }
 
     /// Ensures the ladder watcher is running for the session (one per
-    /// session; the watcher exits when the inbox drains or expires).
+    /// session; the watcher exits when the session has no uninjected message
+    /// left).
     fn ensure_ladder(&self, session: &str) {
-        let mut ladders = self.ladders.lock().expect("ladders lock poisoned");
-        ladders.retain(|_, guard| Arc::strong_count(guard) > 1);
-        if ladders.contains_key(session) {
-            return;
-        }
-        let guard = Arc::new(());
-        ladders.insert(session.to_string(), Arc::clone(&guard));
-        drop(ladders);
         let state = Arc::clone(&self.state);
         let inbox_root = self.inbox_root.clone();
         let ladder = self.ladder;
         let name = session.to_string();
-        let _ = std::thread::Builder::new()
-            .name(format!("a2a-ladder-{name}"))
-            .spawn(move || {
-                loop {
-                    let step =
-                        Self::ladder_pass(state.as_ref(), &inbox_root, &ladder, &name, false);
-                    match step {
-                        LadderStep::Injected | LadderStep::Expired { .. } => break,
-                        _ => std::thread::sleep(LADDER_POLL),
-                    }
-                }
-                drop(guard);
-            });
+        let idle_dir = self.inbox_dir(session);
+        self.ladders.ensure(
+            session,
+            move || Self::ladder_pass(state.as_ref(), &inbox_root, &ladder, &name, false),
+            move || Inbox::new(&idle_dir).uninjected_count() == 0,
+        );
     }
 }
 
@@ -395,7 +411,9 @@ impl crate::core::a2a::MessageSink for SessionMessageSink {
         // supersedes an expiry recorded for an earlier message.
         let inbox_dir = self.inbox_dir(task_id);
         crate::core::a2a::delivery::clear_expiry(&inbox_dir);
-        Inbox::new(&inbox_dir)
+        // The configured TTL is the one the enqueue-time prune applies, so it
+        // can never disagree with the TTL the ladder expires messages at.
+        Inbox::with_ttl(&inbox_dir, self.ladder.ttl_secs)
             .enqueue(QueuedMessage {
                 message_id: message_id.to_string(),
                 sender: sender.to_string(),
@@ -412,13 +430,22 @@ impl crate::core::a2a::MessageSink for SessionMessageSink {
                 ))
             })?;
 
-        // The explicit escalation (interrupt: true): the PTY input now.
+        // The explicit escalation (interrupt: true): the PTY input now,
+        // through the same atomic claim as the ladder. A message is marked
+        // injected only when the PTY write was accepted; otherwise (session
+        // not running, budget throttled) it stays queued and the watcher
+        // below delivers it.
         if meta.interrupt {
-            let inbox = Inbox::with_ttl(&inbox_dir, u64::MAX);
-            let joined = join_framed(&inbox.pending());
-            let _ = sessions_api::deliver_message(&self.state, task_id, sender, &joined);
-            inbox.drain(InjectChannel::Interrupt.as_str());
-            return Ok(());
+            let _ = Self::ladder_pass(
+                self.state.as_ref(),
+                &self.inbox_root,
+                &self.ladder,
+                task_id,
+                true,
+            );
+            if Inbox::new(&inbox_dir).uninjected_count() == 0 {
+                return Ok(());
+            }
         }
 
         self.ensure_ladder(task_id);
@@ -460,6 +487,9 @@ pub fn a2a_router(
         a2a_inbox_root.clone(),
         ladder,
     ));
+    // Messages queued before a restart have no ladder watcher: start one per
+    // session that still holds an uninjected message.
+    sink.recover_pending();
     let backend = Arc::new(SupervisorTaskBackend::new(state, controls, a2a_inbox_root));
     crate::core::a2a::a2a_router_with_jobset(model, backend, Some(sink), auth, jobset)
 }
@@ -985,5 +1015,49 @@ mod tests {
         assert_eq!(hook, 0, "the hook reader runs clean");
         assert!(inbox.injected("msg-1"), "the hook acknowledged the message");
         assert!(inbox.pending().is_empty(), "nothing stays queued");
+    }
+
+    /// An `interrupt: true` message whose PTY write is not accepted (here:
+    /// the session has no live PTY) must stay queued and watched. It used to
+    /// be marked injected regardless of the write result, i.e. lost while the
+    /// sender was told it was delivered.
+    #[test]
+    fn interrupt_delivery_that_cannot_be_written_stays_queued() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state-root");
+        let session = "homelab";
+        let mut state = SupervisorState::new(100);
+        let mut s = SessionState::new(session.to_string());
+        s.status = SessionStatus::Running;
+        state.sessions.insert(session.to_string(), s);
+        let api_state = sessions_api::SessionsApiState::new(
+            Arc::new(std::sync::Mutex::new(state)),
+            SessionControlRegistry::new(),
+            Arc::new(crate::orchestrate::session_log::SessionLogs::from_env()),
+        );
+        let sink = SessionMessageSink::new(api_state, root.clone(), Default::default());
+        crate::core::a2a::MessageSink::deliver_with_meta(
+            &sink,
+            session,
+            "peer-agent",
+            "urgent",
+            "msg-1",
+            DeliveryMeta {
+                hop: 0,
+                interrupt: true,
+            },
+        )
+        .expect("the message is accepted into the inbox");
+
+        let inbox = Inbox::new(crate::core::a2a::inbox::inbox_dir_for(&root, session));
+        assert!(
+            !inbox.injected("msg-1"),
+            "an unwritten message must not be acknowledged"
+        );
+        assert_eq!(inbox.pending().len(), 1, "the claim was handed back");
+        assert!(
+            sink.ladders.is_active(session),
+            "the queued message keeps a ladder watcher"
+        );
     }
 }

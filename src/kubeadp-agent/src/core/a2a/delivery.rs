@@ -243,6 +243,72 @@ pub fn clear_expiry(inbox_dir: &Path) {
     Inbox::new(inbox_dir).clear_expired();
 }
 
+/// The poll interval of a ladder watcher between two non-terminal passes.
+pub const LADDER_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The ladder watcher threads of one delivery sink: at most one per run.
+///
+/// A watcher repeats the sink's ladder pass until the run has nothing left
+/// to deliver. The exit is decided UNDER the registry lock together with a
+/// fresh look at the inbox, which closes the lost-wakeup window of a plain
+/// "is a watcher alive?" check: a message enqueued while the watcher is
+/// about to exit either is seen by that final look (the watcher keeps
+/// running) or finds the watcher already unregistered (a new one starts).
+/// Callers enqueue first and call [`LadderWatchers::ensure`] afterwards.
+#[derive(Default)]
+pub struct LadderWatchers {
+    active: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl LadderWatchers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a watcher is registered for `run` (tests).
+    pub fn is_active(&self, run: &str) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(run)
+    }
+
+    /// Ensures a watcher runs for `run`. `pass` is one ladder pass; `idle`
+    /// reports whether the run has no uninjected message left (leased ones
+    /// count as not idle: their lease may lapse). The watcher exits only when
+    /// a pass returned a terminal step AND `idle` holds.
+    pub fn ensure(
+        &self,
+        run: &str,
+        mut pass: impl FnMut() -> LadderStep + Send + 'static,
+        idle: impl Fn() -> bool + Send + 'static,
+    ) {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if !active.insert(run.to_string()) {
+            return;
+        }
+        let registry = std::sync::Arc::clone(&self.active);
+        let name = run.to_string();
+        let spawned = std::thread::Builder::new()
+            .name(format!("a2a-ladder-{name}"))
+            .spawn(move || loop {
+                let step = pass();
+                if matches!(step, LadderStep::Injected | LadderStep::Expired { .. }) {
+                    let mut active = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    if idle() {
+                        active.remove(&name);
+                        return;
+                    }
+                }
+                std::thread::sleep(LADDER_POLL);
+            });
+        if spawned.is_err() {
+            // No thread: unregister so a later delivery can try again.
+            active.remove(run);
+        }
+    }
+}
+
 /// Whether the message metadata requests the explicit `interrupt` escalation
 /// (trusted request metadata; only exact truthy spellings count).
 pub fn interrupt_requested(metadata: Option<&HashMap<String, Value>>) -> bool {

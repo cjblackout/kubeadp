@@ -203,8 +203,10 @@ pub fn build_router(
     // exactly like the A2A routes.
     #[cfg(feature = "a2a")]
     let app = {
-        let state = crate::core::a2a::http::InboxHttpState::resolve()
-            .map_err(|e| anyhow::anyhow!("failed to resolve the A2A inbox token key: {e}"))?;
+        let state = crate::core::a2a::http::InboxHttpState::resolve(
+            crate::core::a2a::inbox::inbox_state_root(),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to resolve the A2A inbox token key: {e}"))?;
         app.merge(crate::core::a2a::http::inbox_http_router(state))
     };
 

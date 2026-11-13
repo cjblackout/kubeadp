@@ -19,6 +19,12 @@
 //! Without a configured root key the endpoints stay closed (the sandbox gets
 //! no token and cannot read its own inbox).
 //!
+//! The request's `inbox` value is used ONLY to name the run (its last path
+//! segment, sanitized). The store is always this host's own state root: the
+//! path a client sends never decides which database is opened, so an
+//! authenticated run cannot make the host create or open a database (or
+//! directories) at a location of its choosing.
+//!
 //! # Two-phase receive protocol
 //!
 //! Injection is the acknowledgement, so the sandboxed side reaches its inbox
@@ -55,7 +61,7 @@
 //!   Idempotently acknowledges one message. No-op when already injected (or
 //!   unknown).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -64,7 +70,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use super::inbox::{run_id_from_dir, Inbox};
+use super::inbox::{inbox_dir_for, run_id_from_dir, Inbox};
 use crate::core::jobset::resolve_root_key;
 
 /// The derivation label for the per-run inbox token (distinct from the
@@ -78,27 +84,42 @@ const INBOX_TOKEN_SEP: u8 = 0x00;
 pub const HTTP_CLAIM_CHANNEL: &str = "http";
 
 /// State shared by every inbox HTTP route: the resolved root key bytes (or
-/// `None` when no root key is configured, i.e. the endpoints stay closed).
+/// `None` when no root key is configured, i.e. the endpoints stay closed)
+/// and the host's own state root (the ONLY place a request's inbox is
+/// resolved against).
 #[derive(Clone)]
 pub struct InboxHttpState {
     root_key: Option<Arc<[u8]>>,
+    state_root: PathBuf,
 }
 
 impl InboxHttpState {
     /// Resolves the jobset root key once for the whole server. A configured
     /// but unusable key is a startup error naming only the path.
-    pub fn resolve() -> Result<Self, String> {
+    ///
+    /// `state_root` is the state root the host's delivery sink writes (the
+    /// worker's `Config::state_root`, the orchestrator's
+    /// [`crate::core::a2a::inbox::inbox_state_root`]).
+    pub fn resolve(state_root: PathBuf) -> Result<Self, String> {
         Ok(Self {
             root_key: resolve_root_key()?.map(|key| Arc::from(key.as_bytes())),
+            state_root,
         })
     }
 
-    /// Test constructor with explicit key bytes.
+    /// Test constructor with explicit key bytes and state root.
     #[cfg(test)]
-    pub fn with_key(key: Vec<u8>) -> Self {
+    pub fn with_key(key: Vec<u8>, state_root: &Path) -> Self {
         Self {
             root_key: Some(Arc::from(key)),
+            state_root: state_root.to_path_buf(),
         }
+    }
+
+    /// The host-side inbox of `run_id`: always under this host's own state
+    /// root, whatever path the client named.
+    fn inbox_for(&self, run_id: &str) -> Inbox {
+        Inbox::new(inbox_dir_for(&self.state_root, run_id))
     }
 
     fn token_for(&self, run_id: &str) -> Option<String> {
@@ -125,7 +146,8 @@ pub fn run_id_of(inbox_dir: &Path) -> String {
 /// The bearer token a sandboxed run must present for `inbox_dir`. `None`
 /// when the root key is not configured (the run has no inbox access).
 pub fn token_for_run(inbox_dir: &Path) -> Option<String> {
-    let state = InboxHttpState::resolve().ok()?;
+    // Only the key matters for the token; the state root is unused here.
+    let state = InboxHttpState::resolve(PathBuf::new()).ok()?;
     state.token_for(&run_id_of(inbox_dir))
 }
 
@@ -235,7 +257,8 @@ fn authed_inbox<T>(
             "missing Authorization: Bearer token",
         ));
     };
-    let Some(stored) = state.token_for(&run_id_of(Path::new(inbox_dir))) else {
+    let run_id = run_id_of(Path::new(inbox_dir));
+    let Some(stored) = state.token_for(&run_id) else {
         return Err(InboxHttpResponse::err(
             "no A2A inbox key configured; the endpoint is closed",
         ));
@@ -243,7 +266,7 @@ fn authed_inbox<T>(
     if !crate::core::crypto::ct_eq(presented.as_bytes(), stored.as_bytes()) {
         return Err(InboxHttpResponse::err("invalid A2A inbox token"));
     }
-    Ok(Inbox::new(inbox_dir))
+    Ok(state.inbox_for(&run_id))
 }
 
 /// `POST /a2a-inbox/peek`: reports the pending messages a `claim` would
@@ -259,7 +282,11 @@ async fn peek(
         Ok(inbox) => inbox,
         Err(resp) => return Ok(resp),
     };
-    let messages = peek_inbox(&inbox, usize::MAX);
+    // SQLite is blocking (and may wait on the write lock): never on a tokio
+    // worker thread.
+    let messages = tokio::task::spawn_blocking(move || peek_inbox(&inbox, usize::MAX))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let count = messages.len();
     Ok(Json(InboxHttpResponse {
         ok: true,
@@ -285,7 +312,9 @@ async fn claim(
         Err(resp) => return Ok(resp),
     };
     let budget = req.max_bytes.unwrap_or(usize::MAX);
-    let claimed = claim_leased(&inbox, budget);
+    let claimed = tokio::task::spawn_blocking(move || claim_leased(&inbox, budget))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let count = claimed.len();
     Ok(Json(InboxHttpResponse {
         ok: true,
@@ -307,7 +336,10 @@ async fn mark_injected(
         Ok(inbox) => inbox,
         Err(resp) => return Ok(resp),
     };
-    let marked = inbox.mark_injected(&req.message_id, &req.channel);
+    let marked =
+        tokio::task::spawn_blocking(move || inbox.mark_injected(&req.message_id, &req.channel))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(InboxHttpResponse {
         ok: true,
         error: None,
@@ -462,13 +494,13 @@ mod tests {
 
     #[test]
     fn token_is_deterministic_and_domain_separated() {
-        let s1 = InboxHttpState::with_key(key());
-        let s2 = InboxHttpState::with_key(key());
+        let s1 = InboxHttpState::with_key(key(), Path::new("/root"));
+        let s2 = InboxHttpState::with_key(key(), Path::new("/root"));
         assert_eq!(s1.token_for("run-1"), s2.token_for("run-1"));
         // Different runs differ.
         assert_ne!(s1.token_for("run-1"), s1.token_for("run-2"));
         // Different keys differ.
-        let s3 = InboxHttpState::with_key(vec![b'j'; 32]);
+        let s3 = InboxHttpState::with_key(vec![b'j'; 32], Path::new("/root"));
         assert_ne!(s1.token_for("run-1"), s3.token_for("run-1"));
         // roun id derives from the dir.
         assert_eq!(run_id_of(&inbox_dir(Path::new("/root"), "run-1")), "run-1");
@@ -489,7 +521,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
         let dir = inbox_dir(&root, "run-a");
-        let state = InboxHttpState::with_key(key());
+        let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
         let token = token(&state, "run-a");
 
@@ -592,7 +624,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
         let dir = inbox_dir(&root, "run-lease");
-        let state = InboxHttpState::with_key(key());
+        let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
         let token = token(&state, "run-lease");
 
@@ -656,7 +688,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
         let dir = inbox_dir(&root, "run-peek");
-        let state = InboxHttpState::with_key(key());
+        let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
         let token = token(&state, "run-peek");
 
@@ -693,7 +725,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
         let dir = inbox_dir(&root, "run-b");
-        let state = InboxHttpState::with_key(key());
+        let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
         let token = token(&state, "run-b");
 
@@ -750,7 +782,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
         let dir_a = inbox_dir(&root, "run-a");
-        let state = InboxHttpState::with_key(key());
+        let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
         let token_a = token(&state, "run-a");
         let token_b = token(&state, "run-b");
@@ -825,7 +857,10 @@ mod tests {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
         let dir = inbox_dir(&root, "run-x");
-        let state = InboxHttpState { root_key: None };
+        let state = InboxHttpState {
+            root_key: None,
+            state_root: root.clone(),
+        };
         let app = inbox_http_router(state.clone());
         let res = app
             .clone()
@@ -851,7 +886,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
         let dir = inbox_dir(&root, "run-c");
-        let state = InboxHttpState::with_key(key());
+        let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
         let token = token(&state, "run-c");
 
@@ -902,7 +937,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
         let dir = inbox_dir(&root, "run-hook");
-        let state = InboxHttpState::with_key(key());
+        let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
         let inbox = Inbox::new(dir.clone());
 
@@ -971,5 +1006,51 @@ mod tests {
             },
         );
         server.abort();
+    }
+
+    /// The path a client sends only NAMES the run: the host never opens (or
+    /// creates) a database at a client-chosen location, and a forged prefix
+    /// still reads the run's real inbox under the host's own state root.
+    #[tokio::test]
+    async fn client_supplied_inbox_path_never_selects_the_database() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let state = InboxHttpState::with_key(key(), &root);
+        let app = inbox_http_router(state.clone());
+        let token = token(&state, "run-p");
+        Inbox::new(inbox_dir(&root, "run-p"))
+            .enqueue(msg("m1", "real"))
+            .unwrap();
+
+        // Same run id, hostile prefixes: a canonical-looking layout under a
+        // directory the caller picked, and a non-canonical one.
+        let evil_root = tmp.path().join("evil");
+        for forged in [
+            evil_root.join("a2a-inbox").join("run-p"),
+            tmp.path().join("elsewhere").join("run-p"),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/a2a-inbox/peek")
+                        .header("content-type", "application/json")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::from(
+                            json!({"inbox": forged.to_str().unwrap()}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = body_json(res).await;
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["count"], 1, "the run's real inbox is served");
+        }
+        assert!(
+            !evil_root.exists(),
+            "the host must not create a state database under a client-chosen path"
+        );
     }
 }

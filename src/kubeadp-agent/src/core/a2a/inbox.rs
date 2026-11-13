@@ -127,6 +127,12 @@ pub const DEFAULT_TTL_SECS: u64 = 3600;
 /// to build its injection output and acknowledge.
 pub const CLAIM_LEASE_SECS: u64 = 60;
 
+/// How long an INJECTED (acknowledged) row is kept as the dedupe store
+/// (seconds). A re-sent message id inside this window is a no-op; past it
+/// the row is pruned so a long-lived run's acknowledged history (and the
+/// shared database) stays bounded.
+pub const INJECTED_RETENTION_SECS: u64 = 24 * 3600;
+
 /// The durable note recorded when the bounded queue dropped messages.
 pub const DROPPED_NOTE: &str = "[note] earlier message(s) dropped by the A2A inbox";
 
@@ -295,6 +301,52 @@ pub(crate) fn run_id_from_dir(dir: &Path) -> String {
         .and_then(|n| n.to_str())
         .map(sanitize_run_id)
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The run ids that still hold uninjected messages in the shared database
+/// under `state_root`. The delivery sinks call this once at startup: the
+/// ladder watchers are in-memory threads, so after a pod restart the messages
+/// queued before it would otherwise sit unwatched (never escalated, never
+/// expired) until another message happens to arrive for the same run.
+pub fn runs_with_uninjected(state_root: &Path) -> Vec<String> {
+    let Ok(conn) = open_db(state_root) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT DISTINCT run_id FROM a2a_message WHERE fake=0 AND injected_at IS NULL ORDER BY run_id",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map(|r| r.flatten().collect::<Vec<_>>())
+        .unwrap_or_default();
+    rows
+}
+
+/// Removes, for EVERY run under `state_root`, the acknowledged rows and the
+/// expiry records older than [`INJECTED_RETENTION_SECS`]. Nothing else ever
+/// deletes the rows of a run that receives no further message (a finished or
+/// cleaned job), so the host calls this at startup. Best effort; returns the
+/// number of rows removed.
+pub fn sweep_retention(state_root: &Path) -> usize {
+    let Ok(conn) = open_db(state_root) else {
+        return 0;
+    };
+    let now = now_unix();
+    let messages = conn
+        .execute(
+            "DELETE FROM a2a_message WHERE fake=0 AND injected_at IS NOT NULL AND (?1 - injected_at) >= ?2",
+            rusqlite::params![now, INJECTED_RETENTION_SECS],
+        )
+        .unwrap_or(0);
+    let expiries = conn
+        .execute(
+            "DELETE FROM a2a_expiry WHERE fake=0 AND (?1 - expired_at) >= ?2",
+            rusqlite::params![now, INJECTED_RETENTION_SECS],
+        )
+        .unwrap_or(0);
+    messages + expiries
 }
 
 /// Opens a connection to the shared state database (WAL + migrations).
@@ -554,6 +606,19 @@ impl Inbox {
             rusqlite::params![run_id, i64::from(self.fake), now, self.ttl_secs],
         )
         .map_err(|e| format!("failed to prune the A2A inbox: {e}"))?;
+        // Acknowledged rows are the dedupe store only for the retention
+        // window: without this prune a long-lived run's injected history
+        // grows without bound.
+        conn.execute(
+            "DELETE FROM a2a_message WHERE run_id=?1 AND fake=?2 AND injected_at IS NOT NULL AND (?3 - injected_at) >= ?4",
+            rusqlite::params![
+                run_id,
+                i64::from(self.fake),
+                now_unix(),
+                INJECTED_RETENTION_SECS
+            ],
+        )
+        .map_err(|e| format!("failed to prune the acknowledged A2A messages: {e}"))?;
 
         // Bounded queue: drop the oldest queued rows until the bounds hold.
         // Never drop the last remaining message. The drop is visible to the
@@ -800,6 +865,85 @@ impl Inbox {
             .map_err(|e| format!("failed to release the A2A resume claim: {e}"))?;
             Ok(())
         });
+    }
+
+    /// The number of messages that are not injected yet, INCLUDING the ones a
+    /// channel currently holds under a claim lease (which [`Inbox::pending`]
+    /// hides). The ladder watcher keeps running while this is non-zero: a
+    /// claimer that crashed between claim and acknowledgement returns its
+    /// message to the queue when the lease lapses, and somebody must still
+    /// be watching it then. Not TTL-filtered (the ladder applies the TTL).
+    pub fn uninjected_count(&self) -> usize {
+        let run_id = self.run_id();
+        self.with_conn(|conn| {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM a2a_message
+                     WHERE run_id=?1 AND fake=?2 AND injected_at IS NULL",
+                    rusqlite::params![run_id, i64::from(self.fake)],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("failed to count the A2A inbox: {e}"))?;
+            Ok(n.max(0) as usize)
+        })
+        .unwrap_or(0)
+    }
+
+    /// Expires one uninjected message: records the durable expiry (the
+    /// sender's task fails with `reason`) AND removes the queued row, in one
+    /// transaction. Removing the row is what keeps an expired message from
+    /// being served later by a hook / `wait_message` (which would deliver a
+    /// message whose sender was already told it failed) and from blocking the
+    /// younger messages queued behind it. Returns `true` when THIS call
+    /// expired the message; `false` when it was injected (or removed) first.
+    pub fn expire(&self, message_id: &str, reason: &str) -> bool {
+        let (run_id, mid) = self.key(message_id);
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")
+                .map_err(|e| format!("failed to begin the A2A expiry transaction: {e}"))?;
+            let outcome = (|| -> Result<bool, String> {
+                let removed = conn
+                    .execute(
+                        "DELETE FROM a2a_message
+                         WHERE run_id=?1 AND message_id=?2 AND fake=?3 AND injected_at IS NULL",
+                        rusqlite::params![run_id, mid, i64::from(self.fake)],
+                    )
+                    .map_err(|e| format!("failed to remove the expired A2A message: {e}"))?;
+                if removed == 0 {
+                    return Ok(false);
+                }
+                let (expired_at, expired_at_ns) = crate::core::a2a::delivery::now_expiry_pair();
+                conn.execute(
+                    "INSERT INTO a2a_expiry (run_id, fake, message_id, reason, expired_at, expired_at_ns)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(run_id, message_id)
+                     DO UPDATE SET fake=excluded.fake, reason=excluded.reason,
+                                   expired_at=excluded.expired_at, expired_at_ns=excluded.expired_at_ns",
+                    rusqlite::params![
+                        run_id,
+                        i64::from(self.fake),
+                        mid,
+                        reason,
+                        expired_at,
+                        expired_at_ns
+                    ],
+                )
+                .map_err(|e| format!("failed to record the A2A expiry: {e}"))?;
+                Ok(true)
+            })();
+            match outcome {
+                Ok(v) => {
+                    conn.execute_batch("COMMIT")
+                        .map_err(|e| format!("failed to commit the A2A expiry: {e}"))?;
+                    Ok(v)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+        .unwrap_or(false)
     }
 
     /// Whether `message_id` has been injected.
@@ -1601,5 +1745,82 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn expire_records_the_expiry_and_removes_the_row() {
+        let tmp = tempdir().unwrap();
+        let inbox = repo_inbox(&tmp, "run-expire");
+        inbox.enqueue(msg("m1", "one")).unwrap();
+        inbox.enqueue(msg("m2", "two")).unwrap();
+        assert!(inbox.expire("m1", "ttl"));
+        assert!(!inbox.expire("m1", "ttl"), "a second expiry is a no-op");
+        assert_eq!(inbox.read_expired().unwrap().message_id, "m1");
+        // The expired row is gone: no channel can serve it any more, and the
+        // younger message behind it is still pending.
+        let ids: Vec<String> = inbox.pending().into_iter().map(|m| m.message_id).collect();
+        assert_eq!(ids, vec!["m2".to_string()]);
+        // An injected message can no longer expire.
+        assert!(inbox.mark_injected("m2", "hook"));
+        assert!(!inbox.expire("m2", "ttl"));
+        assert!(inbox.injected("m2"));
+    }
+
+    #[test]
+    fn uninjected_count_includes_leased_messages() {
+        let tmp = tempdir().unwrap();
+        let inbox = repo_inbox(&tmp, "run-leased");
+        inbox.enqueue(msg("m1", "one")).unwrap();
+        assert_eq!(inbox.claim_for_resume().len(), 1);
+        assert_eq!(inbox.pending_count(), 0, "leased: not pending");
+        assert_eq!(inbox.uninjected_count(), 1, "leased: still uninjected");
+        assert!(inbox.mark_injected("m1", "idle_turn"));
+        assert_eq!(inbox.uninjected_count(), 0);
+    }
+
+    #[test]
+    fn runs_with_uninjected_lists_only_runs_with_queued_messages() {
+        let tmp = tempdir().unwrap();
+        let queued = repo_inbox(&tmp, "run-queued");
+        let acked = repo_inbox(&tmp, "run-acked");
+        queued.enqueue(msg("m1", "one")).unwrap();
+        acked.enqueue(msg("m1", "one")).unwrap();
+        assert!(acked.mark_injected("m1", "hook"));
+        let root = tmp.path().join("state-root");
+        assert_eq!(runs_with_uninjected(&root), vec!["run-queued".to_string()]);
+    }
+
+    #[test]
+    fn acknowledged_rows_are_pruned_after_the_retention_window() {
+        let tmp = tempdir().unwrap();
+        let inbox = repo_inbox(&tmp, "run-retention");
+        let backdate = |id: &str| {
+            inbox
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE a2a_message SET injected_at=?1 WHERE run_id=?2 AND message_id=?3",
+                        params![now_unix() - INJECTED_RETENTION_SECS - 1, inbox.run_id(), id],
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .unwrap();
+        };
+        inbox.enqueue(msg("m1", "one")).unwrap();
+        assert!(inbox.mark_injected("m1", "hook"));
+        // Inside the window the acknowledged row is the dedupe store.
+        assert_eq!(
+            inbox.enqueue(msg("m1", "one")).unwrap(),
+            EnqueueOutcome::Duplicate
+        );
+        backdate("m1");
+        // The next enqueue of the run prunes it.
+        inbox.enqueue(msg("m2", "two")).unwrap();
+        assert!(!inbox.injected("m1"), "past the retention the row is gone");
+        // The global sweep does the same for a run that gets no new message.
+        assert!(inbox.mark_injected("m2", "hook"));
+        backdate("m2");
+        let root = tmp.path().join("state-root");
+        assert_eq!(sweep_retention(&root), 1);
+        assert!(!inbox.injected("m2"));
     }
 }

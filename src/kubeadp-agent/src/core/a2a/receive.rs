@@ -56,6 +56,9 @@ pub const DEFAULT_INBOX_URL: &str = "http://127.0.0.1:8002";
 /// the MCP call timeout, so a dead host never hangs a hook or a wait.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Poll interval of a blocking receive over the pod-local HTTP API.
+pub const REMOTE_POLL: Duration = Duration::from_millis(500);
+
 /// The receive side of a run's A2A inbox: either the pod-local HTTP API (a
 /// sandboxed run) or the direct database inbox (a trusted/local invocation,
 /// tests).
@@ -79,6 +82,18 @@ impl ReceiveInbox {
                 std::env::var(INBOX_URL_ENV).unwrap_or_else(|_| DEFAULT_INBOX_URL.to_string()),
             ))),
             _ => Inbox::from_env().map(Self::Local),
+        }
+    }
+
+    /// How often a blocking receive should poll this inbox. The direct inbox
+    /// is a local read (`local`, tens of milliseconds); the remote one costs
+    /// an HTTP round trip plus a database open on the host per poll, so it
+    /// is polled at [`REMOTE_POLL`] (still far inside the 2 s wake-up
+    /// contract of `wait_message`).
+    pub fn poll_interval(&self, local: Duration) -> Duration {
+        match self {
+            Self::Local(_) => local,
+            Self::Remote(_) => REMOTE_POLL.max(local),
         }
     }
 
