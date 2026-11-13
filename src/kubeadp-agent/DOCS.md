@@ -21,7 +21,7 @@ The `kubeadp-agent` system operates across three distinct operational contexts:
 
 The engine layer provides a unified interface (`Engine` trait) across underlying agent harnesses, abstracting jobs and interactive sessions into a consistent execution abstraction.
 
-This section describes the engine layer as shipped. The target contract (every endpoint works with every engine, no `501` because of the engine, the conformance suite) is SPEC.md §3 and §12.6; SPEC.md §13.2 lists what is still missing.
+This section describes the engine layer as shipped. The target contract (every endpoint works with every engine, no `501` because of the engine, the conformance suite) is SPEC.md §3 (Engines) and §12 (Tests and Acceptance); the conformance suite is DOCS.md §8.
 
 ### 2.1 The Unified Run Model
 
@@ -80,14 +80,24 @@ Endpoints are classified as `native`, `emulated`, or `unsupported`:
 | `session.restart` | No | Yes | Emulated | Native | Restarts session process group |
 | `session.log` | No | Yes | Emulated | Native | Retrieves sanitized session log |
 | `session.message` | No | Yes | Emulated | Native | Delivers text message to session |
-| `interrupt` | Yes | Yes | Emulated | Native | Halts active execution turn |
-| `pause` | Yes | Yes | Native | Unsupported | Freezes/unfreezes execution state |
-| `fork` | Yes | Yes | Unsupported | Unsupported | Copies worktree context to new run |
+| `interrupt` | Yes | Yes | Emulated | Emulated | Halts active execution turn (emulated for both after S2) |
+| `pause` | Yes | Yes | Emulated | Emulated | Freezes/unfreezes execution state (per-run flag + queue) |
+| `fork` | Yes | Yes | Emulated | Emulated | Copies worktree context to new run |
 | `compact` | Yes | Yes | Emulated | Emulated | Summarize history and restart |
 | `revert` | Yes | Yes | Emulated | Emulated | Restores worktree to checkpoint |
 | `todo` | Yes | Yes | Emulated | Emulated | Returns structured task todo list |
 | `workspace.*` | Yes | Yes | Native | Native | File inspection, diff, cat |
-| `a2a.send_message` | Yes | Yes | Emulated | Native | Sends outbound A2A message |
+| `a2a.send_message` | Yes | Yes | Emulated | Emulated | Sends outbound A2A message (queued to `.engine-message-queue` on the job surface) |
+| `a2a.inject` | Yes | Yes | Native | Native | Harness injects inbound A2A messages into the model context |
+| `permissions` | Yes | Yes | Unsupported | Unsupported | No `Engine` trait method; reported Unsupported, never a 501 |
+
+> The `interrupt`/`pause`/`fork`/`a2a.send_message` rows above show the
+> *effective* (post-S2 emulation) values. SPEC.md §5.5, a locked normative
+> table, still records the historical values for `agy.pause` (native),
+> `agy.fork` (unsupported), `claude.interrupt` (native), `claude.pause`
+> (unsupported), `claude.fork` (unsupported) and `claude.a2a.send_message`
+> (native); those SPEC.md rows are the KNOWN_GAPS the conformance suite pins
+> (see §8) and are not edited here.
 
 #### Emulation Mechanisms
 
@@ -569,3 +579,59 @@ To sweep and repair all orphaned worktrees across the host:
 ```bash
 agent-run --remote http://agent-run-api:8002 repair --all
 ```
+
+---
+
+## 8. Engine Conformance Suite
+
+The engine conformance suite (`tests/conformance.rs`, compiled only with
+`--features engine,test-hooks`, i.e. the CI gate's `--features a2a,test-hooks`)
+holds the shipped engine layer to the contract of this document and of
+SPEC.md §3/§5.5/§12. It is hermetic: it drives a fake `agy` and `claude`
+binary through the real `/api/v1` routes (job lifecycle, control surface,
+selection, `/capabilities`) and never touches a live harness, a real cluster
+or the process HOME state root.
+
+What the suite pins:
+
+- **Job lifecycle** (`job_lifecycle_agy_hermetic`,
+  `job_lifecycle_claude_hermetic`): real `POST /api/v1/jobs` start → status →
+  list → events → result → kill → clean for the fake engines, plus the
+  `workspace.*` inspection endpoints.
+- **Job control surface** (`job_control_surface_answers_usable_bodies`): every
+  `/api/v1/jobs/{id}` control endpoint (`interrupt`/`pause`/`message`/`fork`/
+  `compact`/`revert`/`todo`) answers a usable `data` body for BOTH engines --
+  never a 501 because of the engine (HL-71 S2).
+- **Run control dispatch** (`run_control_capabilities_dispatch`): the
+  `/api/v1/runs/{id}` routes answer the capability they report -- 501
+  `{"code":"unsupported","engine":…}` for an `Unsupported` key, a typed 404
+  `not_found` for an emulated interrupt of a fabricated (non-job) run, 404 for
+  an unknown run.
+- **The 501 contract is not dead code** (`unsupported_control_key_answers_typed_501`):
+  a synthetic bare engine that declares none of the control keys answers the
+  typed 501 on interrupt/pause/compact/fork/revert; `todo` stays 2xx because
+  the emulation layer always fronts it.
+- **Engine selection** (`engine_selection_and_capabilities_listing`): unknown
+  engine → 400 `unknown_engine` (never 501); `/capabilities` lists exactly the
+  registered engines with all `ENDPOINTS` keys present.
+- **Documented-contract parity** (`capabilities_match_documented_tables`): the
+  `/capabilities` report matches the §2.4 tables above exactly. The live-vs-
+  SPEC.md §5.5 divergences are asserted exactly as KNOWN_GAPS (six rows:
+  `agy.pause` native, `agy.fork` unsupported, `claude.interrupt` native,
+  `claude.pause` unsupported, `claude.fork` unsupported,
+  `claude.a2a.send_message` native -- all effectively emulated after S2); a fix
+  to SPEC.md §5.5 (or a change to an engine's table) forces those rows '
+  removal here.
+- **Coverage guards**: an engine outside the admitted set (`agy`, `claude`),
+  a static endpoint key without a conformance case, or a declared key without
+  a case fails the gate -- the suite cannot silently lose coverage as the
+  engine set grows.
+- **CLI black-box additions** (T189-T191 in `tests/cli/run-tests.sh`): bogus
+  `--engine` → client error naming the unknown engine; the `/capabilities`
+  report completeness (all 22 keys, `permissions` unsupported, claude
+  `session.*` native, agy `session.*` emulated, `todo`/`a2a.send_message`
+  emulated); explicit `--engine agy` runs the agy driver with the row's
+  `engine` field set.
+
+The suite is a companion to `PARITY.md` (the agy-vs-claude parity record) and
+belongs to the CI gate's `cargo test --locked --features a2a,test-hooks`.

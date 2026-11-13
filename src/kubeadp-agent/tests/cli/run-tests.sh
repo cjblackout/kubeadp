@@ -5667,6 +5667,145 @@ t_t188() {
   rec T188 PASS "claude FAKE_AUTHFAIL ends failed and result surfaces the auth reason (job $id)"
 }
 
+# T189: engine selection is validated server-side -- a bogus `--engine`
+# reaches the (free-form) CLI flag and the server answers 400
+# `unknown_engine`, never 501 (selection errors are 4xx by design, HL-91 E3).
+t_t189() {
+  local out rc
+  out=$(ar start proj "t189 bogus engine" --engine bogus 2>&1)
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    rec T189 FAIL "start --engine bogus unexpectedly succeeded: $out"
+    return
+  fi
+  case "$out" in
+    *"unknown engine"*|*unknown_engine*|*bogus*) ;;
+    *) rec T189 FAIL "start --engine bogus exit $rc; expected unknown-engine error, got: $out"; return ;;
+  esac
+  rec T189 PASS "start --engine bogus fails client-side with the unknown-engine error (exit $rc)"
+}
+
+# T190: the /api/v1/capabilities report is COMPLETE and EXACT -- the full
+# 22-key static table is present for both engines, the no-route surfaces
+# (workspace.*, session.*, a2a.inject) are native for both where claude
+# drives them, `todo` is emulated for both, `a2a.send_message` is emulated
+# for the job surface, and `permissions` is unsupported-by-design for both
+# (never a 501). Complements T181 (which proves the job control keys).
+t_t190() {
+  local body agy_ws agy_todo agy_perm agy_msg agy_inject agy_ss agy_st agy_sr agy_sl agy_sm
+  local claude_ws claude_todo claude_perm claude_msg claude_inject claude_ss claude_st claude_sr claude_sl claude_sm
+  body=$(curl -s --max-time 10 "http://127.0.0.1:$PORT/api/v1/capabilities")
+  if [ -z "$body" ] || ! printf '%s' "$body" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    rec T190 FAIL "capabilities endpoint returned no/invalid JSON: $body"
+    return
+  fi
+  read -r agy_ws agy_todo agy_perm agy_msg agy_inject agy_ss agy_st agy_sr agy_sl agy_sm \
+        claude_ws claude_todo claude_perm claude_msg claude_inject claude_ss claude_st claude_sr claude_sl claude_sm <<EOF
+$(printf '%s' "$body" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+tabs = {t.get("engine"): t for t in d.get("capabilities", [])}
+def cap(eng, key):
+    t = tabs.get(eng)
+    if not t: return "NONE"
+    return t.get("endpoints", {}).get(key, "NONE")
+keys = ["workspace.*","todo","permissions","a2a.send_message","a2a.inject","session.start","session.stop","session.restart","session.log","session.message"]
+print(" ".join(row for eng in ("agy","claude") for key in keys for row in [cap(eng, key)]))
+')
+EOF
+  # Complete endpoint presence: every one of the 22 static keys must be in
+  # each engine's report (an engine reports Unsupported for anything it did
+  # not declare -- it never omits a key).
+  local missing
+  missing=$(printf '%s' "$body" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+allkeys = ["job.start","job.status","job.list","job.kill","job.retry","job.events","job.result","session.start","session.stop","session.restart","session.log","session.message","interrupt","pause","fork","compact","revert","todo","workspace.*","a2a.send_message","a2a.inject","permissions"]
+bad = []
+for t in d.get("capabilities", []):
+    e = t.get("endpoints", {})
+    for k in allkeys:
+        if k not in e:
+            bad.append("{}:{}".format(t.get("engine"), k))
+print(" ".join(bad))
+')
+  if [ -n "$missing" ]; then
+    rec T190 FAIL "some engine omits a static endpoint key: $missing"
+    return
+  fi
+  # Exact labels for the no-route / control surfaces not covered by T181.
+  if [ "$agy_ws" != "native" ] || [ "$claude_ws" != "native" ]; then
+    rec T190 FAIL "workspace.* must be native for both (agy=$agy_ws claude=$claude_ws)"
+    return
+  fi
+  if [ "$agy_todo" != "emulated" ] || [ "$claude_todo" != "emulated" ]; then
+    rec T190 FAIL "todo must be emulated for both (agy=$agy_todo claude=$claude_todo)"
+    return
+  fi
+  if [ "$agy_msg" != "emulated" ] || [ "$claude_msg" != "emulated" ]; then
+    rec T190 FAIL "a2a.send_message must be emulated for the job surface (agy=$agy_msg claude=$claude_msg)"
+    return
+  fi
+  # a2a.inject is native for both (the harness puts queued A2A messages into
+  # the model context; design HL-113 §7.14).
+  if [ "$agy_inject" != "native" ] || [ "$claude_inject" != "native" ]; then
+    rec T190 FAIL "a2a.inject must be native for both (agy=$agy_inject claude=$claude_inject)"
+    return
+  fi
+  # claude drives sessions natively (PTY adapter); agy has no session mode,
+  # so its session.* keys report emulated (the E4 session surface).
+  if [ "$claude_ss" != "native" ] || [ "$claude_st" != "native" ] \
+     || [ "$claude_sr" != "native" ] || [ "$claude_sl" != "native" ] \
+     || [ "$claude_sm" != "native" ]; then
+    rec T190 FAIL "claude session.* must be native (start=$claude_ss stop=$claude_st restart=$claude_sr log=$claude_sl message=$claude_sm)"
+    return
+  fi
+  if [ "$agy_ss" != "emulated" ] || [ "$agy_st" != "emulated" ] \
+     || [ "$agy_sr" != "emulated" ] || [ "$agy_sl" != "emulated" ] \
+     || [ "$agy_sm" != "emulated" ]; then
+    rec T190 FAIL "agy session.* must be emulated (start=$agy_ss stop=$agy_st restart=$agy_sr log=$agy_sl message=$agy_sm)"
+    return
+  fi
+  # permissions: unsupported-by-design (headless auto-approve) for both --
+  # never a 501.
+  if [ "$agy_perm" != "unsupported" ] || [ "$claude_perm" != "unsupported" ]; then
+    rec T190 FAIL "permissions must be unsupported for both (agy=$agy_perm claude=$claude_perm)"
+    return
+  fi
+  rec T190 PASS "capabilities: both engines report the full 22-key table; workspace.*/a2a.inject native, todo/a2a.send_message emulated, claude session.* native, agy session.* emulated, permissions unsupported"
+}
+
+# T191: an EXPLICIT `--engine agy` selects the agy driver and the row carries
+# engine=agy -- the same visible effect as the default, but driven through the
+# explicit flag (the claude explicit-flag path is covered by T172/T182).
+t_t191() {
+  local id out engine st
+  start_job "FAKE_SLEEP=1 engine agy explicit" --engine agy
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T191 FAIL "start --engine agy: $START_OUT"
+    return
+  fi
+  id="$START_JOB_ID"
+  engine=$(db_field "$id" "engine")
+  if [ "$engine" != "agy" ]; then
+    cleanup_job "$id"
+    rec T191 FAIL "db engine expected 'agy' for explicit --engine agy, got '$engine'"
+    return
+  fi
+  st=$(wait_state "$id" done 60) || {
+    cleanup_job "$id"
+    rec T191 FAIL "agy job did not reach done (last status: $st)"
+    return
+  }
+  out=$(ar result "$id" 2>&1)
+  case "$out" in
+    *FAKE-DONE*) ;;
+    *) cleanup_job "$id"; rec T191 FAIL "agy --engine agy result missing FAKE-DONE: $out"; return ;;
+  esac
+  cleanup_job "$id"
+  rec T191 PASS "explicit --engine agy runs the agy driver; db engine=agy and FAKE-DONE result (job $id)"
+}
+
 # --- main ------------------------------------------------------------------------------
 TEARDOWN_DONE=0
 teardown() {
@@ -5801,6 +5940,9 @@ run_test T185 t_t185
 run_test T186 t_t186
 run_test T187 t_t187
 run_test T188 t_t188
+run_test T189 t_t189
+run_test T190 t_t190
+run_test T191 t_t191
 
 echo
 echo "=== per-test results ==="

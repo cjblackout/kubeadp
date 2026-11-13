@@ -15,6 +15,10 @@ stack. It mirrors the capability tables in `src/engine/agy.rs` and
 - The worker arms every non-native control endpoint as emulated on startup
   (`engine::EngineRegistry::enable_all_emulated`, `worker/entry.rs`), so the
   live server presents the tables recorded here.
+- The tables here are enforced end to end by the engine conformance suite
+  (`tests/conformance.rs`, see DOCS.md §8), which drives the same endpoints
+  through the real `/api/v1` routes and asserts the documented-contract
+  parity plus the SPEC.md §5.5 KNOWN_GAPS.
 
 ## Per-operation record
 
