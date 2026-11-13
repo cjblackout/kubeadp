@@ -222,14 +222,19 @@ impl TaskBackend for JobTaskBackend {
 /// and the `last_interrupt` timestamp (the per-job storm limit). The durable
 /// per-run inbox replaced the in-memory coalesce buffer (design §7.14).
 struct JobSlot {
-    gate: Mutex<()>,
+    /// Serializes every in-process escalation for the job: the ladder
+    /// watcher, the manual ladder pass, and the explicit interrupt share it,
+    /// so two in-process passages of the ladder for the SAME job can never
+    /// both claim an attempt for the same message. Cross-process safety comes
+    /// from the atomic queue claim (`Inbox::claim_for_resume`).
+    gate: Arc<Mutex<()>>,
     last_interrupt: Mutex<Option<Instant>>,
 }
 
 impl JobSlot {
     fn new() -> Self {
         Self {
-            gate: Mutex::new(()),
+            gate: Arc::new(Mutex::new(())),
             last_interrupt: Mutex::new(None),
         }
     }
@@ -338,11 +343,18 @@ impl JobMessageSink {
         drop(ladders);
         let config = Arc::clone(&self.config);
         let job_id = task_id.to_string();
+        // The job's gate rides into the watcher thread: every in-process
+        // escalation of this job (watcher or manual) is serialized by it, so
+        // concurrent ladder passes can never both claim an attempt for the
+        // same message. The watcher drives the SAME `ladder_pass` entry point
+        // as the manual/escalation path (both take the pre-resolved job slot),
+        // so there is exactly one code path through the ladder.
+        let slot = self.slot(task_id);
         let _ = std::thread::Builder::new()
             .name(format!("a2a-ladder-{job_id}"))
             .spawn(move || {
                 loop {
-                    let step = Self::ladder_pass(&config, &job_id, false);
+                    let step = Self::ladder_pass(&config, &slot, &job_id, false);
                     match step {
                         LadderStep::Injected | LadderStep::Expired { .. } => break,
                         _ => std::thread::sleep(LADDER_POLL),
@@ -404,9 +416,42 @@ impl JobMessageSink {
         }
     }
 
+    /// One ladder pass for the job (`idle_turn`/`interrupt` escalation),
+    /// serialized against every other in-process ladder pass for the SAME job
+    /// by the job's gate mutex (the pre-resolved [`JobSlot`], created once per
+    /// job when the sink first touches it). The gate is what makes a manual
+    /// [`JobMessageSink::ladder_pass`] and the background watcher
+    /// ([`ensure_ladder`]) mutually exclusive for one job within this process;
+    /// the atomic store claim ([`Inbox::claim_for_resume`], see
+    /// [`JobMessageSink::ladder_pass_impl`]) is what makes the resume claim
+    /// win exactly once even across processes/channels.
+    ///
+    /// The production entry point of the escalation ladder: the background
+    /// watcher drives it for every job, so the production path and the tests
+    /// exercise the SAME function (a `ladder_pass` with `interrupt = true`
+    /// exercises the interrupt branch of the shared ladder, e.g. the force
+    /// timeout; the explicit `interrupt: true` send still shortcuts through
+    /// [`JobMessageSink::escalate_interrupt`]).
+    fn ladder_pass(config: &Config, slot: &JobSlot, job_id: &str, interrupt: bool) -> LadderStep {
+        let _gate = slot.gate.lock().unwrap_or_else(|e| e.into_inner());
+        Self::ladder_pass_impl(config, job_id, interrupt)
+    }
+
     /// One ladder pass for the job: computes the step for the oldest pending
     /// message and applies it; the caller re-polls on a non-terminal step.
-    fn ladder_pass(config: &Config, job_id: &str, interrupt: bool) -> LadderStep {
+    ///
+    /// The resume (the `idle_turn`/`interrupt` escalation) is claimed
+    /// ATOMICALLY in the store: [`Inbox::claim_for_resume`] marks the pending
+    /// rows `claimed_at` in one transaction and returns only the messages
+    /// THIS caller won. The winner alone resumes the job and acknowledges
+    /// the claimed messages; a loser (another ladder pass, the hook channel,
+    /// or the sandboxed HTTP receive side) gets an empty claim and steps
+    /// `Injected` without touching the job. Without the claim two concurrent
+    /// ladder passes for the same job would both read the same pending
+    /// message and both resume it, claiming TWO attempts for ONE message.
+    /// The caller also holds the per-job gate (see [`ensure_ladder`]) so
+    /// in-process passages are serialized on top.
+    fn ladder_pass_impl(config: &Config, job_id: &str, interrupt: bool) -> LadderStep {
         let ladder_cfg = Self::ladder_config(config);
         let inbox_dir = crate::core::a2a::inbox::inbox_dir_for(&config.state_root, job_id);
         // An already-expired message is never delivered (the marker decides).
@@ -439,20 +484,45 @@ impl JobMessageSink {
                 LadderStep::Expired { reason }
             }
             LadderStep::IdleTurn => {
-                let joined = join_framed(&pending);
-                if Self::apply_idle_turn(config, job_id, &joined) {
-                    inbox.drain(InjectChannel::IdleTurn.as_str());
+                let claimed = inbox.claim_for_resume();
+                if claimed.is_empty() {
+                    // Another pass already claimed (or injected) the message:
+                    // nothing left for THIS pass to resume.
+                    return LadderStep::Injected;
                 }
-                step
+                let joined = join_framed(&claimed);
+                if Self::apply_idle_turn(config, job_id, &joined) {
+                    for msg in &claimed {
+                        inbox.mark_injected(&msg.message_id, InjectChannel::IdleTurn.as_str());
+                    }
+                    LadderStep::IdleTurn
+                } else {
+                    // Resume did not apply: hand the claim back so a later
+                    // pass (or channel) can retry the same message.
+                    for msg in &claimed {
+                        inbox.release_claim(&msg.message_id);
+                    }
+                    LadderStep::Queued
+                }
             }
             LadderStep::Interrupt => {
-                let joined = join_framed(&pending);
+                let claimed = inbox.claim_for_resume();
+                if claimed.is_empty() {
+                    return LadderStep::Injected;
+                }
+                let joined = join_framed(&claimed);
                 if let Ok(meta) = JobMetadata::resolve(&config.state_root, job_id) {
                     if Self::resume_with(config, &meta, &joined).is_ok() {
-                        inbox.drain(InjectChannel::Interrupt.as_str());
+                        for msg in &claimed {
+                            inbox.mark_injected(&msg.message_id, InjectChannel::Interrupt.as_str());
+                        }
+                        return LadderStep::Interrupt;
                     }
                 }
-                step
+                for msg in &claimed {
+                    inbox.release_claim(&msg.message_id);
+                }
+                LadderStep::Queued
             }
             other => other,
         }
@@ -525,8 +595,10 @@ impl JobMessageSink {
     /// The explicit `interrupt` escalation (design §7.14, last resort): the
     /// kill-and-resume of §7.11. Applies the per-job storm limit
     /// (`a2a_interrupt_min_secs`, 0 = off), then resumes with the joined
-    /// pending messages, marked injected through the `interrupt` channel.
-    fn escalate_interrupt(&self, task_id: &str, joined: &str) -> Result<(), SdkA2AError> {
+    /// pending messages -- claimed ATOMICALLY so only one concurrent
+    /// interrupt (or ladder pass) resumes for the same message -- marked
+    /// injected through the `interrupt` channel. Runs under the job's gate.
+    fn escalate_interrupt(&self, task_id: &str) -> Result<(), SdkA2AError> {
         let job = self.slot(task_id);
         let gate = job.gate.lock().expect("gate lock poisoned");
         let min_secs = self.config.a2a_interrupt_min_secs;
@@ -551,9 +623,22 @@ impl JobMessageSink {
             .expect("last_interrupt lock poisoned") = Some(Instant::now());
         let meta = JobMetadata::resolve(&self.config.state_root, task_id)
             .map_err(|_| SdkA2AError::task_not_found(task_id))?;
-        let result = Self::resume_with(&self.config, &meta, joined);
+        let inbox = self.inbox(task_id);
+        let claimed = inbox.claim_for_resume();
+        if claimed.is_empty() {
+            drop(gate);
+            return Ok(());
+        }
+        let joined = join_framed(&claimed);
+        let result = Self::resume_with(&self.config, &meta, &joined);
         if result.is_ok() {
-            self.inbox(task_id).drain(InjectChannel::Interrupt.as_str());
+            for msg in &claimed {
+                inbox.mark_injected(&msg.message_id, InjectChannel::Interrupt.as_str());
+            }
+        } else {
+            for msg in &claimed {
+                inbox.release_claim(&msg.message_id);
+            }
         }
         drop(gate);
         result
@@ -595,11 +680,7 @@ impl MessageSink for JobMessageSink {
         // storm limit applies before the enqueue, then escalate immediately.
         if meta.interrupt {
             self.enqueue(task_id, sender, text, message_id, meta)?;
-            let joined = {
-                let inbox = self.inbox(task_id);
-                join_framed(&inbox.pending())
-            };
-            return self.escalate_interrupt(task_id, &joined);
+            return self.escalate_interrupt(task_id);
         }
 
         // The default path: enqueue into the durable inbox -- the hooks
@@ -1156,6 +1237,7 @@ mod tests {
 
     #[test]
     fn sink_rate_limits_second_interrupt_within_interval() {
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         let temp = TempDir::new().unwrap();
         let (config, worktree) = save_resumable_done_job(&temp, "ratelimit", 3600);
         write_fake_agy(&config.agy_path, &worktree);
@@ -1214,6 +1296,7 @@ mod tests {
 
     #[test]
     fn sink_deliver_queues_and_the_ladder_resumes_done_job_at_the_idle_turn() {
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         let temp = TempDir::new().unwrap();
         let (config, worktree) = save_resumable_done_job(&temp, "e2e", 0);
         // A 1 s ack window so the ladder escalates immediately; force_secs
@@ -1244,8 +1327,9 @@ mod tests {
         // job is done, so the next turn is a fresh resume) and the injection
         // is the ack. force_secs=0: never an interrupt.
         age_pending_message(&sink.inbox("e2e"), 2);
+        let slot = JobSlot::new();
         assert_eq!(
-            JobMessageSink::ladder_pass(&sink.config, "e2e", false),
+            JobMessageSink::ladder_pass(&sink.config, &slot, "e2e", false),
             LadderStep::IdleTurn
         );
         assert!(sink.inbox("e2e").pending().is_empty());
@@ -1288,17 +1372,96 @@ mod tests {
     }
 
     /// Ages every pending message past `seconds` (rewrites the stored
-    /// `queued_at`; the file name is derived the same way the inbox does).
+    /// `queued_at` in the run's shared state database).
     fn age_pending_message(inbox: &Inbox, seconds: u64) {
-        for msg in inbox.pending() {
-            let hex: String = crate::core::crypto::sha256(msg.message_id.as_bytes())
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            let path = inbox.dir().join(format!("m-{hex}.json"));
-            let mut m = msg;
-            m.queued_at = crate::core::a2a::inbox::now_unix().saturating_sub(seconds);
-            std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+        let now = crate::core::a2a::inbox::now_unix();
+        let (run_id,) = (inbox.run_id(),);
+        let _ = inbox.with_conn(|conn| {
+            conn.execute(
+                "UPDATE a2a_message SET queued_at=?1 WHERE run_id=?2 AND fake=?3 AND injected_at IS NULL",
+                rusqlite::params![now.saturating_sub(seconds), run_id, i64::from(inbox.fake())],
+            )
+            .map_err(|e| format!("failed to age the A2A messages: {e}"))?;
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn concurrent_ladder_passes_resume_exactly_once() {
+        // Regression (the double-resume race): two concurrent ladder passes
+        // for the SAME job and the SAME pending message must never BOTH claim
+        // an attempt. The background watcher (`ensure_ladder`) and a manual
+        // `ladder_pass` can both reach the idle turn; the atomic resume claim
+        // (`Inbox::claim_for_resume`) plus the per-job gate must make exactly
+        // one of them resume. Run it many times to shake out the ordering.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
+        for i in 0..20 {
+            let temp = TempDir::new().unwrap();
+            let job_id = format!("concur-{i}");
+            let (config, worktree) = save_resumable_done_job(&temp, &job_id, 0);
+            // A 1 s ack window so the ladder escalates immediately; force_secs
+            // stays 0 (never kill).
+            let config = Config {
+                a2a_ack_secs: 1,
+                ..config
+            };
+            write_fake_agy(&config.agy_path, &worktree);
+            let state_root = config.state_root.clone();
+            let sink = Arc::new(JobMessageSink::new(Arc::new(config)));
+
+            // Deliver the message and age it past the ack window: the idle
+            // turn is the escalation that resumes the (now DONE) job.
+            assert!(sink
+                .deliver_with_meta(
+                    &job_id,
+                    "selma",
+                    "please fix the concurrency flake",
+                    "cm1",
+                    DeliveryMeta::default(),
+                )
+                .is_ok());
+            age_pending_message(&sink.inbox(&job_id), 2);
+            assert_eq!(sink.inbox(&job_id).pending().len(), 1);
+
+            // Two threads race the same ladder pass on the same message.
+            // The slot is looked up once (as the sink does); the two races
+            // share it exactly like the watcher and a manual pass in
+            // production.
+            let slot = sink.slot(&job_id);
+            let config = Arc::clone(&sink.config);
+            let config2 = Arc::clone(&sink.config);
+            let j1 = job_id.clone();
+            let j2 = job_id.clone();
+            let s1 = Arc::clone(&slot);
+            let s2 = Arc::clone(&slot);
+            let t1 =
+                std::thread::spawn(move || JobMessageSink::ladder_pass(&config, &s1, &j1, false));
+            let t2 =
+                std::thread::spawn(move || JobMessageSink::ladder_pass(&config2, &s2, &j2, false));
+            let step1 = t1.join().unwrap();
+            let step2 = t2.join().unwrap();
+            // Exactly ONE resume must have claimed the new attempt, no matter
+            // which pass won (the loser steps Injected without resuming).
+            let after = JobMetadata::load(&state_root, &job_id).unwrap();
+            assert_eq!(
+                after.retry_count, 1,
+                "iteration {i}: exactly one of the two concurrent passes must resume, got retry_count = {}, steps = {step1:?}/{step2:?}",
+                after.retry_count,
+            );
+            assert!(
+                after
+                    .retry_prompt
+                    .as_deref()
+                    .is_some_and(|p| p.contains("please fix the concurrency flake")),
+                "iteration {i}: the winner's resume must carry the pending message, got: {:?}",
+                after.retry_prompt
+            );
+            // Both passes draining here must leave nothing claimed or queued
+            // (the loser's drain is over the already-injected row).
+            assert!(
+                sink.inbox(&job_id).pending().is_empty(),
+                "iteration {i}: the message must be acknowledged (injected), not left pending"
+            );
         }
     }
 
@@ -1327,14 +1490,15 @@ mod tests {
         )
         .unwrap();
         age_pending_message(&sink.inbox("expire"), 9);
+        let slot = JobSlot::new();
         assert_eq!(
-            JobMessageSink::ladder_pass(&sink.config, "expire", false),
+            JobMessageSink::ladder_pass(&sink.config, &slot, "expire", false),
             LadderStep::Queued,
             "busy run inside the ttl: queued"
         );
         age_pending_message(&sink.inbox("expire"), 20);
         assert!(matches!(
-            JobMessageSink::ladder_pass(&sink.config, "expire", false),
+            JobMessageSink::ladder_pass(&sink.config, &slot, "expire", false),
             LadderStep::Expired { .. }
         ));
     }
@@ -1450,6 +1614,7 @@ mod tests {
 
     #[test]
     fn sink_live_delivery_writes_to_running_stdin() {
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         crate::core::a2a_live::with_isolated_live(|| {
             let temp = TempDir::new().unwrap();
             let state_root = temp.path().join("state");
@@ -1484,8 +1649,9 @@ mod tests {
             // Age past the ack window: the idle_turn step writes the stdin
             // line into the RUNNING process.
             age_pending_message(&sink.inbox("livedel"), 2);
+            let slot = JobSlot::new();
             assert_eq!(
-                JobMessageSink::ladder_pass(&sink.config, "livedel", false),
+                JobMessageSink::ladder_pass(&sink.config, &slot, "livedel", false),
                 LadderStep::IdleTurn
             );
             assert!(sink.inbox("livedel").pending().is_empty());

@@ -263,7 +263,14 @@ pub async fn run() -> Result<()> {
             a2a_auth,
             a2a_jobset,
         );
-        app.merge(a2a_routes)
+        // The sandboxed run's inbox API: reachable pod-locally by the run's
+        // own process under a per-run token, NEVER the operator bearer
+        // (a sandboxed agent has no operator token). Mounted after the
+        // bearer layer exactly like the A2A routes.
+        let state = crate::core::a2a::http::InboxHttpState::resolve()
+            .map_err(|e| anyhow::anyhow!("failed to resolve the A2A inbox token key: {e}"))?;
+        let a2a_inbox_http = crate::core::a2a::http::inbox_http_router(state);
+        app.merge(a2a_routes).merge(a2a_inbox_http)
     };
     eprintln!("agent-run-api: listening on {listen}");
 

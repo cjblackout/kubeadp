@@ -17,16 +17,19 @@
 //! TTL expires. The live stdin path of §7.11 stays off unless the
 //! `idle_turn` step needs it. The pure half lives here ([`next_step`],
 //! [`sender_task_state`]); the wiring applies the step and marks the message
-//! injected. The inbox is the queue and the dedupe store; the expiry marker
-//! is the durable record that fails the sender's task.
+//! injected. The inbox is the queue and the dedupe store; the durable
+//! `a2a_expiry` record (in the shared state database, phase 3 of §7.14) is
+//! what fails the sender's task. [`record_expiry`] / [`read_expiry`] /
+//! [`clear_expiry`] keep their phase-2 `inbox_dir` signatures but now address
+//! the database row for that run.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
-use crate::core::crypto::sha256;
+use crate::core::a2a::inbox::Inbox;
 
 /// `ack_secs` default: how long a message may stay queued before the ladder
 /// escalates to `idle_turn` (only with the run idle at a turn boundary).
@@ -180,25 +183,10 @@ pub struct ExpiryRecord {
     pub expired_at: u64,
     /// Nanoseconds since the Unix epoch the message was recorded expired,
     /// kept strictly increasing per process: it is the sub-second order of
-    /// markers recorded within the same one-second `expired_at`. Absent on
-    /// old markers, so it defaults to `0` when parsing them.
+    /// records taken within the same one-second `expired_at`. Absent on old
+    /// markers, so it defaults to `0` when parsing them.
     #[serde(default)]
     pub expired_at_ns: u64,
-}
-
-/// The expiry-marker directory inside a run's inbox: `<inbox>/expired/`.
-pub fn expired_dir_for(inbox_dir: &Path) -> PathBuf {
-    inbox_dir.join(EXPIRED_DIR_NAME)
-}
-
-/// Deterministic file name for an expiry marker (ids are attacker-controlled
-/// strings, so the name is derived, never stored).
-fn expiry_file_name(message_id: &str) -> String {
-    let hex: String = sha256(message_id.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    format!("expired-{hex}.json")
 }
 
 /// The last `expired_at_ns` this process issued. Used to keep the sub-second
@@ -210,8 +198,7 @@ static LAST_EXPIRY_NS: AtomicU64 = AtomicU64::new(0);
 /// Nanoseconds since the Unix epoch, kept strictly increasing within this
 /// process: the value is `now`, but never below the last issued value + 1
 /// (a CAS on `LAST_EXPIRY_NS` hands out distinct values to concurrent
-/// callers). Feeds `ExpiryRecord.expired_at_ns` and the temp file name, so
-/// "latest" and uniqueness both rest on one monotonic source.
+/// callers).
 fn next_expiry_ns() -> u64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -228,85 +215,32 @@ fn next_expiry_ns() -> u64 {
     }
 }
 
-/// Records that `message_id` expired uninjected (durable marker under
-/// `<inbox>/expired/`, atomic). Best effort: an I/O failure is ignored.
+/// The `(expired_at, expired_at_ns)` monotonic pair for a new expiry record:
+/// one `expired_at` from the clock and one strictly-increasing sub-second
+/// value, kept strictly increasing per process even for two records taken in
+/// the same clock nanosecond. "Latest" among records therefore never depends
+/// on insertion order.
+pub fn now_expiry_pair() -> (u64, u64) {
+    (crate::core::a2a::inbox::now_unix(), next_expiry_ns())
+}
+
+/// Records that `message_id` expired uninjected (durable `a2a_expiry` row in
+/// the shared state database, atomic; best effort). `inbox_dir` is the run's
+/// inbox path (`<state_root>/a2a-inbox/<run>/`); the shared database and the
+/// run id are derived from it exactly like the inbox itself.
 pub fn record_expiry(inbox_dir: &Path, message_id: &str, reason: &str) {
-    let dir = expired_dir_for(inbox_dir);
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    // One monotonic sub-second value for both the record and the temp name.
-    let ns = next_expiry_ns();
-    let record = ExpiryRecord {
-        message_id: message_id.to_string(),
-        reason: reason.to_string(),
-        expired_at: crate::core::a2a::inbox::now_unix(),
-        expired_at_ns: ns,
-    };
-    let body = serde_json::to_vec(&record).unwrap_or_else(|_| b"{}".to_vec());
-    // Unique temp name (pid + the same monotonic sub-second value): two
-    // writes in the same second must not clobber each other's temp file.
-    let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), ns));
-    if std::fs::write(&tmp, body).is_err() {
-        return;
-    }
-    let _ = std::fs::rename(&tmp, dir.join(expiry_file_name(message_id)));
+    Inbox::new(inbox_dir).record_expired(message_id, reason);
 }
 
-/// The latest durable expiry marker for the run, if any. "Latest" is
-/// deterministic: the largest `(expired_at, expired_at_ns)`, and on a full
-/// tie the larger message id -- so the result never depends on the
-/// arbitrary order of `read_dir`. Files that cannot be parsed are skipped
-/// (a torn or hostile file never wedges the mapping).
+/// The latest durable expiry record for the run, if any. See [`Inbox::read_expired`].
 pub fn read_expiry(inbox_dir: &Path) -> Option<ExpiryRecord> {
-    let entries = std::fs::read_dir(expired_dir_for(inbox_dir)).ok()?;
-    let mut latest: Option<ExpiryRecord> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !name.starts_with("expired-") || !name.ends_with(".json") {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let Ok(record) = serde_json::from_slice::<ExpiryRecord>(&bytes) else {
-            continue;
-        };
-        if latest.as_ref().is_none_or(|cur| newer_expiry(&record, cur)) {
-            latest = Some(record);
-        }
-    }
-    latest
+    Inbox::new(inbox_dir).read_expired()
 }
 
-/// Whether `a` was recorded after `b`: first the one-second `expired_at`,
-/// then the sub-second `expired_at_ns` (old markers without it are `0`),
-/// and on a full tie the larger message id, so the ordering never depends
-/// on the order the markers were encountered.
-fn newer_expiry(a: &ExpiryRecord, b: &ExpiryRecord) -> bool {
-    match (a.expired_at, a.expired_at_ns).cmp(&(b.expired_at, b.expired_at_ns)) {
-        std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Less => false,
-        // Full tie: decide by message id so the answer never depends on the
-        // order the markers were encountered.
-        std::cmp::Ordering::Equal => a.message_id > b.message_id,
-    }
-}
-
-/// Removes every expiry marker for the run (a fresh delivery supersedes the
+/// Removes every expiry record for the run (a fresh delivery supersedes the
 /// last failure). Best effort.
 pub fn clear_expiry(inbox_dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(expired_dir_for(inbox_dir)) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.starts_with("expired-") && name.ends_with(".json") {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
+    Inbox::new(inbox_dir).clear_expired();
 }
 
 /// Whether the message metadata requests the explicit `interrupt` escalation
@@ -424,47 +358,29 @@ mod tests {
     }
 
     #[test]
-    fn expiry_markers_roundtrip_and_clear() {
+    fn expiry_records_roundtrip_and_clear() {
         let tmp = tempdir().unwrap();
         let inbox_dir = tmp.path().join("a2a-inbox/run-1");
         assert!(read_expiry(&inbox_dir).is_none());
         record_expiry(&inbox_dir, "m1", "first reason");
         record_expiry(&inbox_dir, "m2", "second reason");
         assert_eq!(read_expiry(&inbox_dir).unwrap().message_id, "m2");
-        assert_eq!(expired_dir_for(&inbox_dir), inbox_dir.join("expired"));
         // A fresh delivery supersedes the failure.
         clear_expiry(&inbox_dir);
         assert!(read_expiry(&inbox_dir).is_none());
-        // A torn/hostile marker is skipped; unrelated files ignored.
+        // Overwrite the same message id: the newest reason wins.
         record_expiry(&inbox_dir, "m3", "ok");
-        std::fs::write(
-            expired_dir_for(&inbox_dir).join("expired-garbage.json"),
-            b"\x00not json",
-        )
-        .unwrap();
-        assert_eq!(read_expiry(&inbox_dir).unwrap().message_id, "m3");
-        // An old-format marker (no `expired_at_ns`) still parses and reads.
-        std::fs::write(
-            expired_dir_for(&inbox_dir).join(expiry_file_name("old")),
-            r#"{"message_id":"old","reason":"legacy","expired_at":123}"#,
-        )
-        .unwrap();
-        let old = read_expiry(&inbox_dir).expect("the old-format marker must be read");
-        assert_eq!(old.message_id, "m3");
-        // The old marker itself parses when it is the only one present.
-        std::fs::remove_file(expired_dir_for(&inbox_dir).join(expiry_file_name("m3"))).unwrap();
-        let legacy = read_expiry(&inbox_dir).expect("the old-format marker must be read");
-        assert_eq!(legacy.message_id, "old");
-        assert_eq!(legacy.reason, "legacy");
-        assert_eq!(legacy.expired_at, 123);
-        assert_eq!(legacy.expired_at_ns, 0);
+        record_expiry(&inbox_dir, "m3", "newer");
+        let rec = read_expiry(&inbox_dir).unwrap();
+        assert_eq!(rec.message_id, "m3");
+        assert_eq!(rec.reason, "newer");
     }
 
     #[test]
-    fn expiry_markers_last_recorded_wins_within_the_same_second() {
-        // Ten markers recorded back-to-back without sleeping: they all share
-        // the one-second `expired_at`, so the sub-second order must decide.
-        // The last recorded one must win every time, never the directory order.
+    fn expiry_last_recorded_wins_within_the_same_second() {
+        // Ten records recorded back-to-back without sleeping: they all share
+        // the one-second `expired_at`, so the monotonic sub-second ordering
+        // must decide: the last recorded one always wins.
         for round in 0..3 {
             let tmp = tempdir().unwrap();
             let inbox_dir = tmp.path().join(format!("a2a-inbox/run-{round}"));
@@ -479,8 +395,7 @@ mod tests {
             );
         }
         // Reversed id order too: the winner is the last recorded, not the
-        // largest or smallest id, so a message-id tiebreak cannot be what
-        // decides (all ten share one second).
+        // largest or smallest id.
         let tmp = tempdir().unwrap();
         let inbox_dir = tmp.path().join("a2a-inbox/reversed");
         for i in (0..10u32).rev() {

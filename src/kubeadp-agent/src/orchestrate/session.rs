@@ -796,27 +796,13 @@ fn run_session_iteration(
         // The jobset root key file is hidden too (agents see only their derived
         // per-jobset secret through the `secret` channel). No-op when unset.
         let policy = policy.hide_jobset_root_key_file();
-        // HL-113 phase 1 (a2a builds): the durable A2A inbox grant -- the
-        // inbox directory read-only (queued messages) and its `injected/`
-        // subdir read-write (the injection markers only). The injected dir is
-        // a writable policy path, so `ensure_writable_dirs` creates it at
-        // launch.
-        #[cfg(feature = "a2a")]
-        let policy = {
-            let mut p = policy;
-            let injected_dir = crate::core::a2a::inbox::injected_dir_for(&a2a_inbox_dir);
-            // The inbox directory must exist for the read grant to be real
-            // (a sandbox backend silently skips a rule on a non-existent
-            // path); the injected dir is created by ensure_writable_dirs.
-            let _ = std::fs::create_dir_all(&a2a_inbox_dir);
-            if !p.ro.contains(&a2a_inbox_dir) {
-                p.ro.push(a2a_inbox_dir.clone());
-            }
-            if !p.rw.contains(&injected_dir) {
-                p.rw.push(injected_dir);
-            }
-            p
-        };
+        // HL-113 phase 3 (sqlite inbox): the session's A2A inbox lives in the
+        // shared per-pod `state.sqlite`, which the sandbox NEVER gets (the
+        // grant was removed: the database is host-owned). The sandboxed
+        // receive side reaches its inbox through the pod-local HTTP API,
+        // named by `KUBEADP_A2A_INBOX_DIR` and authenticated by the per-run
+        // token set below.
+        // (No sandbox grant: the inbox is host-side only.)
         let policy_path =
             std::env::temp_dir().join(format!("session-policy-{}.json", session.session_id));
         if let Err(e) = crate::sandbox::SandboxPolicy::write_policy_file(&policy, &policy_path) {
@@ -890,6 +876,16 @@ fn run_session_iteration(
     // session's grants filter), so it passes through.
     #[cfg(feature = "a2a")]
     cmd.env(crate::core::a2a::inbox::INBOX_ENV, &a2a_inbox_dir);
+    // HL-113 phase 3: the sandbox has NO database grant, so the receive side
+    // reaches its inbox through the pod-local HTTP API. Hand it the per-run
+    // token (derived host-side from the jobset root key; the sandbox never
+    // sees the key). Absent a root key nothing is set and the receive side
+    // falls back to the (now ungranted) direct inbox, which a sandboxed
+    // agent simply finds empty.
+    #[cfg(feature = "a2a")]
+    if let Some(token) = crate::core::a2a::http::token_for_run(&a2a_inbox_dir) {
+        cmd.env(crate::core::a2a::receive::INBOX_TOKEN_ENV, token);
+    }
 
     // 5. Open PTY
     let mut pty = match Pty::open() {
@@ -1564,6 +1560,8 @@ mod tests {
 
     #[test]
     fn test_bounded_child_escalation_unkillable() {
+        // Spawns a real child; take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         let mut child = Command::new("sleep")
             .arg("60")
             .spawn()
@@ -1603,6 +1601,8 @@ mod tests {
 
     #[test]
     fn test_bounded_child_escalation_reaped_on_term() {
+        // Spawns a real child; take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         use std::os::unix::process::CommandExt;
         let mut cmd = Command::new("sleep");
         cmd.arg("60");

@@ -88,8 +88,10 @@ schemars = { version = "1.2", default-features = false, features = ["derive"], o
 # Kubernetes discovery + agent-card fetch for the `mcp-a2a` subcommand.
 # Version matches a2a-client-lf's, so the lock already resolves it. rustls TLS
 # (the same provider a2a-client-lf's default builds use) keeps no native TLS
-# in the dependency tree.
-reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
+# in the dependency tree. The `blocking` client is the SANDBOXED A2A inbox
+# receive side (`a2a-hook`, `mcp-a2a`): those run as synchronous processes and
+# reach their inbox over the pod-local HTTP API.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking"], optional = true }
 
 [dev-dependencies]
 tempfile = "=3.10.1"

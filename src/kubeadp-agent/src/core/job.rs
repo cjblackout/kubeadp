@@ -4,6 +4,7 @@ use rusqlite::{params, Connection, Row};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration as StdDuration;
 
 /// Status of an agent-run job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
@@ -191,19 +192,29 @@ pub fn open_state_db(state_root: &Path) -> Result<Connection> {
     }
     let conn = Connection::open(&path)
         .with_context(|| format!("Failed to open state database at {}", path.display()))?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .with_context(|| format!("Failed to enable WAL journal mode on state database at {} (is the file corrupted?)", path.display()))?;
-    // WAL allows concurrent readers but only one writer at a time; without a
-    // busy timeout, a second concurrent writer (e.g. `start` inserting a job
-    // while a job monitor thread updates another job's PID/exit code) fails
-    // immediately with SQLITE_BUSY instead of waiting briefly for the lock.
-    conn.busy_timeout(std::time::Duration::from_secs(5))
+    // The busy timeout MUST be set before any other pragma: two connections
+    // that open the same NEW database at the same time (e.g. parallel tests,
+    // or the worker and a CLI process) race the first `PRAGMA journal_mode =
+    // WAL` on a fresh file, and without a timeout that pragma fails
+    // immediately with SQLITE_BUSY instead of waiting for the other opener to
+    // finish. A plain busy timeout of several seconds absorbs the initial
+    // creation window and also the normal WAL writer contention
+    // (e.g. `start` inserting a job while a job monitor thread updates
+    // another job's PID/exit code).
+    conn.busy_timeout(StdDuration::from_secs(5))
         .with_context(|| {
             format!(
                 "Failed to set busy timeout on state database at {}",
                 path.display()
             )
         })?;
+    // Enable WAL with a short bounded retry: the busy timeout above lets a
+    // concurrent opener's exclusive file-lock window pass, but on some SQLite
+    // builds/configs `journal_mode` reports SQLITE_BUSY against a lock that a
+    // repeated attempt clears immediately. Real corruption is never a busy
+    // error -- SQLITE_NOTADB / malformed-header errors surface unchanged on
+    // the last attempt.
+    set_wal_with_retry(&conn, &path)?;
     crate::core::migrations::migrate(&conn).with_context(|| {
         format!(
             "Failed to migrate state database at {} (is the file corrupted?)",
@@ -211,6 +222,48 @@ pub fn open_state_db(state_root: &Path) -> Result<Connection> {
         )
     })?;
     Ok(conn)
+}
+
+/// Whether a `rusqlite` error is a transient lock (busy/locked) rather than a
+/// real database problem (corruption, schema mismatch, ...).
+fn is_busy_locked(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if e.code == rusqlite::ErrorCode::DatabaseBusy
+                || e.code == rusqlite::ErrorCode::DatabaseLocked
+    )
+}
+
+/// Runs `PRAGMA journal_mode = WAL` with a bounded retry on transient
+/// SQLITE_BUSY / SQLITE_LOCKED (a concurrent opener of a brand-new database
+/// can hold the exclusive creation lock). Keeps the corrupt-file detection
+/// for real corruption: the error is only reported once the retry budget is
+/// exhausted.
+fn set_wal_with_retry(conn: &Connection, path: &Path) -> Result<()> {
+    const ATTEMPTS: usize = 8;
+    const BACKOFF_MS: &[u64] = &[5, 10, 20, 40, 80, 160, 320];
+    for attempt in 0..ATTEMPTS {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(e) if is_busy_locked(&e) && attempt + 1 < ATTEMPTS => {
+                let ms = BACKOFF_MS
+                    .get(attempt)
+                    .copied()
+                    .unwrap_or_else(|| BACKOFF_MS[BACKOFF_MS.len() - 1]);
+                std::thread::sleep(StdDuration::from_millis(ms));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "Failed to enable WAL journal mode on state database at {} (is the file corrupted?)",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    unreachable!("the retry loop always returns")
 }
 
 /// Ensures the full state directory layout exists under `state_root`: the root
@@ -4343,5 +4396,42 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
             JobStatus::Done,
             "a claude row with a claude stream-json success is Done"
         );
+    }
+
+    #[test]
+    fn concurrent_opens_of_a_fresh_state_db_all_succeed() {
+        // Regression (HL-113 gates): several openings of a brand-new
+        // state.sqlite at the same time (parallel tests, or the worker and a
+        // CLI) raced the first `PRAGMA journal_mode = WAL` on the fresh file
+        // and one of them failed with "database is locked" (SQLITE_BUSY).
+        // The busy timeout set BEFORE the pragma plus the bounded retry on
+        // busy/locked must make every opener succeed: each open runs the
+        // (idempotent) migrations on first use and returns an immediately
+        // usable connection.
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("s");
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let root = state_root.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..30 {
+                    let conn = open_state_db(&root)
+                        .expect("concurrent open of a fresh state db must succeed");
+                    // The connection must be usable: migrations ran, the
+                    // jobs table exists, WAL is active.
+                    let wal: String = conn
+                        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                        .expect("read journal_mode");
+                    assert_eq!(wal, "wal", "WAL journal mode must be enabled");
+                    let n: i64 = conn
+                        .query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))
+                        .expect("jobs table must exist after a concurrent open");
+                    assert_eq!(n, 0);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("concurrent open thread panicked");
+        }
     }
 }

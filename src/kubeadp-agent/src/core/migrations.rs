@@ -8,7 +8,13 @@
 //! Current table owners:
 //! - the `jobs` table (the agent-run job store, version 1),
 //! - the orchestrator's `supervisor_state` / `session_state` tables
-//!   (version 2).
+//!   (version 2),
+//! - the per-run A2A inbox (`a2a_message` / `a2a_expiry`,
+//!   version 3). The inbox is the shared per-pod SQLite-backed store (HL-113
+//!   phase 3): the pod's own process (the A2A sink and the escalation ladder)
+//!   writes and reads it directly; a SANDDBOXED run reaches it only through
+//!   the pod's local HTTP API (see `crate::core::a2a::http`), never the
+//!   database file.
 //!
 //! Rules for a new migration:
 //! - additive only (new tables, new columns; never drop or rename),
@@ -155,6 +161,65 @@ CREATE TABLE IF NOT EXISTS session_state (
 );
 ";
 
+/// The per-run A2A inbox (HL-113 §7.14, phase 3): one shared SQLite store
+/// (`<state_root>/state.sqlite`) replaces the phase-1/2 per-run directory
+/// (`<state_root>/a2a-inbox/<run>/`).
+///
+/// - `a2a_message` holds every message ever accepted for a run, in states
+///   `queued` -> `injected` (the phase-1 injection marker maps to the
+///   `injected_at`/`channel` columns of the SAME row; the durable dedupe
+///   store is the row itself, keyed by (run_id, message_id)). Injected rows
+///   are kept (the acknowledgement is permanent, exactly like the phase-1
+///   markers); expired uninjected rows are pruned by the host's next enqueue.
+///   The bounded-queue drop note (design §7.14: `MAX_QUEUED_MSGS` /
+///   `MAX_QUEUED_BYTES`, oldest dropped, durable note) is inserted as an
+///   ordinary `a2a_message` row (sender `inbox`, the note text), exactly like
+///   the phase-1 note message -- so the injecting side sees and consumes it.
+/// - `a2a_expiry` replaces the phase-2 `expired/` marker directory: the
+///   durable record that fails the sender's task after the TTL.
+///
+/// A `fake` flag exists for the parity/black-box tests that keep using the
+/// in-memory/custom-rooted `Inbox` (any run whose messages were written with
+/// `fake=1` is served from in-memory tables and never collides with the real
+/// per-pod db). Only the pod's own process uses the module directly; a
+/// sandboxed run reaches the inbox through the local HTTP API
+/// (`crate::core::a2a::http`) with a per-run token, never this database.
+fn a2a_inbox_v3(conn: &Connection) -> Result<()> {
+    conn.execute_batch(A2A_INBOX_V3_SQL)
+        .context("Failed to initialize the A2A inbox tables")
+}
+
+const A2A_INBOX_V3_SQL: &str = "
+CREATE TABLE IF NOT EXISTS a2a_message (
+    run_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    fake INTEGER NOT NULL DEFAULT 0,
+    sender TEXT NOT NULL,
+    hop INTEGER NOT NULL,
+    context_id TEXT,
+    task_id TEXT,
+    framed TEXT NOT NULL,
+    queued_at INTEGER NOT NULL,
+    claimed_at INTEGER,
+    injected_at INTEGER,
+    channel TEXT,
+    PRIMARY KEY (run_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS a2a_message_pending_idx ON a2a_message (run_id, injected_at, claimed_at, queued_at)
+    WHERE fake = 0;
+CREATE TABLE IF NOT EXISTS a2a_expiry (
+    run_id TEXT NOT NULL,
+    fake INTEGER NOT NULL DEFAULT 0,
+    message_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    expired_at INTEGER NOT NULL,
+    expired_at_ns INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS a2a_expiry_run_idx ON a2a_expiry (run_id)
+    WHERE fake = 0;
+";
+
 /// Every declared migration, in application order. Append new migrations at
 /// the end (additive, ascending version); see the module docs.
 pub const MIGRATIONS: &[Migration] = &[
@@ -167,6 +232,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "supervisor and session state tables",
         apply: supervisor_session_state_v2,
+    },
+    Migration {
+        version: 3,
+        name: "A2A inbox tables",
+        apply: a2a_inbox_v3,
     },
 ];
 
@@ -221,7 +291,13 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let version = migrate(&conn).unwrap();
         assert_eq!(version, current_version());
-        for table in ["jobs", "supervisor_state", "session_state"] {
+        for table in [
+            "jobs",
+            "supervisor_state",
+            "session_state",
+            "a2a_message",
+            "a2a_expiry",
+        ] {
             let exists: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",

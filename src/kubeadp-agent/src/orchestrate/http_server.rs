@@ -197,6 +197,16 @@ pub fn build_router(
     let app = crate::core::server::obs::add_observability(app, auth_state, ready, state_metrics);
     #[cfg(feature = "a2a")]
     let app = app.merge(a2a_routes);
+    // The sandboxed session's inbox API: reachable pod-locally by the run's
+    // own process under a per-run token, NEVER the operator bearer (a
+    // sandboxed agent has no operator token). Mounted after the bearer layer
+    // exactly like the A2A routes.
+    #[cfg(feature = "a2a")]
+    let app = {
+        let state = crate::core::a2a::http::InboxHttpState::resolve()
+            .map_err(|e| anyhow::anyhow!("failed to resolve the A2A inbox token key: {e}"))?;
+        app.merge(crate::core::a2a::http::inbox_http_router(state))
+    };
 
     Ok(app)
 }

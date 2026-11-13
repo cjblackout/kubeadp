@@ -150,7 +150,12 @@ async fn mcp_server_with_inbox(inbox: Inbox) -> A2aMcpServer {
         async move { Ok(vec![peer]) }
     };
     let ctx = build_ctx(None, list_services).await.expect("build ctx");
-    A2aMcpServer::with_inbox(ctx, Some(inbox))
+    A2aMcpServer::with_inbox(
+        ctx,
+        Some(kubeadp_agent::core::a2a::receive::ReceiveInbox::Local(
+            inbox,
+        )),
+    )
 }
 
 /// Drive the in-memory MCP transport around a server.
@@ -182,18 +187,24 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Ages the stored message file past the TTL (the file name is derived from
-/// the message id, the same derivation the inbox uses).
+/// Ages the stored message past the TTL by rewriting its `queued_at` in the
+/// inbox store (the shared state database or the in-memory mirror).
 fn age_message_file(inbox: &Inbox, message_id: &str, seconds: u64) {
-    let hex: String = kubeadp_agent::core::crypto::sha256(message_id.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let path = inbox.dir().join(format!("m-{hex}.json"));
-    let bytes = std::fs::read(&path).expect("message file exists");
-    let mut msg: QueuedMessage = serde_json::from_slice(&bytes).unwrap();
-    msg.queued_at = kubeadp_agent::core::a2a::inbox::now_unix().saturating_sub(seconds);
-    std::fs::write(&path, serde_json::to_vec(&msg).unwrap()).unwrap();
+    let now = kubeadp_agent::core::a2a::inbox::now_unix();
+    let (run_id,) = (inbox.run_id(),);
+    let _ = inbox.with_conn(|conn| {
+        conn.execute(
+            "UPDATE a2a_message SET queued_at=?1 WHERE run_id=?2 AND message_id=?3 AND fake=?4",
+            rusqlite::params![
+                now.saturating_sub(seconds),
+                run_id,
+                message_id,
+                i64::from(inbox.fake())
+            ],
+        )
+        .map_err(|e| format!("failed to age the A2A message: {e}"))?;
+        Ok(())
+    });
 }
 
 // ---------------------------------------------------------------------------

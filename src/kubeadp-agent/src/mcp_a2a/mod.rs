@@ -52,8 +52,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::core::a2a::client::{A2aClientCtx, MAX_HOP};
-use crate::core::a2a::inbox::Inbox;
+use crate::core::a2a::inbox::QueuedMessage;
 use crate::core::a2a::inject::{join_framed, MAX_INJECT_BYTES};
+use crate::core::a2a::receive::ReceiveInbox;
 use crate::engine::capability::InjectChannel;
 
 /// Cap on any single tool response body.
@@ -145,8 +146,10 @@ pub struct A2aMcpServer {
     /// The run's durable A2A inbox (design HL-113 §7.14), named by the
     /// `KUBEADP_A2A_INBOX_DIR` environment variable. `None` when the run has
     /// no inbox (the receive side answers empty, the other tools change
-    /// nothing).
-    inbox: Option<Inbox>,
+    /// nothing). Inside a sandbox this is the pod-local HTTP receive side
+    /// under the per-run token; a trusted/local invocation uses the direct
+    /// database inbox.
+    inbox: Option<ReceiveInbox>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -179,13 +182,14 @@ impl ServerHandler for A2aMcpServer {
 impl A2aMcpServer {
     /// Build the server for the stdio transport from a pre-built client
     /// context. The inbox (if any) is named by the `KUBEADP_A2A_INBOX_DIR`
-    /// environment variable.
+    /// environment variable (through the per-run pod-local HTTP side inside a
+    /// sandbox, or the direct inbox otherwise).
     pub fn new(ctx: A2aClientCtx) -> Self {
-        Self::with_inbox(ctx, Inbox::from_env())
+        Self::with_inbox(ctx, ReceiveInbox::from_env())
     }
 
     /// Build the server with an explicit inbox (tests; `new` reads the env).
-    pub fn with_inbox(ctx: A2aClientCtx, inbox: Option<Inbox>) -> Self {
+    pub fn with_inbox(ctx: A2aClientCtx, inbox: Option<ReceiveInbox>) -> Self {
         Self {
             ctx,
             inbox,
@@ -235,7 +239,7 @@ impl A2aMcpServer {
 
     /// The result shape of the receive side (`wait_message`): the messages
     /// injected through this call with the fields `reply` needs.
-    fn wait_result(messages: &[crate::core::a2a::inbox::QueuedMessage]) -> serde_json::Value {
+    fn wait_result(messages: &[QueuedMessage]) -> serde_json::Value {
         let items: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {

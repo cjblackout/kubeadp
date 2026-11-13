@@ -55,7 +55,16 @@ pub mod inject;
 pub mod delivery;
 
 #[cfg(feature = "a2a")]
+pub mod mem;
+
+#[cfg(feature = "a2a")]
+pub mod http;
+
+#[cfg(feature = "a2a")]
 pub mod client;
+
+#[cfg(feature = "a2a")]
+pub mod receive;
 
 pub use auth::A2aAuthLayer;
 pub use backend::{map_job_status, A2AError, A2aTask, TaskBackend};
@@ -209,22 +218,38 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     crate::core::crypto::ct_eq(a, b)
 }
 
-/// Test-only helper: mutate the process environment (which the card helpers
-/// read) under a process-wide lock so env-touching unit tests never race
-/// each other (cargo runs unit tests on parallel threads). Sets the given
-/// (var, value) pairs -- clearing any of `VARS` not listed first -- and
-/// restores the previous values on drop (while still holding the lock).
+/// Test-only helper: mutate the process environment (which the card helpers,
+/// the receive-side inbox helpers and the state-root resolution read) under a
+/// process-wide lock so env-touching unit tests never race each other (cargo
+/// runs unit tests on parallel threads). Sets the given (var, value) pairs --
+/// clearing any of the known `VARS` not listed first -- and restores the
+/// previous values on drop (while still holding the lock).
+///
+/// Every test in the crate that touches one of these variables MUST go
+/// through this guard (or the `testenv::with_env` closure form): a
+/// module-local `Mutex` does not serialize against a sibling module, so two
+/// tests could otherwise read each other's half-applied environment.
 #[cfg(test)]
 pub(crate) mod testenv {
     use std::sync::{Mutex, MutexGuard};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Every env var the crate's tests touch. A guard clears all of these and
+    /// restores them on drop, so a test can never leak a variable into a
+    /// sibling test (e.g. `KUBEADP_A2A_INBOX_TOKEN` leaking into the direct
+    /// `a2a-hook` path and silently switching it to the remote inbox).
     const VARS: &[&str] = &[
         "KUBEADP_A2A_NAME",
         "A2A_SELF_NAME",
         "POD_NAME",
         "HOSTNAME",
         "KUBEADP_A2A_URL",
+        "KUBEADP_A2A_INBOX_DIR",
+        "KUBEADP_A2A_INBOX_TOKEN",
+        "KUBEADP_A2A_INBOX_URL",
+        "AGENT_RUN_STATE_ROOT",
+        "AGENT_RUN_WORKSPACE_ROOT",
+        "AGENT_RUN_CONFIG",
     ];
 
     pub struct Guard {
@@ -233,6 +258,10 @@ pub(crate) mod testenv {
     }
 
     impl Guard {
+        /// Takes the env lock, clears the known vars, applies `pairs`. The
+        /// returned guard restores the previous values on drop (still holding
+        /// the lock). Scope it tightly (a block) so it is dropped before the
+        /// next guard.
         pub fn set(pairs: &[(&str, Option<&str>)]) -> Self {
             let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prior = VARS
@@ -260,6 +289,16 @@ pub(crate) mod testenv {
                 }
             }
         }
+    }
+
+    /// Runs `f` under the env lock with the known vars cleared and the given
+    /// pairs applied. Helpful when the body is a closure (e.g. async tests
+    /// that must not hold the lock across an await).
+    pub fn with_env<T>(pairs: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+        let guard = Guard::set(pairs);
+        let out = f();
+        drop(guard);
+        out
     }
 }
 

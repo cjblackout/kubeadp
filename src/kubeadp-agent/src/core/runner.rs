@@ -302,32 +302,15 @@ pub fn build_command(
         Some(engine_bin),
         Some(vec![config.sandbox_home.clone()]),
     );
-    // HL-113 phase 1 (a2a builds): the run's durable A2A inbox. The sandbox
-    // gets the inbox directory read-only (the queued messages) and its
-    // `injected/` subdirectory read-write (the injection markers only), as an
-    // automatic grant; the directory itself is named to the agent by the
-    // `KUBEADP_A2A_INBOX_DIR` env var below (the `mcp-a2a` server the agent
-    // spawns and the `a2a-hook` subcommand read it). Nothing enqueues yet
-    // (phase 2 wires the delivery), so the receive side answers empty until
-    // then.
+    // HL-113 phase 3 (sqlite inbox): the run's A2A inbox lives in the shared
+    // per-pod `state.sqlite`, which the sandbox NEVER gets (the grant was
+    // removed: the database is host-owned). The sandboxed receive side (the
+    // `mcp-a2a` server the agent spawns and the `a2a-hook` subcommand) reaches
+    // its inbox through the pod-local HTTP API, named by the
+    // `KUBEADP_A2A_INBOX_DIR` env var and authenticated by the per-run token
+    // set below.
     #[cfg(feature = "a2a")]
-    let base_policy = {
-        let mut p = base_policy;
-        let a2a_inbox_dir =
-            crate::core::a2a::inbox::inbox_dir_for(&config.state_root, &meta.job_id);
-        let injected_dir = crate::core::a2a::inbox::injected_dir_for(&a2a_inbox_dir);
-        // Both directories must exist for the grants to be real (a sandbox
-        // backend silently skips a rule on a non-existent path).
-        let _ = std::fs::create_dir_all(&a2a_inbox_dir);
-        let _ = std::fs::create_dir_all(&injected_dir);
-        if !p.ro.contains(&a2a_inbox_dir) {
-            p.ro.push(a2a_inbox_dir.clone());
-        }
-        if !p.rw.contains(&injected_dir) {
-            p.rw.push(injected_dir);
-        }
-        p
-    };
+    let _inbox_dir = crate::core::a2a::inbox::inbox_dir_for(&config.state_root, &meta.job_id);
     // Jobset wiring: if this job is a jobset member (registered in the
     // process-wide registry before launch), its jobset secret rides the
     // sandbox `secret` channel (an inherited fd the sandbox turns into a 0400
@@ -417,6 +400,16 @@ pub fn build_command(
         let a2a_inbox_dir =
             crate::core::a2a::inbox::inbox_dir_for(&config.state_root, &meta.job_id);
         cmd.env(crate::core::a2a::inbox::INBOX_ENV, &a2a_inbox_dir);
+        // HL-113 phase 3: the sandbox has NO database grant, so the receive
+        // side reaches its inbox through the pod-local HTTP API. Hand it the
+        // per-run token (derived host-side from the jobset root key; the
+        // sandbox never sees the key). Absent a root key nothing is set and
+        // the receive side falls back to the (now ungranted) direct inbox,
+        // which a sandboxed agent simply finds empty.
+        let token = crate::core::a2a::http::token_for_run(&a2a_inbox_dir);
+        if let Some(token) = token {
+            cmd.env(crate::core::a2a::receive::INBOX_TOKEN_ENV, token);
+        }
     }
 
     crate::core::proxy::apply_proxy(&mut cmd, Some(config), meta.proxy.as_deref());
@@ -2109,6 +2102,10 @@ mod tests {
 
     #[test]
     fn test_launch_background_job_in_process_thread() {
+        // Spawns a real child (fake agy); take the process-child test lock so
+        // it never races the zombie reaper tests (a tracked-zombie window
+        // could otherwise make `reap_round` skip).
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         let tmp = tempdir().unwrap();
         let state_root = tmp.path().join("state");
         let workspace_root = tmp.path().join("ws");
@@ -2172,6 +2169,8 @@ mod tests {
 
     #[test]
     fn test_runner_recovers_conversation_id_while_child_runs() {
+        // Spawns a real child (fake agy); take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         // The log never carries a conversation id (agy prints a plain
         // SUCCESS line without one); the monitor's background poller must
         // recover the ID from agy's conversation files while the child
@@ -2266,6 +2265,8 @@ mod tests {
 
     #[test]
     fn test_runner_recovers_nothing_when_marker_is_ambiguous() {
+        // Spawns a real child (fake agy); take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         // Same setup as `test_runner_recovers_conversation_id_while_child_runs`
         // (fast fake agy, no conversation id in the log) EXCEPT that the
         // prompt marker matches TWO conversation databases. Recovery must
@@ -2366,6 +2367,8 @@ mod tests {
 
     #[test]
     fn test_launch_background_job_bails_when_agy_unspawnable() {
+        // Attempts a real spawn; take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         let tmp = tempdir().unwrap();
         let state_root = tmp.path().join("state");
         let workspace_root = tmp.path().join("ws");
@@ -2423,6 +2426,8 @@ mod tests {
 
     #[test]
     fn test_detached_spawn_becomes_own_process_group_leader() {
+        // Spawns and kills a real child; take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         // The agy child is spawned with setsid in the child. Verify the
         // mechanism the `agent-run kill` process-group signalling relies on:
         // the child must be the leader of its own new session/process group.
@@ -2477,6 +2482,8 @@ mod tests {
 
     #[test]
     fn test_reparented_orphan_is_reaped_by_subreaper() {
+        // Spawns real children; take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         // End-to-end: mark THIS test process a subreaper, spawn a child
         // that backgrounds a grandchild and exits, then confirm the
         // orphaned grandchild reparents here (not to PID 1) and is
@@ -2520,6 +2527,8 @@ mod tests {
 
     #[test]
     fn test_drain_orphans_leaves_a_tracked_zombie_for_its_owner() {
+        // Spawns a tracked child; take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         // Regression: the post-job drain used a raw `waitpid(-1, WNOHANG)`, which
         // reaped the exit status of a child that another in-server command
         // (quota, info, remote-control, ...) was about to collect itself, so the
@@ -2573,6 +2582,8 @@ mod tests {
 
     #[test]
     fn test_exit_code_from_status_signal_and_plain_exit() {
+        // Spawns real children; take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         // Plain exit: the code passes through unchanged.
         let status = Command::new("sh")
             .arg("-c")
@@ -2607,6 +2618,8 @@ mod tests {
 
     #[test]
     fn test_oversized_prompt_fails_before_any_job_state() {
+        // Attempts a real spawn; take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         let tmp = tempdir().unwrap();
         let state_root = tmp.path().join("state");
         let workspace_root = tmp.path().join("ws");
@@ -2686,6 +2699,8 @@ mod tests {
 
     #[test]
     fn test_cancelled_launch_fails_and_leaves_no_agy() {
+        // Attempts a real spawn; take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         // (b) monitor delayed past the window, then cancelled: it never spawns.
         let tmp = tempdir().unwrap();
         let state_root = tmp.path().join("state");
@@ -2778,6 +2793,8 @@ mod tests {
 
     #[test]
     fn test_cancel_after_spawn_kills_agy_and_records_nothing() {
+        // Spawns and kills a real agy; take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         // (a) launch times out and NO agy process remains (fake agy writes its
         // pid to a file; assert the pid is gone/killed within a short time).
         let tmp = tempdir().unwrap();
@@ -2887,6 +2904,8 @@ mod tests {
 
     #[test]
     fn test_boundary_race_never_leaves_orphaned_agy() {
+        // Spawns real children; take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         // (c) the boundary race, made deterministic. The original version raced
         // a launch against a cancellation 200 times (tiny sleeps in the pre-spawn
         // hook) and ASSERTED both outcomes occurred at least once -- a
@@ -3067,6 +3086,8 @@ mod tests {
 
     #[test]
     fn test_pid_confirmed_right_at_the_timeout_boundary_succeeds() {
+        // Spawns a real child; take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         // A slow (but healthy) launch: the monitor reaches agy only late in
         // the confirmation window, so the PID is confirmed right at the
         // boundary. The launch must succeed with the confirmed PID and the
@@ -3135,6 +3156,8 @@ mod tests {
 
     #[test]
     fn test_launch_timeout_comes_from_config() {
+        // Attempts a real spawn; take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         // `launch_background_job` must honor `config.launch_timeout_secs`
         // (the value fed by `AGENT_RUN_LAUNCH_TIMEOUT_SECS`, default 20 s)
         // instead of a hard-coded window: with a 1 s config value the
@@ -3238,6 +3261,8 @@ mod tests {
     #[cfg(feature = "test-hooks")]
     #[test]
     fn test_fake_agy_runs_through_real_sandbox_wrapper() {
+        // Spawns real children; take the process-child test lock.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         // Probe with the same code `sandbox-exec` uses to decide a backend; if
         // no mechanism is available here, isolation cannot run and the test is
         // meaningless (and the wrapper would fail closed with exit 125).

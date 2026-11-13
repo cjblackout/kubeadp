@@ -16,7 +16,7 @@
 
 use std::io::Write;
 
-use crate::core::a2a::inbox::{Inbox, QueuedMessage};
+use crate::core::a2a::inbox::QueuedMessage;
 use crate::engine::capability::InjectChannel;
 
 /// Cap on the injected text of one boundary. Well above the queue byte bound
@@ -140,7 +140,7 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
         );
         return 2;
     }
-    let Some(inbox) = Inbox::from_env() else {
+    let Some(receive) = crate::core::a2a::receive::ReceiveInbox::from_env() else {
         // No inbox for this run (KUBEADP_A2A_INBOX_DIR unset): nothing to
         // inject. The agy events still print `{}` (agy parses the stdout of
         // every hook invocation).
@@ -151,7 +151,7 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
         };
     };
     let channel = event_channel(event);
-    let messages = inbox.drain_capped(channel, MAX_INJECT_BYTES);
+    let messages = receive.drain_capped(channel, MAX_INJECT_BYTES);
     if messages.is_empty() {
         return if is_agy_event(event) {
             print_agy_empty()
@@ -206,6 +206,7 @@ fn print_agy_empty() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::a2a::inbox::Inbox;
     use tempfile::tempdir;
 
     fn msg(id: &str, text: &str) -> QueuedMessage {
@@ -287,15 +288,17 @@ mod tests {
 
     #[test]
     fn run_a2a_hook_prints_the_hook_json_and_marks_injected() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir().unwrap();
         let inbox = Inbox::new(tmp.path());
         inbox.enqueue(msg("m1", "hello")).unwrap();
 
-        std::env::set_var(crate::core::a2a::inbox::INBOX_ENV, tmp.path());
-        let code = run_a2a_hook(&["PostToolUse".to_string()]);
-        std::env::remove_var(crate::core::a2a::inbox::INBOX_ENV);
+        let code = crate::core::a2a::testenv::with_env(
+            &[(
+                crate::core::a2a::inbox::INBOX_ENV,
+                Some(tmp.path().to_str().unwrap()),
+            )],
+            || run_a2a_hook(&["PostToolUse".to_string()]),
+        );
         assert_eq!(code, 0);
         // The message was injected through the hook channel.
         assert!(inbox.injected("m1"));
@@ -304,26 +307,25 @@ mod tests {
 
     #[test]
     fn run_a2a_hook_is_silent_on_an_empty_or_absent_inbox() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // No inbox configured at all: the Claude events print nothing.
-        std::env::remove_var(crate::core::a2a::inbox::INBOX_ENV);
-        assert_eq!(run_a2a_hook(&["Stop".to_string()]), 0);
+        crate::core::a2a::testenv::with_env(&[], || {
+            assert_eq!(run_a2a_hook(&["Stop".to_string()]), 0);
+        });
         // An existing, empty inbox.
         let tmp = tempdir().unwrap();
-        std::env::set_var(crate::core::a2a::inbox::INBOX_ENV, tmp.path());
-        let code = run_a2a_hook(&["UserPromptSubmit".to_string()]);
-        std::env::remove_var(crate::core::a2a::inbox::INBOX_ENV);
-        assert_eq!(code, 0);
-        // A wrong event or extra arguments are usage errors.
-        std::env::set_var(crate::core::a2a::inbox::INBOX_ENV, tmp.path());
-        let bad_event = run_a2a_hook(&["Nope".to_string()]);
-        let bad_args = run_a2a_hook(&["Stop".to_string(), "x".to_string()]);
-        let no_args = run_a2a_hook(&[]);
-        std::env::remove_var(crate::core::a2a::inbox::INBOX_ENV);
-        assert_eq!(bad_event, 2);
-        assert_eq!(bad_args, 2);
-        assert_eq!(no_args, 2);
+        crate::core::a2a::testenv::with_env(
+            &[(
+                crate::core::a2a::inbox::INBOX_ENV,
+                Some(tmp.path().to_str().unwrap()),
+            )],
+            || {
+                assert_eq!(run_a2a_hook(&["UserPromptSubmit".to_string()]), 0);
+                // A wrong event or extra arguments are usage errors.
+                assert_eq!(run_a2a_hook(&["Nope".to_string()]), 2);
+                assert_eq!(run_a2a_hook(&["Stop".to_string(), "x".to_string()]), 2);
+                assert_eq!(run_a2a_hook(&[]), 2);
+            },
+        );
     }
 
     #[test]
