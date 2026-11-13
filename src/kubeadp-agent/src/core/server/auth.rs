@@ -138,8 +138,9 @@ impl AuthState {
             super::token::StartupAuth::Unauthenticated => {
                 eprintln!(
                     "WARNING: no operator api token configured and api_allow_unauthenticated is set; \
-                     the API and A2A surface are unauthenticated (in-cluster NetworkPolicy must \
-                     restrict reachability)"
+                     the API surface is unauthenticated (in-cluster NetworkPolicy must \
+                     restrict reachability). The A2A routes additionally require \
+                     KUBEADP_API_ALLOW_OPEN=true, otherwise they are not mounted"
                 );
                 Ok(Self::none())
             }
@@ -157,8 +158,10 @@ impl AuthState {
 /// Builds an A2A [`crate::core::a2a::AuthVerifier`] from the same operator
 /// token that guards `/api/v1`, so the REST sessions/jobs API and the A2A
 /// surface share one credential. With no token configured (the
-/// `api_allow_unauthenticated` path) the verifier is `None` and the A2A
-/// routes are as open as the REST routes.
+/// `api_allow_unauthenticated` path) the verifier is `None`; the mount sites
+/// then refuse to serve the A2A routes unless `KUBEADP_API_ALLOW_OPEN` is set
+/// (`crate::core::server::token::a2a_open_permitted`), so `None` never means
+/// an accidentally open surface.
 ///
 /// The raw token is never retained: the verifier closes over only the
 /// SHA-256 digest and hashes the presented bearer credential before the

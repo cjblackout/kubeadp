@@ -34,6 +34,11 @@ pub const API_TOKEN_FILE_ENV: &str = "KUBEADP_API_TOKEN_FILE";
 /// Environment variable allowing a startup without any token (config key
 /// `api_allow_unauthenticated` maps to it).
 pub const ALLOW_UNAUTHENTICATED_ENV: &str = "KUBEADP_API_ALLOW_UNAUTHENTICATED";
+/// Environment variable explicitly allowing the open A2A surface (no config
+/// key: the A2A routes stay open without an operator token only when this is
+/// set true; otherwise the server refuses to mount them, see
+/// [`a2a_open_permitted`]).
+pub const ALLOW_OPEN_ENV: &str = "KUBEADP_API_ALLOW_OPEN";
 
 /// Length of a SHA-256 digest in bytes.
 pub const DIGEST_LEN: usize = 32;
@@ -107,6 +112,15 @@ pub fn allow_unauthenticated_from_env() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the A2A routes may stay open without an operator token:
+/// `KUBEADP_API_ALLOW_OPEN` set true (parsed leniently like the other flag).
+pub fn allow_open_from_env() -> bool {
+    std::env::var(ALLOW_OPEN_ENV)
+        .ok()
+        .map(|v| parse_bool(&v))
+        .unwrap_or(false)
+}
+
 fn parse_bool(v: &str) -> bool {
     matches!(
         v.trim().to_ascii_lowercase().as_str(),
@@ -140,6 +154,17 @@ pub fn startup_permitted(token_configured: bool, allow_unauthenticated: bool) ->
     token_configured || allow_unauthenticated
 }
 
+/// `true` when the A2A routes may be mounted with the given operator-token
+/// state: a token configured (the A2A routes sit behind the same bearer as
+/// `/api/v1`), or `KUBEADP_API_ALLOW_OPEN` set true (the explicit open path).
+/// Pure decision predicate so it is table-testable; the mount sites refuse to
+/// start with a clear error naming `KUBEADP_API_ALLOW_OPEN` when it returns
+/// `false` -- a `None` operator verifier must never mean an open A2A surface
+/// by accident.
+pub fn a2a_open_permitted(token_configured: bool, allow_open: bool) -> bool {
+    token_configured || allow_open
+}
+
 /// The result of resolving the operator-token configuration at startup:
 /// either the (optional) token to protect the API with, or a fatal startup
 /// error the server must refuse to continue past.
@@ -147,8 +172,9 @@ pub fn startup_permitted(token_configured: bool, allow_unauthenticated: bool) ->
 pub enum StartupAuth {
     /// Serve with this bearer token guarding `/api/v1` and the A2A surface.
     Token(String),
-    /// No token configured and the unauthenticated flag is set: the whole
-    /// API surface is open (the operator took the explicit unsafe path).
+    /// No token configured and the unauthenticated flag is set: the `/api/v1`
+    /// surface is open (the operator took the explicit unsafe path); the A2A
+    /// routes stay unmounted unless `KUBEADP_API_ALLOW_OPEN` is set too.
     Unauthenticated,
     /// No token configured and the flag is absent: startup refused. The
     /// string is the message to log before refusing.
@@ -216,6 +242,15 @@ mod tests {
         assert!(startup_permitted(true, true));
         assert!(startup_permitted(false, true));
         assert!(!startup_permitted(false, false));
+    }
+
+    #[test]
+    fn test_a2a_open_permitted() {
+        assert!(a2a_open_permitted(true, false));
+        assert!(a2a_open_permitted(true, true));
+        assert!(a2a_open_permitted(false, true));
+        // No token and no explicit open flag: the A2A routes refuse to mount.
+        assert!(!a2a_open_permitted(false, false));
     }
 
     #[test]
@@ -313,6 +348,31 @@ mod tests {
             }
             unsafe {
                 std::env::remove_var(ALLOW_UNAUTHENTICATED_ENV);
+            }
+        });
+    }
+
+    #[test]
+    fn test_allow_open_parsing() {
+        with_env_lock(|| {
+            unsafe {
+                std::env::remove_var(ALLOW_OPEN_ENV);
+            }
+            assert!(!allow_open_from_env());
+            for val in ["1", "true", "TRUE", "yes", "on"] {
+                unsafe {
+                    std::env::set_var(ALLOW_OPEN_ENV, val);
+                }
+                assert!(allow_open_from_env(), "value {val:?}");
+            }
+            for val in ["0", "false", "no", "off", "banana"] {
+                unsafe {
+                    std::env::set_var(ALLOW_OPEN_ENV, val);
+                }
+                assert!(!allow_open_from_env(), "value {val:?}");
+            }
+            unsafe {
+                std::env::remove_var(ALLOW_OPEN_ENV);
             }
         });
     }

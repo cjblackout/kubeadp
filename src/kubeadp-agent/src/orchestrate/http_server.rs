@@ -144,6 +144,22 @@ pub fn build_router(
     let a2a_auth: Option<crate::core::a2a::AuthVerifier> =
         crate::core::server::auth::auth_verifier_from_state(&auth_state);
 
+    // Fail closed: a `None` operator verifier (no KUBEADP_API_TOKEN_FILE)
+    // means open only when KUBEADP_API_ALLOW_OPEN=true is set explicitly;
+    // otherwise the server refuses to start with a clear error naming the
+    // flag. Production deployments always configure the token.
+    #[cfg(feature = "a2a")]
+    if !crate::core::server::token::a2a_open_permitted(
+        a2a_auth.is_some(),
+        crate::core::server::token::allow_open_from_env(),
+    ) {
+        anyhow::bail!(
+            "agent-orchestrate: no operator api token configured (KUBEADP_API_TOKEN_FILE) and \
+             KUBEADP_API_ALLOW_OPEN is not set; refusing to mount open A2A routes -- \
+             supply the operator token or explicitly set KUBEADP_API_ALLOW_OPEN=true"
+        );
+    }
+
     #[cfg(feature = "a2a")]
     // The A2A router shares the SAME SessionsApiState (and thus the same
     // message rate limiter) as the REST /api/v1/sessions router above, so the

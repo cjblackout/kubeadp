@@ -230,6 +230,8 @@ Protected A2A routes enforce authentication **before** parsing request bodies:
    }
    ```
 
+**No-token fail closed**: with no operator token configured (`KUBEADP_API_TOKEN_FILE` unset or empty), the A2A routes stay open only when the env `KUBEADP_API_ALLOW_OPEN=true` is set explicitly; otherwise the server refuses to start with an error naming `KUBEADP_API_ALLOW_OPEN` (fail closed: a missing token never means an accidentally open A2A surface). Both Deployments that run the agent (`kubeadp-agent-worker`, `ai-server`) set the token file, so production is unaffected.
+
 ### 4.3 Jobsets and Derived Secrets
 
 A *jobset* represents an isolated messaging group spanning worker jobs and orchestrator sessions:
@@ -334,6 +336,7 @@ queued -> injection at the next boundary of any available channel (the hook
 
 - **agy**: the worker installs a NATIVE agy plugin (`worker/agy_plugin.rs`, `agy plugin install <dir>` into the job's agy home; never touches the user's other plugins). The plugin root holds `.antigravity-plugin/plugin.json` plus `hooks.json` AT THE PLUGIN ROOT with flat handler lists: `{"a2a":{"PreInvocation":[{"type":"command","command":"<abs> a2a-hook pre-invocation"}],"PostInvocation":[...],"Stop":[...]}}`. Hook commands run via `sh -c` with cwd = the plugin dir, so the binary path is absolute. Install is best effort (logged, never fatal); the hook channel then simply never fires and `tool_result` still delivers.
 - **Claude Code**: the supervisor merges the A2A hooks into the session settings (`~/.claude/settings.json`, `orchestrate/claude_config.rs`): `PostToolUse`, `UserPromptSubmit` and `Stop` entries pointing at `<abs> a2a-hook <event>`, keeping every existing hook entry and setting (idempotent: when all three are present the file is not rewritten).
+- **Residual risk of the agy hook channel (accepted)**: on agy the untrusted message reaches the model as a `systemMessage` (`injectSteps` system message printed by the `a2a-hook` invocations; Claude Code instead delivers the same text as `hookSpecificOutput.additionalContext`, a lower-authority context injection). The text is framed as untrusted data from the sender whose A2A connection was verified (the sender identity itself is only claimed), length-capped (`MAX_INJECT_BYTES`, 16 KiB per boundary) and control-character-stripped before framing. This residual risk — a system-role message carrying untrusted content — is accepted because agy has no other hook output: it parses the stdout of every hook invocation and offers no additionalContext-equivalent channel, so the verified plugin's `injectSteps` system message is the only way to reach the model from a hook.
 
 ---
 

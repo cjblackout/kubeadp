@@ -12,7 +12,10 @@
 //!   against the *target* task/agent of the request (target-aware, constant
 //!   time); a request that presents no jobset credential is accepted only when
 //!   the operator/bearer verifier accepts it (or no verifier is configured --
-//!   the network-policy-only model).
+//!   a state the mount sites never produce by accident: a server without an
+//!   operator token mounts open A2A routes only with `KUBEADP_API_ALLOW_OPEN`
+//!   set, otherwise it refuses to start, see
+//!   `crate::core::server::token::a2a_open_permitted`).
 //!
 //! A request that fails answers HTTP `401` with the A2A `application/problem+json`
 //! envelope (status `UNAUTHENTICATED`) and a `WWW-Authenticate: Bearer` header,

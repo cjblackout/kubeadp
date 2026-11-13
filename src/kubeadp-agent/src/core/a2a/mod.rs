@@ -87,9 +87,9 @@ use axum::Router;
 /// Returns `true` when the request's headers carry an accepted bearer token.
 /// The wrapper serving the router builds this from its configured token
 /// (constant-time compare; see [`constant_time_eq`]). A `None` value disables
-/// the check entirely -- the wrapper then relies on network policy to keep
-/// the endpoint unreachable, matching the agent-run-api / agent-orchestrate
-/// "no token configured" model.
+/// the check entirely -- a state only reached on the explicit
+/// `KUBEADP_API_ALLOW_OPEN` path (the mount sites refuse to serve open A2A
+/// routes without that flag, so the endpoint is never reachable by accident).
 pub type AuthVerifier = Arc<dyn Fn(&HeaderMap) -> bool + Send + Sync>;
 
 /// Builds the A2A axum router from the SDK's sub-routers.
@@ -99,7 +99,9 @@ pub type AuthVerifier = Arc<dyn Fn(&HeaderMap) -> bool + Send + Sync>;
 ///
 /// The REST sub-router uses [`ServerRequestHandler`] carrying the optional
 /// bearer verifier and [`MessageSink`]; an absent verifier lets everything
-/// through (network-policy-only access control). The agent card stays public.
+/// through (the explicit `KUBEADP_API_ALLOW_OPEN` path -- the mount sites
+/// refuse to serve open A2A routes without that flag). The agent card stays
+/// public.
 pub fn a2a_router(
     model: A2aModel,
     backend: Arc<dyn TaskBackend>,
@@ -182,8 +184,8 @@ impl JobsetCred {
 /// credential is verified against the TARGET task/agent of the request (the
 /// `send_message` recipient, or the task on `/tasks/{id}`), and a request that
 /// presents no jobset credential is accepted only when the operator/bearer
-/// verifier accepts it (or no verifier is configured -- the
-/// network-policy-only model).
+/// verifier accepts it (or no verifier is configured -- the explicit
+/// `KUBEADP_API_ALLOW_OPEN` path, never reached by accident).
 ///
 /// The check is installed ONLY on the A2A routes (the SDK JSON-RPC + REST
 /// sub-routers share one [`ServerRequestHandler`]), so the jobset credential
