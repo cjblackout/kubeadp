@@ -113,6 +113,7 @@ impl ClaudePtyAdapter {
             name,
             crate::orchestrate::sessions_api::REST_SENDER,
             text,
+            true,
         );
         outcome_to_error(outcome, &run)
     }

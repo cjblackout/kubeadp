@@ -503,7 +503,7 @@ async fn inject_message(
     let state = Arc::clone(&state);
     let closure_name = name.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        deliver_message(&state, &closure_name, REST_SENDER, &text)
+        deliver_message(&state, &closure_name, REST_SENDER, &text, true)
     })
     .await
     .expect("spawn_blocking task panicked or runtime shut down");
@@ -574,6 +574,7 @@ pub fn deliver_message(
     name: &str,
     sender: &str,
     text: &str,
+    charge_budget: bool,
 ) -> DeliverOutcome {
     // 404/not_found for an unknown session.
     let Some(control) = state.controls.get(name) else {
@@ -613,14 +614,19 @@ pub fn deliver_message(
         if !slot.taken() {
             false
         } else {
-            let mut limits = state
-                .message_limits
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(retry_after) = limits.record(name, sender, Instant::now()) {
-                return DeliverOutcome::RateLimited {
-                    retry_after_secs: retry_after,
-                };
+            // N7: a session message is charged ONCE against the budget. The
+            // A2A sink charges at acceptance and passes `charge_budget=false`
+            // here; the REST (and engine adapter) callers charge here.
+            if charge_budget {
+                let mut limits = state
+                    .message_limits
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(retry_after) = limits.record(name, sender, Instant::now()) {
+                    return DeliverOutcome::RateLimited {
+                        retry_after_secs: retry_after,
+                    };
+                }
             }
             // The PTY write is bounded by a deadline (see PtyInput::write_all):
             // a stuck child that never drains its input queue turns into a

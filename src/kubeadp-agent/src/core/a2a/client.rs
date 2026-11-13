@@ -48,7 +48,7 @@
 //! hop is the incoming message's hop + 1; a hop above `MAX_HOP` is refused
 //! with a clear error.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use a2a::{A2AError, GetTaskRequest, Message, Part, Role, SendMessageRequest, SendMessageResponse};
@@ -67,6 +67,10 @@ pub const MAX_HOP: u32 = 4;
 pub const META_SENDER: &str = "a2a.sender";
 /// Metadata key for the hop counter.
 pub const META_HOP: &str = "a2a.hop";
+/// Metadata key for the signed one-time HOP TOKEN the sender mints for every
+/// outgoing message (the receiver reads the hop ONLY from this verified
+/// token; the claimed `a2a.hop` is ignored). Re-exported from [`crate::core::a2a::ingress`].
+pub use crate::core::a2a::ingress::META_HOP_TOKEN;
 /// Label selecting agent Services in the Kubernetes discovery.
 pub const AGENT_LABEL: &str = "a2a.homelab/agent=true";
 /// Env var naming the static A2A peer registry: a comma-separated
@@ -123,10 +127,24 @@ pub struct A2aClientCtx {
     self_name: Arc<str>,
     /// Default namespace for unadorned agent lookup (e.g. the pod's namespace).
     default_namespace: Option<String>,
-    /// Interceptors applied to every outgoing request: the per-jobset
-    /// credential (when this agent is a jobset member) plus any bearer
-    /// credential. Built once at construction, not per request.
+    /// Interceptors applied to every outgoing request: any bearer credential.
+    /// Built once at construction, not per request. The per-jobset credential
+    /// is held separately (see [`A2aClientCtx::jobset_interceptor`]): it is
+    /// attached only to the peers it may go to.
     interceptors: Vec<Arc<dyn CallInterceptor>>,
+    /// This process's own jobset credential, when it is a jobset member.
+    /// Signs the outgoing hop token (`a2a.hop_token`) so the receiver can
+    /// verify the hop count instead of trusting the claimed `a2a.hop`.
+    jobset_credential: Option<Arc<crate::core::jobset::JobsetCredential>>,
+    /// The jobset credential interceptor, attached to an outgoing request
+    /// ONLY when the target qualifies (N9): an explicitly configured peer
+    /// (`A2A_PEERS` or a `A2A_URL_OVERRIDES` entry) or an HTTPS endpoint.
+    /// Never to a peer merely discovered by Service label over plain HTTP.
+    jobset_interceptor: Option<Arc<dyn CallInterceptor>>,
+    /// The explicitly configured static peer keys (`A2A_PEERS`), computed at
+    /// construction: a target matching one of these is an explicitly
+    /// configured peer.
+    static_peer_keys: StaticPeerKeys,
 }
 
 impl A2aClientCtx {
@@ -220,11 +238,25 @@ impl A2aClientCtx {
     /// request (see [`JobsetCredentialInterceptor`]) so the target agent can
     /// verify membership.
     fn client_for(&self, entry: &AgentEntry) -> Result<A2AClient<RestTransport>, String> {
-        let base = url_override(&entry.name, &entry.namespace).unwrap_or_else(|| entry.url.clone());
+        let override_base = url_override(&entry.name, &entry.namespace);
+        let base = override_base.clone().unwrap_or_else(|| entry.url.clone());
         let http = a2a_client::default_reqwest_client(None)
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
         let transport = RestTransport::new(http, base.trim_end_matches('/').to_string());
-        Ok(A2AClient::new(transport).with_interceptors(self.interceptors.clone()))
+        // The jobset secret header goes ONLY to the peers it may go to (N9):
+        // an explicitly configured peer (a static `A2A_PEERS` entry or an
+        // `A2A_URL_OVERRIDES` mapping) or an HTTPS endpoint. Never to a peer
+        // merely discovered by Service label over plain HTTP.
+        let mut interceptors = self.interceptors.clone();
+        let static_peer = self
+            .static_peer_keys
+            .contains(&(entry.namespace.clone(), entry.name.clone()));
+        if secret_header_allowed(&base, override_base.is_some(), static_peer) {
+            if let Some(js) = &self.jobset_interceptor {
+                interceptors.push(Arc::clone(js));
+            }
+        }
+        Ok(A2AClient::new(transport).with_interceptors(interceptors))
     }
 
     /// Compute the outgoing hop and refuse when it exceeds [`MAX_HOP`].
@@ -256,6 +288,12 @@ impl A2aClientCtx {
         }
         let hop = self.next_hop(incoming_hop)?;
         let mut message = Message::new(Role::User, vec![Part::text(text)]);
+        // The hop token binds the message id the receiver replays against;
+        // an SDK Message always carries one, but a fresh id is minted when
+        // it is somehow absent so the token can never bind an empty key.
+        if message.message_id.trim().is_empty() {
+            message.message_id = crate::core::a2a::ingress::fresh_message_id();
+        }
         message.context_id = context_id;
         message.task_id = task_id;
         let mut metadata = HashMap::new();
@@ -264,6 +302,24 @@ impl A2aClientCtx {
             serde_json::json!(self.self_name.as_ref()),
         );
         metadata.insert(META_HOP.to_string(), serde_json::json!(hop));
+        // The receiver no longer trusts the sender's `a2a.hop` integer: when
+        // this process is a jobset member it signs the hop into a one-time
+        // `a2a.hop_token` ({hop, expiry, message_id}, HMAC-SHA256 with the
+        // jobset secret). The receiver verifies the token with the target
+        // jobset's secret and ignores the claimed hop. Without a token the
+        // receiver refuses the message (fail closed), so every jobset-member
+        // send mints one.
+        if let Some(cred) = &self.jobset_credential {
+            if !cred.secret.is_empty() {
+                let token = crate::core::a2a::ingress::issue_hop_token(
+                    hop,
+                    &message.message_id,
+                    cred.secret.as_bytes(),
+                    crate::core::a2a::inbox::now_unix(),
+                );
+                metadata.insert(META_HOP_TOKEN.to_string(), serde_json::json!(token));
+            }
+        }
         message.metadata = Some(metadata);
         Ok(message)
     }
@@ -572,12 +628,41 @@ where
         .unwrap_or_else(|| "kubeadp-agent".to_string())
         .into();
 
+    let (interceptors, jobset_interceptor, static_peer_keys) = client_ctx_parts(own_ns.as_deref());
     Ok(A2aClientCtx {
         agents: Arc::new(agents),
         self_name,
         default_namespace: own_ns,
-        interceptors: interceptors_from_env(),
+        interceptors,
+        jobset_credential: crate::core::jobset::JobsetCredential::from_env().map(Arc::new),
+        jobset_interceptor,
+        static_peer_keys,
     })
+}
+
+/// The explicitly configured static peer keys (`A2A_PEERS`), keyed by
+/// (namespace, name).
+type StaticPeerKeys = Arc<HashSet<(String, String)>>;
+
+/// The shared construction pieces of a client context: the always-on
+/// interceptors, the (separately held) jobset credential interceptor and the
+/// explicitly configured static peer keys.
+type ClientCtxParts = (
+    Vec<Arc<dyn CallInterceptor>>,
+    Option<Arc<dyn CallInterceptor>>,
+    StaticPeerKeys,
+);
+
+fn client_ctx_parts(default_namespace: Option<&str>) -> ClientCtxParts {
+    let keys: HashSet<(String, String)> = static_peers(default_namespace)
+        .into_iter()
+        .map(|(ns, name, _)| (ns, name))
+        .collect();
+    (
+        interceptors_from_env(),
+        jobset_credential_interceptor().map(|i| Arc::new(i) as Arc<dyn CallInterceptor>),
+        Arc::new(keys),
+    )
 }
 
 /// An empty client context (no discovered agents). Used by the MCP server when
@@ -585,11 +670,15 @@ where
 /// reports a clear error instead of the process exiting. The jobset credential
 /// is still attached (it is independent of discovery).
 pub fn empty_ctx() -> A2aClientCtx {
+    let (interceptors, jobset_interceptor, static_peer_keys) = client_ctx_parts(None);
     A2aClientCtx {
         agents: Arc::new(HashMap::new()),
         self_name: "kubeadp-agent".into(),
         default_namespace: None,
-        interceptors: interceptors_from_env(),
+        interceptors,
+        jobset_credential: crate::core::jobset::JobsetCredential::from_env().map(Arc::new),
+        jobset_interceptor,
+        static_peer_keys,
     }
 }
 
@@ -617,11 +706,15 @@ pub fn static_peers_ctx() -> A2aClientCtx {
         .filter(|s| is_valid_self_name(s))
         .unwrap_or_else(|| "kubeadp-agent".to_string())
         .into();
+    let (interceptors, jobset_interceptor, static_peer_keys) = client_ctx_parts(own_ns.as_deref());
     A2aClientCtx {
         agents: Arc::new(agents),
         self_name,
         default_namespace: own_ns,
-        interceptors: interceptors_from_env(),
+        interceptors,
+        jobset_credential: crate::core::jobset::JobsetCredential::from_env().map(Arc::new),
+        jobset_interceptor,
+        static_peer_keys,
     }
 }
 
@@ -691,6 +784,14 @@ pub fn discovery_namespaces(own_namespace: Option<&str>) -> Vec<String> {
 /// wins over a bare-name override; a bare `name` applies to every agent with
 /// that name (used by the single-peer tests). Returns `None` when unset or the
 /// key does not match.
+/// Whether the jobset secret header may be attached to a request toward
+/// `base` (N9): only to an HTTPS endpoint or to an explicitly configured peer
+/// (a static `A2A_PEERS` entry or an `A2A_URL_OVERRIDES` mapping). Never to a
+/// peer merely discovered by Service label over plain HTTP.
+fn secret_header_allowed(base: &str, override_configured: bool, static_peer: bool) -> bool {
+    base.trim_end_matches('/').starts_with("https://") || override_configured || static_peer
+}
+
 fn url_override(name: &str, namespace: &str) -> Option<String> {
     #[cfg(feature = "test-hooks")]
     {
@@ -782,6 +883,9 @@ mod tests {
             self_name: "test-self".into(),
             default_namespace: None,
             interceptors: Vec::new(),
+            jobset_credential: None,
+            jobset_interceptor: None,
+            static_peer_keys: Arc::new(HashSet::new()),
         }
     }
 
@@ -817,6 +921,66 @@ mod tests {
     fn empty_text_is_refused() {
         let ctx = ctx_with(vec![("alpha", "ops", "http://alpha.ops.svc:8080")]);
         assert!(ctx.build_send_message("   ", None, None, None).is_err());
+    }
+
+    #[test]
+    fn jobset_secret_header_only_to_explicit_or_https_peers() {
+        // N9: the secret header goes only to an explicitly configured peer
+        // (A2A_PEERS / URL overrides) or an HTTPS endpoint, never to a peer
+        // merely discovered by Service label over plain HTTP.
+        assert!(!secret_header_allowed(
+            "http://svc.ns.svc:8080",
+            false,
+            false
+        ));
+        assert!(secret_header_allowed(
+            "https://svc.ns.svc:8080",
+            false,
+            false
+        ));
+        assert!(secret_header_allowed("http://127.0.0.1:8080", true, false));
+        assert!(secret_header_allowed("http://svc.ns.svc:8080", false, true));
+        // An HTTPS override is allowed either way.
+        assert!(secret_header_allowed("https://x", true, false));
+    }
+
+    #[test]
+    fn jobset_member_mints_a_verifiable_hop_token() {
+        // A jobset-member sender signs the hop into a one-time
+        // `a2a.hop_token`: the receiver reads the hop ONLY from the verified
+        // token, so the claimed `a2a.hop` integer is no longer trusted (N1).
+        let secret = "jobset-secret-value";
+        let mut ctx = ctx_with(vec![("alpha", "ops", "http://alpha.ops.svc:8080")]);
+        ctx.jobset_credential = Some(Arc::new(crate::core::jobset::JobsetCredential {
+            jobset_id: "js-1".to_string(),
+            secret: secret.to_string(),
+            epoch: crate::core::jobset::EPOCH_ZERO,
+        }));
+        let msg = ctx
+            .build_send_message("hello", None, Some("t1".into()), Some(0))
+            .unwrap();
+        let meta = msg.metadata.as_ref().unwrap();
+        let token = meta[META_HOP_TOKEN].as_str().expect("hop token present");
+        // The receiver-side verification with the same jobset secret accepts
+        // and reads the hop from the token (the claimed hop is ignored).
+        let info = crate::core::a2a::ingress::HopGuard::new()
+            .verify_and_next(
+                token,
+                secret.as_bytes(),
+                crate::core::a2a::inbox::now_unix(),
+            )
+            .expect("token verifies with the sender's own jobset secret");
+        assert_eq!(info.hop, 1);
+        assert_eq!(info.message_id, msg.message_id);
+        // A different secret (the receiver of another jobset) rejects it.
+        assert!(crate::core::a2a::ingress::HopGuard::new()
+            .verify_and_next(token, b"other-secret", crate::core::a2a::inbox::now_unix())
+            .is_err());
+        // A non-member sends no token (its receiver keeps the old bounded
+        // hop check).
+        let plain = ctx_with(vec![("alpha", "ops", "http://alpha.ops.svc:8080")]);
+        let msg = plain.build_send_message("hello", None, None, None).unwrap();
+        assert!(msg.metadata.as_ref().unwrap().get(META_HOP_TOKEN).is_none());
     }
 
     #[tokio::test]

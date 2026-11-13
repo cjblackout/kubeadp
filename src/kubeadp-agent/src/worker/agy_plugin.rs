@@ -39,7 +39,13 @@ pub const INSTALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// the path must be absolute).
 pub fn hook_command(event: &str) -> String {
     let exe = crate::sandbox::find_launcher_exe();
-    format!("{} a2a-hook {}", exe.to_string_lossy(), event)
+    // N12: the path is interpolated into `sh -c` -- quoted, so a path with
+    // spaces or shell metacharacters stays one word.
+    format!(
+        "{} a2a-hook {}",
+        crate::sandbox::shell_quote(&exe.to_string_lossy()),
+        event
+    )
 }
 
 /// The plugin directory for a run state root: `<state_root>/a2a-plugin/`.
@@ -211,7 +217,16 @@ mod tests {
             assert_eq!(handlers.len(), 1, "{key}: {v}");
             assert_eq!(handlers[0]["type"], "command", "{key}: {v}");
             let command = handlers[0]["command"].as_str().unwrap();
-            assert!(command.starts_with('/'), "absolute path: {command}");
+            // N12: the binary path is shell-quoted; the quoted path is absolute.
+            let quoted = command
+                .strip_suffix(&format!(" a2a-hook {event}"))
+                .unwrap_or(command);
+            assert!(
+                quoted.starts_with('\'')
+                    && quoted.ends_with('\'')
+                    && quoted[1..quoted.len() - 1].starts_with('/'),
+                "quoted absolute path: {command}"
+            );
             assert_eq!(command, hook_command(event), "{key}: {v}");
             assert!(
                 command.ends_with(&format!("a2a-hook {event}")),
@@ -256,11 +271,48 @@ mod tests {
     #[test]
     fn hook_command_uses_the_absolute_launcher_path() {
         let cmd = hook_command("pre-invocation");
-        assert!(cmd.starts_with('/'), "absolute binary path, got: {cmd}");
-        assert!(cmd.ends_with(" a2a-hook pre-invocation"), "got: {cmd}");
+        // N12: the binary path is shell-quoted inside the `sh -c` command;
+        // the quoted path itself is absolute.
+        let quoted = cmd
+            .strip_suffix(" a2a-hook pre-invocation")
+            .expect("suffix, got: {cmd}");
+        assert!(
+            quoted.starts_with('\'') && quoted.ends_with('\''),
+            "quoted: {cmd}"
+        );
+        assert!(
+            quoted[1..quoted.len() - 1].starts_with('/'),
+            "absolute: {cmd}"
+        );
         assert_eq!(
             plugin_dir_for(Path::new("/state")),
             PathBuf::from("/state/a2a-plugin")
         );
+    }
+
+    #[test]
+    fn shell_quote_is_safe_for_hostile_paths() {
+        // N12: a path with spaces or shell metacharacters stays ONE word.
+        for hostile in [
+            "/opt/my tools/agent-run",
+            "/opt/agent;rm -rf /",
+            "/opt/%(evil)/agent-run",
+            "/opt/a'b/agent-run",
+            "/opt/a`b`/agent-run",
+        ] {
+            let quoted = crate::sandbox::shell_quote(hostile);
+            assert!(
+                quoted.starts_with('\'') && quoted.ends_with('\''),
+                "{hostile}"
+            );
+            // No unquoted metacharacter survives outside the quotes: the
+            // only characters outside the leading/trailing quotes are the
+            // escaped inner quote sequence.
+            let inner = &quoted[1..quoted.len() - 1];
+            if !hostile.contains('\'') {
+                assert_eq!(inner, hostile, "{hostile}");
+            }
+        }
+        assert_eq!(crate::sandbox::shell_quote("/opt/a'b"), "'/opt/a'\\''b'");
     }
 }

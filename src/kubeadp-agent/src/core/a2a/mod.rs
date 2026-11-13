@@ -250,6 +250,8 @@ pub(crate) mod testenv {
         "AGENT_RUN_STATE_ROOT",
         "AGENT_RUN_WORKSPACE_ROOT",
         "AGENT_RUN_CONFIG",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
     ];
 
     pub struct Guard {
@@ -475,10 +477,14 @@ mod jobset_router_tests {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// A request that names no target (`GET /tasks`) still has to present the
-    /// jobset's secret: the id alone is not a credential.
+    /// A request that names no target (`GET /tasks` without `?contextId=`) is
+    /// REFUSED for a presented jobset credential, even with the correct
+    /// secret: a jobset credential only ever authorizes the jobset(s) it
+    /// names, so an untargeted list would read every job on the pod across
+    /// jobsets. The caller must name its target (a task id or a
+    /// `?contextId=`), which is then membership-checked.
     #[tokio::test]
-    async fn jobset_targetless_request_verifies_the_secret() {
+    async fn jobset_targetless_request_refused_even_with_the_secret() {
         let cred = cred_with_members(&[("t1", "js-1", "secret-1")]);
         let app = a2a_router_with_jobset(
             model(),
@@ -487,18 +493,7 @@ mod jobset_router_tests {
             None,
             Some(cred),
         );
-        let wrong = app
-            .clone()
-            .oneshot(get_task_req(
-                "/tasks",
-                &[
-                    (crate::core::jobset::JOBSET_ID_HEADER, "js-1"),
-                    (crate::core::jobset::JOBSET_SECRET_HEADER, "not-the-secret"),
-                ],
-            ))
-            .await
-            .unwrap();
-        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        // An untargeted list with the CORRECT secret: still refused.
         let right = app
             .oneshot(get_task_req(
                 "/tasks",
@@ -509,7 +504,80 @@ mod jobset_router_tests {
             ))
             .await
             .unwrap();
-        assert_ne!(right.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(right.status(), StatusCode::UNAUTHORIZED);
+        // ...and with the wrong secret, of course.
+        let wrong = a2a_router_with_jobset(
+            model(),
+            FakeBackend::with(vec![task("t1")]),
+            None,
+            None,
+            Some(cred_with_members(&[("t1", "js-1", "secret-1")])),
+        )
+        .oneshot(get_task_req(
+            "/tasks",
+            &[
+                (crate::core::jobset::JOBSET_ID_HEADER, "js-1"),
+                (crate::core::jobset::JOBSET_SECRET_HEADER, "not-the-secret"),
+            ],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A targeted list with `?contextId=` requires membership of the decoded
+    /// context id; a percent-encoded path id is normalised before the check
+    /// (the handler sees the decoded segment).
+    #[tokio::test]
+    async fn jobset_targeted_list_and_percent_encoded_keys() {
+        // `GET /tasks?contextId=t1` with the t1 membership: accepted.
+        let cred = cred_with_members(&[("t1", "js-1", "secret-1")]);
+        let app = a2a_router_with_jobset(
+            model(),
+            FakeBackend::with(vec![task("t1")]),
+            None,
+            None,
+            Some(cred),
+        );
+        let res = app
+            .clone()
+            .oneshot(get_task_req(
+                "/tasks?contextId=t1",
+                &[
+                    (crate::core::jobset::JOBSET_ID_HEADER, "js-1"),
+                    (crate::core::jobset::JOBSET_SECRET_HEADER, "secret-1"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        // The same with a percent-encoded context id: decoded before the
+        // membership check.
+        let res = app
+            .clone()
+            .oneshot(get_task_req(
+                "/tasks?contextId=t%31",
+                &[
+                    (crate::core::jobset::JOBSET_ID_HEADER, "js-1"),
+                    (crate::core::jobset::JOBSET_SECRET_HEADER, "secret-1"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        // A percent-encoded path id is normalised too: /tasks/t%31 verifies
+        // against the decoded t1 membership.
+        let res = app
+            .oneshot(get_task_req(
+                "/tasks/t%31",
+                &[
+                    (crate::core::jobset::JOBSET_ID_HEADER, "js-1"),
+                    (crate::core::jobset::JOBSET_SECRET_HEADER, "secret-1"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -646,5 +714,282 @@ mod jobset_router_tests {
         let app = a2a_router_with_jobset(model(), backend, None, None, None);
         let res = app.oneshot(get_task_req("/tasks/t1", &[])).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    // ---- Guarded sends (N1 hop token, N6 interrupt strip) ----------------
+
+    /// One recorded `deliver_with_meta` call: (task, sender, text, message
+    /// id, delivery metadata).
+    type RecordedCall = (String, String, String, String, DeliveryMeta);
+
+    /// A sink that records every `deliver_with_meta` call.
+    struct RecordingSink {
+        calls: Mutex<Vec<RecordedCall>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+        fn single(&self) -> DeliveryMeta {
+            let calls = self.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "exactly one delivery");
+            calls[0].4
+        }
+    }
+
+    impl MessageSink for RecordingSink {
+        fn deliver_with_meta(
+            &self,
+            task_id: &str,
+            sender: &str,
+            text: &str,
+            message_id: &str,
+            meta: DeliveryMeta,
+        ) -> Result<(), a2a::A2AError> {
+            self.calls.lock().unwrap().push((
+                task_id.to_string(),
+                sender.to_string(),
+                text.to_string(),
+                message_id.to_string(),
+                meta,
+            ));
+            Ok(())
+        }
+    }
+
+    /// Builds a `POST /message:send` body for task `t1` with the given
+    /// message metadata, serialized with the SDK's own types (the same shape
+    /// the SDK's REST router parses).
+    fn send_body_for(metadata: HashMap<String, serde_json::Value>) -> String {
+        let mut message = a2a::Message::new(a2a::Role::User, vec![a2a::Part::text("hello")]);
+        message.task_id = Some("t1".to_string());
+        message.metadata = Some(metadata);
+        let req = a2a::SendMessageRequest {
+            message,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        serde_json::to_string(&req).unwrap()
+    }
+
+    fn send_req(uri: &str, body: String, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(Body::from(body)).unwrap()
+    }
+
+    fn jobset_headers() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (crate::core::jobset::JOBSET_ID_HEADER, "js-1"),
+            (crate::core::jobset::JOBSET_SECRET_HEADER, "secret-1"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn guarded_send_reads_the_hop_only_from_a_valid_token() {
+        // N1: the sender's claimed `a2a.hop` integer is ignored; the hop is
+        // read from the signed one-time `a2a.hop_token` minted with the
+        // target jobset's secret. A hostile member claiming hop 0 every time
+        // is refused once the replay/limit machinery kicks in.
+        let sink = RecordingSink::new();
+        let cred = cred_with_members(&[("t1", "js-1", "secret-1")]);
+        let app = a2a_router_with_jobset(
+            model(),
+            FakeBackend::with(vec![task("t1")]),
+            Some(sink.clone()),
+            None,
+            Some(cred),
+        );
+        let now = crate::core::a2a::inbox::now_unix();
+        let token = crate::core::a2a::ingress::HopGuard::new().issue(2, "m-1", b"secret-1", now);
+        let mut metadata = HashMap::new();
+        // The hostile claim: hop 0. It is ignored; the verified hop wins.
+        metadata.insert("a2a.hop".to_string(), serde_json::json!(0));
+        metadata.insert(
+            crate::core::a2a::ingress::META_HOP_TOKEN.to_string(),
+            serde_json::json!(token),
+        );
+        let body = send_body_for(metadata);
+        let res = app
+            .clone()
+            .oneshot(send_req("/message:send", body.clone(), &jobset_headers()))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let meta = sink.single();
+        assert_eq!(meta.hop, 2, "the verified hop, not the claimed 0");
+        assert!(!meta.interrupt);
+
+        // A replay of the same token (same message id) is refused.
+        let res = app
+            .oneshot(send_req("/message:send", body, &jobset_headers()))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn guarded_send_without_or_with_a_bad_token_is_refused() {
+        let sink = RecordingSink::new();
+        let cred = cred_with_members(&[("t1", "js-1", "secret-1")]);
+        let app = a2a_router_with_jobset(
+            model(),
+            FakeBackend::with(vec![task("t1")]),
+            Some(sink.clone()),
+            None,
+            Some(cred),
+        );
+        // No hop token at all (a member that does not mint one): refused.
+        let mut metadata = HashMap::new();
+        metadata.insert("a2a.hop".to_string(), serde_json::json!(0));
+        let res = app
+            .clone()
+            .oneshot(send_req(
+                "/message:send",
+                send_body_for(metadata),
+                &jobset_headers(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(sink.calls.lock().unwrap().is_empty(), "nothing delivered");
+
+        // A token signed with the WRONG secret (forged hop): refused.
+        let token = crate::core::a2a::ingress::HopGuard::new().issue(
+            0,
+            "m-2",
+            b"attacker-secret",
+            crate::core::a2a::inbox::now_unix(),
+        );
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::core::a2a::ingress::META_HOP_TOKEN.to_string(),
+            serde_json::json!(token),
+        );
+        let res = app
+            .oneshot(send_req(
+                "/message:send",
+                send_body_for(metadata),
+                &jobset_headers(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(sink.calls.lock().unwrap().is_empty(), "nothing delivered");
+    }
+
+    #[tokio::test]
+    async fn guarded_send_strips_interrupt_from_non_operator() {
+        // N6: `a2a.interrupt: true` is honoured only for the operator
+        // credential. A jobset member's message is still delivered (no
+        // interrupt); an operator send keeps the flag.
+        let sink = RecordingSink::new();
+        let cred = cred_with_members(&[("t1", "js-1", "secret-1")]);
+        let app = a2a_router_with_jobset(
+            model(),
+            FakeBackend::with(vec![task("t1")]),
+            Some(sink.clone()),
+            None,
+            Some(cred),
+        );
+        let token = crate::core::a2a::ingress::HopGuard::new().issue(
+            0,
+            "m-int",
+            b"secret-1",
+            crate::core::a2a::inbox::now_unix(),
+        );
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::core::a2a::ingress::META_HOP_TOKEN.to_string(),
+            serde_json::json!(token),
+        );
+        metadata.insert("a2a.interrupt".to_string(), serde_json::json!(true));
+        let res = app
+            .clone()
+            .oneshot(send_req(
+                "/message:send",
+                send_body_for(metadata),
+                &jobset_headers(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let meta = sink.single();
+        assert!(!meta.interrupt, "the interrupt flag was stripped");
+
+        // The operator credential keeps the flag (no jobset headers, bearer
+        // accepted): the message is forwarded untouched.
+        let op_sink = RecordingSink::new();
+        let bearer: AuthVerifier = Arc::new(|_headers: &HeaderMap| true);
+        let app = a2a_router_with_jobset(
+            model(),
+            FakeBackend::with(vec![task("t1")]),
+            Some(op_sink.clone()),
+            Some(bearer),
+            None,
+        );
+        let mut metadata = HashMap::new();
+        metadata.insert("a2a.interrupt".to_string(), serde_json::json!(true));
+        let res = app
+            .oneshot(send_req("/message:send", send_body_for(metadata), &[]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let meta = op_sink.single();
+        assert!(meta.interrupt, "the operator's interrupt is honoured");
+    }
+
+    #[tokio::test]
+    async fn guarded_send_charges_a_per_jobset_budget_with_429() {
+        // The guarded path's per-jobset budget: a member that pushes past the
+        // per-minute window is answered 429 with Retry-After.
+        let sink = RecordingSink::new();
+        let cred = cred_with_members(&[("t1", "js-1", "secret-1")]);
+        let app = a2a_router_with_jobset(
+            model(),
+            FakeBackend::with(vec![task("t1")]),
+            Some(sink.clone()),
+            None,
+            Some(cred),
+        );
+        let guard = crate::core::a2a::ingress::HopGuard::new();
+        let now = crate::core::a2a::inbox::now_unix();
+        let per_minute = guard.limits().per_minute;
+        let mut last = None;
+        for i in 0..=per_minute {
+            let token = guard.issue(0, &format!("budget-m-{i}"), b"secret-1", now);
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                crate::core::a2a::ingress::META_HOP_TOKEN.to_string(),
+                serde_json::json!(token),
+            );
+            last = Some(
+                app.clone()
+                    .oneshot(send_req(
+                        "/message:send",
+                        send_body_for(metadata),
+                        &jobset_headers(),
+                    ))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let res = last.expect("last response");
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            res.headers().get(axum::http::header::RETRY_AFTER).is_some(),
+            "Retry-After present"
+        );
+        // The first per_minute messages were delivered.
+        assert_eq!(sink.calls.lock().unwrap().len(), per_minute as usize);
     }
 }

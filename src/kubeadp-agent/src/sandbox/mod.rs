@@ -81,6 +81,14 @@ impl SandboxInfo {
 /// runner in `deps/` that does not handle `sandbox-exec`, so the test build
 /// additionally honours `CARGO_BIN_EXE_kubeadp-agent` and scans `deps/` for
 /// the compiled binary (see [`find_launcher_exe_test`]).
+/// Quotes a path as a single POSIX shell word (N12): the hook commands
+/// interpolate the launcher binary path into `sh -c`, and an unquoted path
+/// with spaces or shell metacharacters would run as extra shell code. Single
+/// quotes with the standard `'\''` escape are safe for every byte.
+pub fn shell_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
 pub fn find_launcher_exe() -> std::path::PathBuf {
     #[cfg(not(test))]
     {

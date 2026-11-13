@@ -883,8 +883,19 @@ fn run_session_iteration(
     // falls back to the (now ungranted) direct inbox, which a sandboxed
     // agent simply finds empty.
     #[cfg(feature = "a2a")]
-    if let Some(token) = crate::core::a2a::http::token_for_run(&a2a_inbox_dir) {
+    if let Some(token) =
+        crate::core::a2a::http::token_for_run(&a2a_inbox_dir, crate::core::a2a::inbox::now_unix())
+    {
         cmd.env(crate::core::a2a::receive::INBOX_TOKEN_ENV, token);
+    }
+    // N4: hand the sandboxed receive side the REAL inbox API address — the
+    // loopback form of the same listener this host serves — so a changed
+    // listen port cannot break delivery silently.
+    #[cfg(feature = "a2a")]
+    if let Some(url) = crate::core::a2a::receive::inbox_url_for_listen(
+        &crate::orchestrate::http_server::listen_addr_from_env(),
+    ) {
+        cmd.env(crate::core::a2a::receive::INBOX_URL_ENV, url);
     }
 
     // 5. Open PTY

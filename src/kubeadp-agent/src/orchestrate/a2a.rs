@@ -333,9 +333,15 @@ impl SessionMessageSink {
                     LadderStep::Interrupt => InjectChannel::Interrupt,
                     _ => InjectChannel::IdleTurn,
                 };
-                if let sessions_api::DeliverOutcome::Accepted { .. } =
-                    sessions_api::deliver_message(state, session, &claimed[0].sender, &joined)
-                {
+                // N7: the A2A sink charged this message at acceptance, so
+                // the ladder's PTY write does not charge again.
+                if let sessions_api::DeliverOutcome::Accepted { .. } = sessions_api::deliver_message(
+                    state,
+                    session,
+                    &claimed[0].sender,
+                    &joined,
+                    false,
+                ) {
                     for msg in &claimed {
                         inbox.mark_injected(&msg.message_id, channel.as_str());
                     }

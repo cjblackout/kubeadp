@@ -5,19 +5,26 @@
 //! sandboxed run (`a2a-hook`, `mcp-a2a`, both separate processes with no
 //! database grant) reaches its inbox only through THIS API on `127.0.0.1` /
 //! the pod's local listener, never the database file. Authentication is a
-//! per-run HMAC token derived from the jobset root key:
+//! per-run HMAC token derived from the jobset root key and bound to the run's
+//! start time (N3):
 //!
 //! ```text
-//! token = hex(hmac_sha256(root_key, b"kubeadp-a2a-inbox-v1" || 0x00 || run_id))
+//! token = hex(hmac_sha256(root_key,
+//!             b"kubeadp-a2a-inbox-v2" || 0x00 || run_id || 0x00 || started_at))
 //! ```
 //!
 //! The run id is the sanitized last segment of the run's inbox
 //! ([`crate::core::a2a::inbox::run_id_from_dir`], exposed as
-//! [`run_id_of`]). Both sides derive it from the SAME root key file
-//! (`resolve_root_key`); a request is authenticated only when its token
-//! equals the token of the run it addresses, compared in constant time.
-//! Without a configured root key the endpoints stay closed (the sandbox gets
-//! no token and cannot read its own inbox).
+//! [`run_id_of`]); both sides derive it from the SAME root key file
+//! (`resolve_root_key`) and the run's stored start time. A request is
+//! authenticated only when its token equals the token of the LIVE run it
+//! addresses (the run's metadata exists and its status is `Running`),
+//! compared in constant time: the token expires the moment the run finished,
+//! and a retried job's new attempt mints a fresh token the previous attempt
+//! never had. Failed authentication answers 401 and is counted; the first
+//! failure and then every 10th are logged (count only, no secrets). Without
+//! a configured root key the endpoints stay closed (the sandbox gets no
+//! token and cannot read its own inbox).
 //!
 //! The request's `inbox` value is used ONLY to name the run (its last path
 //! segment, sanitized). The store is always this host's own state root: the
@@ -74,8 +81,10 @@ use super::inbox::{inbox_dir_for, run_id_from_dir, Inbox};
 use crate::core::jobset::resolve_root_key;
 
 /// The derivation label for the per-run inbox token (distinct from the
-/// jobset-secret label so the two domains never collide).
-const INBOX_TOKEN_LABEL: &[u8] = b"kubeadp-a2a-inbox-v1";
+/// jobset-secret label so the two domains never collide). V2 binds the token
+/// to the run's START TIME (a retried job's new attempt mints a fresh token
+/// and the previous attempt's token stops verifying).
+const INBOX_TOKEN_LABEL: &[u8] = b"kubeadp-a2a-inbox-v2";
 const INBOX_TOKEN_SEP: u8 = 0x00;
 
 /// The channel name recorded when `mark-injected` acknowledges a message
@@ -122,18 +131,39 @@ impl InboxHttpState {
         Inbox::new(inbox_dir_for(&self.state_root, run_id))
     }
 
-    fn token_for(&self, run_id: &str) -> Option<String> {
+    fn token_for(&self, run_id: &str, started_at: u64) -> Option<String> {
         let key = self.root_key.as_ref()?;
-        let mut msg = Vec::with_capacity(INBOX_TOKEN_LABEL.len() + 1 + run_id.len());
+        let mut msg = Vec::with_capacity(INBOX_TOKEN_LABEL.len() + 2 + run_id.len() + 20);
         msg.extend_from_slice(INBOX_TOKEN_LABEL);
         msg.push(INBOX_TOKEN_SEP);
         msg.extend_from_slice(run_id.as_bytes());
+        msg.push(INBOX_TOKEN_SEP);
+        msg.extend_from_slice(started_at.to_string().as_bytes());
         let mac = crate::core::crypto::hmac_sha256(key, &msg);
         let mut out = String::with_capacity(mac.len() * 2);
         for b in mac {
             out.push_str(&format!("{b:02x}"));
         }
         Some(out)
+    }
+
+    /// The expected token for a LIVE run: derives it from the run's stored
+    /// start time and refuses when the run is not live (no metadata, already
+    /// finished, or never started). This is the expiry (N3): a token is valid
+    /// only while the run it addresses is live, and it is rejected once the
+    /// run finished.
+    fn live_run_token(&self, run_id: &str) -> Result<String, String> {
+        let meta = crate::core::job::JobMetadata::resolve(&self.state_root, run_id)
+            .map_err(|e| format!("run '{run_id}' has no metadata: {e:#}"))?;
+        if meta.status != Some(crate::core::job::JobStatus::Running) {
+            return Err(format!("run '{run_id}' is not live"));
+        }
+        let started_at = meta
+            .started_at
+            .ok_or_else(|| format!("run '{run_id}' never started"))?;
+        let secs = u64::try_from(started_at.timestamp()).unwrap_or(0);
+        self.token_for(run_id, secs)
+            .ok_or_else(|| "no A2A inbox key configured; the endpoint is closed".to_string())
     }
 }
 
@@ -144,12 +174,19 @@ pub fn run_id_of(inbox_dir: &Path) -> String {
 }
 
 /// The bearer token a sandboxed run must present for `inbox_dir`. `None`
-/// when the root key is not configured (the run has no inbox access).
-pub fn token_for_run(inbox_dir: &Path) -> Option<String> {
+/// when the root key is not configured (the run has no inbox access) or the
+/// run has no start time: the token is bound to the run's start time (N3), so
+/// a run that has not started has no token.
+pub fn token_for_run(inbox_dir: &Path, started_at: u64) -> Option<String> {
     // Only the key matters for the token; the state root is unused here.
     let state = InboxHttpState::resolve(PathBuf::new()).ok()?;
-    state.token_for(&run_id_of(inbox_dir))
+    state.token_for(&run_id_of(inbox_dir), started_at)
 }
+
+/// Count of repeated A2A inbox auth failures this process has seen. The
+/// first failure and then every 10th are logged (count only, never the
+/// presented token or any other secret).
+static AUTH_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The body of the `claim` request.
 #[derive(Debug, Deserialize, Serialize)]
@@ -212,19 +249,6 @@ pub struct InboxHttpResponse<T> {
     pub data: std::marker::PhantomData<T>,
 }
 
-impl<T> InboxHttpResponse<T> {
-    fn err(msg: impl Into<String>) -> Json<InboxHttpResponse<T>> {
-        Json(InboxHttpResponse {
-            ok: false,
-            error: Some(msg.into()),
-            messages: None,
-            count: None,
-            marked: None,
-            data: std::marker::PhantomData,
-        })
-    }
-}
-
 /// Builds the inbox HTTP router. The endpoints carry their own per-run token
 /// check (NOT the operator bearer / API v1 layer), so the caller merges this
 /// router AFTER the bearer layer exactly like the A2A routes.
@@ -246,25 +270,36 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Authenticates the request against the addressed run and hands back its
-/// inbox. `None` (with the error already written) on any failure.
-fn authed_inbox<T>(
+/// inbox. The token is the per-run HMAC bound to the run's start time, and it
+/// is accepted only while the run is live (rejected once it finished, N3).
+/// `Err` (with the error already written) on any failure; a failed
+/// authentication answers 401 and is counted, the first failure and then
+/// every 10th logged (count only, no secrets).
+fn authed_inbox(
     headers: &HeaderMap,
     state: &InboxHttpState,
     inbox_dir: &str,
-) -> Result<Inbox, Json<InboxHttpResponse<T>>> {
-    let Some(presented) = bearer_token(headers) else {
-        return Err(InboxHttpResponse::err(
-            "missing Authorization: Bearer token",
-        ));
+) -> Result<Inbox, StatusCode> {
+    use std::sync::atomic::Ordering;
+    let fail = |msg: &'static str| -> Result<Inbox, StatusCode> {
+        let n = AUTH_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_multiple_of(10) {
+            eprintln!("a2a inbox: repeated auth failures: {n} ({msg})");
+        }
+        Err(StatusCode::UNAUTHORIZED)
     };
+    if bearer_token(headers).is_none() {
+        return fail("missing Authorization: Bearer token");
+    }
     let run_id = run_id_of(Path::new(inbox_dir));
-    let Some(stored) = state.token_for(&run_id) else {
-        return Err(InboxHttpResponse::err(
-            "no A2A inbox key configured; the endpoint is closed",
-        ));
+    // The expected token: derived from the run's stored start time and
+    // accepted only while the run is live.
+    let Ok(stored) = state.live_run_token(&run_id) else {
+        return fail("unknown or finished run");
     };
+    let presented = bearer_token(headers).unwrap_or_default();
     if !crate::core::crypto::ct_eq(presented.as_bytes(), stored.as_bytes()) {
-        return Err(InboxHttpResponse::err("invalid A2A inbox token"));
+        return fail("invalid A2A inbox token");
     }
     Ok(state.inbox_for(&run_id))
 }
@@ -278,10 +313,7 @@ async fn peek(
     headers: HeaderMap,
     Json(req): Json<PeekRequest>,
 ) -> Result<Json<InboxHttpResponse<ClaimedMessage>>, StatusCode> {
-    let inbox = match authed_inbox(&headers, &state, &req.inbox) {
-        Ok(inbox) => inbox,
-        Err(resp) => return Ok(resp),
-    };
+    let inbox = authed_inbox(&headers, &state, &req.inbox)?;
     // SQLite is blocking (and may wait on the write lock): never on a tokio
     // worker thread.
     let messages = tokio::task::spawn_blocking(move || peek_inbox(&inbox, usize::MAX))
@@ -307,10 +339,7 @@ async fn claim(
     headers: HeaderMap,
     Json(req): Json<ClaimRequest>,
 ) -> Result<Json<InboxHttpResponse<ClaimedMessage>>, StatusCode> {
-    let inbox = match authed_inbox(&headers, &state, &req.inbox) {
-        Ok(inbox) => inbox,
-        Err(resp) => return Ok(resp),
-    };
+    let inbox = authed_inbox(&headers, &state, &req.inbox)?;
     let budget = req.max_bytes.unwrap_or(usize::MAX);
     let claimed = tokio::task::spawn_blocking(move || claim_leased(&inbox, budget))
         .await
@@ -332,10 +361,7 @@ async fn mark_injected(
     headers: HeaderMap,
     Json(req): Json<MarkInjectedRequest>,
 ) -> Result<Json<InboxHttpResponse<bool>>, StatusCode> {
-    let inbox = match authed_inbox(&headers, &state, &req.inbox) {
-        Ok(inbox) => inbox,
-        Err(resp) => return Ok(resp),
-    };
+    let inbox = authed_inbox(&headers, &state, &req.inbox)?;
     let marked =
         tokio::task::spawn_blocking(move || inbox.mark_injected(&req.message_id, &req.channel))
             .await
@@ -471,8 +497,50 @@ mod tests {
         crate::core::a2a::inbox::inbox_dir_for(root, run)
     }
 
+    /// Seeds a LIVE run (status Running, started now) in the test state root:
+    /// the endpoints accept a token only while the addressed run is live
+    /// (N3), so every authenticated request needs this row.
+    fn seed_live_run(root: &Path, run: &str) {
+        let meta = crate::core::job::JobMetadata {
+            job_id: run.to_string(),
+            project: "t".to_string(),
+            prompt: "t".to_string(),
+            resolved_prompt: "t".to_string(),
+            model: None,
+            effort: None,
+            sandbox: false,
+            mode: "fast".to_string(),
+            add_dirs: Vec::new(),
+            print_timeout: None,
+            created_at: chrono::Utc::now(),
+            worktree_path: root.join(run),
+            branch: format!("agent-run/{run}"),
+            base_ref: "main".to_string(),
+            conversation_id: None,
+            retry_count: 0,
+            pid: None,
+            exit_code: None,
+            status: Some(crate::core::job::JobStatus::Running),
+            hindsight: None,
+            auto_recall: None,
+            auto_retain: None,
+            retry_prompt: None,
+            read_only: false,
+            external_worktree: false,
+            pid_start_time: None,
+            hindsight_bank: None,
+            proxy: None,
+            max_runtime: None,
+            started_at: Some(chrono::Utc::now()),
+            hindsight_query: None,
+            sandbox_info: None,
+            engine: None,
+        };
+        meta.save(root).unwrap();
+    }
+
     fn token(state: &InboxHttpState, run: &str) -> String {
-        state.token_for(run).unwrap()
+        state.live_run_token(run).unwrap()
     }
 
     fn msg(id: &str, text: &str) -> QueuedMessage {
@@ -493,26 +561,43 @@ mod tests {
     }
 
     #[test]
-    fn token_is_deterministic_and_domain_separated() {
+    fn token_is_deterministic_domain_separated_and_start_bound() {
         let s1 = InboxHttpState::with_key(key(), Path::new("/root"));
         let s2 = InboxHttpState::with_key(key(), Path::new("/root"));
-        assert_eq!(s1.token_for("run-1"), s2.token_for("run-1"));
+        assert_eq!(
+            s1.token_for("run-1", 1_000_000),
+            s2.token_for("run-1", 1_000_000)
+        );
         // Different runs differ.
-        assert_ne!(s1.token_for("run-1"), s1.token_for("run-2"));
+        assert_ne!(
+            s1.token_for("run-1", 1_000_000),
+            s1.token_for("run-2", 1_000_000)
+        );
         // Different keys differ.
         let s3 = InboxHttpState::with_key(vec![b'j'; 32], Path::new("/root"));
-        assert_ne!(s1.token_for("run-1"), s3.token_for("run-1"));
+        assert_ne!(
+            s1.token_for("run-1", 1_000_000),
+            s3.token_for("run-1", 1_000_000)
+        );
+        // N3: the token is bound to the run's start time - a new attempt
+        // (a new started_at) mints a fresh token and the previous attempt's
+        // token stops verifying.
+        assert_ne!(
+            s1.token_for("run-1", 1_000_000),
+            s1.token_for("run-1", 1_000_001)
+        );
         // roun id derives from the dir.
         assert_eq!(run_id_of(&inbox_dir(Path::new("/root"), "run-1")), "run-1");
-        // A hostile run segment (a `..` escape) is sanitized to a plain
-        // segment used only as a row key, never a path.
+        // A hostile run segment (a `..` escape) never forms a `..` path
+        // element: each ambiguous byte is hex-encoded into a plain segment
+        // used only as a row key, never a path.
         assert_eq!(
             run_id_of(Path::new("/root/a2a-inbox/../../etc/passwd")),
             "passwd"
         );
         assert_eq!(
             crate::core::a2a::inbox::inbox_dir_for(Path::new("/root"), "../etc/passwd"),
-            Path::new("/root/a2a-inbox/___etc_passwd")
+            Path::new("/root/a2a-inbox/2e2e2f6574632f706173737764")
         );
     }
 
@@ -520,6 +605,7 @@ mod tests {
     async fn claim_leases_and_mark_injected_acks_exactly_once_across_channels() {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
+        seed_live_run(&root, "run-a");
         let dir = inbox_dir(&root, "run-a");
         let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
@@ -623,6 +709,7 @@ mod tests {
     async fn leased_message_returns_to_the_queue_after_the_lease() {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
+        seed_live_run(&root, "run-lease");
         let dir = inbox_dir(&root, "run-lease");
         let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
@@ -687,6 +774,7 @@ mod tests {
     async fn peek_reports_pending_without_claiming_or_acking() {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
+        seed_live_run(&root, "run-peek");
         let dir = inbox_dir(&root, "run-peek");
         let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
@@ -724,6 +812,7 @@ mod tests {
     async fn claim_honours_the_byte_budget() {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
+        seed_live_run(&root, "run-b");
         let dir = inbox_dir(&root, "run-b");
         let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
@@ -781,6 +870,8 @@ mod tests {
     async fn wrong_or_missing_token_is_rejected_and_cross_run_denied() {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
+        seed_live_run(&root, "run-a");
+        seed_live_run(&root, "run-b");
         let dir_a = inbox_dir(&root, "run-a");
         let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
@@ -790,7 +881,8 @@ mod tests {
         let inbox_a = Inbox::new(dir_a.clone());
         inbox_a.enqueue(msg("m1", "secret")).unwrap();
 
-        // Missing token -> 200 {ok:false} (the body carries the error).
+        // Missing token -> 401 (the auth failure is counted and throttled
+        // logging keeps the count only, N3).
         let res = app
             .clone()
             .oneshot(
@@ -805,11 +897,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let body = body_json(res).await;
-        assert_eq!(body["ok"], false);
-        assert!(body["error"].as_str().unwrap().contains("token"));
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
-        // Wrong token (run-a claims with run-b's token) -> rejected.
+        // Wrong token (run-a claims with run-b's token) -> 401.
         let res = app
             .clone()
             .oneshot(
@@ -825,8 +915,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let body = body_json(res).await;
-        assert_eq!(body["ok"], false);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         // Nothing was disclosed (still pending).
         assert_eq!(inbox_a.pending().len(), 1);
 
@@ -848,6 +937,76 @@ mod tests {
             .unwrap();
         let body = body_json(res).await;
         assert_eq!(body["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn finished_or_unknown_run_keeps_the_endpoint_closed() {
+        // N3: the token is accepted only while the run is live. A finished
+        // (Done) run and an unknown run are refused even with the token the
+        // run had while it was live.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let state = InboxHttpState::with_key(key(), &root);
+        let app = inbox_http_router(state.clone());
+        seed_live_run(&root, "run-done");
+        // Age the run: mark it Done in the stored metadata.
+        let mut meta = crate::core::job::JobMetadata::resolve(&root, "run-done").unwrap();
+        meta.status = Some(crate::core::job::JobStatus::Done);
+        meta.save(&root).unwrap();
+        let dir = inbox_dir(&root, "run-done");
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/a2a-inbox/claim")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer whatever")
+                    .body(Body::from(
+                        json!({"inbox": dir.to_str().unwrap()}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // An unknown run: no metadata at all -> closed.
+        let dir = inbox_dir(&root, "run-ghost");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/a2a-inbox/claim")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer whatever")
+                    .body(Body::from(
+                        json!({"inbox": dir.to_str().unwrap()}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn sanitized_run_key_is_collision_free() {
+        // N3: two different run ids never sanitize onto the same key
+        // (`a.b` and `a_b` used to both become `a_b`).
+        let a = crate::core::a2a::inbox::inbox_dir_for(Path::new("/root"), "a.b");
+        let b = crate::core::a2a::inbox::inbox_dir_for(Path::new("/root"), "a_b");
+        assert_ne!(a, b);
+        // A hostile `..` escape stays a plain segment.
+        let esc = crate::core::a2a::inbox::inbox_dir_for(Path::new("/root"), "../../etc/passwd");
+        assert!(!esc.to_string_lossy().contains(".."));
+        // Sanitization is idempotent: the sanitized segment re-sanitizes to
+        // itself (the recovery path feeds sanitized ids back through).
+        let seg = a.file_name().unwrap().to_str().unwrap().to_string();
+        assert_eq!(
+            crate::core::a2a::inbox::inbox_dir_for(Path::new("/root"), &seg),
+            a
+        );
     }
 
     #[tokio::test]
@@ -877,14 +1036,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let body = body_json(res).await;
-        assert_eq!(body["ok"], false);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn mark_injected_is_idempotent_and_per_run() {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
+        seed_live_run(&root, "run-c");
         let dir = inbox_dir(&root, "run-c");
         let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
@@ -936,6 +1095,7 @@ mod tests {
         // every event of both engines, exactly like the file-based path.
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
+        seed_live_run(&root, "run-hook");
         let dir = inbox_dir(&root, "run-hook");
         let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
@@ -953,7 +1113,7 @@ mod tests {
         // whole body below is synchronous (the hook and its assertions never
         // await), so the shared testenv guard can be scoped around it; the
         // hook's HTTP round trips run on their own threads.
-        let token = state.token_for("run-hook").unwrap();
+        let token = state.live_run_token("run-hook").unwrap();
         let url = format!("http://{addr}");
         let dir_str = dir.to_str().unwrap().to_string();
         crate::core::a2a::testenv::with_env(
@@ -1015,6 +1175,7 @@ mod tests {
     async fn client_supplied_inbox_path_never_selects_the_database() {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("root");
+        seed_live_run(&root, "run-p");
         let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
         let token = token(&state, "run-p");

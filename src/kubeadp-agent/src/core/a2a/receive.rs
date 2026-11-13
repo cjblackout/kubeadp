@@ -52,6 +52,43 @@ pub const INBOX_URL_ENV: &str = "KUBEADP_A2A_INBOX_URL";
 /// serves; the sandboxed process shares the pod network namespace).
 pub const DEFAULT_INBOX_URL: &str = "http://127.0.0.1:8002";
 
+/// The pod-local inbox API base URL for a host listen address (N4): the
+/// loopback form of the SAME listener the host serves. A launcher sets
+/// `KUBEADP_A2A_INBOX_URL` to this so a changed listen port cannot break
+/// delivery silently. `None` when `listen` is not a `host:port` address.
+pub fn inbox_url_for_listen(listen: &str) -> Option<String> {
+    let port = listen.rsplit_once(':')?.1.parse::<u16>().ok()?;
+    Some(format!("http://127.0.0.1:{port}"))
+}
+
+/// Some(reason) when the pod-local inbox API is UNREACHABLE from this
+/// process (N4): sandbox net mode `relay` gives the agent its own
+/// loopback-only network namespace and the relay proxy refuses loopback
+/// destinations, so the host's TCP inbox API cannot be reached and hooks and
+/// `wait_message` would silently see an empty inbox. Detected from the relay
+/// proxy env the sandbox launcher injects; the receiver FAILS CLOSED with
+/// this reason instead. The Unix-socket inbox is the planned target (do not
+/// build it here).
+pub fn inbox_unreachable_reason() -> Option<String> {
+    for var in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(value) = std::env::var(var) {
+            if value.trim_end_matches('/') == crate::sandbox::relay::RELAY_PROXY_URL {
+                return Some(
+                    "A2A inbox API unreachable in sandbox net mode 'relay': the pod-local API listens on the host loopback, which the relay does not forward (the Unix-socket inbox is the planned target)".to_string(),
+                );
+            }
+        }
+    }
+    None
+}
+
 /// Per-call HTTP timeout, well above the queue byte accounting and far below
 /// the MCP call timeout, so a dead host never hangs a hook or a wait.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -112,6 +149,42 @@ impl ReceiveInbox {
         match self {
             Self::Local(inbox) => inbox.drain_capped(channel, max_bytes),
             Self::Remote(remote) => remote.drain_capped(channel, max_bytes),
+        }
+    }
+
+    /// Claims (leases) the oldest pending messages up to the byte budget,
+    /// WITHOUT acknowledging them (N10, at-least-once receive): the caller
+    /// hands the text to a channel first and acknowledges afterwards with
+    /// [`ReceiveInbox::ack`]. A claimed-but-unacked message stops being
+    /// claimable for the lease, then returns to the queue, so a crash between
+    /// claim and ack re-delivers the message (a duplicate print is harmless).
+    pub fn claim_capped(&self, max_bytes: usize) -> Vec<QueuedMessage> {
+        match self {
+            Self::Local(inbox) => inbox.claim_capped(max_bytes),
+            Self::Remote(remote) => remote
+                .claim(max_bytes)
+                .into_iter()
+                .map(QueuedMessage::from)
+                .collect(),
+        }
+    }
+
+    /// Acknowledges (marks injected through `channel`) one claimed message
+    /// after the text reached the channel. Idempotent; the ack is deduped by
+    /// message id.
+    pub fn ack(&self, channel: &str, message_id: &str) -> bool {
+        match self {
+            Self::Local(inbox) => inbox.mark_injected(message_id, channel),
+            Self::Remote(remote) => remote.mark_injected(channel, message_id),
+        }
+    }
+
+    /// Hands a claim back after the text could NOT reach the channel. Local:
+    /// the lease is released so another channel can claim at once. Remote:
+    /// a no-op (the claim lease lapses and the message returns to the queue).
+    pub fn release(&self, message_id: &str) {
+        if let Self::Local(inbox) = self {
+            inbox.release_claim(message_id);
         }
     }
 }
@@ -282,6 +355,51 @@ mod tests {
                     assert_eq!(remote.token, "t0k3n");
                 }
                 _ => panic!("expected the remote inbox"),
+            },
+        );
+    }
+
+    #[test]
+    fn inbox_url_follows_the_real_listen_address() {
+        // N4: the launcher derives the inbox API base from the SAME listener
+        // the host serves (loopback form); a changed listen port is picked
+        // up, a non-address yields None.
+        assert_eq!(
+            inbox_url_for_listen("0.0.0.0:8002"),
+            Some("http://127.0.0.1:8002".to_string())
+        );
+        assert_eq!(
+            inbox_url_for_listen("127.0.0.1:9100"),
+            Some("http://127.0.0.1:9100".to_string())
+        );
+        assert_eq!(inbox_url_for_listen("not-an-address"), None);
+        assert_eq!(inbox_url_for_listen("host:noport"), None);
+    }
+
+    #[test]
+    fn relay_sandbox_fails_the_inbox_closed() {
+        // N4: with net: relay the agent's netns is loopback-only and the
+        // relay proxy refuses loopback, so the TCP inbox API is unreachable.
+        // The receiver announces it instead of silently seeing an empty
+        // inbox; without the relay env nothing is announced.
+        crate::core::a2a::testenv::with_env(&[], || {
+            assert!(inbox_unreachable_reason().is_none());
+        });
+        crate::core::a2a::testenv::with_env(
+            &[("HTTP_PROXY", Some(crate::sandbox::relay::RELAY_PROXY_URL))],
+            || {
+                let reason = inbox_unreachable_reason().expect("announced");
+                assert!(reason.contains("relay"), "{reason}");
+                // The hook subcommand fails closed with the same reason.
+                let code = crate::core::a2a::inject::run_a2a_hook(&["PostToolUse".to_string()]);
+                assert_eq!(code, 2, "the hook fails closed");
+            },
+        );
+        // A non-relay proxy value is not announced.
+        crate::core::a2a::testenv::with_env(
+            &[("HTTP_PROXY", Some("http://proxy.example:8888"))],
+            || {
+                assert!(inbox_unreachable_reason().is_none());
             },
         );
     }

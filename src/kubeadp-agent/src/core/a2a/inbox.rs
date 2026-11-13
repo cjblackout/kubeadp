@@ -270,24 +270,40 @@ pub fn injected_dir_for(inbox_dir: &Path) -> PathBuf {
     inbox_dir.join(INJECTED_DIR_NAME)
 }
 
-/// Reduces a run id to a safe single path segment: ASCII alphanumerics, `-`
-/// and `_` kept, everything else (including `.` and separators, so a hostile
-/// id can never form a `..` segment) replaced with `_`, capped at 128 chars.
-/// A job id or session name never traverses the state root.
+/// Reduces a run id to a safe single path segment, collision-free for every
+/// HONEST id (N3): a run id that is already a safe segment (ASCII
+/// alphanumerics, `-`, `_`, at most 128 chars) passes verbatim, so two
+/// generated job ids (8 hex chars) or session names can never collapse into
+/// the same key. An id containing any other character (`a.b`, separators, a
+/// hostile value) is hex-encoded (a hostile id can never form a `..`
+/// segment), over-long ones are hashed instead, so the segment stays
+/// bounded. The identity is only ever used as a row key and a path segment;
+/// both sides derive it through this one function, so the sanitized run id
+/// can never disagree between them.
 fn sanitize_run_id(run_id: &str) -> String {
-    let mut out: String = run_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(128)
-        .collect();
-    if out.is_empty() {
-        out = "unknown".to_string();
+    if run_id.is_empty() {
+        return "unknown".to_string();
+    }
+    if run_id.len() <= 128
+        && run_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return run_id.to_string();
+    }
+    let encoded = hex_encode(run_id.as_bytes());
+    if encoded.len() <= 128 {
+        encoded
+    } else {
+        hex_encode(&crate::core::crypto::sha256(run_id.as_bytes()))
+    }
+}
+
+/// Lowercase hex encoding of `bytes`.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
     }
     out
 }
@@ -1063,6 +1079,49 @@ impl Inbox {
         }
         out
     }
+
+    /// Claims (leases) the oldest pending messages up to the byte budget,
+    /// atomically, WITHOUT acknowledging them (N10, at-least-once receive):
+    /// the caller hands the text to a channel first and acknowledges
+    /// afterwards. A claimed-but-unacked message stops being claimable for
+    /// the claim lease, then returns to the queue, so a crash between claim
+    /// and ack re-delivers the message (a duplicate is harmless; the inbox
+    /// dedupes the ack by message id).
+    pub fn claim_capped(&self, max_bytes: usize) -> Vec<QueuedMessage> {
+        let mut out = Vec::new();
+        let mut budget = max_bytes;
+        let now = now_unix();
+        for msg in self.pending() {
+            let sep = if out.is_empty() { 0 } else { 2 };
+            if msg.framed.len() + sep > budget {
+                break;
+            }
+            budget -= msg.framed.len() + sep;
+            if self.claim_one(&msg.message_id, now) {
+                out.push(msg);
+            }
+        }
+        out
+    }
+
+    /// Leases one message (marks `claimed_at`), exactly once across
+    /// concurrent claimers. `true` when this caller won the message.
+    fn claim_one(&self, message_id: &str, now: u64) -> bool {
+        let (run_id, mid) = self.key(message_id);
+        let lease = self.lease.max(1);
+        let claimed = self
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE a2a_message SET claimed_at=?1
+                     WHERE run_id=?3 AND message_id=?4 AND fake=?5 AND injected_at IS NULL
+                       AND (claimed_at IS NULL OR (?1 - claimed_at) >= ?2)",
+                    rusqlite::params![now, lease, run_id, mid, i64::from(self.fake)],
+                )
+                .map_err(|e| format!("failed to claim the A2A message: {e}"))
+            })
+            .unwrap_or(0);
+        claimed > 0
+    }
 }
 
 /// The legacy directory migration: moves a phase-1/2 per-run inbox directory
@@ -1568,7 +1627,7 @@ mod tests {
             PathBuf::from("/state/a2a-inbox/job-1")
         );
         let dir = inbox_dir_for(root, "../../etc");
-        assert_eq!(dir, PathBuf::from("/state/a2a-inbox/______etc"));
+        assert_eq!(dir, PathBuf::from("/state/a2a-inbox/2e2e2f2e2e2f657463"));
         assert!(!dir.to_string_lossy().contains(".."));
         assert_eq!(inbox_dir_for(root, "ab/cd"), inbox_dir_for(root, "ab/cd"));
     }

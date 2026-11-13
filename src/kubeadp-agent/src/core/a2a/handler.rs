@@ -191,9 +191,12 @@ impl RequestHandler for ServerRequestHandler {
         #[cfg(feature = "a2a")]
         let (sender, text_to_deliver, delivery_meta) = {
             // Validates the WHOLE message (all parts: empty, size and hop) and
-            // frames it with a per-message nonce delimiter. The hop and the
-            // interrupt request are trusted metadata (never the framed
-            // content).
+            // frames it with a per-message nonce delimiter. For a
+            // jobset-authenticated send the auth layer has already verified
+            // the signed hop token and rewritten the metadata, so the hop
+            // here is the receiver-verified one, never the sender's claimed
+            // `a2a.hop` integer; the interrupt escalation request is the
+            // operator's only (stripped by the layer for any other sender).
             let ingress = process_ingress(&req.message.parts, req.message.metadata.as_ref())?;
             let meta = DeliveryMeta {
                 hop: ingress.hop,

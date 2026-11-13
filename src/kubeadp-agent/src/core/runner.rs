@@ -403,12 +403,22 @@ pub fn build_command(
         // HL-113 phase 3: the sandbox has NO database grant, so the receive
         // side reaches its inbox through the pod-local HTTP API. Hand it the
         // per-run token (derived host-side from the jobset root key; the
-        // sandbox never sees the key). Absent a root key nothing is set and
-        // the receive side falls back to the (now ungranted) direct inbox,
-        // which a sandboxed agent simply finds empty.
-        let token = crate::core::a2a::http::token_for_run(&a2a_inbox_dir);
-        if let Some(token) = token {
-            cmd.env(crate::core::a2a::receive::INBOX_TOKEN_ENV, token);
+        // sandbox never sees the key). The token is bound to the run's start
+        // time (N3) and is accepted only while the run is live: a run that
+        // has not started (no started_at) gets no token and no inbox access.
+        if let Some(started_at) = meta.started_at {
+            let secs = u64::try_from(started_at.timestamp()).unwrap_or(0);
+            if let Some(token) = crate::core::a2a::http::token_for_run(&a2a_inbox_dir, secs) {
+                cmd.env(crate::core::a2a::receive::INBOX_TOKEN_ENV, token);
+            }
+        }
+        // N4: hand the sandboxed receive side the REAL inbox API address —
+        // the loopback form of the same listener the host serves — so a
+        // changed listen port cannot break delivery silently.
+        let listen =
+            std::env::var("AGENT_RUN_API_LISTEN").unwrap_or_else(|_| "0.0.0.0:8002".to_string());
+        if let Some(url) = crate::core::a2a::receive::inbox_url_for_listen(&listen) {
+            cmd.env(crate::core::a2a::receive::INBOX_URL_ENV, url);
         }
     }
 

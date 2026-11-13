@@ -192,6 +192,11 @@ pub fn open_state_db(state_root: &Path) -> Result<Connection> {
     }
     let conn = Connection::open(&path)
         .with_context(|| format!("Failed to open state database at {}", path.display()))?;
+    // N12: the state database holds message text (and job state) and must
+    // not be readable by other users. Tighten to 0600 right after creation;
+    // the -wal/-shm siblings SQLite creates alongside are tightened after the
+    // migrations below (the WAL is created by the journal-mode switch).
+    tighten_state_db_permissions(&path);
     // The busy timeout MUST be set before any other pragma: two connections
     // that open the same NEW database at the same time (e.g. parallel tests,
     // or the worker and a CLI process) race the first `PRAGMA journal_mode =
@@ -221,7 +226,33 @@ pub fn open_state_db(state_root: &Path) -> Result<Connection> {
             path.display()
         )
     })?;
+    // N12: the migrations above created the -wal/-shm siblings (WAL mode) --
+    // tighten those too, best effort.
+    tighten_state_db_permissions(&path);
     Ok(conn)
+}
+
+/// N12: tightens the state database file (and its `-wal`/`-shm` siblings,
+/// when present) to mode 0600. Best effort: a filesystem that does not
+/// support permission bits leaves the files untouched.
+fn tighten_state_db_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let tighten = |p: PathBuf| {
+        if let Ok(meta) = fs::metadata(&p) {
+            let mut perms = meta.permissions();
+            if perms.mode() & 0o777 != 0o600 {
+                perms.set_mode(0o600);
+                let _ = fs::set_permissions(&p, perms);
+            }
+        }
+    };
+    tighten(path.to_path_buf());
+    let mut sibling = path.as_os_str().to_owned();
+    sibling.push("-wal");
+    tighten(PathBuf::from(sibling));
+    let mut sibling = path.as_os_str().to_owned();
+    sibling.push("-shm");
+    tighten(PathBuf::from(sibling));
 }
 
 /// Whether a `rusqlite` error is a transient lock (busy/locked) rather than a

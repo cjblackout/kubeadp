@@ -140,6 +140,14 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
         );
         return 2;
     }
+    // N4 (fail closed): inside a relay-sandboxed run the pod-local TCP inbox
+    // API is unreachable (loopback-only netns, the relay refuses loopback).
+    // Fail loudly instead of silently seeing an empty inbox, whatever the
+    // receive side is.
+    if let Some(reason) = crate::core::a2a::receive::inbox_unreachable_reason() {
+        eprintln!("kubeadp-agent (a2a-hook): {reason}");
+        return 2;
+    }
     let Some(receive) = crate::core::a2a::receive::ReceiveInbox::from_env() else {
         // No inbox for this run (KUBEADP_A2A_INBOX_DIR unset): nothing to
         // inject. The agy events still print `{}` (agy parses the stdout of
@@ -151,7 +159,11 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
         };
     };
     let channel = event_channel(event);
-    let messages = receive.drain_capped(channel, MAX_INJECT_BYTES);
+    // N10 (at-least-once receive): the hook CLAIMS (leases) the messages,
+    // prints the hook JSON and only then acknowledges each one. A crash in
+    // between re-delivers the message after its lease lapses; a duplicate
+    // print is harmless. A write error hands the claim back.
+    let messages = receive.claim_capped(MAX_INJECT_BYTES);
     if messages.is_empty() {
         return if is_agy_event(event) {
             print_agy_empty()
@@ -164,8 +176,18 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
         Ok(json) => {
             let mut out = std::io::stdout();
             match (writeln!(out, "{json}"), out.flush()) {
-                (Ok(()), Ok(())) => 0,
+                (Ok(()), Ok(())) => {
+                    // The text reached stdout: acknowledge each claimed
+                    // message afterwards.
+                    for m in &messages {
+                        receive.ack(channel, &m.message_id);
+                    }
+                    0
+                }
                 (e, f) => {
+                    for m in &messages {
+                        receive.release(&m.message_id);
+                    }
                     if e.is_err() {
                         eprintln!(
                             "kubeadp-agent (a2a-hook): failed to write the hook output: {e:?}"
@@ -179,6 +201,9 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
             }
         }
         Err(e) => {
+            for m in &messages {
+                receive.release(&m.message_id);
+            }
             eprintln!("kubeadp-agent (a2a-hook): {e}");
             2
         }

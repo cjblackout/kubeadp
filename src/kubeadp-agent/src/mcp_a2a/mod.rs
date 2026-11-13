@@ -431,6 +431,16 @@ impl A2aMcpServer {
     )]
     pub async fn wait_message(&self, args: Parameters<WaitMessageArgs>) -> CallToolResult {
         let timeout = args.0.timeout_s.unwrap_or(MAX_WAIT_SECS).min(MAX_WAIT_SECS);
+        // N4 (fail closed): inside a relay-sandboxed run the pod-local TCP
+        // inbox API is unreachable (loopback-only netns, the relay refuses
+        // loopback). Return a structured error instead of silently waiting on
+        // an inbox that can never fill.
+        if let Some(reason) = crate::core::a2a::receive::inbox_unreachable_reason() {
+            return CallToolResult::structured_error(serde_json::json!({
+                "code": "a2a_inbox_unreachable",
+                "message": reason,
+            }));
+        }
         let Some(inbox) = self.inbox.as_ref() else {
             // No inbox directory for this run (KUBEADP_A2A_INBOX_DIR unset):
             // answer empty rather than erroring, so an agent that waits in a

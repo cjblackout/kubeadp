@@ -164,7 +164,13 @@ fn update_settings_map(map: &mut serde_json::Map<String, Value>) {
 /// PostToolUse/UserPromptSubmit, `decision: block` for Stop).
 fn a2a_hook_command(event: &str) -> String {
     let exe = crate::sandbox::find_launcher_exe();
-    format!("{} a2a-hook {}", exe.to_string_lossy(), event)
+    // N12: the path is interpolated into `sh -c` -- quoted, so a path with
+    // spaces or shell metacharacters stays one word.
+    format!(
+        "{} a2a-hook {}",
+        crate::sandbox::shell_quote(&exe.to_string_lossy()),
+        event
+    )
 }
 
 /// Merges the A2A hooks (PostToolUse, UserPromptSubmit, Stop pointing at
@@ -708,10 +714,12 @@ mod tests {
         }
         assert_eq!(hooks["PostToolUse"][0]["matcher"], "*");
         assert!(hooks["UserPromptSubmit"][0].get("matcher").is_none());
+        // N12: the binary path inside the command is shell-quoted; the
+        // quoted path itself is absolute.
         assert!(hooks["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .starts_with('/'));
+            .starts_with('\''));
 
         // Merge into existing settings: the operator's own hooks and every
         // other key are kept; only a MISSING A2A event entry is added; the
