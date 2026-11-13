@@ -93,6 +93,14 @@ retained; (3) a freshly created row with no PID younger than two minutes stays
 `running`; (4) otherwise the exit code and the (lossily decoded) log determine
 the status.
 
+The kill/control path signals only after a PID sanity check: the process must
+be alive, its documented start time must match, and its `/proc` command line or
+executable must look like a launch target of the job's engine (`agy`, the
+`claude` harness), the always-on `sandbox-exec` wrapper, or the
+`agent-run`/`kubeadp-agent` launcher. A recycled or unrelated PID is never
+signalled, and a finished job whose PID was recycled reports not-running
+(exit `0`), never `killed`.
+
 ### 2.2 Job record
 One row per job in the `jobs` table (§2.3); `created_at` stores integer epoch
 nanoseconds, booleans 0/1. Fields: `job_id`, `project`, `prompt`,
@@ -127,9 +135,10 @@ file; the exceptions are listed at the end of this section.
 |---|---|---|---|
 | 1 | `jobs` | job commands and the job monitor | — |
 | 2 | `supervisor_state` (one row), `session_state` (one row per session) | session supervisor | legacy JSON state file (imported once, renamed `*.migrated`) |
-| 3 | `jobset`, `jobset_member` | jobset module of the hosting pod | `jobsets.json` and the in-memory `entries`/`known`/`ended` maps (file imported once, renamed `*.migrated`) |
-| 4 | `inbox`, `a2a_audit` | A2A ingress and delivery of the hosting pod | `<state_root>/a2a-inbox/<run_id>/` directories with their `injected/` and `expired/` markers, the in-memory seen-cache and coalesce buffer, the worktree file `.engine-message-queue` |
-| 5 | `run_meta` | engine layer | the in-memory run registry, the worktree file `.engine-compact.json` |
+| 3 | `a2a_message`, `a2a_expiry` | the A2A sink and delivery ladder of the hosting pod | the per-run inbox directories of the earlier phases; the `<state_root>/a2a-inbox/<run>/` directory survives only as the run key |
+
+The planned `jobset`/`jobset_member` tables (§7.2) and `run_meta` (§3.7) are
+appended as later additive migrations when implemented (§13.1).
 
 Table definitions (normative column sets; types are SQLite affinities):
 
@@ -139,27 +148,27 @@ jobset(jobset_id TEXT PRIMARY KEY, creator_agent_id TEXT NOT NULL,
        created_at INTEGER NOT NULL, ended_at INTEGER)
 jobset_member(jobset_id TEXT NOT NULL, agent_id TEXT NOT NULL,
        joined_at INTEGER NOT NULL, PRIMARY KEY (jobset_id, agent_id))
-inbox(to_agent_id TEXT NOT NULL, message_id TEXT NOT NULL,
-       from_agent_id TEXT NOT NULL, jobset_id TEXT, origin TEXT NOT NULL,
-       hop INTEGER NOT NULL, interrupt INTEGER NOT NULL DEFAULT 0,
-       framed TEXT, size INTEGER NOT NULL, state TEXT NOT NULL,
-       enqueued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
-       injected_at INTEGER, channel TEXT, context_id TEXT, task_id TEXT,
-       PRIMARY KEY (to_agent_id, message_id))
-a2a_audit(id INTEGER PRIMARY KEY, direction TEXT NOT NULL,
-       from_agent_id TEXT NOT NULL, to_agent_id TEXT NOT NULL,
-       jobset_id TEXT, message_id TEXT NOT NULL, message_size INTEGER NOT NULL,
-       timestamp INTEGER NOT NULL, channel TEXT, delivered_at INTEGER,
-       injected_at INTEGER, outcome TEXT NOT NULL)
+a2a_message(run_id TEXT NOT NULL, message_id TEXT NOT NULL,
+       fake INTEGER NOT NULL DEFAULT 0, sender TEXT NOT NULL,
+       hop INTEGER NOT NULL, context_id TEXT, task_id TEXT,
+       framed TEXT NOT NULL, queued_at INTEGER NOT NULL, claimed_at INTEGER,
+       injected_at INTEGER, channel TEXT, PRIMARY KEY (run_id, message_id))
+a2a_expiry(run_id TEXT NOT NULL, fake INTEGER NOT NULL DEFAULT 0,
+       message_id TEXT NOT NULL, reason TEXT NOT NULL, expired_at INTEGER NOT NULL,
+       expired_at_ns INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (run_id, message_id))
 run_meta(run_id TEXT PRIMARY KEY, kind TEXT NOT NULL, paused INTEGER NOT NULL DEFAULT 0,
        compact_summary TEXT, compacted_at INTEGER, forked_from TEXT,
        updated_at INTEGER NOT NULL)
 ```
-`inbox.origin` ∈ `a2a` (a jobset message, §7) or `api` (text queued by the
-emulation layer for a run that cannot take it now, §3.6). `inbox.state` ∈
-`queued`, `injected`, `expired`, `dropped`. `a2a_audit.direction` ∈ `in`, `out`;
-`a2a_audit.outcome` ∈ `queued`, `injected`, `expired`, `dropped`, `rejected`,
-`sent`.
+`jobset`/`jobset_member` and `run_meta` are planned (§13.1). The per-run A2A
+inbox is implemented: every accepted message is one `a2a_message` row keyed by
+`(run_id, message_id)`, the durable dedupe store. A row is `queued`
+(`injected_at` NULL) or `injected` (`injected_at` and `channel` set; injected
+rows are kept). An expired uninjected row is removed and recorded in
+`a2a_expiry` (the sender's task then fails, §7.14); the bounded-queue drop note
+is an ordinary `a2a_message` row (sender `inbox`) delivered like any message.
+The `fake` flag keeps the test suites' in-memory store apart from the real
+per-pod database.
 
 The run registry is not a table: a run is the union view of a `jobs` row or a
 `session_state` row with its optional `run_meta` row (§3.7).
@@ -269,9 +278,16 @@ and secrets.
 - Message injection uses the native agy plugin hooks of §7.14.
 
 ### 3.3 claude engine (`"claude"`)
-- **Job mode** (transport `stream_json`) invokes `claude -p --input-format
-  stream-json --output-format stream-json` (newline-delimited JSON) with a
-  bounded, drop-oldest event buffer.
+- **Job mode** (transport `stream_json`) invokes `claude
+  --dangerously-skip-permissions -p --input-format stream-json
+  --output-format stream-json --verbose` with a bounded, drop-oldest event
+  buffer. The prompt is NOT part of the argv: the stream-json input format
+  reads it as the first NDJSON line on stdin. A `plan` job passes
+  `--permission-mode plan` (plan-only turn); any other mode passes no
+  `--permission-mode` flag. The agy `--mode` flag is never passed (the claude
+  CLI rejects it), `--verbose` is mandatory for `-p --output-format
+  stream-json`, the model is passed as `--model <name>` exactly like agy, and
+  a retry resumes the harness conversation via `--resume <conversation_id>`.
 - **Session mode** has two transports, fixed per session at creation and never
   changed by a resume: `pty_remote_control` (the supervisor PTY with
   `--remote-control`, §4.6; required for sessions that must be reachable from
@@ -520,8 +536,9 @@ generated one on name/id conflict.
 - A session is an agent: it owns its default jobset and may be a member of
   others (§7.2); memberships are read from `jobset_member` and survive session
   and pod restarts.
-- Inbound jobset messages are enqueued in the `inbox` table and injected by the
-  delivery ladder (§7.14). Text injected into the PTY (the `idle_turn` channel
+- Inbound jobset messages are enqueued as `a2a_message` rows (§2.3) and
+  injected by the delivery ladder (§7.14). Text injected into the PTY (the
+  `idle_turn` channel
   and the sessions API `message` route) goes through the one `deliver_message`
   core of §4.5.
 
@@ -714,6 +731,12 @@ rw/shared_rw/private-tmp path must be a real directory and a missing grant-rw
 path is created as a directory, or launch fails closed (125); a granted rw
 path that already exists as a regular file is a valid single-file grant and is
 kept as-is.
+
+**Claude OAuth token passthrough**: a claude-engine job's policy adds the env
+NAME `CLAUDE_CODE_OAUTH_TOKEN` to `env_allow` (never a value) so the worker
+pod's durable claude login passes the env filter into the job process; agy jobs
+keep the default allowlist. The value never enters argv, the policy file or any
+log line.
 
 ### 6.5 Path hiding and secret channel
 Every sandboxed policy (job, session, hand-run) must hide the API bearer
@@ -953,12 +976,17 @@ A request that names no recipient (`GET /tasks`, `GET /a2a/agents`) needs 1 and
 - On every A2A route except the public agent card, authorization (§7.4) runs
   before any body validation. The body read for recipient resolution is capped
   at `SEND_BODY_LIMIT` (64 KiB).
-- Error bodies are `application/problem+json` with `WWW-Authenticate: Jobset`
+- Error bodies are `application/problem+json` with `WWW-Authenticate: Bearer`
   on `401`.
-- An `Authorization` header is ignored on A2A routes: the API bearer never
-  authorizes messaging, and a request carrying only a bearer is answered
-  `401 invalid_jobset_secret`. `api_allow_unauthenticated` does not apply.
-- Failed A2A authentications are throttled per peer exactly as in §5.6.
+- A request that presents no jobset credential is accepted only when the
+  operator bearer verifier accepts it: the A2A surface sits behind the same
+  bearer as `/api/v1`, mounted only when a token is configured or
+  `KUBEADP_API_ALLOW_OPEN` is set (a server without a token refuses to mount
+  the A2A routes otherwise). A presented-but-invalid jobset credential is
+  refused outright and never downgraded to the bearer.
+- The guarded send path charges a per-jobset message budget; over the budget
+  the answer is `429` + `Retry-After` (`code:"rate_limited"`). Inbox-API
+  authentication failures are answered `401` and counted.
 
 ### 7.6 Limits
 | Limit | Value | Over the limit |
@@ -1044,8 +1072,9 @@ Routes outside the SDK set, same authorization layer:
 GET  /a2a/agents               agents of the presented jobset hosted here (§7.7)
 POST /a2a/jobsets/{id}:end     end propagation between hosting pods (§7.16)
 ```
-`POST /a2a/local/inbox:drain` (§7.14) is not a route of the pod's TCP listener;
-it exists only on the per-agent delivery sockets (§6.9).
+`POST /a2a-inbox/{peek,claim,mark-injected}` (§7.14) is mounted on the same
+listener after the bearer layer; it carries its own per-run token check, not
+the SDK authorization layer.
 Authorization and limit errors use the same envelope with these codes:
 
 | Code | HTTP | When |
@@ -1077,21 +1106,23 @@ in the recipient's context).
   `TASK_NOT_CANCELABLE`.
 - **Sender's view of a sent message**: `submitted` while the message is queued,
   `working` once injected, `failed` with a reason naming the TTL when it
-  expired uninjected (§7.14). The backends read this from the `inbox` table.
+  expired uninjected (§7.14). The backends read this from the run's
+  `a2a_message`/`a2a_expiry` rows (§2.3).
 
 ### 7.11 Message sinks
 A `MessageSink` is the hosting pod's entry point for an authorized message:
-`deliver_with_meta(recipient, verified_sender, jobset_id, text, message_id,
+`deliver_with_meta(recipient, claimed_sender, text, message_id,
 DeliveryMeta{hop, interrupt})`. Both roles pass a sink to the A2A router. A sink
 does exactly this, identically for jobs and sessions:
 1. Resolve the recipient among the pod's agents; an unknown, cleaned or
    discarded agent was already refused by §7.4 (`no_shared_jobset`).
-2. Apply the limits of §7.6, frame the text (§7.12) and insert one `inbox`
-   row (`state = queued`). A message id already present for that recipient is
-   a no-op success (exactly once by `(to_agent_id, message_id)`; the table is
-   the only dedupe store).
-3. Write one `a2a_audit` row (§7.15) and return; injection is done by the
-   ladder (§7.14), never synchronously by killing work.
+2. Apply the limits of §7.6, frame the text (§7.12) and enqueue one
+   `a2a_message` row for the recipient's run (§2.3). A message id already
+   present for that run is a no-op success (exactly once by
+   `(run_id, message_id)`; the inbox row is the durable dedupe store, and the
+   sink keeps a bounded in-memory accepted-id cache scoped to the recipient).
+3. Return; injection is done by the ladder (§7.14), never synchronously by
+   killing work.
 
 Recipient state decides only when the ladder can inject:
 
@@ -1099,16 +1130,18 @@ Recipient state decides only when the ladder can inject:
 |---|---|
 | running job or session | injected at the next boundary of any channel; nothing is killed |
 | finished job with a conversation (`done`, `failed`, `self-terminated`, `incomplete`, `quota-exhausted`) | idle: after `a2a_ack_secs` the `idle_turn` step resumes it as a retry whose prompt is the framed message (same conversation, worktree and jobsets) |
-| absent: stopped or paused session, `killed` job, job without a conversation, job with no worktree | stays queued until the agent (re)starts or the TTL expires; an operator-killed job is never woken by a message |
+| absent: stopped or paused session | stays queued until the agent (re)starts or the TTL expires |
+| unwakeable: operator-`killed` job | never woken by a message: the sink refuses it and the ladder expires its queued messages, failing the sender's task |
+| gone: unknown or removed agent, job with no worktree | refused (task not found) |
 
 Resuming (`resume_with`) stops a running job only on the `interrupt` step, via
 `kill::terminate_process_to` (SIGTERM → grace → SIGKILL, scoped by pid +
 `pid_start_time`) without kill bookkeeping, then runs `retry::run` with the
-queued messages as the prompt. The combined prompt is bounded at 100 000 bytes,
-newest kept, joined with `\n`. A write to a live stdin pipe is serialized per
-job and gated on the channel's recorded pid + start time matching the job row,
-so a recycled pid is never written to; a stale or broken pipe is unregistered
-and the message stays queued for the next step.
+queued messages as the prompt, joined oldest-first with a blank line and
+bounded by the queue bounds of §7.6. A write to a live stdin pipe is serialized
+per job and gated on the channel's recorded pid + start time matching the job
+row, so a recycled pid is never written to; a stale or broken pipe is
+unregistered and the message stays queued for the next step.
 
 ### 7.12 Ingress (framing)
 Incoming text is always untrusted DATA, wrapped in delimiters with a
@@ -1159,22 +1192,35 @@ Goal: an accepted message reaches the model context of a RUNNING agent without
 killing in-flight work, identically for every engine, and without the model
 having to read a mailbox.
 
-- **Inbox**: the `inbox` rows of the recipient (§2.3), states `queued →
-  injected | expired | dropped`. Marking a row `injected` (with `injected_at`
-  and the channel) is the acknowledgement and happens in the same transaction
-  that hands the text to a channel. Exactly once across all channels.
-- **Pod-local delivery API**: the state store is hidden from sandboxed agents,
-  so the harness processes inside the sandbox (`a2a-hook`, `mcp-a2a`) fetch
-  the agent's queued messages with `POST /a2a/local/inbox:drain`
-  `{"channel", "max_bytes", "wait_s"}` as HTTP over the agent's own Unix
-  socket `KUBEADP_A2A_LOCAL_SOCKET` (§6.9), never over TCP. The recipient is
-  fixed by the socket (one socket per agent); the request is additionally
-  authorized with the agent's credential for its own default jobset (§7.4
-  steps 1–2), and a credential of another agent is refused (`403
-  no_shared_jobset`). The answer `{"messages":[{from_agent_id, jobset_id,
-  message_id, context_id, task_id, hop, framed}], "count"}` marks the returned
-  rows `injected`. `wait_s` (0..25) blocks until a message is queued. No
-  per-run token is minted; an agent can drain only its own inbox.
+- **Inbox**: the run's `a2a_message` rows in the shared per-pod state database
+  (§2.3); the `<state_root>/a2a-inbox/<run>/` directory survives only as the
+  run key both sides derive, no message is written to it. A row is `queued`
+  (`injected_at` NULL) or `injected` (`injected_at` + channel; the row is kept
+  as the dedupe store). Marking a row `injected` is the acknowledgement and is
+  atomic (`injected_at IS NULL` guarded), so exactly once across all channels.
+  An expired uninjected row is removed and recorded in `a2a_expiry` (the
+  sender's task then fails); the bounded-queue drop note of §7.6 is an
+  ordinary `a2a_message` row (sender `inbox`) delivered like any message.
+- **Pod-local inbox API**: the state store is hidden from sandboxed agents, so
+  the harness processes inside the sandbox (`a2a-hook`, `mcp-a2a`) reach their
+  run's inbox only through the host's pod-local HTTP API on the same listener
+  the host serves (`KUBEADP_A2A_INBOX_URL`, default `http://127.0.0.1:8002`),
+  never the database file. Authentication is a per-run bearer token
+  (`KUBEADP_A2A_INBOX_TOKEN`), derived host-side from the jobset root key and
+  bound to the run's start time: it is accepted only while the run is live, so
+  it expires the moment the run finishes and a retried job mints a fresh one.
+  Without a configured root key the endpoints stay closed (the sandbox gets no
+  token). The request body's `inbox` value only names the run (the host always
+  serves its own state root, never a client-chosen path). The endpoints:
+  - `POST /a2a-inbox/peek` — reports the pending messages without claiming or
+    acknowledging (the `wait_message` long poll);
+  - `POST /a2a-inbox/claim` — atomically claims (leases) the oldest pending
+    messages up to the byte budget; a claimed-but-unacked message stops being
+    claimable for the lease window (60 s), then returns to the queue;
+  - `POST /a2a-inbox/mark-injected` — the idempotent acknowledgement.
+  The run is named by `KUBEADP_A2A_INBOX_DIR`; failed authentication answers
+  `401` and is counted (the first failure and then every 10th logged, count
+  only).
 - **Injection channels** (capability `a2a.inject`):
 
 | Channel | Claude Code | agy |
@@ -1187,11 +1233,15 @@ having to read a mailbox.
   Both engines support `hook`, `tool_result` and `idle_turn`, so a busy agent of
   either engine receives a message at its next model call.
 - **`a2a-hook <event>`** (subcommand, events `PostToolUse`, `UserPromptSubmit`,
-  `Stop`, `pre-invocation`, `post-invocation`, `stop`): drains up to 16 KiB
-  (`MAX_INJECT_BYTES`) for the event's channel and prints the event's JSON.
-  With nothing queued or the delivery API unreachable it prints `{}` for the
-  agy events and nothing for the Claude Code events and exits `0` (a hook never
-  breaks the engine). Unknown or surplus arguments → exit `2`.
+  `Stop`, `pre-invocation`, `post-invocation`, `stop`): claims (leases) up to
+  16 KiB (`MAX_INJECT_BYTES`) for the event's channel, prints the event's JSON
+  and acknowledges each claimed message only after the text reached stdout
+  (at-least-once: a crash between claim and ack re-delivers after the lease).
+  With nothing queued it prints `{}` for the agy events and nothing for the
+  Claude Code events and exits `0` (a hook never breaks the engine). Inside a
+  relay-sandboxed run the pod-local inbox API is unreachable: the hook fails
+  closed with the reason on stderr, exit `2`. Unknown or surplus arguments →
+  exit `2`.
 - **Hook installation**: the session supervisor writes the Claude Code hook
   settings for each session; the worker writes the native agy plugin
   (`.antigravity-plugin/plugin.json` plus `hooks.json` at the plugin root,
@@ -1203,15 +1253,21 @@ having to read a mailbox.
   queued after `a2a_ack_secs` (default 45; `0` = at once) and the agent idle:
   `idle_turn` → only for a message sent with `interrupt: true`, or after
   `a2a_force_secs` when that is non-zero (default `0` = never): `interrupt`.
-  By default nothing is ever killed: a message stays queued until injected or
-  until its TTL expires, and the sender's task then fails with a reason naming
-  the TTL.
+  Each `idle_turn`/`interrupt` escalation claims the pending messages
+  ATOMICALLY (`claimed_at` + lease, §2.3), so exactly one concurrent escalation
+  resumes the run for a message; a claim the resume cannot apply is handed
+  back. By default nothing is ever killed: a message stays queued until
+  injected or until its TTL expires, and the sender's task then fails with a
+  reason naming the TTL.
 - **Absent recipient**: the send succeeds with delivery `queued`; the ladder
-  injects at the first boundary after the agent (re)starts.
-- **Security**: injected text is always the framed block of §7.12; a delivery
-  socket serves only its own agent's inbox and is not reachable over the
-  network; the state store, the root key and the
-  API bearer stay hidden from the agent.
+  injects at the first boundary after the agent (re)starts. An
+  operator-`killed` job is never woken: its queued messages are expired and
+  the sender's task fails.
+- **Security**: injected text is always the framed block of §7.12; the inbox
+  API authenticates with the expiring per-run token and its request body only
+  names the run (the host serves its own state root); the state store, the
+  root key and the API bearer stay hidden from the agent; in `relay` network
+  mode the pod-local API is unreachable and the receive side fails closed.
 
 ### 7.15 Audit and retention
 - Every accepted, rejected-after-authorization, sent, injected, expired and
@@ -1385,6 +1441,9 @@ never logged.
 | `KUBEADP_SELF_AGENT_ID` | agents | the agent's own id, set by the launcher for each job and session |
 | `KUBEADP_JOBSET_CREDENTIALS_FILE` | agents | path of the 0400 credential file (§6.5); set by the launcher only |
 | `KUBEADP_A2A_LOCAL_SOCKET` | `mcp-a2a`, `a2a-hook` | in-sandbox path of the agent's delivery socket (§6.9, §7.14); set by the launcher only |
+| `KUBEADP_A2A_INBOX_DIR` | `a2a-hook`, `mcp-a2a` | the run's A2A inbox identity (`<state_root>/a2a-inbox/<run>/`, §7.14); set by the launcher only |
+| `KUBEADP_A2A_INBOX_TOKEN` | `a2a-hook`, `mcp-a2a` | per-run bearer token for the pod-local inbox API (§7.14); derived host-side, set by the launcher only |
+| `KUBEADP_A2A_INBOX_URL` | `a2a-hook`, `mcp-a2a` | pod-local inbox API base URL, default `http://127.0.0.1:8002` (§7.14); set by the launcher only |
 | `KUBEADP_JOBSET` | `agent-run start` | jobset to join; may only name the caller's own default jobset (§7.2) |
 | `AGENT_ORCHESTRATE_AGY_PATH` | orchestrator | agy binary for agy sessions |
 | `A2A_KUBE_API` | discovery | API base override; test-only (`test-hooks`) |
@@ -1661,7 +1720,7 @@ section is outstanding.
 | migrations 1–2 (`jobs`, `supervisor_state`, `session_state`), WAL, busy timeout | implemented | |
 | refusal of a newer `user_version` | planned | |
 | migration 3 (`jobset`, `jobset_member`, `jobsets.json` import) | planned | membership is `jobsets.json` plus in-memory maps today |
-| migration 4 (`inbox`, `a2a_audit`) | planned | inbox is one directory per run under `<state_root>/a2a-inbox/` with marker files; dedupe cache in memory; no audit |
+| `a2a_message`/`a2a_expiry` inbox tables, per-run inbox in the shared database | implemented | the code's migration 3; the `<state_root>/a2a-inbox/<run>/` directory survives only as the run key, the sandboxed receive side reads through the pod-local HTTP API |
 | migration 5 (`run_meta`), run registry as a view | planned | run registry is in memory and not populated outside tests; compact record and message queue are worktree files |
 
 ### 13.2 Engines (§3, §5.4, §5.5)
@@ -1673,12 +1732,13 @@ section is outstanding.
 | claude sessions (`pty_remote_control`), agy sessions (live stream-json) | partial | work on the orchestrator; the session supervisor branches on the engine name; claude `stream_json` sessions planned |
 | engine persisted per run and used by retry/restart | implemented | |
 | built-in default by run kind only | implemented | |
-| capability table of §3.4 | partial | the code reports `unsupported` for claude `job.list`/`job.kill`/`job.result`/`interrupt`/`pause`/`workspace.*`, for `fork` on both engines, and `emulated` for agy `a2a.send_message` |
-| no `501` because of the engine | planned | `start` answers `501` for claude in a build without `engine`; unsupported rows above answer `501` |
-| run-control routes resolving real jobs and sessions | planned | routes exist; they resolve only runs registered by tests |
-| `fork` creating a run, `permissions` route | planned | |
+| capability table of §3.4 | partial | `a2a.send_message` is `emulated` for both engines and `permissions` is `unsupported` for both; the raw claude table reports `interrupt`/`pause`/`fork`/`compact`/`revert`/`todo` `unsupported` until the worker arms the emulation layer, while the agy table declares the same set `emulated` from the start |
+| no `501` because of the engine | implemented | the worker arms the emulation layer for every control endpoint each engine lacks, so no `/api/v1` control route answers `501` because of the engine; an `unsupported` endpoint still answers the typed `501` by contract |
+| run-control routes resolving real jobs and sessions | partial | the job surface (`/api/v1/jobs/{id}/...`) resolves the job row on demand; the `/api/v1/runs/{id}` routes still resolve only runs registered by tests (`404` in production); session run-control is the sessions API |
+| `fork` creating a run | implemented | the job surface clones the source worktree and returns the new run id |
+| `permissions` route | planned | the capability key exists; no HTTP handler |
 | queue of §3.6 in the `inbox` table | planned | worktree file `.engine-message-queue` today |
-| conformance suite (§12.6) | planned | |
+| conformance suite (§12.6) | implemented | |
 
 ### 13.3 Jobset messaging (§7, §8)
 | Item | Status | Note |
@@ -1687,13 +1747,13 @@ section is outstanding.
 | root key mandatory with `a2a` | planned | a random in-memory secret is used without a root key |
 | multi-jobset membership, default jobset per agent, join at start only | planned | one jobset per agent; caller-chosen `jobset_id` joins without proof |
 | creator proof on start (§7.2), `jobset_creator_required` | planned | |
-| member proof, verified sender, authorization order and codes (§7.4) | planned | sender is claimed; all failures answer `401` without a code |
-| API bearer refused on A2A routes | planned | requests without jobset headers are accepted with the API bearer |
+| member proof, verified sender, authorization order and codes (§7.4) | planned | sender is claimed (the credential binds the jobset, not the agent); every authorization failure answers `401` with the `UNAUTHENTICATED` envelope |
+| API bearer accepted on A2A routes (operator credential) | implemented | the A2A surface sits behind the same operator token as `/api/v1`, mounted only with a token or `KUBEADP_API_ALLOW_OPEN`; a presented-but-invalid jobset credential is never downgraded to the bearer |
 | one credential file with all jobsets (§6.5) | planned | one secret file plus `KUBEADP_JOBSET_ID`/`_EPOCH`/`_SECRET_FILE` |
-| limits of §7.6 | partial | size, queue bound, TTL, hop cap, interrupt interval implemented; rate is 30/min per (session, sender); hop uses a signed token |
+| limits of §7.6 | partial | size, queue bound, TTL, hop cap, interrupt interval implemented; the guarded A2A send path charges a per-jobset budget (60/min, 500 lifetime) answered `429` + `Retry-After`, the session PTY message route keeps 30/min per (session, sender); the hop is read server-side from the signed `a2a.hop_token`, never from the claimed integer |
 | discovery, agent card, SDK REST surface, task mapping | implemented | card still declares a bearer scheme; `GET /a2a/agents` planned |
 | framing with verified sender and jobset (§7.12) | planned | frame says `claimed sender: <sender>` |
-| inbox, channels, `a2a-hook`, hook installation, ladder (§7.14) | implemented | on files; reading through the pod-local delivery API planned (the inbox directory is mounted into the sandbox today) |
+| inbox, channels, `a2a-hook`, hook installation, ladder (§7.14) | implemented | the inbox is the shared state database (`a2a_message`/`a2a_expiry`); the sandboxed receive side reads it through the pod-local inbox API under a per-run token |
 | absent recipient queued, `delivery` in the send answer | partial | queue and TTL implemented; the send answer carries no `delivery` value |
 | audit and text deletion (§7.15) | planned | |
 | end by creator, tombstone, peer propagation (§7.16) | partial | operator end route and epoch bump implemented, per pod only |
