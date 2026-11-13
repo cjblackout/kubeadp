@@ -12,9 +12,9 @@ use clap::{Args, Parser, Subcommand};
 
 pub use crate::core::args::{
     CatArgs, CleanArgs, CommitArgs, DiffArgs, DiscardArgs, ExportArgs, FilesArgs, GcArgs, InfoArgs,
-    InitArgs, JobIdArg, JobsetEndArgs, ListArgs, ModelsArgs, ProjectsArgs, QuotaArgs,
-    RemoteControlAction, RemoteControlArgs, RepairArgs, ResultArgs, RetryArgs, ReviewArgs,
-    StartArgs, WaitArgs,
+    InitArgs, JobIdArg, JobsetEndArgs, ListArgs, MessageArgs, ModelsArgs, PauseArgs, ProjectsArgs,
+    QuotaArgs, RemoteControlAction, RemoteControlArgs, RepairArgs, ResultArgs, RetryArgs,
+    RevertArgs, ReviewArgs, StartArgs, WaitArgs,
 };
 
 /// agent-run: remote CLI client for the agent-run API server
@@ -136,6 +136,30 @@ pub enum Commands {
     /// End a jobset: bump its epoch and mark it ended (old credentials stop
     /// verifying). Operator-only.
     Jobset(JobsetEndArgs),
+
+    /// Interrupt a running job (emulated: process-group SIGTERM then SIGKILL,
+    /// no kill bookkeeping; the job can be resumed with `retry`).
+    Interrupt(JobIdArg),
+
+    /// Pause or resume a job's E4 emulation flag (messages queue while paused).
+    Pause(PauseArgs),
+
+    /// Deliver a message to a job; queued in `.engine-message-queue` for the
+    /// next turn when the engine has no live mid-run channel.
+    Message(MessageArgs),
+
+    /// Fork a job's worktree into a new run (emulated worktree copy).
+    Fork(JobIdArg),
+
+    /// Compact a job's context (emulated summarise-then-restart).
+    Compact(JobIdArg),
+
+    /// Revert a job's worktree to its latest engine checkpoint; an empty
+    /// message unreverts.
+    Revert(RevertArgs),
+
+    /// Show a job's structured todo list (collected from its event stream).
+    Todo(JobIdArg),
 }
 
 /// Arguments for `agent-run auth`.

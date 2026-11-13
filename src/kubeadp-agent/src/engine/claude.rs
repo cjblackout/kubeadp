@@ -459,13 +459,25 @@ impl Engine for ClaudeEngine {
     }
 
     fn capabilities(&self) -> CapabilityTable {
+        // The claude job driver (engine-aware runner) provides the full job
+        // lifecycle over the same HTTP/CLI surface as agy (HL-71 S1 engine
+        // parity): start/status/retry/events plus list/kill/result and the
+        // worktree inspection endpoints, which are engine-agnostic (they
+        // operate on the job row / worktree and already parse claude's
+        // stream-json text). Tested end-to-end through the black-box suite
+        // (tests/cli/run-tests.sh, T172+) and the job.rs/result.rs unit
+        // tests.
         CapabilityTable::builder(ENGINE_ID)
             .transport(Transport::StreamJson)
             .native(&[
                 "job.start",
                 "job.status",
+                "job.list",
+                "job.kill",
                 "job.retry",
                 "job.events",
+                "job.result",
+                "workspace.*",
                 "session.start",
                 "session.stop",
                 "session.restart",
@@ -475,6 +487,16 @@ impl Engine for ClaudeEngine {
                 // into the model's context (mcp-a2a tool_result + the session
                 // hooks); the supported channels are in `inject_channels`.
                 "a2a.inject",
+            ])
+            .emulated(&[
+                // HL-71 S2: the job-scoped message surface is fronted by the
+                // E4 emulation layer for every engine without a live mid-run
+                // channel. Claude's PTY adapter handles `session.message`
+                // natively when a session exists, but a job-mode run (worker,
+                // no PTY) has no live channel -- `send_message` falls back to
+                // the per-run queue, so `a2a.send_message` is emulated for the
+                // job surface (the wrapper never reports a job message 501).
+                "a2a.send_message",
             ])
             .build()
     }
@@ -669,9 +691,16 @@ exit 0
         assert_eq!(table.transport, Some(Transport::StreamJson));
         assert_eq!(table.capability("job.start"), Some(Capability::Native));
         assert_eq!(table.capability("job.status"), Some(Capability::Native));
-        // job.events / job.retry are now native (event buffer + --resume).
+        // job.events / job.retry are native (event buffer + --resume).
         assert_eq!(table.capability("job.retry"), Some(Capability::Native));
         assert_eq!(table.capability("job.events"), Some(Capability::Native));
+        // HL-71 S1: the claude job driver reaches the full job lifecycle and
+        // the worktree endpoints over the same surface as agy (list/kill/
+        // result are engine-agnostic; the black-box suite proves them).
+        assert_eq!(table.capability("job.list"), Some(Capability::Native));
+        assert_eq!(table.capability("job.kill"), Some(Capability::Native));
+        assert_eq!(table.capability("job.result"), Some(Capability::Native));
+        assert_eq!(table.capability("workspace.*"), Some(Capability::Native));
         assert_eq!(table.capability("session.start"), Some(Capability::Native));
         assert_eq!(table.capability("session.log"), Some(Capability::Native));
         assert_eq!(
@@ -734,6 +763,23 @@ exit 0
         assert!(argv_log.contains("--input-format"));
         assert!(argv_log.contains("stream-json"));
         assert!(argv_log.contains("--output-format"));
+        // Token set of the recorded argv (the fake records `echo "$@"`,
+        // space-joined). `--verbose` is last on a fresh start, so a
+        // token-boundary match via split, not a substring, is used.
+        let argv_tokens: Vec<&str> = argv_log.split_whitespace().collect();
+        // `--output-format stream-json` with `-p` requires `--verbose` on the
+        // real claude CLI.
+        assert!(
+            argv_tokens.contains(&"--verbose"),
+            "claude job argv must carry --verbose: {argv_log}"
+        );
+        // The agy-only `--mode` flag must never reach the claude harness (the
+        // real CLI rejects it with `error: unknown option '--mode'`). A token
+        // match, so `--permission-mode` does not trip it.
+        assert!(
+            !argv_tokens.contains(&"--mode"),
+            "claude job argv must not carry the agy-only --mode flag: {argv_log}"
+        );
 
         let run = Run::new(run_id.clone(), RunKind::Job, tmp.path().join("proj"));
 

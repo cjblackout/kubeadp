@@ -141,7 +141,17 @@ fn final_error_text(log: &str) -> Option<String> {
                 .map(|s| s.to_string()),
         );
     }
-    last.and_then(|e| e)
+    let Some(err) = last.and_then(|e| e) else {
+        // Defect 2 fallback (_HL-71 S1_): no terminal error line was found, but
+        // a failed claude job may still carry its reason text in a synthetic
+        // `assistant` message (`model:"<synthetic>"`) or in the plain-text
+        // stderr tail of the log. Surface that instead of an empty `error`.
+        return crate::core::job::claude_fallback_error_text(log);
+    };
+    if err.trim().is_empty() {
+        return crate::core::job::claude_fallback_error_text(log);
+    }
+    Some(err)
 }
 
 #[cfg(test)]
@@ -179,6 +189,56 @@ mod tests {
         let log6 = r#"{"status":"ERROR","error":"first"}
 {"status":"FAILED"}"#;
         assert_eq!(final_error_text(log6), None);
+    }
+
+    #[test]
+    fn test_final_error_text_claude_result_field() {
+        // Defect 2 (HL-71 S1): a claude error `result` line with `is_error:
+        // true` and the reason in the `result` field (NO `error` field) must
+        // surface as the job's error text.
+        let log = r#"{"type":"assistant","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"Failed to authenticate: OAuth session expired and could not be refreshed"}]},"session_id":"cl1"}
+{"type":"result","subtype":"error","is_error":true,"result":"Failed to authenticate: OAuth session expired and could not be refreshed","session_id":"cl1"}
+"#;
+        assert_eq!(
+            final_error_text(log).as_deref(),
+            Some("Failed to authenticate: OAuth session expired and could not be refreshed"),
+            "the claude error result's `result` text must be surfaced as the error"
+        );
+
+        // A succeeding claude result line carries no error -> None.
+        let ok_log = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"cl1"}
+"#;
+        assert_eq!(
+            final_error_text(ok_log),
+            None,
+            "a claude success result must yield no error text"
+        );
+    }
+
+    #[test]
+    fn test_final_error_text_claude_fallback_chain() {
+        // Defect 2 fallback (_HL-71 S1_): a failed claude job whose log has NO
+        // terminal error `result` line still surfaces a reason -- the last
+        // synthetic `assistant` message text, or the last non-JSON log line.
+        // Without this, `agent-run result --json` reports an empty `error`.
+
+        // No error-result line at all; the synthetic assistant carries the reason.
+        let synthetic = r#"[claude-code:unrecognized_model] Failed to authenticate: OAuth session expired
+{"type":"assistant","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"Failed to authenticate: OAuth session expired and could not be refreshed"}]},"session_id":"cl1"}
+"#;
+        assert_eq!(
+            final_error_text(synthetic).as_deref(),
+            Some("Failed to authenticate: OAuth session expired and could not be refreshed"),
+            "the synthetic assistant text must be the fallback reason"
+        );
+
+        // A non-claude plain-chatter log must NOT surface a fallback reason.
+        let chatter = "agent chatter only\nstill no structure\n";
+        assert_eq!(
+            final_error_text(chatter),
+            None,
+            "a non-claude log must not gain a fallback error"
+        );
     }
 
     #[test]

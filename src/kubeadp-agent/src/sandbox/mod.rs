@@ -29,7 +29,7 @@ pub mod relay;
 pub mod testhook;
 
 pub use detect::{detect_runtime, probe_environment, EnvironmentProbe, SandboxRuntime};
-pub use policy::SandboxPolicy;
+pub use policy::{SandboxPolicy, CLAUDE_OAUTH_TOKEN_ENV};
 
 use serde::{Deserialize, Serialize};
 

@@ -380,6 +380,11 @@ pub fn dispatch(cli: &Cli, base_url: &str) -> ! {
                 subpath.push_str(&urlencode(status));
                 first = false;
             }
+            if let Some(engine) = &args.engine {
+                subpath.push_str(if first { "?" } else { "&" });
+                subpath.push_str("engine=");
+                subpath.push_str(&urlencode(engine));
+            }
             let agent = build_agent(Some(ordinary_read_timeout()));
             exit_output(
                 &call(
@@ -526,6 +531,110 @@ pub fn dispatch(cli: &Cli, base_url: &str) -> ! {
                     &agent,
                     "POST",
                     &format!("{base}{API_PREFIX}/jobsets/{encoded}/end"),
+                    None,
+                    json_mode,
+                ),
+                json_mode,
+            )
+        }
+        Commands::Interrupt(args) => {
+            // `interrupt <id>` -> POST /api/v1/jobs/<id>/interrupt (emulated
+            // process-group SIGTERM -> SIGKILL, no kill bookkeeping; the job
+            // stays resumable with `retry`).
+            let agent = build_agent(Some(ordinary_read_timeout()));
+            exit_output(
+                &call(
+                    &agent,
+                    "POST",
+                    &job_url(&base, &args.job_id, "/interrupt"),
+                    None,
+                    json_mode,
+                ),
+                json_mode,
+            )
+        }
+        Commands::Pause(args) => {
+            // `pause <id> [--paused true|false]` -> POST /api/v1/jobs/<id>/pause.
+            let agent = build_agent(Some(ordinary_read_timeout()));
+            exit_output(
+                &call(
+                    &agent,
+                    "POST",
+                    &job_url(&base, &args.job_id, "/pause"),
+                    Some(&json!({ "paused": args.paused })),
+                    json_mode,
+                ),
+                json_mode,
+            )
+        }
+        Commands::Message(args) => {
+            // `message <id> <text>` -> POST /api/v1/jobs/<id>/message (queued
+            // in `.engine-message-queue` for the next turn).
+            let agent = build_agent(Some(ordinary_read_timeout()));
+            exit_output(
+                &call(
+                    &agent,
+                    "POST",
+                    &job_url(&base, &args.job_id, "/message"),
+                    Some(&json!({ "message": args.message })),
+                    json_mode,
+                ),
+                json_mode,
+            )
+        }
+        Commands::Fork(args) => {
+            // `fork <id>` -> POST /api/v1/jobs/<id>/fork (emulated worktree
+            // copy seeded from the source job's worktree).
+            let agent = build_agent(Some(ordinary_read_timeout()));
+            exit_output(
+                &call(
+                    &agent,
+                    "POST",
+                    &job_url(&base, &args.job_id, "/fork"),
+                    None,
+                    json_mode,
+                ),
+                json_mode,
+            )
+        }
+        Commands::Compact(args) => {
+            // `compact <id>` -> POST /api/v1/jobs/<id>/compact (emulated
+            // summarise-then-restart).
+            let agent = build_agent(Some(LONG_READ_TIMEOUT));
+            exit_output(
+                &call(
+                    &agent,
+                    "POST",
+                    &job_url(&base, &args.job_id, "/compact"),
+                    None,
+                    json_mode,
+                ),
+                json_mode,
+            )
+        }
+        Commands::Revert(args) => {
+            // `revert <id> [--commit <sha>]` -> POST /api/v1/jobs/<id>/revert
+            // (an empty commit unreverts).
+            let agent = build_agent(Some(ordinary_read_timeout()));
+            exit_output(
+                &call(
+                    &agent,
+                    "POST",
+                    &job_url(&base, &args.job_id, "/revert"),
+                    Some(&json!({ "commit": args.commit })),
+                    json_mode,
+                ),
+                json_mode,
+            )
+        }
+        Commands::Todo(args) => {
+            // `todo <id>` -> GET /api/v1/jobs/<id>/todo.
+            let agent = build_agent(Some(ordinary_read_timeout()));
+            exit_output(
+                &call(
+                    &agent,
+                    "GET",
+                    &job_url(&base, &args.job_id, "/todo"),
                     None,
                     json_mode,
                 ),

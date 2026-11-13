@@ -209,6 +209,20 @@ pub fn revert(run: &Run) -> Result<String> {
 /// same anchor [`revert`] reports, so the two operations are symmetric (a
 /// caller observes the run back at its checkpoint either way).
 pub fn unrevert(run: &Run) -> Result<String> {
+    let Some(sha) = preserved_work_sha(run)? else {
+        bail!(
+            "no reverted work is preserved for run '{}' (unrevert before revert, or the checkpoint had no prior work to restore)",
+            run.id
+        );
+    };
+    run_git(&run.workdir, &["reset", "--hard", &sha])?;
+    Ok(checkpoint_sha(run)?.unwrap_or(sha))
+}
+
+/// Returns the sha `revert` preserved on [`work_ref`], or `None` when no
+/// revert has happened yet (used to make an unrevert-without-revert a
+/// graceful no-op on the emulated surface instead of an error).
+pub fn preserved_work_sha(run: &Run) -> Result<Option<String>> {
     let output = crate::core::reaper::output_tracked(git(&run.workdir).args([
         "rev-parse",
         "--verify",
@@ -217,14 +231,10 @@ pub fn unrevert(run: &Run) -> Result<String> {
     ]))
     .with_context(|| format!("git rev-parse failed in {}", run.workdir.display()))?;
     if !output.status.success() {
-        bail!(
-            "no reverted work is preserved for run '{}' (unrevert before revert, or the checkpoint had no prior work to restore)",
-            run.id
-        );
+        return Ok(None);
     }
     let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    run_git(&run.workdir, &["reset", "--hard", &sha])?;
-    Ok(checkpoint_sha(run)?.unwrap_or(sha))
+    Ok(Some(sha))
 }
 
 /// A marker for the paths the emulation layer owns inside a worktree. Kept as

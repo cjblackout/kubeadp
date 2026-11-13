@@ -53,7 +53,7 @@ use std::sync::Arc;
 /// `log?offset=` read (the remote client resumes from it).
 pub const LOG_OFFSET_HEADER: &str = "Agent-Run-Log-Offset";
 
-type AppState = Arc<Config>;
+pub(crate) type AppState = Arc<Config>;
 
 /// In-memory state tracking for remote control supervision.
 #[derive(Clone, Default)]
@@ -216,6 +216,19 @@ pub fn router_with_engines(
         .route("/runs/{run_id}/fork", post(runs::fork_run))
         .route("/runs/{run_id}/revert", post(runs::revert_run))
         .route("/runs/{run_id}/todo", get(runs::todo_run))
+        // HL-71 S2: the job-scoped run-control surface (the production
+        // counterpart of the run routes -- the run registry resolves no runs
+        // in production, but a job row always resolves). Each endpoint gates
+        // on the job's recorded engine's reported capability and dispatches
+        // through the E4 emulation wrapper, so claude/agy jobs answer the
+        // control surface with real behaviour.
+        .route("/jobs/{job_id}/interrupt", post(runs::interrupt_job))
+        .route("/jobs/{job_id}/pause", post(runs::pause_job))
+        .route("/jobs/{job_id}/message", post(runs::message_job))
+        .route("/jobs/{job_id}/compact", post(runs::compact_job))
+        .route("/jobs/{job_id}/fork", post(runs::fork_job))
+        .route("/jobs/{job_id}/revert", post(runs::revert_job))
+        .route("/jobs/{job_id}/todo", get(runs::todo_job))
         .layer(Extension(EngineRunRegistry::global()))
         .fallback(api_v1_not_found)
         .with_state(state)
@@ -308,7 +321,7 @@ fn strip_state_path(message: &str) -> String {
 
 /// Runs a blocking core command off the tokio worker threads (the core does
 /// file I/O, sqlite, process spawning, and 500ms poll loops).
-async fn run_blocking<T>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T>
+pub(crate) async fn run_blocking<T>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T>
 where
     T: Send + 'static,
 {
@@ -588,13 +601,15 @@ fn parse_export_query(raw: Option<&str>) -> Result<ExportQuery, String> {
     })
 }
 
-/// Parsed `jobs?project=<p>&status=<s>` list query. `status` is repeatable
-/// and each value may itself be a comma-separated list (both shapes collapse
-/// to one `Vec<String>`; the core's `--status` parser splits the commas).
+/// Parsed `jobs?project=<p>&status=<s>&engine=<e>` list query. `status` is
+/// repeatable and each value may itself be a comma-separated list (both
+/// shapes collapse to one `Vec<String>`; the core's `--status` parser splits
+/// the commas). `engine` is single-valued.
 #[derive(Debug)]
 struct ListQuery {
     project: Option<String>,
     status: Vec<String>,
+    engine: Option<String>,
 }
 
 /// Parses the raw `?`-less list query string. The CLI client sends `status`
@@ -603,11 +618,13 @@ struct ListQuery {
 /// `Query<ListArgs>` extractor can fold into a `Vec<String>` -- so the raw
 /// string is parsed as a flat list of `(key, value)` pairs (like
 /// [`parse_diff_query`]). Absent keys keep the historical defaults (no
-/// project filter, no status filter). A value's commas are preserved verbatim
-/// in the collected vector: the core's status filter splits them.
+/// project filter, no status filter, no engine filter). A value's commas are
+/// preserved verbatim in the collected vector: the core's status filter
+/// splits them.
 fn parse_list_query(raw: Option<&str>) -> Result<ListQuery, String> {
     let mut project: Option<String> = None;
     let mut status: Vec<String> = Vec::new();
+    let mut engine: Option<String> = None;
     if let Some(raw) = raw {
         let raw = raw.trim();
         if !raw.is_empty() {
@@ -628,6 +645,8 @@ fn parse_list_query(raw: Option<&str>) -> Result<ListQuery, String> {
                     // Repeatable: every `status=` occurrence appends, so both
                     // `?status=a&status=b` and `?status=a,b` are honoured.
                     "status" => status.push(value),
+                    // Single-valued like `project` (last occurrence wins).
+                    "engine" => engine = Some(value),
                     // Unknown keys are ignored (forward-compat with the diff
                     // route), keeping an old client that sends no filter keys
                     // working.
@@ -636,7 +655,11 @@ fn parse_list_query(raw: Option<&str>) -> Result<ListQuery, String> {
             }
         }
     }
-    Ok(ListQuery { project, status })
+    Ok(ListQuery {
+        project,
+        status,
+        engine,
+    })
 }
 
 /// `files?path=&depth=` query (path defaults to the worktree root, depth is
@@ -814,6 +837,7 @@ async fn list_jobs(State(config): State<AppState>, RawQuery(raw_query): RawQuery
     let args = ListArgs {
         project: query.project,
         status: query.status,
+        engine: query.engine,
     };
     let config = Arc::clone(&config);
     match run_blocking(move || commands::list::run(&config, &args)).await {
@@ -2189,16 +2213,19 @@ mod tests {
         let q = parse_list_query(None).unwrap();
         assert!(q.project.is_none());
         assert!(q.status.is_empty());
+        assert!(q.engine.is_none());
         for empty in ["", "   "] {
             let q = parse_list_query(Some(empty)).unwrap();
             assert!(q.project.is_none());
             assert!(q.status.is_empty());
+            assert!(q.engine.is_none());
         }
 
         // A single status value; the project filter is captured verbatim.
         let q = parse_list_query(Some("project=myrepo&status=done")).unwrap();
         assert_eq!(q.project.as_deref(), Some("myrepo"));
         assert_eq!(q.status, vec!["done".to_string()]);
+        assert!(q.engine.is_none());
 
         // `status` is REPEATED: every occurrence appends (the part a
         // `Query<ListArgs>` extractor cannot fold), in any position and
@@ -2220,6 +2247,20 @@ mod tests {
         // project only (no status) -- a pre-status client with a filter.
         let q = parse_list_query(Some("project=alpha")).unwrap();
         assert_eq!(q.project.as_deref(), Some("alpha"));
+        assert!(q.status.is_empty());
+        assert!(q.engine.is_none());
+
+        // `engine` is single-valued (last occurrence wins) and combines with
+        // the other filters; URL-encoding is undone.
+        let q = parse_list_query(Some("engine=claude&project=alpha")).unwrap();
+        assert_eq!(q.engine.as_deref(), Some("claude"));
+        assert_eq!(q.project.as_deref(), Some("alpha"));
+        let q = parse_list_query(Some("status=done&engine=claude&engine=agy")).unwrap();
+        assert_eq!(q.engine.as_deref(), Some("agy"));
+        assert_eq!(q.status, vec!["done".to_string()]);
+        let q = parse_list_query(Some("engine=claude")).unwrap();
+        assert_eq!(q.engine.as_deref(), Some("claude"));
+        assert!(q.project.is_none());
         assert!(q.status.is_empty());
     }
 

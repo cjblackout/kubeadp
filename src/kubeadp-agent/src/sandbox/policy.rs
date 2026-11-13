@@ -110,6 +110,13 @@ fn default_env_allow() -> Vec<String> {
 /// backends). Anything else is rejected at parse time.
 pub const NET_MODES: &[&str] = &["host", "shared", "relay"];
 
+/// The environment variable carrying the long-lived claude OAuth token
+/// (`claude setup-token`) that claude-engine jobs authenticate with. Only the
+/// NAME is ever listed in a policy's `env_allow` (and so written into a policy
+/// file); the VALUE travels through the filtered process environment and is
+/// never logged or serialized.
+pub const CLAUDE_OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
 fn default_net() -> String {
     "host".to_string()
 }
@@ -426,6 +433,23 @@ impl SandboxPolicy {
         self.with_hidden_path(jobset_root_key_file_path().as_deref())
     }
 
+    /// Adds `CLAUDE_CODE_OAUTH_TOKEN` to the policy's `env_allow` list so a
+    /// claude-engine job receives the pod's durable claude login through the
+    /// env_allow filter. Callers use it ONLY for claude-engine job policies
+    /// (agy jobs keep the default allowlist). Idempotent: an entry already
+    /// present (e.g. a hand-written policy) is not duplicated. The allowlist
+    /// carries the variable NAME only: the token VALUE stays in the pod
+    /// environment and reaches the job exclusively through the filtered
+    /// process env (`build_agent_env`), never through the policy file, argv
+    /// or any log line.
+    pub fn allow_claude_oauth_env(mut self) -> Self {
+        let var = CLAUDE_OAUTH_TOKEN_ENV.to_string();
+        if !self.env_allow.iter().any(|p| p == &var) {
+            self.env_allow.push(var);
+        }
+        self
+    }
+
     /// Adds `path` to the policy's `hide` list so a sandboxed agent can never
     /// read it. No-op when `path` is `None`. Idempotent: an already-hidden
     /// path is not duplicated.
@@ -593,6 +617,85 @@ mod tests {
         assert!(policy.is_env_allowed("A2A_SOMETHING"));
         assert!(policy.is_env_allowed("KUBEADP_ROLE"));
         assert!(!policy.is_env_allowed("VIKUNJA_API_TOKEN"));
+    }
+
+    #[test]
+    fn test_allow_claude_oauth_env_name_only() {
+        // The default for_job policy does NOT pass the claude OAuth token env
+        // (the name matches no literal and no wildcard pattern), so agy jobs
+        // keep it out of their environment.
+        let base = SandboxPolicy::for_job(
+            "job-71",
+            Path::new("/workspace/.agent-jobs/homelab/job-71"),
+            None,
+            None,
+            None,
+        );
+        assert!(!base.is_env_allowed(CLAUDE_OAUTH_TOKEN_ENV));
+
+        // The claude-job policy adds the NAME to `env_allow` so the pod's
+        // CLAUDE_CODE_OAUTH_TOKEN value passes the sandbox-exec env filter
+        // into the agent process.
+        let policy = base.clone().allow_claude_oauth_env();
+        assert!(policy.is_env_allowed(CLAUDE_OAUTH_TOKEN_ENV));
+
+        // Idempotent: a second call does not duplicate the entry.
+        let policy = policy.allow_claude_oauth_env();
+        assert_eq!(
+            policy
+                .env_allow
+                .iter()
+                .filter(|p| *p == CLAUDE_OAUTH_TOKEN_ENV)
+                .count(),
+            1
+        );
+
+        // Only the NAME is ever serialized: the policy JSON lists the env var
+        // name and never a token VALUE (values ride the filtered process
+        // environment via `filter_env`, which never feeds the policy file).
+        let json = serde_json::to_string(&policy).unwrap();
+        assert!(json.contains(CLAUDE_OAUTH_TOKEN_ENV));
+        assert!(!json.contains("oat01-fake-token-value"));
+    }
+
+    #[test]
+    fn test_filter_env_passes_claude_token_value() {
+        // The env filter passes the token VALUE from the worker pod's
+        // environment to the job process when the policy allows the NAME;
+        // other secret-named variables stay filtered out.
+        let policy = SandboxPolicy::for_job(
+            "job-71",
+            Path::new("/workspace/.agent-jobs/homelab/job-71"),
+            None,
+            None,
+            None,
+        )
+        .allow_claude_oauth_env();
+        let env = [
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            (
+                CLAUDE_OAUTH_TOKEN_ENV.to_string(),
+                "oat01-fake-token-value".to_string(),
+            ),
+            ("VIKUNJA_API_TOKEN".to_string(), "vj-secret".to_string()),
+        ];
+        let filtered = policy.filter_env(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        assert!(filtered.contains(&(
+            CLAUDE_OAUTH_TOKEN_ENV.to_string(),
+            "oat01-fake-token-value".to_string()
+        )));
+        assert!(filtered.iter().all(|(k, _)| k != "VIKUNJA_API_TOKEN"));
+
+        // Without the allowlist entry the same variable is dropped entirely.
+        let denied = SandboxPolicy::for_job(
+            "job-71",
+            Path::new("/workspace/.agent-jobs/homelab/job-71"),
+            None,
+            None,
+            None,
+        );
+        let filtered = denied.filter_env(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        assert!(filtered.iter().all(|(k, _)| k != CLAUDE_OAUTH_TOKEN_ENV));
     }
 
     #[test]

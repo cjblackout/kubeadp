@@ -70,11 +70,11 @@ Endpoints are classified as `native`, `emulated`, or `unsupported`:
 |---|---|---|---|---|---|
 | `job.start` | Yes | No | Native | Native | Starts a job run |
 | `job.status` | Yes | No | Native | Native | Retrieves job state and metadata |
-| `job.list` | Yes | No | Native | Unsupported | Lists existing jobs |
-| `job.kill` | Yes | No | Native | Unsupported | Terminates active job run |
+| `job.list` | Yes | No | Native | Native | Lists existing jobs |
+| `job.kill` | Yes | No | Native | Native | Terminates active job run |
 | `job.retry` | Yes | No | Native | Native | Retries/resumes job on worktree |
 | `job.events` | Yes | No | Native | Native | Structured JSON event stream |
-| `job.result` | Yes | No | Native | Unsupported | Returns final execution summary |
+| `job.result` | Yes | No | Native | Native | Returns final execution summary |
 | `session.start` | No | Yes | Emulated | Native | Initializes interactive session |
 | `session.stop` | No | Yes | Emulated | Native | Gracefully halts session |
 | `session.restart` | No | Yes | Emulated | Native | Restarts session process group |
@@ -86,7 +86,7 @@ Endpoints are classified as `native`, `emulated`, or `unsupported`:
 | `compact` | Yes | Yes | Emulated | Emulated | Summarize history and restart |
 | `revert` | Yes | Yes | Emulated | Emulated | Restores worktree to checkpoint |
 | `todo` | Yes | Yes | Emulated | Emulated | Returns structured task todo list |
-| `workspace.*` | Yes | Yes | Native | Unsupported | File inspection, diff, cat |
+| `workspace.*` | Yes | Yes | Native | Native | File inspection, diff, cat |
 | `a2a.send_message` | Yes | Yes | Emulated | Native | Sends outbound A2A message |
 
 #### Emulation Mechanisms
@@ -332,7 +332,7 @@ All `/api/v1` endpoints require a bearer token matching `KUBEADP_API_TOKEN_FILE`
     ```
   - Response (200): `{"job_id": "ab12cd34", "status": "running"}`
   - Status codes: `400` invalid request or unknown engine, `501` unsupported engine operation.
-- `GET /api/v1/jobs`: Lists jobs. Supports filtering via `?project=<name>` and `?status=<status>`.
+- `GET /api/v1/jobs`: Lists jobs. Supports filtering via `?project=<name>`, `?status=<status>` (repeatable, comma allowed) and `?engine=<name>` (`agy`/`claude`; unknown → 400). The table includes an `ENGINE` column between `ACTIVITY` and `PROMPT` (legacy rows show `agy`).
 - `GET /api/v1/jobs/{job_id}`: Retrieves complete job status and metadata.
 - `GET /api/v1/jobs/{job_id}/log?offset=0`: Streams raw log bytes starting from the given byte offset. Returns `Agent-Run-Log-Offset` header.
 - `GET /api/v1/jobs/{job_id}/events`: Streams Server-Sent Events (SSE) representing execution updates.

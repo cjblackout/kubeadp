@@ -287,6 +287,35 @@ impl EngineRegistry {
         self.engines.get(engine_id).cloned()
     }
 
+    /// Attaches the host `Config` to every registered wrapper so the emulation
+    /// layer can drive job-mode control that needs real process state (the
+    /// emulated interrupt of the job's child process group). Called by the
+    /// role entry points after registration; idempotent for later registrations
+    /// (they pick the config up at the next attach).
+    pub fn attach_config(&self, config: Arc<crate::core::config::Config>) {
+        for wrapped in self.engines.values() {
+            wrapped.set_config(Arc::clone(&config));
+        }
+    }
+
+    /// Arms the emulation (E4) for every control endpoint the inner engine
+    /// does not implement natively, for every registered wrapper. The worker
+    /// role calls this after registration so claude/agy jobs report
+    /// interrupt/pause/fork/compact/revert/todo emulated (never unsupported);
+    /// the capability table and the endpoint guard then agree. A self-recursive
+    /// call is impossible: [`emulate::EMULATED_KEYS`] are the only keys it
+    /// enables.
+    pub fn enable_all_emulated(&self) {
+        for wrapped in self.engines.values() {
+            wrapped.enable_all();
+        }
+    }
+
+    /// Whether some registered wrapper adopts the config (for tests).
+    pub fn config_attached(&self) -> bool {
+        self.engines.values().any(|w| w.config().is_some())
+    }
+
     /// Resolves the engine to use for `kind` and `role`, applying the
     /// precedence: request field > per-run config > per-role default. A
     /// request/config naming an unregistered engine is

@@ -59,9 +59,22 @@ impl AgyEngine {
     /// `/api/v1/capabilities` resolve it through the trait. When the config
     /// sets `default_engine` (HL-91 E1, selection precedence level 2) it
     /// becomes the registry's job fallback (level 3 is per-role "agy").
+    ///
+    /// The E4 emulation layer is armed for every control endpoint the agy
+    /// engine lacks natively (fork/compact/revert, plus interrupt/todo from
+    /// the base wrapper) so the shared control routes answer them as
+    /// `emulated` -- never 501 because of the engine (HL-71 S2). `pause` is
+    /// declared native by the engine even though the trait default is
+    /// `Unsupported`; the config-attached emulation wrapper also fronts it, so
+    /// the two tables are kept in sync by the worker's `enable_all_emulated`.
     pub fn build_registry(config: Arc<Config>) -> crate::engine::EngineRegistry {
         let mut registry = crate::engine::EngineRegistry::new();
         registry.register(Arc::new(Self::new(config.clone())));
+        // Arm the E4 emulation for endpoints the agy engine has no native
+        // implementation for (fork/compact/revert; interrupt/todo already
+        // emulated by the wrapper's base table). The worker entry point then
+        // runs `enable_all_emulated` again -- idempotent.
+        registry.enable_all_emulated();
         if let Some(default) = config
             .default_engine
             .clone()
@@ -254,7 +267,6 @@ impl Engine for AgyEngine {
             "job.retry",
             "job.events",
             "job.result",
-            "pause",
             "workspace.*",
             // Design HL-113 §7.14: the harness puts queued A2A messages into
             // the model's context (the mcp-a2a tool_result channel); the
@@ -262,7 +274,23 @@ impl Engine for AgyEngine {
             "a2a.inject",
         ];
         let emulated: &[crate::engine::capability::CapEndpointKey] = &[
+            // `pause` is emulated, not native: the agy engine has no native
+            // pause implementation (trait default = Unsupported); the E4
+            // per-run pause flag + message queue front it (HL-71 S2). The
+            // historical "native" declaration was dishonest -- the endpoint
+            // never had an implementation behind it.
+            "pause",
             "interrupt",
+            // The remaining E4 job-control surface is emulated from the start
+            // too (the wrapper implements fork/compact/revert/todo; the raw
+            // table declares them so the engine's own report is honest before
+            // the worker arms `enable_all_emulated` -- contrast claude, whose
+            // raw table reports these unsupported as the honest engine gap
+            // until the worker upgrades them).
+            "fork",
+            "compact",
+            "revert",
+            "todo",
             "session.start",
             "session.stop",
             "session.restart",
@@ -353,6 +381,8 @@ mod tests {
     fn capabilities_report_native_job_endpoints() {
         // The agy engine's own capability table: job endpoints native, the E4
         // control surface emulated, permissions unsupported (never a 501).
+        // `pause` is emulated too (no native implementation; the E4 pause flag
+        // + queue front it, HL-71 S2).
         let engine = AgyEngine::new(Arc::new(Config::default()));
         let table = engine.capabilities();
         assert_eq!(table.engine, "agy");
@@ -363,11 +393,12 @@ mod tests {
             Some(Capability::Emulated)
         );
         assert_eq!(table.capability("interrupt"), Some(Capability::Emulated));
+        assert_eq!(table.capability("pause"), Some(Capability::Emulated));
         assert_eq!(
             table.capability("permissions"),
             Some(Capability::Unsupported)
         );
-        assert_eq!(table.capability("fork"), Some(Capability::Unsupported));
+        assert_eq!(table.capability("fork"), Some(Capability::Emulated));
         assert_eq!(table.transport, None);
     }
 
@@ -592,5 +623,97 @@ some non-json noise line
         // host is left clean (the job monitor thread reaps the child).
         let _ = crate::core::commands::kill::send_signal(pid, "KILL");
         crate::core::reaper::untrack_child(pid);
+    }
+
+    /// HL-71 S2 parity: through the exact production registry wiring
+    /// (`build_registry` + claude registration + `attach_config` +
+    /// `enable_all_emulated`, mirroring `worker/entry.rs`), agy and claude
+    /// report the SAME effective capability for every job-control endpoint
+    /// the emulation layer fronts -- `Native` for the proven job lifecycle,
+    /// `Emulated` for interrupt/pause/message/fork/compact/revert/todo. No
+    /// control endpoint may be `Unsupported` for one engine and declared for
+    /// the other (owner rule: no job-control route answers 501 because of the
+    /// engine). Table-driven over the endpoint keys.
+    #[test]
+    fn agy_claude_job_control_parity_after_enable_all_emulated() {
+        use crate::engine::capability::CapEndpointKey;
+        use crate::engine::capability::Capability;
+        use crate::engine::claude::ClaudeEngine;
+
+        let config = Arc::new(Config::default());
+        let mut registry = AgyEngine::build_registry(Arc::clone(&config));
+        registry.register(Arc::new(ClaudeEngine::new(
+            std::path::PathBuf::from("claude"),
+            None,
+        )));
+        registry.attach_config(Arc::clone(&config));
+        registry.enable_all_emulated();
+
+        // Job lifecycle endpoints stay native for both (parity with the
+        // black-box suite's T172-T180 proof for claude and T02-T46 for agy).
+        for key in [
+            "job.start",
+            "job.status",
+            "job.list",
+            "job.kill",
+            "job.retry",
+            "job.events",
+            "job.result",
+            "workspace.*",
+        ] {
+            let agy_cap = registry
+                .emulating("agy")
+                .expect("agy wrapper")
+                .capability(key);
+            let claude_cap = registry
+                .emulating("claude")
+                .expect("claude wrapper")
+                .capability(key);
+            assert_eq!(
+                agy_cap, claude_cap,
+                "parity: agy and claude must both report the same effective capability for '{key}' (agy={agy_cap:?} claude={claude_cap:?})"
+            );
+            assert_eq!(
+                agy_cap,
+                Capability::Native,
+                "proven job endpoint '{key}' must stay native for agy"
+            );
+        }
+
+        // The emulated job-control surface: identical, non-unsupported
+        // declarations for both engines.
+        let control_keys: &[CapEndpointKey] = &[
+            "interrupt",
+            "pause",
+            "a2a.send_message",
+            "fork",
+            "compact",
+            "revert",
+            "todo",
+        ];
+        for key in control_keys {
+            let agy_cap = registry
+                .emulating("agy")
+                .expect("agy wrapper")
+                .capability(key);
+            let claude_cap = registry
+                .emulating("claude")
+                .expect("claude wrapper")
+                .capability(key);
+            assert_eq!(
+                agy_cap, claude_cap,
+                "parity: agy and claude must declare '{key}' identically (agy={agy_cap:?} claude={claude_cap:?})"
+            );
+            assert_ne!(
+                agy_cap,
+                Capability::Unsupported,
+                "owner rule: job-control endpoint '{key}' must never be unsupported for agy"
+            );
+            assert_ne!(
+                claude_cap,
+                Capability::Unsupported,
+                "owner rule: job-control endpoint '{key}' must never be unsupported for claude"
+            );
+        }
     }
 }

@@ -1,5 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use std::ffi::OsStr;
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,6 +12,18 @@ use crate::core::output::CommandOutput;
 
 pub use crate::core::job::get_process_start_time;
 
+/// Returns the basename stem of a configured engine path (e.g.
+/// `/usr/local/libexec/agy` -> `agy`, `/usr/local/bin/claude` -> `claude`, a
+/// fake test script -> its filename), lowercased. The stem is the token the
+/// cmdline match compares against, since the configured path may be a
+/// symlink/copy (in tests the fake harness has an arbitrary temp filename).
+fn engine_stem(path: &Path) -> String {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
 /// Sends `SIG<sig_name>` (e.g. "TERM", "KILL") to `pid`.
 ///
 /// Jobs always run as the server's own process user, so a direct `libc::kill()`
@@ -19,33 +33,48 @@ pub use crate::core::job::get_process_start_time;
 /// Lightweight sanity check to guard against PID reuse before signaling.
 ///
 /// Verifies /proc/<pid>/cmdline or /proc/<pid>/exe still looks like an expected
-/// agent process (agy, agent-run, or test runner processes like sleep).
+/// agent process: the engine the job actually used (`agy` for agy jobs, the
+/// `claude` harness for claude jobs), the always-on `sandbox-exec` wrapper both
+/// engines run under, the `agent-run`/`kubeadp-agent` launchers, or test
+/// runner processes like `sleep`.
+///
+/// The whole command line is compared (prefix-free) against the launch-target
+/// tokens, so a `claude` job whose recorded PID is the `sandbox-exec` wrapper
+/// (`sandbox-exec --policy <file> -- /usr/local/bin/claude ...`) passes while
+/// an unrelated process whose executable happens to share a substring cannot
+/// masquerade as one. PID reuse safety is still primarily anchored on the
+/// recorded start time; this check only rejects grossly unrelated processes.
 pub(crate) fn is_pid_plausible_job_process(config: &Config, pid: u32) -> bool {
+    // The launch targets the job's engines define. Both engines run through the
+    // always-on `sandbox-exec` wrapper, so the wrapper token counts for either
+    // engine (the recorded PID is the wrapper's process, and its cmdline names
+    // the wrapped engine binary).
+    let mut expected: Vec<String> = vec![
+        engine_stem(&config.agy_path),
+        engine_stem(&config.claude_path),
+        "agy".to_string(),
+        "claude".to_string(),
+        "sandbox-exec".to_string(),
+        "agent-run".to_string(),
+        "sleep".to_string(),
+    ];
+    // An empty stem (a path without a filename) must never make the substring
+    // match unconditional (`"".contains() == true`).
+    expected.retain(|t| !t.is_empty());
+
     let cmdline_path = format!("/proc/{}/cmdline", pid);
     if let Ok(cmdline) = std::fs::read(&cmdline_path) {
         let s = String::from_utf8_lossy(&cmdline);
         if !s.is_empty() {
-            let agy_stem = config
-                .agy_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "agy".to_string());
-            if s.contains(&agy_stem)
-                || s.contains("agy")
-                || s.contains("agent-run")
-                || s.contains("sleep")
-            {
-                return true;
-            }
-            return false;
+            let lower = s.to_ascii_lowercase();
+            return expected.iter().any(|t| lower.contains(t.as_str()));
         }
     }
 
     let exe_path = format!("/proc/{}/exe", pid);
     if let Ok(target) = std::fs::read_link(&exe_path) {
         let path_str = target.to_string_lossy();
-        if path_str.contains("agy") || path_str.contains("agent-run") || path_str.contains("sleep")
-        {
+        if expected.iter().any(|t| path_str.contains(t.as_str())) {
             return true;
         }
         return false;
@@ -380,6 +409,160 @@ fn run_with_meta(config: &Config, job_id: &str, meta: JobMetadata) -> Result<Com
 mod tests {
     use super::*;
     use std::process::Command;
+
+    /// Writes an executable shell script into `dir` that sleeps forever (a
+    /// `trap '' TERM` keeps it alive against a misdirected signal during the
+    /// test), so a process spawned through it keeps its argv visible in
+    /// `/proc/<pid>/cmdline` long enough for the identity checks below.
+    fn write_sleep_script(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(
+            &p,
+            "#!/bin/sh\ntrap '' TERM\nwhile true; do sleep 1; done\n",
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&p)
+            .status()
+            .unwrap();
+        p
+    }
+
+    /// Reaps a spawned fake-engine child (kills + waits). Leaves nothing behind.
+    fn reap_child(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn test_plausibility_accepts_real_claude_and_agy_launch_shapes() {
+        // Defect 1 (HL-71 S1): a claude job's recorded PID is the always-on
+        // `sandbox-exec` wrapper (`sandbox-exec --policy <file> --
+        // /usr/local/bin/claude --dangerously-skip-permissions -p ...`), and
+        // the old name-only check (`agy`/`agent-run`/`sleep`) rejected it,
+        // so `agent-run kill` refused and the job kept running. The check must
+        // accept the engine launch target the JOB actually used: the claude
+        // harness, the agy binary, and the wrapping sandbox-exec (whose cmdline
+        // names the wrapped engine).
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox_exec = write_sleep_script(dir.path(), "sandbox-exec");
+        let claude = write_sleep_script(dir.path(), "claude");
+        let agy = write_sleep_script(dir.path(), "agy");
+
+        let config = Config {
+            agy_path: agy.clone(),
+            claude_path: claude.clone(),
+            ..Default::default()
+        };
+
+        // The claude wrapper shape (the live recorded-PID cmdline).
+        let wrapper = Command::new(&sandbox_exec)
+            .arg("--policy")
+            .arg("/state/logs/j1.policy.json")
+            .arg("--")
+            .arg(&claude)
+            .arg("--dangerously-skip-permissions")
+            .arg("-p")
+            .arg("--output-format")
+            .arg("stream-json")
+            .spawn()
+            .expect("spawn sandbox-exec wrapper");
+        std::thread::sleep(Duration::from_millis(50));
+        let wrapper_pid = wrapper.id();
+        assert!(
+            is_pid_plausible_job_process(&config, wrapper_pid),
+            "the claude sandbox-exec wrapper must look like a job process"
+        );
+        // The wrapper is the launch target the job killer must accept even
+        // against the recorded start time.
+        let identity = ProcessIdentity {
+            pid: wrapper_pid,
+            start_time: get_process_start_time(wrapper_pid),
+        };
+        assert!(
+            identity.is_still_target(&config),
+            "the claude wrapper must pass the full identity check"
+        );
+        reap_child(wrapper);
+
+        // The claude child itself (whenever the harness is the recorded PID).
+        let claude_child = Command::new(&claude)
+            .arg("--dangerously-skip-permissions")
+            .arg("-p")
+            .spawn()
+            .expect("spawn claude child");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            is_pid_plausible_job_process(&config, claude_child.id()),
+            "a direct claude child must look like a job process"
+        );
+        reap_child(claude_child);
+
+        // The agy child itself (agy engine).
+        let agy_child = Command::new(&agy)
+            .arg("--mode")
+            .arg("accept-edits")
+            .spawn()
+            .expect("spawn agy child");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            is_pid_plausible_job_process(&config, agy_child.id()),
+            "an agy child must look like a job process"
+        );
+        reap_child(agy_child);
+    }
+
+    #[test]
+    fn test_plausibility_rejects_unrelated_process_and_reused_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = write_sleep_script(dir.path(), "claude");
+        let config = Config {
+            agy_path: dir.path().join("agy"),
+            claude_path: claude.clone(),
+            ..Default::default()
+        };
+
+        // (1) A claude-shaped process matches, and a fabricated start-time
+        //     mismatch (PID reuse) is detected even though the cmdline still
+        //     looks like a job process.
+        let claude_child = Command::new(&claude)
+            .arg("--dangerously-skip-permissions")
+            .arg("-p")
+            .spawn()
+            .expect("spawn claude child");
+        std::thread::sleep(Duration::from_millis(50));
+        let pid = claude_child.id();
+        let real_start = get_process_start_time(pid);
+        assert!(
+            is_pid_plausible_job_process(&config, pid),
+            "the claude-shaped process must be plausible"
+        );
+        let reused = ProcessIdentity {
+            pid,
+            start_time: Some(real_start.unwrap_or(100) + 99999),
+        };
+        assert!(
+            !reused.is_still_target(&config),
+            "a start-time mismatch must restore the reused-PID safety"
+        );
+        reap_child(claude_child);
+
+        // (2) An unrelated process (a shell one-liner whose cmdline shares no
+        //     launch-target token -- no 'sleep', no engine name) is NOT a job
+        //     process.
+        let unrelated = Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; while true; do :; done")
+            .spawn()
+            .expect("spawn unrelated process");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !is_pid_plausible_job_process(&config, unrelated.id()),
+            "an unrelated process (sh -c loop) must not look like a job process"
+        );
+        reap_child(unrelated);
+    }
 
     #[test]
     fn test_send_signal_local_mode_terminates_real_process() {

@@ -180,6 +180,55 @@ impl Run {
                 | RunStatus::Interrupted
         )
     }
+
+    /// Builds the trait `Run` view of a job row (`core::job::JobMetadata`).
+    ///
+    /// The job API stays authoritative; this is the union view the engine
+    /// control surface talks to. The run id is the job id, the engine is the
+    /// row's recorded engine (defaulting to the config default / "agy"), and
+    /// `meta` carries the process identity (`pid`/`pid_start_time`/`retry_count`)
+    /// plus the worktree + conversation id so the emulation layer can drive
+    /// real process/state control (HL-71 S2).
+    pub fn from_job(meta: &crate::core::job::JobMetadata, engine: &str) -> Self {
+        let status = match meta.status {
+            Some(crate::core::job::JobStatus::Running) => RunStatus::Running,
+            Some(crate::core::job::JobStatus::Done) => RunStatus::Done,
+            Some(crate::core::job::JobStatus::Failed) => RunStatus::Failed,
+            Some(crate::core::job::JobStatus::Killed) => RunStatus::Killed,
+            Some(crate::core::job::JobStatus::SelfTerminated) => RunStatus::Interrupted,
+            _ => RunStatus::Pending,
+        };
+        let job_id = meta.job_id.clone();
+        let context_id = meta.conversation_id.clone();
+        let workdir = meta.worktree_path.clone();
+        let started_at = meta.started_at;
+        let exit = meta.exit_code.map(|code| ExitInfo {
+            code: Some(code),
+            signal: None,
+        });
+        let meta_value = serde_json::json!({
+            "pid": meta.pid,
+            "pid_start_time": meta.pid_start_time,
+            "retry_count": meta.retry_count,
+            "conversation_id": context_id,
+            "job_id": job_id,
+            "project": meta.project,
+        });
+        Self {
+            id: job_id,
+            engine: engine.to_string(),
+            transport: None,
+            kind: RunKind::Job,
+            context_id,
+            status,
+            workdir,
+            started_at,
+            ended_at: None,
+            exit,
+            events_seq: 0,
+            meta: meta_value,
+        }
+    }
 }
 
 /// The pod role hosting a run (selection fallback).

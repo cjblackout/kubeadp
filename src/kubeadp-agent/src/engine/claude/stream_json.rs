@@ -16,7 +16,7 @@ use crate::engine::run::{EngineEvent, Role, RunStatus};
 pub enum StreamJsonMode {
     /// Normal (non-interactive) run.
     Normal,
-    /// `--mode plan`: plan-only turn.
+    /// `--permission-mode plan`: plan-only turn.
     Plan,
 }
 
@@ -33,7 +33,7 @@ pub struct StreamJsonArgs {
     /// from `session_id` so a resume invocation can build an argv with exactly
     /// one `--resume` flag without repurposing the fresh-run fields.
     pub resume: Option<crate::engine::run::ContextId>,
-    /// The `--mode` value, default `Normal`.
+    /// The job mode, default `Normal`; `Plan` maps to `--permission-mode plan`.
     pub mode: StreamJsonMode,
     /// Whether `--dangerously-skip-permissions` is passed (jobs default on).
     pub dangerous: bool,
@@ -43,23 +43,30 @@ impl StreamJsonArgs {
     /// Builds the claude argv.
     ///
     /// Layout:
-    /// `<binary> [--dangerously-skip-permissions] [-p] [--mode <m>] --input-format
-    /// stream-json --output-format stream-json [--resume <session_id|resume>]`
+    /// `<binary> [--dangerously-skip-permissions] [-p] --input-format
+    /// stream-json --output-format stream-json --verbose
+    /// [--permission-mode plan] [--resume <session_id|resume>]`
+    ///
+    /// The real `claude` CLI has no `--mode` flag (it exits with
+    /// `error: unknown option '--mode'`): the job mode maps onto
+    /// `--permission-mode`, which `Plan` sets to `plan` and `Normal` omits
+    /// entirely (a `--dangerously-skip-permissions` run is auto-approved).
+    /// `--verbose` is mandatory for `-p --output-format stream-json`.
     pub fn argv(&self) -> Vec<String> {
         let mut argv = vec![self.binary.clone()];
         if self.dangerous {
             argv.push("--dangerously-skip-permissions".to_string());
         }
         argv.push("-p".to_string());
-        argv.push("--mode".to_string());
-        argv.push(match self.mode {
-            StreamJsonMode::Normal => "normal".to_string(),
-            StreamJsonMode::Plan => "plan".to_string(),
-        });
         argv.push("--input-format".to_string());
         argv.push("stream-json".to_string());
         argv.push("--output-format".to_string());
         argv.push("stream-json".to_string());
+        argv.push("--verbose".to_string());
+        if self.mode == StreamJsonMode::Plan {
+            argv.push("--permission-mode".to_string());
+            argv.push("plan".to_string());
+        }
         if let Some(ref session_id) = self.session_id {
             argv.push("--resume".to_string());
             argv.push(session_id.clone());
@@ -162,9 +169,16 @@ pub fn parse_stream_json_line(line: &str) -> Result<StreamMessage, String> {
         if value.get("subtype").and_then(|v| v.as_str()) == Some("error")
             || value.get("is_error") == Some(&serde_json::Value::Bool(true))
         {
+            // Defect 2 (HL-71 S1): the live error shape carries the reason in
+            // the `result` field ({"type":"result","subtype":"error",
+            // "is_error":true,"result":"Failed to authenticate: ..."}) with no
+            // `error` field at all; surface `result` first so the error text
+            // is not lost.
             let message = value
-                .get("error")
+                .get("result")
                 .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| value.get("error").and_then(|v| v.as_str()))
                 .unwrap_or("stream-json result error")
                 .to_string();
             return Ok(StreamMessage::Error { message });
@@ -310,12 +324,18 @@ mod tests {
         assert_eq!(argv[0], "/usr/bin/claude");
         assert!(argv.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(argv.contains(&"-p".to_string()));
-        let mode_idx = argv.iter().position(|a| a == "--mode").unwrap();
-        assert_eq!(argv[mode_idx + 1], "normal");
+        // Normal mode carries NO `--permission-mode` flag (auto-approved via
+        // `--dangerously-skip-permissions`) and, critically, never the agy
+        // `--mode` flag the real claude CLI rejects.
+        assert!(!argv.contains(&"--permission-mode".to_string()));
+        assert!(!argv.contains(&"--mode".to_string()));
         let input_idx = argv.iter().position(|a| a == "--input-format").unwrap();
         assert_eq!(argv[input_idx + 1], "stream-json");
         let output_idx = argv.iter().position(|a| a == "--output-format").unwrap();
         assert_eq!(argv[output_idx + 1], "stream-json");
+        // `--output-format stream-json` with `-p` requires `--verbose` on the
+        // real claude CLI.
+        assert!(argv.contains(&"--verbose".to_string()));
     }
 
     #[test]
@@ -331,9 +351,34 @@ mod tests {
         let argv = args.argv();
         let resume_idx = argv.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(argv[resume_idx + 1], "ctx-1");
-        let mode_idx = argv.iter().position(|a| a == "--mode").unwrap();
+        // Plan mode is expressed as `--permission-mode plan` (the agy
+        // `--mode` flag does not exist on the claude CLI).
+        let mode_idx = argv.iter().position(|a| a == "--permission-mode").unwrap();
         assert_eq!(argv[mode_idx + 1], "plan");
+        assert!(!argv.contains(&"--mode".to_string()));
         assert!(!argv.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    /// The real `claude` CLI rejects the agy-only `--mode` flag with
+    /// `error: unknown option '--mode'`; a stream-json job argv must never
+    /// contain it (the live finding that broke every claude job in S1).
+    #[test]
+    fn argv_never_carries_agy_mode_flag() {
+        for mode in [StreamJsonMode::Normal, StreamJsonMode::Plan] {
+            let args = StreamJsonArgs {
+                binary: "claude".to_string(),
+                workdir: std::path::PathBuf::from("/w"),
+                session_id: Some("sid".to_string()),
+                resume: Some("res".to_string()),
+                mode,
+                dangerous: true,
+            };
+            let argv = args.argv();
+            assert!(
+                !argv.iter().any(|a| a.starts_with("--mode")),
+                "claude job argv must not carry the agy-only --mode flag: {argv:?}"
+            );
+        }
     }
 
     #[test]

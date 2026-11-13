@@ -367,15 +367,17 @@ DURATION=$(( END_TIME - START_TIME ))
 # --- FAKE_DELIVER_QUEUE: deliver the engine's per-run message queue ----------
 # The E4 emulation layer keeps mid-run messages in a per-run queue file
 # `.engine-message-queue` in the run worktree (one escaped line per message)
-# and drains it into the resume prompt. On a resumed invocation (cwd is the
-# worktree), read that file and fold the delivered messages into the SUCCESS
-# response so the black-box test can assert the queued text arrived.
+# and drains it into the resume prompt (retry.rs / EmulatingEngine::resume_job:
+# the queued text is folded into the continuation prompt and the queue file is
+# removed). On a resumed invocation the delivered messages therefore arrive as
+# part of `$PROMPT`, after the marker line: feed them into the SUCCESS response
+# so the black-box test can assert the queued text arrived.
 FAKE_DELIVERED_QUEUE=""
 if [[ "$PROMPT" == *FAKE_DELIVER_QUEUE* ]]; then
-  if [ -f ".engine-message-queue" ]; then
-    FAKE_DELIVERED_QUEUE=$(tr '\n' ' ' < .engine-message-queue 2>/dev/null || true)
-    FAKE_DELIVERED_QUEUE=$(printf '%s' "$FAKE_DELIVERED_QUEUE" | sed 's/[[:space:]]*$//')
-  fi
+  tail="${PROMPT#*FAKE_DELIVER_QUEUE}"
+  tail="${tail#*$'\n\n'}"
+  tail="${tail%%$'\n\n[agent-run'*}"
+  FAKE_DELIVERED_QUEUE=$(printf '%s\n' "$tail" | sed 's/[[:space:]]*$//')
 fi
 
 # --- worktree side effects (cwd is the job worktree) ------------------------

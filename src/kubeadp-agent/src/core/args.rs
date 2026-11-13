@@ -326,6 +326,14 @@ pub struct ListArgs {
     #[serde(default)]
     pub project: Option<String>,
 
+    /// Only show jobs that run on this engine (`agy` is the default for rows
+    /// recorded before engine selection existed, so `--engine agy` matches
+    /// both explicit agy jobs and legacy rows). An unknown engine is an error
+    /// listing the valid names.
+    #[arg(long, value_name = "ENGINE")]
+    #[serde(default)]
+    pub engine: Option<String>,
+
     /// Only show jobs in this status (repeatable; each value may be
     /// comma-separated, e.g. --status running --status done,failed).
     /// Valid values: running, done, failed, self-terminated, killed,
@@ -623,6 +631,40 @@ pub struct RemoteControlArgs {
 pub struct JobsetEndArgs {
     /// Jobset id (or a unique prefix is not accepted -- jobsets use exact ids).
     pub jobset_id: String,
+}
+
+/// Pause/resume a job's E4 emulation flag (HL-71 S2).
+#[derive(Debug, Args, Clone, serde::Deserialize)]
+pub struct PauseArgs {
+    /// Short unique job ID.
+    pub job_id: String,
+
+    /// `true` pauses (messages queue while paused), `false` resumes.
+    #[arg(long, default_value_t = true)]
+    pub paused: bool,
+}
+
+/// Deliver a message to a job (HL-71 S2); queued for the next turn when the
+/// engine has no live mid-run channel.
+#[derive(Debug, Args, Clone, serde::Deserialize)]
+pub struct MessageArgs {
+    /// Short unique job ID.
+    pub job_id: String,
+
+    /// The message text to deliver.
+    pub message: String,
+}
+
+/// Revert a job's worktree to its latest engine checkpoint (HL-71 S2).
+#[derive(Debug, Args, Clone, serde::Deserialize)]
+pub struct RevertArgs {
+    /// Short unique job ID.
+    pub job_id: String,
+
+    /// The commit/checkpoint to revert to (a non-empty value reverts, an
+    /// empty one -- the default -- unreverts).
+    #[arg(long, default_value = "")]
+    pub commit: String,
 }
 #[derive(Debug, Subcommand, Clone, PartialEq, Eq, serde::Deserialize)]
 pub enum RemoteControlAction {

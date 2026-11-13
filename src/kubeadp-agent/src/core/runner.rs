@@ -199,11 +199,24 @@ pub fn build_command_and_args(
 ///
 /// Mirrors `engine::claude::stream_json::StreamJsonArgs` (kept self-contained
 /// here so `core` does not depend on the `engine` layer): the run is always
-/// headless auto-approve (`--dangerously-skip-permissions`), the mode maps
-/// meta.mode to `normal`/`plan`, and a retry resumes the harness conversation
-/// via `--resume <conversation_id>`. The prompt is NOT part of the argv: the
-/// stream-json input format reads it as an NDJSON line on stdin (the monitor
-/// writes it, exactly like `render_text_request` in the engine driver).
+/// headless auto-approve (`--dangerously-skip-permissions`), and a retry
+/// resumes the harness conversation via `--resume <conversation_id>`.
+///
+/// The mode maps onto the real `claude` CLI's `--permission-mode`: a `plan`
+/// job passes `--permission-mode plan` (plan-only turn), any other mode
+/// passes NO `--permission-mode` flag at all (the auto-approve
+/// `--dangerously-skip-permissions` above is the normal-mode behaviour).
+/// The agy `--mode <m>` flag is agy-specific -- the claude CLI rejects it
+/// with `error: unknown option '--mode'` -- and must never appear in this
+/// argv.
+/// `--verbose` is required by the real CLI whenever `--output-format
+/// stream-json` is combined with `-p`.
+/// The job model (the `--model` flag or the `default_model` config) is passed
+/// through as `--model <name>`, exactly like the agy builder.
+///
+/// The prompt is NOT part of the argv: the stream-json input format reads it
+/// as an NDJSON line on stdin (the monitor writes it, exactly like
+/// `render_text_request` in the engine driver).
 fn build_claude_command_and_args(
     config: &Config,
     meta: &JobMetadata,
@@ -213,17 +226,25 @@ fn build_claude_command_and_args(
     let mut args: Vec<String> = vec![
         "--dangerously-skip-permissions".to_string(),
         "-p".to_string(),
-        "--mode".to_string(),
-        if meta.mode.eq_ignore_ascii_case("plan") {
-            "plan".to_string()
-        } else {
-            "normal".to_string()
-        },
         "--input-format".to_string(),
         "stream-json".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
+        "--verbose".to_string(),
     ];
+    // Plan-only turn: the claude CLI's permission mode is `plan`. Any other
+    // mode (normal) keeps `--dangerously-skip-permissions` and no
+    // `--permission-mode` flag.
+    if meta.mode.eq_ignore_ascii_case("plan") {
+        args.push("--permission-mode".to_string());
+        args.push("plan".to_string());
+    }
+    // Model: the claude CLI takes `--model <name>` exactly like agy; the job
+    // model (CLI flag or the `default_model` config) is engine-agnostic.
+    if let Some(m) = &meta.model {
+        args.push("--model".to_string());
+        args.push(m.clone());
+    }
     // A retry resumes the harness session: like agy's `--conversation`, the
     // claude resume key is the captured conversation/session id of the last
     // attempt. `live` A2A jobs deliver the prompt over stdin like any claude
@@ -328,6 +349,17 @@ pub fn build_command(
     // jobset secret (agents see only their derived per-jobset secret through
     // the `secret` channel). No-op when no root key file is configured.
     let policy = policy.hide_jobset_root_key_file();
+    // HL-71: claude-engine jobs authenticate with the worker pod's durable
+    // claude OAuth token (`claude setup-token`, Secret claude-oauth-token env
+    // CLAUDE_CODE_OAUTH_TOKEN): the env NAME joins the job's `env_allow` so the
+    // value passes the sandbox-exec env filter into the agent process. Agy jobs
+    // keep the default allowlist; the VALUE never enters argv, the policy file
+    // or any log line.
+    let policy = if meta.engine.as_deref() == Some("claude") {
+        policy.allow_claude_oauth_env()
+    } else {
+        policy
+    };
     let policy_path =
         JobMetadata::log_dir(&config.state_root).join(format!("{}.policy.json", meta.job_id));
     if let Err(e) = std::fs::create_dir_all(JobMetadata::log_dir(&config.state_root)) {
@@ -1789,6 +1821,111 @@ mod tests {
         assert!(args.contains(&"/workspace/homelab/.agent-jobs/test1234".to_string()));
     }
 
+    /// The claude job argv (HL-91 E5) must use the REAL `claude` CLI flags
+    /// only. The live finding (claude 2.1.322 in the worker pod): the agy
+    /// `--mode` flag made every claude job fail immediately with
+    /// `error: unknown option '--mode'`. Plan mode maps to
+    /// `--permission-mode plan`, normal mode passes no `--permission-mode`,
+    /// and `--verbose` is required for `-p --output-format stream-json`.
+    #[test]
+    fn test_build_command_claude_args() {
+        let config = Config {
+            agy_path: PathBuf::from("/usr/local/bin/agy"),
+            claude_path: PathBuf::from("/usr/local/bin/claude"),
+            ..Default::default()
+        };
+
+        let mut meta = test_meta_overrides();
+        meta.engine = Some("claude".to_string());
+
+        // A retry resumes the harness conversation via --resume.
+        meta.conversation_id = Some("conv-uuid-999".to_string());
+        meta.retry_count = 1;
+        let mode = InvocationMode::Retry {
+            conversation_id: Some("conv-uuid-999".to_string()),
+            prompt: Some("retry prompt".to_string()),
+        };
+
+        // Normal mode (the job mode string is not `plan`).
+        let (_, args) = build_command_and_args(&config, &meta, &mode, false);
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(args.contains(&"-p".to_string()));
+        assert!(args.contains(&"--input-format".to_string()));
+        assert!(args.contains(&"stream-json".to_string()));
+        assert!(args.contains(&"--output-format".to_string()));
+        assert!(args.contains(&"--verbose".to_string()));
+        assert!(args.contains(&"--resume".to_string()));
+        assert!(args.contains(&"conv-uuid-999".to_string()));
+        // The prompt travels as a stdin NDJSON line, never as an argv element.
+        assert!(!args.contains(&"retry prompt".to_string()));
+        // Normal mode: auto-approved by --dangerously-skip-permissions, so NO
+        // --permission-mode flag at all.
+        assert!(!args.contains(&"--permission-mode".to_string()));
+        // No model configured -> no --model flag (test meta has model: None).
+        assert!(!args.contains(&"--model".to_string()));
+        // With a model set, the claude argv passes it through as
+        // `--model <name>`, exactly like the agy builder.
+        meta.model = Some("sonnet".to_string());
+        let (_, args_model) = build_command_and_args(&config, &meta, &mode, false);
+        let m_idx = args_model.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(args_model[m_idx + 1], "sonnet");
+
+        // Plan mode: --permission-mode plan.
+        let mut plan_meta = test_meta_overrides();
+        plan_meta.engine = Some("claude".to_string());
+        plan_meta.mode = "plan".to_string();
+        let start_mode = InvocationMode::Start {
+            resolved_prompt: "plan prompt".to_string(),
+        };
+        let (prog, plan_args) = build_command_and_args(&config, &plan_meta, &start_mode, false);
+        assert_eq!(prog, PathBuf::from("/usr/local/bin/claude"));
+        assert!(plan_args.contains(&"--permission-mode".to_string()));
+        let idx = plan_args
+            .iter()
+            .position(|a| a == "--permission-mode")
+            .unwrap();
+        assert_eq!(plan_args[idx + 1], "plan");
+        // A start attempt has no --resume yet.
+        assert!(!plan_args.contains(&"--resume".to_string()));
+    }
+
+    /// Regression guard for the live `unknown option '--mode'` failure: no
+    /// claude job argv element may ever start with `--mode` (that flag is
+    /// agy-specific; the claude CLI's mode knob is `--permission-mode`).
+    #[test]
+    fn test_claude_args_never_carry_mode_flag() {
+        let config = Config {
+            agy_path: PathBuf::from("/usr/local/bin/agy"),
+            claude_path: PathBuf::from("/usr/local/bin/claude"),
+            ..Default::default()
+        };
+        let mut meta = test_meta_overrides();
+        meta.engine = Some("claude".to_string());
+        meta.conversation_id = Some("conv-1".to_string());
+        meta.retry_count = 1;
+
+        for job_mode in ["normal", "plan", "accept-edits"] {
+            meta.mode = job_mode.to_string();
+            for invocation in [
+                InvocationMode::Start {
+                    resolved_prompt: "p".to_string(),
+                },
+                InvocationMode::Retry {
+                    conversation_id: Some("conv-1".to_string()),
+                    prompt: Some("p".to_string()),
+                },
+            ] {
+                for live in [false, true] {
+                    let (_, args) = build_command_and_args(&config, &meta, &invocation, live);
+                    assert!(
+                        !args.iter().any(|a| a.starts_with("--mode")),
+                        "claude job argv must not carry the agy-only --mode flag (mode={job_mode}, live={live}): {args:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn apply_a2a_self_name_sets_per_job_identity() {
         // Serialize env mutation.
@@ -3207,6 +3344,61 @@ mod tests {
         assert!(
             argv_text.contains("--output-format"),
             "the sandboxed agy must have executed its body: {argv_text}"
+        );
+    }
+
+    #[test]
+    fn test_claude_job_policy_allows_oauth_env_agy_does_not() {
+        // HL-71: only a claude-engine job's policy lists the OAuth token env
+        // NAME in `env_allow` (the pod's value then passes the sandbox-exec
+        // env filter); agy jobs keep the default allowlist. The policy file
+        // carries the NAME only -- never a token VALUE.
+        let tmp = tempdir().unwrap();
+        let state_root = tmp.path().join("state");
+        let workspace_root = tmp.path().join("ws");
+        fs::create_dir_all(&state_root).unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        let wt = tmp.path().join("wt");
+        fs::create_dir_all(&wt).unwrap();
+        let config = Config {
+            workspace_root,
+            state_root,
+            agy_path: std::path::PathBuf::from("/usr/local/bin/agy"),
+            claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            sandbox_home: tmp.path().join("sbx-home"),
+            ..Default::default()
+        };
+        let mode = InvocationMode::Start {
+            resolved_prompt: "policy probe".to_string(),
+        };
+
+        // claude job: the written policy lists the env NAME.
+        let mut meta = test_meta_overrides();
+        meta.engine = Some("claude".to_string());
+        meta.job_id = "clj71claude".to_string();
+        build_command(&config, &meta, &mode, false).expect("claude job builds");
+        let claude_policy_path =
+            JobMetadata::log_dir(&config.state_root).join(format!("{}.policy.json", meta.job_id));
+        let claude_json = fs::read_to_string(&claude_policy_path).unwrap();
+        assert!(
+            claude_json.contains(crate::sandbox::CLAUDE_OAUTH_TOKEN_ENV),
+            "the claude job policy must allow CLAUDE_CODE_OAUTH_TOKEN: {claude_json}"
+        );
+        assert!(
+            !claude_json.contains("oat01-fake-token-value"),
+            "the policy file must never carry a token value: {claude_json}"
+        );
+
+        // agy job (no engine): the default allowlist is kept.
+        let mut meta = test_meta_overrides();
+        meta.job_id = "clj71agy".to_string();
+        build_command(&config, &meta, &mode, false).expect("agy job builds");
+        let agy_policy_path =
+            JobMetadata::log_dir(&config.state_root).join(format!("{}.policy.json", meta.job_id));
+        let agy_json = fs::read_to_string(&agy_policy_path).unwrap();
+        assert!(
+            !agy_json.contains(crate::sandbox::CLAUDE_OAUTH_TOKEN_ENV),
+            "the agy job policy must NOT allow CLAUDE_CODE_OAUTH_TOKEN: {agy_json}"
         );
     }
 }

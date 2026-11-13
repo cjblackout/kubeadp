@@ -110,6 +110,10 @@ FAKE_AGY="$TMPROOT/fake-agy.sh"
 cp "$SCRIPT_DIR/fake-agy.sh" "$FAKE_AGY" || die "could not copy fake-agy.sh"
 chmod +x "$FAKE_AGY"
 
+FAKE_CLAUDE="$TMPROOT/fake-claude.sh"
+cp "$SCRIPT_DIR/fake-claude.sh" "$FAKE_CLAUDE" || die "could not copy fake-claude.sh"
+chmod +x "$FAKE_CLAUDE"
+
 mkdir -p "$WORKSPACE/proj" "$FAKE_HOME"
 git -C "$WORKSPACE/proj" init -b main >/dev/null 2>&1 || {
   git -C "$WORKSPACE/proj" init >/dev/null 2>&1 || die "git init failed"
@@ -135,6 +139,7 @@ start_server() {
       AGENT_RUN_WORKSPACE_ROOT="$WORKSPACE" \
       AGENT_RUN_STATE_ROOT="$STATE_ROOT" \
       AGENT_RUN_AGY_PATH="$FAKE_AGY" \
+      AGENT_RUN_CLAUDE_PATH="$FAKE_CLAUDE" \
       AGENT_RUN_JOBS_DIR_NAME=".agent-jobs" \
       AGENT_RUN_MAX_PARALLEL=3 \
       AGENT_RUN_HINDSIGHT_ENABLED=false \
@@ -287,7 +292,7 @@ t_t01() {
     rec T01 FAIL "agent-run --version exited $rc: $out"
     return
   fi
-  local subs=( init start status log tail diff list clean kill retry repair gc wait result review commit discard export auth cancel )
+  local subs=( init start status log tail diff list clean kill retry repair gc wait result review commit discard export auth cancel interrupt pause message fork compact revert todo )
   for sub in "${subs[@]}"; do
     out=$(ar help "$sub" 2>&1)
     rc=$?
@@ -3547,15 +3552,15 @@ t_t152() {
   hdr=$(printf '%s\n' "$out" | head -n 1)
   done_row=$(printf '%s\n' "$out" | grep -E "^${done_id} " || true)
   hang_row=$(printf '%s\n' "$out" | grep -E "^${hang_id} " || true)
-  if ! printf '%s' "$hdr" | grep -Eq "JOB ID .*PROJECT.*STATUS.*CREATED.*AGE +ACTIVITY +PROMPT" \
+  if ! printf '%s' "$hdr" | grep -Eq "JOB ID .*PROJECT.*STATUS.*CREATED.*AGE +ACTIVITY +ENGINE +PROMPT" \
     || [ -z "$done_row" ] || [ -z "$hang_row" ]; then
     ar kill "$hang_id" >/dev/null 2>&1 || true; wait_state "$hang_id" killed 45 >/dev/null || true
     cleanup_job "$hang_id"; cleanup_job "$done_id"
-    rec T152 FAIL "header missing AGE/ACTIVITY before PROMPT, or a row is missing: $hdr || $done_row || $hang_row"
+    rec T152 FAIL "header missing AGE/ACTIVITY/ENGINE before PROMPT, or a row is missing: $hdr || $done_row || $hang_row"
     return
   fi
   # column fields: id(1) project(2) status(3) created-date(4) created-time(5)
-  # age(6) activity(7) prompt(8+)
+  # age(6) activity(7) engine(8) prompt(9+)
   age=$(printf '%s\n' "$done_row" | awk '{print $6}')
   act=$(printf '%s\n' "$done_row" | awk '{print $7}')
   if [ -z "$age" ] || [ "$act" != "-" ]; then
@@ -4397,6 +4402,1271 @@ t_t171() {
   rec T171 PASS "mid-run queue message delivered on the resume turn (result echoes it, queue drained; job $id)"
 }
 
+# ---- T172+ : claude job engine parity (HL-71 S1) -------------------------------
+# Every job below is started with `--engine claude` against the private server,
+# which runs the scripted fake-claude.sh (AGENT_RUN_CLAUDE_PATH). The suite's
+# fake claude speaks the stream-json NDJSON protocol and emits a harness
+# `session_id` on its assistant/result lines, which the engine captures as the
+# job's conversation id (extract_conversation_id pattern 2b) so `retry` can
+# resume with `--resume <session_id>`.
+
+# T172: claude lifecycle -- start -> done, result surfaces claude text, log is
+# live (init + assistant + result), argv carried the stream-json headless
+# flags, and the prompt reached the harness as one NDJSON user line over stdin.
+t_t172() {
+  local id out res log argv_file prompt_file rc
+  start_job "FAKE_SLEEP=1 claude basic prompt" --engine claude
+  if [ "$START_RC" -ne 0 ]; then
+    rec T172 FAIL "start --engine claude exited $START_RC: $START_OUT"
+    return
+  fi
+  id="$START_JOB_ID"
+  [ -n "$id" ] || { rec T172 FAIL "no job id parsed: $START_OUT"; return; }
+  # The row must carry engine=claude so status/result/retry re-derive the
+  # claude driver after the fact.
+  local engine
+  engine=$(db_field "$id" "engine")
+  if [ "$engine" != "claude" ]; then
+    cleanup_job "$id"
+    rec T172 FAIL "db engine expected 'claude', got '$engine'"
+    return
+  fi
+  # The stream-json init/assistant lines are emitted at the START of the
+  # run, so the log is live while the job runs (like agy's stream-json
+  # prelude). Poll the log (the job may finish before the first poll, so
+  # don't assert the live `running` status -- the retained lines prove the
+  # prelude arrived).
+  local live i
+  live=""
+  for i in $(seq 1 60); do
+    live=$(ar log "$id" 2>&1)
+    case "$live" in
+      *'"subtype":"init"'*|*'"type":"assistant"'*) break ;;
+    esac
+    sleep 0.25
+  done
+  case "$live" in
+    *'"subtype":"init"'*|*'"type":"assistant"'*) ;;
+    *) cleanup_job "$id"; rec T172 FAIL "claude log missing stream-json init/assistant: $live"; return ;;
+  esac
+  local st
+  st=$(wait_state "$id" done 60) || {
+    cleanup_job "$id"
+    rec T172 FAIL "claude job did not reach done (last status: $st)"
+    return
+  }
+  # The conversation id (harness session_id) must have been captured to the
+  # row, since retry's resume key comes from it.
+  local conv
+  conv=$(db_field "$id" "conversation_id")
+  if [ -z "$conv" ]; then
+    cleanup_job "$id"
+    rec T172 FAIL "claude job captured no conversation id from session_id lines"
+    return
+  fi
+  res=$(ar result "$id" 2>&1)
+  case "$res" in
+    *CLAUDE-DONE*) ;;
+    *) cleanup_job "$id"; rec T172 FAIL "claude result missing CLAUDE-DONE: $res"; return ;;
+  esac
+  case "$res" in
+    *"Status: done"*) ;;
+    *) cleanup_job "$id"; rec T172 FAIL "claude result status not done: $res"; return ;;
+  esac
+  log=$(ar log "$id" 2>&1)
+  case "$log" in
+    *'"type":"result"'*) ;;
+    *) cleanup_job "$id"; rec T172 FAIL "claude log missing the terminal result line: $log"; return ;;
+  esac
+  cleanup_job "$id"
+  rec T172 PASS "claude start -> done; result surfaces CLAUDE-DONE; log live + terminal; conversation id captured (job $id)"
+}
+
+# T173: claude failure classification -- an error `result` line (FAKE_FAIL)
+# ends the job `failed` and `result` surfaces the agent error text.
+t_t173() {
+  local id out res st engine
+  start_job "FAKE_FAIL claude failure prompt" --engine claude
+  if [ "$START_RC" -ne 0 ]; then
+    rec T173 FAIL "start --engine claude exited $START_RC: $START_OUT"
+    return
+  fi
+  id="$START_JOB_ID"
+  [ -n "$id" ] || { rec T173 FAIL "no job id parsed: $START_OUT"; return; }
+  st=$(wait_state "$id" failed 60) || {
+    cleanup_job "$id"
+    rec T173 FAIL "claude failure never classified failed (last status: $st)"
+    return
+  }
+  out=$(ar status "$id" 2>&1)
+  case "$out" in
+    *"Status: failed"*) ;;
+    *) cleanup_job "$id"; rec T173 FAIL "claude status not failed: $out"; return ;;
+  esac
+  res=$(ar result "$id" 2>&1)
+  case "$res" in
+    *"boom"*) ;;
+    *) cleanup_job "$id"; rec T173 FAIL "claude result missing error text 'boom': $res"; return ;;
+  esac
+  cleanup_job "$id"
+  rec T173 PASS "claude FAKE_FAIL ends failed; result surfaces the agent error ($id)"
+}
+
+# T174: claude kill -- a FAKE_HANG claude job is running, is killed by
+# `agent-run kill`, ends `killed`, and no claude process is left alive.
+t_t174() {
+  local id st out pid
+  start_job "FAKE_HANG claude hang prompt" --engine claude
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T174 FAIL "start claude hang: $START_OUT"
+    return
+  fi
+  id="$START_JOB_ID"
+  st=$(wait_state "$id" running 30) || {
+    cleanup_job "$id"
+    rec T174 FAIL "claude hang never ran (last status: $st)"
+    return
+  }
+  pid=$(db_field "$id" "pid")
+  out=$(ar kill "$id" 2>&1)
+  if [ $? -ne 0 ]; then
+    cleanup_job "$id"
+    rec T174 FAIL "claude kill exited non-zero: $out"
+    return
+  fi
+  st=$(wait_state "$id" killed 45) || {
+    cleanup_job "$id"
+    rec T174 FAIL "claude kill did not reach killed (last status: $st)"
+    return
+  }
+  # The process group must be gone (the fake-claude FAKE_HANG loop).
+  local i alive=0
+  for i in $(seq 1 40); do
+    if [ -z "$pid" ] || [ ! -d "/proc/$pid" ]; then
+      alive=0
+      break
+    fi
+    # A zombie still has a /proc entry; a `z` state means it is reaped and
+    # about to disappear.
+    local st2
+    st2=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)
+    [ "$st2" = "Z" ] || alive=1
+    sleep 0.25
+  done
+  if [ "$alive" = "1" ]; then
+    cleanup_job "$id"
+    rec T174 FAIL "claude fake process still alive after kill (pid $pid)"
+    return
+  fi
+  cleanup_job "$id"
+  rec T174 PASS "claude FAKE_HANG killed -> 'killed', process group gone (job $id)"
+}
+
+# T175: claude worktree endpoints -- a FAKE_WRITE claude job leaves a file in
+# the worktree; `files`, `cat`, and `diff` all surface it (engine-agnostic
+# endpoints over the claude job's worktree). Also covers a FAKE_COMMIT diff.
+t_t175() {
+  local id st out
+  start_job "FAKE_WRITE=result.txt FAKE_COMMIT claude writes" --engine claude
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T175 FAIL "start --engine claude: $START_OUT"
+    return
+  fi
+  id="$START_JOB_ID"
+  st=$(wait_state "$id" done 60) || {
+    cleanup_job "$id"
+    rec T175 FAIL "claude write job did not finish (last status: $st)"
+    return
+  }
+  out=$(ar files "$id" 2>&1)
+  case "$out" in
+    *result.txt*) ;;
+    *) cleanup_job "$id"; rec T175 FAIL "files missing result.txt: $out"; return ;;
+  esac
+  out=$(ar cat "$id" result.txt 2>&1)
+  case "$out" in
+    *"fake content for result.txt"*) ;;
+    *) cleanup_job "$id"; rec T175 FAIL "cat of result.txt wrong: $out"; return ;;
+  esac
+  out=$(ar diff "$id" 2>&1)
+  case "$out" in
+    *result.txt*|*committed-file.txt*) ;;
+    *) cleanup_job "$id"; rec T175 FAIL "diff missing the claude changes: $out"; return ;;
+  esac
+  cleanup_job "$id"
+  rec T175 PASS "claude worktree files/cat/diff surface the job's changes (job $id)"
+}
+
+# T176: claude quota exhaustion -- a FAKE_QUOTA claude job ends
+# `quota-exhausted` (the shared QUOTA_MARKERS scan on the claude error text).
+t_t176() {
+  local id st
+  start_job "FAKE_QUOTA claude quota prompt" --engine claude
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T176 FAIL "start --engine claude: $START_OUT"
+    return
+  fi
+  id="$START_JOB_ID"
+  st=$(wait_state "$id" quota-exhausted 60) || {
+    cleanup_job "$id"
+    rec T176 FAIL "claude quota job not quota-exhausted (last status: $st)"
+    return
+  }
+  cleanup_job "$id"
+  rec T176 PASS "claude FAKE_QUOTA ends quota-exhausted (job $id)"
+}
+
+# T177: claude retry/resume -- a retry on a done claude job resumes the
+# harness conversation with `--resume <session_id>` (asserted from the
+# server-wide argv log: the fake claude appends one tab-separated argv line
+# per invocation), and the result reports the resumed turn's text.
+t_t177() {
+  local id conv out res argvf rc count newlines
+  argvf="$TMPROOT/argv.log"
+  # Take a snapshot of the claude invocation count before this test so the
+  # assertions below only look at THIS test's invocations (the log is shared
+  # with agy jobs and earlier claude tests).
+  local before
+  before=$(grep -c "fake-claude.sh" "$argvf" 2>/dev/null || true)
+  before=${before:-0}
+
+  start_job "FAKE_SLEEP=1 claude resume first turn" --engine claude
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T177 FAIL "start claude resume: $START_OUT"
+    return
+  fi
+  id="$START_JOB_ID"
+  wait_state "$id" done 60 >/dev/null || { cleanup_job "$id"; rec T177 FAIL "first turn not done (last status: $st)"; return; }
+  conv=$(db_field "$id" "conversation_id")
+  [ -n "$conv" ] || { cleanup_job "$id"; rec T177 FAIL "no conversation id captured for resume"; return; }
+
+  out=$(ar retry "$id" --prompt "claude resume follow-up" 2>&1)
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$id"
+    rec T177 FAIL "claude retry exited $rc: $out"
+    return
+  fi
+  case "$out" in
+    *"retry launched in background"*) ;;
+    *) cleanup_job "$id"; rec T177 FAIL "claude retry did not launch: $out"; return ;;
+  esac
+  local st
+  st=$(wait_state "$id" done 60) || { cleanup_job "$id"; rec T177 FAIL "resumed turn not done (last: $st)"; return; }
+  res=$(ar result "$id" 2>&1)
+  case "$res" in
+    *"CLAUDE-RESUMED:$conv"*) ;;
+    *) cleanup_job "$id"; rec T177 FAIL "resumed result missing the resume marker: $res (conv $conv)"; return ;;
+  esac
+
+  # The fake claude appends one tab-separated argv line per invocation to the
+  # server-wide argv log. Since this test's snapshot, exactly TWO claude
+  # invocations must have appeared: the first (start) without --resume and
+  # the resumed one carrying `--resume <captured session id>`.
+  local added_after
+  added_after=$(grep -c "fake-claude.sh" "$argvf" 2>/dev/null || true)
+  added_after=${added_after:-0}
+  local added2=$(( added_after - before ))
+  if [ "$added2" -lt 2 ]; then
+    cleanup_job "$id"
+    rec T177 FAIL "expected >=2 claude invocations in the argv log (added $added2): $(tr '\n' '|' < "$argvf")"
+    return
+  fi
+  local resume_lines
+  resume_lines=$(grep "fake-claude.sh" "$argvf" | tail -n "$added2" | grep -c -- "--resume" || true)
+  if [ "$resume_lines" -lt 1 ]; then
+    cleanup_job "$id"
+    rec T177 FAIL "claude retry argv never carried --resume: $(tr '\n' '|' < "$argvf")"
+    return
+  fi
+  if ! grep "fake-claude.sh" "$argvf" | tail -n "$added2" | grep -q -- "--resume	$conv"; then
+    cleanup_job "$id"
+    rec T177 FAIL "claude retry argv carried --resume but not the captured session id: $(tr '\n' '|' < "$argvf")"
+    return
+  fi
+  cleanup_job "$id"
+  rec T177 PASS "claude retry resumes via --resume <captured session id> and result confirms the resumed turn (job $id, conv $conv)"
+}
+
+# T178: claude list engine column + filter -- `list` shows ENGINE between
+# ACTIVITY and PROMPT (agy for legacy/agy rows, claude for claude jobs);
+# `list --engine claude` keeps only claude rows; `list --engine agy` keeps
+# the agy/legacy rows; an unknown engine is a typed error listing the names.
+t_t178() {
+  local cid aid out hdr crow arow rc j
+  start_job "FAKE_SLEEP=1 claude list job" --engine claude
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T178 FAIL "start claude list: $START_OUT"
+    return
+  fi
+  cid="$START_JOB_ID"
+  wait_state "$cid" done 60 >/dev/null || { cleanup_job "$cid"; rec T178 FAIL "claude list job not done"; return; }
+  start_job "FAKE_SLEEP=1 agy list job"
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    cleanup_job "$cid"
+    rec T178 FAIL "start agy list: $START_OUT"
+    return
+  fi
+  aid="$START_JOB_ID"
+  wait_state "$aid" done 60 >/dev/null || { cleanup_job "$aid"; cleanup_job "$cid"; rec T178 FAIL "agy list job not done"; return; }
+
+  out=$(ar list 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$aid"; cleanup_job "$cid"
+    rec T178 FAIL "list exited $rc: $out"
+    return
+  fi
+  hdr=$(printf '%s\n' "$out" | head -n 1)
+  if ! printf '%s' "$hdr" | grep -Eq "JOB ID .*PROJECT.*STATUS.*CREATED.*AGE +ACTIVITY +ENGINE +PROMPT"; then
+    cleanup_job "$aid"; cleanup_job "$cid"
+    rec T178 FAIL "header missing the ENGINE column before PROMPT: $hdr"
+    return
+  fi
+  crow=$(printf '%s\n' "$out" | grep -E "^${cid} " || true)
+  arow=$(printf '%s\n' "$out" | grep -E "^${aid} " || true)
+  if [ -z "$crow" ] || [ -z "$arow" ]; then
+    cleanup_job "$aid"; cleanup_job "$cid"
+    rec T178 FAIL "claude/agy rows missing from list: $out"
+    return
+  fi
+  # fields: id(1) project(2) status(3) created-date(4) created-time(5)
+  # age(6) activity(7) engine(8) prompt(9+)
+  local cengine aengine
+  cengine=$(printf '%s\n' "$crow" | awk '{print $8}')
+  aengine=$(printf '%s\n' "$arow" | awk '{print $8}')
+  if [ "$cengine" != "claude" ] || [ "$aengine" != "agy" ]; then
+    cleanup_job "$aid"; cleanup_job "$cid"
+    rec T178 FAIL "ENGINE cells wrong (claude [$cengine] agy [$aengine]): $crow | $arow"
+    return
+  fi
+
+  # --engine claude keeps only the claude job.
+  out=$(ar list --engine claude 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$aid"; cleanup_job "$cid"
+    rec T178 FAIL "list --engine claude exited $rc: $out"
+    return
+  fi
+  if printf '%s\n' "$out" | grep -Eq "^${aid} "; then
+    cleanup_job "$aid"; cleanup_job "$cid"
+    rec T178 FAIL "list --engine claude leaked an agy row: $out"
+    return
+  fi
+  if ! printf '%s\n' "$out" | grep -Eq "^${cid} "; then
+    cleanup_job "$aid"; cleanup_job "$cid"
+    rec T178 FAIL "list --engine claude hid the claude row: $out"
+    return
+  fi
+
+  # --engine agy keeps the agy row (and any legacy rows) but hides claude.
+  out=$(ar list --engine agy 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$aid"; cleanup_job "$cid"
+    rec T178 FAIL "list --engine agy exited $rc: $out"
+    return
+  fi
+  if printf '%s\n' "$out" | grep -Eq "^${cid} "; then
+    cleanup_job "$aid"; cleanup_job "$cid"
+    rec T178 FAIL "list --engine agy leaked a claude row: $out"
+    return
+  fi
+  if ! printf '%s\n' "$out" | grep -Eq "^${aid} "; then
+    cleanup_job "$aid"; cleanup_job "$cid"
+    rec T178 FAIL "list --engine agy hid the agy row: $out"
+    return
+  fi
+
+  # An unknown engine is a typed error listing the valid engines.
+  out=$(ar list --engine bogus-engine 2>&1); rc=$?
+  if [ $rc -eq 0 ]; then
+    cleanup_job "$aid"; cleanup_job "$cid"
+    rec T178 FAIL "list --engine bogus-engine unexpectedly succeeded: $out"
+    return
+  fi
+  case "$out" in
+    *"unknown engine 'bogus-engine'"*) ;;
+    *) cleanup_job "$aid"; cleanup_job "$cid"; rec T178 FAIL "wrong error for unknown engine: $out"; return ;;
+  esac
+  case "$out" in
+    *agy*claude*|*claude*agy*) ;;
+    *) cleanup_job "$aid"; cleanup_job "$cid"; rec T178 FAIL "error must list valid engines: $out"; return ;;
+  esac
+
+  cleanup_job "$aid"; cleanup_job "$cid"
+  rec T178 PASS "list shows ENGINE column between ACTIVITY and PROMPT; --engine claude/agy filter; unknown engine is a 400 listing valid engines"
+}
+
+# T179: claude watch/events SSE -- `watch` streams the claude log and reports
+# the done transition (exit 0) exactly like agy (T112 pattern).
+t_t179() {
+  local id out rc
+  start_job "FAKE_SLEEP=1 claude watch done" --engine claude
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T179 FAIL "start claude watch: $START_OUT"
+    return
+  fi
+  id="$START_JOB_ID"
+  wait_state "$id" done 60 >/dev/null || { cleanup_job "$id"; rec T179 FAIL "claude watch job not done"; return; }
+  out=$(ar watch "$id" 2>&1)
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$id"
+    rec T179 FAIL "watch of a done claude job exited $rc, expected 0: $out"
+    return
+  fi
+  case "$out" in
+    *CLAUDE-DONE*) ;;
+    *) cleanup_job "$id"; rec T179 FAIL "claude watch stdout missing the job log: $out"; return ;;
+  esac
+  cleanup_job "$id"
+  rec T179 PASS "claude watch streams the log and exits 0 for a done job (job $id)"
+}
+
+# T180: table-driven agy-vs-claude parity (HL-71 S1). The SAME scenario list
+# runs against the fake agy (no --engine) and the fake claude (--engine
+# claude); each scenario reduces to a canonical engine-agnostic signature
+# (final statuses, result presence + exit code, kill return code + final
+# status, retry outcome + retry count, SSE event kinds). The two engines must
+# produce IDENTICAL signatures over the same HTTP/CLI surface.
+
+# parity_sig_done <engine_args>: a done job -> "done;rc=<result rc>;resp=yes|no"
+parity_sig_done() {
+  local engine_args="$1" id out rc present
+  start_job "FAKE_SLEEP=1 parity done target" $engine_args
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    echo "FAIL-start"
+    return
+  fi
+  id="$START_JOB_ID"
+  if ! wait_state "$id" done 60 >/dev/null; then
+    cleanup_job "$id"
+    echo "FAIL-notdone"
+    return
+  fi
+  out=$(ar result "$id" 2>&1); rc=$?
+  present="no"
+  case "$out" in
+    *"Status: done"*) present="yes" ;;
+  esac
+  cleanup_job "$id"
+  printf 'done;rc=%s;resp=%s' "$rc" "$present"
+}
+
+# parity_sig_kill <engine_args>: a kill -> "killrc=<rc>;status=<final>"
+parity_sig_kill() {
+  local engine_args="$1" id out rc st
+  start_job "FAKE_HANG parity hang target" $engine_args
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    echo "FAIL-start"
+    return
+  fi
+  id="$START_JOB_ID"
+  if ! wait_state "$id" running 30 >/dev/null; then
+    cleanup_job "$id"
+    echo "FAIL-notrunning"
+    return
+  fi
+  out=$(ar kill "$id" 2>&1); rc=$?
+  st=$(wait_state "$id" killed 45) || {
+    cleanup_job "$id"
+    echo "FAIL-notkilled"
+    return
+  }
+  cleanup_job "$id"
+  printf 'killrc=%s;status=%s' "$rc" "$st"
+}
+
+# parity_sig_retry <engine_args>: a retry --prompt on a done job ->
+# "retryrc=<rc>;status=<final>;count=<retry_count>"
+parity_sig_retry() {
+  local engine_args="$1" id out rc st nretry
+  start_job "FAKE_SLEEP=1 parity retry target" $engine_args
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    echo "FAIL-start"
+    return
+  fi
+  id="$START_JOB_ID"
+  if ! wait_state "$id" done 60 >/dev/null; then
+    cleanup_job "$id"
+    echo "FAIL-notdone"
+    return
+  fi
+  out=$(ar retry "$id" --prompt "FAKE_SLEEP=1 parity follow-up target" 2>&1); rc=$?
+  case "$out" in
+    *"retry launched in background"*) ;;
+    *) cleanup_job "$id"; echo "FAIL-nolaunch"; return ;;
+  esac
+  st=$(wait_state "$id" done 60) || {
+    cleanup_job "$id"
+    echo "FAIL-retry"
+    return
+  }
+  nretry=$(db_field "$id" "retry_count")
+  cleanup_job "$id"
+  printf 'retryrc=%s;status=%s;count=%s' "$rc" "$st" "$nretry"
+}
+
+# parity_sig_events <engine_args>: the SSE event kinds of a done job's stream
+# -> "events=<space-joined sorted kinds>" (both engines must stream the same
+# kinds: status, log, end).
+parity_sig_events() {
+  local engine_args="$1" id kinds
+  start_job "FAKE_SLEEP=1 parity events target" $engine_args
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    echo "FAIL-start"
+    return
+  fi
+  id="$START_JOB_ID"
+  if ! wait_state "$id" done 60 >/dev/null; then
+    cleanup_job "$id"
+    echo "FAIL-notdone"
+    return
+  fi
+  kinds=$(curl -sN --max-time 10 "http://127.0.0.1:$PORT/api/v1/jobs/$id/events" 2>/dev/null \
+    | grep -o '^event: [a-z]*' | awk '{print $2}' | sort -u | tr '\n' ' ' | sed 's/ $//')
+  cleanup_job "$id"
+  printf 'events=%s' "$kinds"
+}
+
+t_t180() {
+  local esig psig
+  esig=$(parity_sig_done ""); esig="$esig|$(parity_sig_kill "")"
+  esig="$esig|$(parity_sig_retry "")"; esig="$esig|$(parity_sig_events "")"
+  psig=$(parity_sig_done "--engine claude"); psig="$psig|$(parity_sig_kill "--engine claude")"
+  psig="$psig|$(parity_sig_retry "--engine claude")"; psig="$psig|$(parity_sig_events "--engine claude")"
+  if [ "$esig" = "$psig" ]; then
+    rec T180 PASS "agy and claude produce identical job signatures for done/kill/retry/events: agy[$esig] claude[$psig]"
+  else
+    rec T180 FAIL "agy/claude signatures differ: agy[$esig] claude[$psig]"
+  fi
+}
+
+# T181: capability declarations match the proven behaviour -- the live
+# /api/v1/capabilities endpoint reports the claude (stream-json) engine's
+# job endpoints (job.list, job.kill, job.result, workspace.*) native, exactly
+# because the black-box suite drives them end to end (T172-T180). Also
+# asserts agy declares the same set native (parity). Since HL-71 S2, every
+# job control endpoint the emulation layer fronts is declared emulated (never
+# unsupported) for BOTH engines: claude interrupt/pause/fork/compact/revert,
+# message, and agy pause/fork/compact/revert -- so no /api/v1/jobs control
+# route can answer 501 because of the engine.
+t_t181() {
+  local body agy_claude claude_joblist claude_jobkill claude_jobresult claude_ws
+  local agy_joblist agy_jobkill agy_jobresult agy_ws claude_interrupt claude_fork
+  local claude_pause claude_message claude_compact claude_revert claude_todo
+  local agy_pause agy_fork agy_compact agy_revert agy_todo
+  body=$(curl -s --max-time 10 "http://127.0.0.1:$PORT/api/v1/capabilities")
+  if [ -z "$body" ] || ! printf '%s' "$body" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    rec T181 FAIL "capabilities endpoint returned no/invalid JSON: $body"
+    return
+  fi
+  # Parse each field with python3; echo NONE for a missing engine/key.
+  read -r agy_joblist agy_jobkill agy_jobresult agy_ws \
+        agy_pause agy_fork agy_compact agy_revert agy_todo \
+        claude_joblist claude_jobkill claude_jobresult claude_ws \
+        claude_interrupt claude_fork claude_pause claude_message \
+        claude_compact claude_revert claude_todo <<EOF
+$(printf '%s' "$body" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+tabs = {t.get("engine"): t for t in d.get("capabilities", [])}
+def cap(eng, key):
+    t = tabs.get(eng)
+    if not t: return "NONE"
+    return t.get("endpoints", {}).get(key, "NONE")
+def row(eng, keys):
+    return " ".join(cap(eng, k) for k in keys)
+agy = row("agy", ["job.list","job.kill","job.result","workspace.*","pause","fork","compact","revert","todo"])
+claude = row("claude", ["job.list","job.kill","job.result","workspace.*","interrupt","fork","pause","a2a.send_message","compact","revert","todo"])
+print(agy, claude)
+')
+EOF
+  if [ "$agy_joblist" != "native" ] || [ "$agy_jobkill" != "native" ] \
+     || [ "$agy_jobresult" != "native" ] || [ "$agy_ws" != "native" ]; then
+    rec T181 FAIL "agy capability table does not declare all proven job endpoints native (list=$agy_joblist kill=$agy_jobkill result=$agy_jobresult ws=$agy_ws): $body"
+    return
+  fi
+  if [ "$claude_joblist" != "native" ] || [ "$claude_jobkill" != "native" ] \
+     || [ "$claude_jobresult" != "native" ] || [ "$claude_ws" != "native" ]; then
+    rec T181 FAIL "claude capability table does not declare all proven job endpoints native (list=$claude_joblist kill=$claude_jobkill result=$claude_jobresult ws=$claude_ws): $body"
+    return
+  fi
+  # HL-71 S2: every control endpoint the emulation layer fronts is declared
+  # emulated for both engines -- never unsupported (owner rule: no endpoint
+  # answers 501 because of the engine).
+  if [ "$claude_interrupt" != "emulated" ] || [ "$claude_fork" != "emulated" ] \
+     || [ "$claude_pause" != "emulated" ] || [ "$claude_message" != "emulated" ] \
+     || [ "$claude_compact" != "emulated" ] || [ "$claude_revert" != "emulated" ] \
+     || [ "$claude_todo" != "emulated" ]; then
+    rec T181 FAIL "claude capability table must declare the emulated job control endpoints emulated (interrupt=$claude_interrupt fork=$claude_fork pause=$claude_pause message=$claude_message compact=$claude_compact revert=$claude_revert todo=$claude_todo): $body"
+    return
+  fi
+  if [ "$agy_pause" != "emulated" ] || [ "$agy_fork" != "emulated" ] \
+     || [ "$agy_compact" != "emulated" ] || [ "$agy_revert" != "emulated" ] \
+     || [ "$agy_todo" != "emulated" ]; then
+    rec T181 FAIL "agy capability table must declare the emulated job control endpoints emulated (pause=$agy_pause fork=$agy_fork compact=$agy_compact revert=$agy_revert todo=$agy_todo): $body"
+    return
+  fi
+  rec T181 PASS "capabilities: agy and claude both declare job.list/kill/result/workspace.* native; every emulated job-control endpoint (interrupt/pause/message/fork/compact/revert/todo) declared emulated for both"
+}
+
+# ---- T182+ : emulated job-control surface (HL-71 S2) --------------------------
+# Every /api/v1/jobs/{id} control endpoint (interrupt/pause/message/fork/
+# compact/revert/todo) is fronted by the E4 emulation layer for BOTH engines,
+# so no job-control route answers 501 because of the engine. T183-T186 drive
+# them end to end through the `agent-run` client against the private server
+# (fake claude / fake agy). The design decisions under test: interrupt is an
+# emulated process-group SIGTERM->SIGKILL WITHOUT kill bookkeeping (the job
+# stays resumable with `retry`); messages queue to `.engine-message-queue`
+# and are drained into the next turn's prompt (retry.rs / resume_job); fork
+# returns a fresh run/worktree; compact/revert/todo answer usable bodies.
+
+# T183: `interrupt` on a running job (claude and agy) -- the emulated
+# process-group stop terminates the job without kill bookkeeping, so a retry
+# resumes the (formerly running) job into a fresh turn.
+t_t183() {
+  local st out rc
+  # (a) claude engine
+  start_job "FAKE_HANG claude interrupt target" --engine claude
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T183 FAIL "start claude interrupt target: $START_OUT"
+    return
+  fi
+  local cid="$START_JOB_ID"
+  local i
+  for i in $(seq 1 20); do
+    st=$(get_status "$cid")
+    [ "$st" = "running" ] && break
+    sleep 0.5
+  done
+  if [ "$st" != "running" ]; then
+    cleanup_job "$cid"
+    rec T183 FAIL "claude job never showed running before interrupt (last status: $st)"
+    return
+  fi
+  out=$(ar interrupt "$cid" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$cid"
+    rec T183 FAIL "claude interrupt exited $rc: $out"
+    return
+  fi
+  case "$out" in
+    *"interrupted"*|*"Interrupt"*) ;;
+    *) cleanup_job "$cid"; rec T183 FAIL "claude interrupt did not report success: $out"; return ;;
+  esac
+  # The interrupted job reaches a terminal state; a retry then resumes it (no
+  # kill bookkeeping, so --prompt follow-up is legal).
+  st=$(wait_state "$cid" terminal 60) || {
+    cleanup_job "$cid"
+    rec T183 FAIL "claude interrupt left no terminal state (last: $st)"
+    return
+  }
+  local res
+  out=$(ar retry "$cid" --prompt "claude resumed after interrupt" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$cid"
+    rec T183 FAIL "claude retry after interrupt exited $rc: $out"
+    return
+  fi
+  case "$out" in
+    *"retry launched in background"*) ;;
+    *) cleanup_job "$cid"; rec T183 FAIL "claude retry after interrupt did not launch: $out"; return ;;
+  esac
+  st=$(wait_state "$cid" done 60) || { cleanup_job "$cid"; rec T183 FAIL "claude resumed turn not done (last: $st)"; return; }
+  res=$(ar result "$cid" 2>&1)
+  case "$res" in
+    *"CLAUDE"*) ;;
+    *) cleanup_job "$cid"; rec T183 FAIL "claude resumed result missing marker: $res"; return ;;
+  esac
+  cleanup_job "$cid"
+
+  # (b) agy engine
+  start_job "FAKE_HANG agy interrupt target"
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T183 FAIL "start agy interrupt target: $START_OUT"
+    return
+  fi
+  local aid="$START_JOB_ID"
+  for i in $(seq 1 20); do
+    st=$(get_status "$aid")
+    [ "$st" = "running" ] && break
+    sleep 0.5
+  done
+  if [ "$st" != "running" ]; then
+    cleanup_job "$aid"
+    rec T183 FAIL "agy job never showed running before interrupt (last status: $st)"
+    return
+  fi
+  out=$(ar interrupt "$aid" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$aid"
+    rec T183 FAIL "agy interrupt exited $rc: $out"
+    return
+  fi
+  st=$(wait_state "$aid" terminal 60) || {
+    cleanup_job "$aid"
+    rec T183 FAIL "agy interrupt left no terminal state (last: $st)"
+    return
+  }
+  out=$(ar retry "$aid" --prompt "agy resumed after interrupt" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$aid"
+    rec T183 FAIL "agy retry after interrupt exited $rc: $out"
+    return
+  fi
+  case "$out" in
+    *"retry launched in background"*) ;;
+    *) cleanup_job "$aid"; rec T183 FAIL "agy retry after interrupt did not launch: $out"; return ;;
+  esac
+  st=$(wait_state "$aid" done 60) || { cleanup_job "$aid"; rec T183 FAIL "agy resumed turn not done (last: $st)"; return; }
+  cleanup_job "$aid"
+
+  # (c) pause/resume on a live agy job (the E4 per-run flag; never 501)
+  start_job "FAKE_HANG agy pause target"
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T183 FAIL "start agy pause target: $START_OUT"
+    return
+  fi
+  local pid="$START_JOB_ID"
+  for i in $(seq 1 20); do
+    st=$(get_status "$pid")
+    [ "$st" = "running" ] && break
+    sleep 0.5
+  done
+  if [ "$st" != "running" ]; then
+    cleanup_job "$pid"
+    rec T183 FAIL "agy pause target never showed running (last status: $st)"
+    return
+  fi
+  out=$(ar pause "$pid" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$pid"
+    rec T183 FAIL "agy pause exited $rc: $out"
+    return
+  fi
+  case "$out" in
+    *"paused"*) ;;
+    *) cleanup_job "$pid"; rec T183 FAIL "agy pause did not report paused: $out"; return ;;
+  esac
+  out=$(ar pause "$pid" --paused false 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$pid"
+    rec T183 FAIL "agy resume exited $rc: $out"
+    return
+  fi
+  case "$out" in
+    *"resumed"*) ;;
+    *) cleanup_job "$pid"; rec T183 FAIL "agy resume did not report resumed: $out"; return ;;
+  esac
+  cleanup_job "$pid"
+
+  rec T183 PASS "interrupt terminates a running claude and agy job (process-group SIGTERM->SIGKILL, no kill bookkeeping) and a retry resumes both; pause/resume answers on a live agy job"
+}
+
+# T184: `message` on a running job queues to `.engine-message-queue`; on the
+# next turn (interrupt + retry) the queue is drained into the resume prompt
+# and the fake agy delivers a "DELIVERED:<text>" marker. The queue file is
+# gone after the drain -- the same contract T171 asserts via a hand-written
+# queue file, here through the real `message` client route.
+t_t184() {
+  local st out rc
+  start_job "FAKE_HANG agy message target"
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T184 FAIL "start agy message target: $START_OUT"
+    return
+  fi
+  local id="$START_JOB_ID"
+  local i
+  for i in $(seq 1 20); do
+    st=$(get_status "$id")
+    [ "$st" = "running" ] && break
+    sleep 0.5
+  done
+  if [ "$st" != "running" ]; then
+    cleanup_job "$id"
+    rec T184 FAIL "agy message target never showed running (last status: $st)"
+    return
+  fi
+  local worktree
+  worktree=$(db_field "$id" "worktree_path")
+  if [ -z "$worktree" ] || [ ! -d "$worktree" ]; then
+    cleanup_job "$id"
+    rec T184 FAIL "job worktree missing or unknown: '$worktree'"
+    return
+  fi
+  out=$(ar message "$id" "t183 mid-run ping" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$id"
+    rec T184 FAIL "message exited $rc: $out"
+    return
+  fi
+  case "$out" in
+    *"queued"*) ;;
+    *) cleanup_job "$id"; rec T184 FAIL "message did not report queued: $out"; return ;;
+  esac
+  # The queue file must exist right after `message` on the live job.
+  if [ ! -f "$worktree/.engine-message-queue" ]; then
+    cleanup_job "$id"
+    rec T184 FAIL "queue file not created by message route: $worktree/.engine-message-queue"
+    return
+  fi
+  # Interrupt the running job, then resume it: the queue is drained into the
+  # resume prompt and delivered (FAKE_DELIVERED_QUEUE echoes it).
+  out=$(ar interrupt "$id" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$id"
+    rec T184 FAIL "interrupt before resume exited $rc: $out"
+    return
+  fi
+  st=$(wait_state "$id" terminal 60) || {
+    cleanup_job "$id"
+    rec T184 FAIL "message target interrupt left no terminal state (last: $st)"
+    return
+  }
+  out=$(ar retry "$id" --prompt "FAKE_DELIVER_QUEUE t183 continue" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$id"
+    rec T184 FAIL "retry after message exited $rc: $out"
+    return
+  fi
+  case "$out" in
+    *"retry launched in background"*) ;;
+    *) cleanup_job "$id"; rec T184 FAIL "retry after message did not launch: $out"; return ;;
+  esac
+  st=$(wait_state "$id" done 60) || {
+    cleanup_job "$id"
+    rec T184 FAIL "resumed turn after message not done (last: $st)"
+    return
+  }
+  local res
+  res=$(ar result "$id" 2>&1)
+  case "$res" in
+    *"t183 mid-run ping"*) ;;
+    *) cleanup_job "$id"; rec T184 FAIL "resume result missing the delivered message: $res"; return ;;
+  esac
+  if [ -f "$worktree/.engine-message-queue" ]; then
+    cleanup_job "$id"
+    rec T184 FAIL "queue file still present after the drain: $worktree/.engine-message-queue"
+    return
+  fi
+  cleanup_job "$id"
+  rec T184 PASS "message queues to .engine-message-queue on a running job; the queued text is delivered on the next turn and the queue file is drained (job $id)"
+}
+
+# T185: fork/compact/revert on a done job (claude and agy) answer usable,
+# non-501 bodies: fork returns a NEW run id, compact reports compacted, and
+# revert reports reverted/unreverted.
+t_t185() {
+  local out rc
+  # (a) claude engine
+  start_job "FAKE_SLEEP=1 claude fork compact revert target" --engine claude
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T185 FAIL "start claude fork target: $START_OUT"
+    return
+  fi
+  local cid="$START_JOB_ID"
+  local st
+  st=$(wait_state "$cid" done 60) || { cleanup_job "$cid"; rec T185 FAIL "claude fork target not done (last: $st)"; return; }
+  out=$(ar fork "$cid" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$cid"
+    rec T185 FAIL "claude fork exited $rc: $out"
+    return
+  fi
+  # The human-readable line follows the run scoped endpoints' convention
+  # ("Forked job '<id>' as run '<newid>'."); the run id is also the JSON data
+  # when --json is used.
+  local newid
+  newid=$(printf '%s\n' "$out" | sed -nE "s/.*as run '([^']+)'.*/\1/p" | head -n1)
+  if [ -z "$newid" ]; then
+    cleanup_job "$cid"
+    rec T185 FAIL "claude fork did not report the new run id: $out"
+    return
+  fi
+  # The fork's worktree is a copied sibling directory: emulated_fork names it
+  # `<job_src_dir>-fork-<seq>` next to the source job worktree, inside the
+  # project's jobs root. Verify a distinctly-named fork directory exists.
+  local src_worktree fw parent
+  src_worktree=$(db_field "$cid" "worktree_path")
+  parent=$(dirname "$src_worktree")
+  fw=""
+  local cand
+  for cand in "$parent"/*-fork-*; do
+    [ -d "$cand" ] && fw="$cand" && break
+  done
+  if [ -z "$fw" ]; then
+    cleanup_job "$cid"
+    rec T185 FAIL "claude fork produced no fork worktree in $parent (run id $newid): $out"
+    return
+  fi
+  cleanup_job "$cid"
+  rm -rf "$fw" 2>/dev/null || true
+
+  # (b) compact + revert on the same claude surface (a fresh done job)
+  start_job "FAKE_SLEEP=1 claude compact revert target" --engine claude
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T185 FAIL "start claude compact target: $START_OUT"
+    return
+  fi
+  local c2="$START_JOB_ID"
+  st=$(wait_state "$c2" done 60) || { cleanup_job "$c2"; rec T185 FAIL "claude compact target not done (last: $st)"; return; }
+  out=$(ar compact "$c2" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$c2"
+    rec T185 FAIL "claude compact exited $rc: $out"
+    return
+  fi
+  case "$out" in
+    *"compacted"*) ;;
+    *) cleanup_job "$c2"; rec T185 FAIL "claude compact did not report success: $out"; return ;;
+  esac
+  out=$(ar revert "$c2" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$c2"
+    rec T185 FAIL "claude revert exited $rc: $out"
+    return
+  fi
+  case "$out" in
+    *"reverted"*) ;;
+    *) cleanup_job "$c2"; rec T185 FAIL "claude revert did not report success: $out"; return ;;
+  esac
+  cleanup_job "$c2"
+
+  # (c) agy fork/compact/revert
+  start_job "FAKE_SLEEP=1 agy fork compact revert target"
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T185 FAIL "start agy fork target: $START_OUT"
+    return
+  fi
+  local aid="$START_JOB_ID"
+  st=$(wait_state "$aid" done 60) || { cleanup_job "$aid"; rec T185 FAIL "agy fork target not done (last: $st)"; return; }
+  out=$(ar fork "$aid" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$aid"
+    rec T185 FAIL "agy fork exited $rc: $out"
+    return
+  fi
+  newid=$(printf '%s\n' "$out" | sed -nE "s/.*as run '([^']+)'.*/\1/p" | head -n1)
+  if [ -z "$newid" ]; then
+    cleanup_job "$aid"
+    rec T185 FAIL "agy fork did not report the new run id: $out"
+    return
+  fi
+  src_worktree=$(db_field "$aid" "worktree_path")
+  parent=$(dirname "$src_worktree")
+  fw=""
+  local cand
+  for cand in "$parent"/*-fork-*; do
+    [ -d "$cand" ] && fw="$cand" && break
+  done
+  if [ -z "$fw" ]; then
+    cleanup_job "$aid"
+    rec T185 FAIL "agy fork produced no fork worktree in $parent (run id $newid): $out"
+    return
+  fi
+  cleanup_job "$aid"
+  rm -rf "$fw" 2>/dev/null || true
+
+  rec T185 PASS "fork/compact/revert answer non-501 bodies on done claude and agy jobs (fork returns a fresh run/worktree, compact/revert report success)"
+}
+
+# T186: `todo` on a done job returns a usable JSON list (empty is fine) for
+# both engines -- never 501 by engine gap.
+t_t186() {
+  local out rc
+  start_job "FAKE_SLEEP=1 claude todo target" --engine claude
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T186 FAIL "start claude todo target: $START_OUT"
+    return
+  fi
+  local cid="$START_JOB_ID"
+  local st
+  st=$(wait_state "$cid" done 60) || { cleanup_job "$cid"; rec T186 FAIL "claude todo target not done (last: $st)"; return; }
+  out=$(ar todo "$cid" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$cid"
+    rec T186 FAIL "claude todo exited $rc: $out"
+    return
+  fi
+  if ! printf '%s' "$out" | grep -qi "todo item"; then
+    cleanup_job "$cid"
+    rec T186 FAIL "claude todo did not report the todo list: $out"
+    return
+  fi
+  cleanup_job "$cid"
+
+  start_job "FAKE_SLEEP=1 agy todo target"
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T186 FAIL "start agy todo target: $START_OUT"
+    return
+  fi
+  local aid="$START_JOB_ID"
+  st=$(wait_state "$aid" done 60) || { cleanup_job "$aid"; rec T186 FAIL "agy todo target not done (last: $st)"; return; }
+  out=$(ar todo "$aid" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    cleanup_job "$aid"
+    rec T186 FAIL "agy todo exited $rc: $out"
+    return
+  fi
+  if ! printf '%s' "$out" | grep -qi "todo item"; then
+    cleanup_job "$aid"
+    rec T186 FAIL "agy todo did not report the todo list: $out"
+    return
+  fi
+  cleanup_job "$aid"
+  rec T186 PASS "todo returns a usable todos list for done claude and agy jobs"
+}
+
+# T182: claude plan mode argv (HL-71 S1). A plan-mode claude job must reach
+# the harness with `--permission-mode plan` and WITHOUT the agy-only `--mode`
+# flag (the live failure: real claude 2.1.322 exited with
+# `error: unknown option '--mode'` and every claude job failed). Also: the
+# normal-mode claude argv carries no --permission-mode at all, and every
+# claude argv carries --verbose (required by the real CLI for
+# `--output-format stream-json` with `-p`).
+t_t182() {
+  local id argvf before res st
+  argvf="$TMPROOT/argv.log"
+  before=$(grep -c "fake-claude.sh" "$argvf" 2>/dev/null || true)
+  before=${before:-0}
+
+  start_job "FAKE_SLEEP=1 claude plan mode prompt" --engine claude --plan
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T182 FAIL "start --engine claude --plan: $START_OUT"
+    return
+  fi
+  id="$START_JOB_ID"
+  st=$(wait_state "$id" done 60) || {
+    cleanup_job "$id"
+    rec T182 FAIL "claude plan job did not reach done (last status: $st)"
+    return
+  }
+  res=$(ar result "$id" 2>&1)
+  case "$res" in
+    *CLAUDE-DONE*) ;;
+    *) cleanup_job "$id"; rec T182 FAIL "claude plan result missing CLAUDE-DONE: $res"; return ;;
+  esac
+
+  local line
+  line=$(grep "fake-claude.sh" "$argvf" | tail -n 1)
+  if [ -z "$line" ]; then
+    cleanup_job "$id"
+    rec T182 FAIL "no claude invocation in the argv log: $(tr '\n' '|' < "$argvf")"
+    return
+  fi
+  case "$line" in
+    *--permission-mode*plan*) ;;
+    *)
+      cleanup_job "$id"
+      rec T182 FAIL "claude plan argv missing --permission-mode plan: $line"
+      return
+      ;;
+  esac
+  case "$line" in
+    *--mode*|*$'\t--mode'*)
+      cleanup_job "$id"
+      rec T182 FAIL "claude plan argv carried the agy-only --mode flag: $line"
+      return
+      ;;
+  esac
+  # A word-boundary check: no standalone --mode token (the real claude CLI
+  # rejects it with `error: unknown option '--mode'`).
+  if printf '%s' "$line" | tr '\t' ' ' | grep -q -- "--mode "; then
+    cleanup_job "$id"
+    rec T182 FAIL "claude plan argv carried the agy-only --mode flag: $line"
+    return
+  fi
+  case "$line" in
+    *--verbose*) ;;
+    *)
+      cleanup_job "$id"
+      rec T182 FAIL "claude argv missing --verbose (required by the real CLI for stream-json with -p): $line"
+      return
+      ;;
+  esac
+
+  # Normal mode: the plan flag must be ABSENT (auto-approved by
+  # --dangerously-skip-permissions), --verbose still present.
+  local id2
+  start_job "FAKE_SLEEP=1 claude normal mode prompt" --engine claude
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    cleanup_job "$id"
+    rec T182 FAIL "start --engine claude (normal): $START_OUT"
+    return
+  fi
+  id2="$START_JOB_ID"
+  st=$(wait_state "$id2" done 60) || {
+    cleanup_job "$id"; cleanup_job "$id2"
+    rec T182 FAIL "claude normal job did not reach done (last status: $st)"
+    return
+  }
+  line=$(grep "fake-claude.sh" "$argvf" | tail -n 1)
+  case "$line" in
+    *--permission-mode*)
+      cleanup_job "$id"; cleanup_job "$id2"
+      rec T182 FAIL "claude normal argv must not carry --permission-mode: $line"
+      return
+      ;;
+  esac
+  case "$line" in
+    *--dangerously-skip-permissions*) ;;
+    *)
+      cleanup_job "$id"; cleanup_job "$id2"
+      rec T182 FAIL "claude normal argv missing --dangerously-skip-permissions: $line"
+      return
+      ;;
+  esac
+  case "$line" in
+    *--verbose*) ;;
+    *)
+      cleanup_job "$id"; cleanup_job "$id2"
+      rec T182 FAIL "claude normal argv missing --verbose: $line"
+      return
+      ;;
+  esac
+  cleanup_job "$id"; cleanup_job "$id2"
+  rec T182 PASS "claude plan job argv carries --permission-mode plan + --verbose and NO --mode; normal argv carries no --permission-mode (jobs $id/$id2)"
+}
+
+# T187: claude kill accepts the ENGINE launch target (Defect 1, HL-71 S1).
+# The recorded job PID is the `sandbox-exec` wrapper around the claude
+# harness (`sandbox-exec --policy <file> -- <claude> ...`). `agent-run kill`
+# must pass its PID-identity sanity check (accepting the wrapper's claude
+# launch target), terminate the whole tree, mark the job `killed`, and be
+# idempotent -- no process leftover. This drives the exact live failure
+# (the old name-only check refused `sandbox-exec`/`claude` and the job kept
+# running).
+t_t187() {
+  local id st out pid log
+  start_job "FAKE_HANG claude engine-aware kill prompt" --engine claude
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T187 FAIL "start claude hang: $START_OUT"
+    return
+  fi
+  id="$START_JOB_ID"
+  st=$(wait_state "$id" running 30) || {
+    cleanup_job "$id"
+    rec T187 FAIL "claude hang never ran (last status: $st)"
+    return
+  }
+  pid=$(db_field "$id" "pid")
+  [ -n "$pid" ] || { cleanup_job "$id"; rec T187 FAIL "no recorded pid for claude job"; return; }
+
+  # The recorded PID must be a launch-target process: the sandbox-exec
+  # wrapper whose cmdline carries the claude engine (or claude itself when
+  # the wrapper is stripped). If it were an unrelated process, the sanity
+  # check would have refused -- the bug this test guards.
+  local cmdline
+  cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+  case "$cmdline" in
+    *sandbox-exec*claude*|*claude*)
+      ;;
+    *)
+      # A fake harness may run unwrapped; require the claude engine token.
+      case "$cmdline" in
+        *fake-claude.sh*|*claude*) ;;
+        *)
+          cleanup_job "$id"
+          rec T187 FAIL "claude job pid $pid is not a launch-target process: $cmdline"
+          return
+          ;;
+      esac
+      ;;
+  esac
+
+  out=$(ar kill "$id" 2>&1)
+  if [ $? -ne 0 ]; then
+    cleanup_job "$id"
+    rec T187 FAIL "claude kill exited non-zero: $out"
+    return
+  fi
+  st=$(wait_state "$id" killed 45) || {
+    cleanup_job "$id"
+    rec T187 FAIL "claude kill did not reach killed (last status: $st)"
+    return
+  }
+  # The whole process tree must be gone (no leftover claude/fake process).
+  local i alive=0
+  for i in $(seq 1 40); do
+    if [ ! -d "/proc/$pid" ]; then
+      alive=0; break
+    fi
+    local st2
+    st2=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)
+    [ "$st2" = "Z" ] || alive=1
+    sleep 0.25
+  done
+  if [ "$alive" = "1" ]; then
+    cleanup_job "$id"
+    rec T187 FAIL "claude process tree still alive after kill (pid $pid)"
+    return
+  fi
+  # Idempotence: a second kill is a clean no-op (not running anymore), not a
+  # hard error and no sanity-check refusal.
+  out=$(ar kill "$id" 2>&1)
+  if [ $? -ne 0 ]; then
+    cleanup_job "$id"
+    rec T187 FAIL "second claude kill exited non-zero: $out"
+    return
+  fi
+  st=$(get_status "$id")
+  if [ "$st" != "killed" ]; then
+    cleanup_job "$id"
+    rec T187 FAIL "second kill must keep status killed, got '$st'"
+    return
+  fi
+  # The log must record the SIGTERM + terminated-successfully lines.
+  log=$(ar log "$id" 2>&1)
+  cleanup_job "$id"
+  rec T187 PASS "claude FAKE_HANG killed via engine-aware PID check; tree gone; kill idempotent (job $id, recorded pid $pid)"
+}
+
+# T188: a claude job that fails through the REAL claude error shape surfaces
+# the reason (Defect 2, HL-71 S1). FAKE_AUTHFAIL emits a synthetic assistant
+# message + an error `result` whose `result` field holds the message (NO
+# `error` field), exactly the live "Failed to authenticate: OAuth session
+# expired" / unrecognized-model shape. `agent-run result --json` must report
+# status failed WITH the reason instead of an empty error.
+t_t188() {
+  local id out st res errf jsonout
+  start_job "FAKE_AUTHFAIL claude auth failure prompt" --engine claude
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    rec T188 FAIL "start claude authfail: $START_OUT"
+    return
+  fi
+  id="$START_JOB_ID"
+  st=$(wait_state "$id" failed 60) || {
+    cleanup_job "$id"
+    rec T188 FAIL "claude authfail never classified failed (last status: $st)"
+    return
+  }
+  # JSON result must carry both the failed status and the reason text.
+  jsonout=$(ar result "$id" --json 2>&1)
+  case "$jsonout" in
+    *"\"status\": \"failed\""*) ;;
+    *) cleanup_job "$id"; rec T188 FAIL "claude authfail status not failed: $jsonout"; return ;;
+  esac
+  case "$jsonout" in
+    *"OAuth session expired"*) ;;
+    *) cleanup_job "$id"; rec T188 FAIL "claude authfail result missing the reason: $jsonout"; return ;;
+  esac
+  # Human result surfaces the reason too (extract_final_response carries the
+  # terminal error-result text as the response, and/or the Error reported line).
+  res=$(ar result "$id" 2>&1)
+  case "$res" in
+    *"OAuth session expired"*) ;;
+    *) cleanup_job "$id"; rec T188 FAIL "claude authfail human result missing the reason: $res"; return ;;
+  esac
+  # The raw log carries the [claude-code:...] marker line.
+  errf=$(ar log "$id" 2>&1)
+  case "$errf" in
+    *unrecognized_model*|*OAuth*) ;;
+    *) cleanup_job "$id"; rec T188 FAIL "claude authfail log missing the claude-code marker: $errf"; return ;;
+  esac
+  cleanup_job "$id"
+  rec T188 PASS "claude FAKE_AUTHFAIL ends failed and result surfaces the auth reason (job $id)"
+}
+
 # --- main ------------------------------------------------------------------------------
 TEARDOWN_DONE=0
 teardown() {
@@ -4404,10 +5674,12 @@ teardown() {
   TEARDOWN_DONE=1
   local rc=$?
   stop_server
-  # kill any leftover fake agy processes spawned under the temp root
+  # kill any leftover fake agy/claude processes spawned under the temp root
   pkill -f "$TMPROOT/fake-agy.sh" 2>/dev/null || true
+  pkill -f "$TMPROOT/fake-claude.sh" 2>/dev/null || true
   sleep 0.5
   pkill -KILL -f "$TMPROOT/fake-agy.sh" 2>/dev/null || true
+  pkill -KILL -f "$TMPROOT/fake-claude.sh" 2>/dev/null || true
   if [ "${KEEP:-0}" = "1" ]; then
     echo "KEEP=1: leaving temp root at $TMPROOT (server log: $SERVER_LOG, results: $RESULTS)"
   else
@@ -4512,6 +5784,23 @@ run_test_stops_server T168 t_t168
 run_test_stops_server T169 t_t169
 run_test T170 t_t170
 run_test T171 t_t171
+run_test T172 t_t172
+run_test T173 t_t173
+run_test T174 t_t174
+run_test T175 t_t175
+run_test T176 t_t176
+run_test T177 t_t177
+run_test T178 t_t178
+run_test T179 t_t179
+run_test T180 t_t180
+run_test T181 t_t181
+run_test T182 t_t182
+run_test T183 t_t183
+run_test T184 t_t184
+run_test T185 t_t185
+run_test T186 t_t186
+run_test T187 t_t187
+run_test T188 t_t188
 
 echo
 echo "=== per-test results ==="

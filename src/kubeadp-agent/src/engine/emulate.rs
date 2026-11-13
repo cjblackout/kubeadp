@@ -70,7 +70,7 @@ use async_trait::async_trait;
 use crate::engine::capability::{CapEndpointKey, Capability, CapabilityTable};
 use crate::engine::errors::EngineError;
 use crate::engine::run::{EngineEvent, Run, RunId, RunKind, RunStatus, TodoItem};
-use crate::engine::{EmptyEngineCtx, Engine, EngineCtx, JobSpec, SessionSpec};
+use crate::engine::{Engine, EngineCtx, JobSpec, SessionSpec};
 
 /// The endpoint keys the emulation layer can front (the shared control
 /// surface for the six E4 run-control routes; `permissions` is *not* in the
@@ -168,6 +168,10 @@ pub struct EmulatingEngine {
     cursor: Arc<Mutex<EventCursor>>,
     runs: Arc<EngineRunRegistry>,
     fork_seq: AtomicU64,
+    /// The host `Config` for the job-mode emulated interrupt (process-group
+    /// termination of the job's real child). Unset for standalone
+    /// engines/tests; a job-mode interrupt then stays unsupported.
+    config: Arc<Mutex<Option<Arc<crate::core::config::Config>>>>,
 }
 
 impl EmulatingEngine {
@@ -190,7 +194,21 @@ impl EmulatingEngine {
             cursor: Arc::new(Mutex::new(EventCursor::default())),
             runs,
             fork_seq: AtomicU64::new(0),
+            config: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Attaches the host `Config` so the emulation layer can drive job-mode
+    /// control that needs real process state (the emulated interrupt of the
+    /// job's child process group). Called by the role entry points that
+    /// construct the registry from config.
+    pub fn set_config(&self, config: Arc<crate::core::config::Config>) {
+        *self.config.lock().expect("config lock poisoned") = Some(config);
+    }
+
+    /// The host config, when attached.
+    pub fn config(&self) -> Option<Arc<crate::core::config::Config>> {
+        self.config.lock().expect("config lock poisoned").clone()
     }
 
     /// The engine behind the wrapper.
@@ -331,7 +349,72 @@ impl EmulatingEngine {
     async fn emulated_interrupt(&self, run: &Run) -> Result<(), EngineError> {
         match run.kind {
             RunKind::Session => self.inner.stop_session(run, false).await,
-            RunKind::Job => Err(EngineError::unsupported(self.inner.id(), "interrupt")),
+            RunKind::Job => {
+                // A job's real child must be stopped at the process level: the
+                // job control surface (`commands::kill`) is the only thing
+                // that reaches the sandboxed child, so a claude/agy job
+                // without a native interrupt is interrupted the same way an
+                // operator kill does -- clean SIGTERM to the process group,
+                // grace, then SIGKILL -- but WITHOUT the kill bookkeeping:
+                // this is an interrupt, not a user kill, and the job is meant
+                // to be resumed afterwards. The stoppage mirrors
+                // `worker::a2a.rs::resume_with` (the "[a2a interrupt]"
+                // pattern) except the log lines carry the engine `interrupt`
+                // prefix so status classification and A2A parsing agree.
+                let config = self
+                    .config
+                    .lock()
+                    .expect("config lock poisoned")
+                    .clone()
+                    .ok_or_else(|| EngineError::unsupported(self.inner.id(), "interrupt"))?;
+                let job_id = run.id.clone();
+                let Some(meta) =
+                    crate::core::job::JobMetadata::resolve(&config.state_root, &job_id).ok()
+                else {
+                    return Err(EngineError::NotFound { run: job_id });
+                };
+                let is_running = crate::core::job::compute_status(&meta, &config.state_root)
+                    == crate::core::job::JobStatus::Running;
+                use std::io::Write;
+                let log_path =
+                    crate::core::job::JobMetadata::log_path(&config.state_root, &meta.job_id);
+                let append = |line: String| {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_path)
+                    {
+                        let _ = f.write_all(format!("[engine interrupt] {line}\n").as_bytes());
+                    }
+                };
+                if let (true, Some(pid)) = (is_running, meta.pid) {
+                    crate::core::commands::kill::terminate_process_to(
+                        &config,
+                        &meta.job_id,
+                        pid,
+                        meta.pid_start_time,
+                        Some(meta.retry_count),
+                        &mut |_stderr, line| append(line),
+                    )
+                    .map_err(|e| {
+                        EngineError::Internal(format!(
+                            "failed to interrupt job '{}': {e}",
+                            meta.job_id
+                        ))
+                    })?;
+                    append(format!(
+                        "job '{}' (PID {}) interrupted (engine emulation).",
+                        meta.job_id, pid
+                    ));
+                } else {
+                    append(format!(
+                        "job '{}' interrupt requested but the job is not running (status: {}).",
+                        meta.job_id,
+                        crate::core::job::compute_status(&meta, &config.state_root).as_str()
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -388,19 +471,42 @@ impl EmulatingEngine {
 
         match run.kind {
             RunKind::Job => {
-                let spec = JobSpec {
-                    prompt: summary.next_prompt.clone(),
-                    conversation_id: run.context_id.clone(),
-                    mode: "normal".to_string(),
-                    workdir: run.workdir.clone(),
-                    project: String::new(),
-                    options: serde_json::Value::Null,
-                };
-                let mut updated = run.clone();
-                let new_context = self.inner.start_job(spec, &mut EmptyEngineCtx).await?;
-                updated.context_id = Some(new_context);
-                updated.status = RunStatus::Starting;
-                self.runs.register(updated);
+                // Restart the JOB with the summarised continuation prompt
+                // through the job command layer (`commands::retry`), so the
+                // emulated compact drives the same machinery both engines use
+                // for a resumed turn (the agy trait `start_job` is not wired;
+                // the job layer is the real driver for both agy and claude,
+                // HL-71 S2). The restart is best-effort: a wrapper without an
+                // attached config (test/registry usage) or a job row that
+                // cannot be resumed still answers the endpoint honestly -- the
+                // compact record is written and survives for a later resume.
+                let restart = self.config.lock().expect("config lock poisoned").clone();
+                if let Some(config) = restart {
+                    let job_id = run.id.clone();
+                    match crate::core::commands::retry::run(
+                        &config,
+                        &crate::core::args::RetryArgs {
+                            job_id: job_id.clone(),
+                            hindsight: None,
+                            hindsight_query: None,
+                            prompt: Some(summary.next_prompt.clone()),
+                        },
+                    ) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            // A row that cannot be resumed (still running, no
+                            // conversation id) leaves the compact record -- the
+                            // summarised context survives -- and the restart is
+                            // deferred. The endpoint still reports the compact
+                            // honestly; it is not an engine gap (a 501).
+                            append_compact_note(
+                                &config,
+                                &job_id,
+                                &format!("compact written; restart deferred: {e}"),
+                            );
+                        }
+                    }
+                }
             }
             RunKind::Session => {
                 // No session-restart surface in E1; record the summary and
@@ -421,9 +527,17 @@ impl EmulatingEngine {
         match run.kind {
             RunKind::Job => {
                 if commit.is_empty() {
-                    revert::unrevert(run)
-                        .map(|_| ())
-                        .map_err(|e| EngineError::Internal(e.to_string()))
+                    // Unrevert: restore the work `revert` discarded. A job that
+                    // was never reverted has no preserved work -- that is a
+                    // graceful no-op (the endpoint always answers a usable
+                    // body), not an engine failure.
+                    match revert::preserved_work_sha(run) {
+                        Ok(Some(_)) => revert::unrevert(run)
+                            .map(|_| ())
+                            .map_err(|e| EngineError::Internal(e.to_string())),
+                        Ok(None) => Ok(()),
+                        Err(e) => Err(EngineError::Internal(e.to_string())),
+                    }
                 } else {
                     revert::revert(run)
                         .map(|_| ())
@@ -471,6 +585,21 @@ fn copy_worktree(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Appends a `[engine compact]` note to a job's log (best-effort; the note
+/// records that the emulated compact wrote its record but the restart was
+/// deferred).
+fn append_compact_note(config: &crate::core::config::Config, job_id: &str, note: &str) {
+    use std::io::Write;
+    let log_path = crate::core::job::JobMetadata::log_path(&config.state_root, job_id);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let _ = f.write_all(format!("[engine compact] {note}\n").as_bytes());
+    }
 }
 
 #[async_trait]
@@ -819,31 +948,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emulated_compact_restarts_with_summary_prompt_and_keeps_context() {
+    async fn emulated_compact_writes_record_and_is_graceful_without_config() {
         let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let init = crate::core::reaper::output_tracked(
+            crate::core::git::hardened_git()
+                .arg("init")
+                .arg("-b")
+                .arg("main")
+                .arg(&workdir),
+        )
+        .unwrap();
+        assert!(init.status.success());
+        std::process::Command::new("git")
+            .args(["-C", workdir.to_string_lossy().as_ref()])
+            .args(["config", "user.name", "emulate-compact-test"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", workdir.to_string_lossy().as_ref()])
+            .args(["config", "user.email", "emulate@example.com"])
+            .status()
+            .unwrap();
+        std::fs::write(workdir.join("a.txt"), "a\n").unwrap();
+        crate::core::git::commit_uncommitted_changes(&workdir, "summ", "add a").unwrap();
+
         let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let inner = Arc::new(MockInner::new("mock", &[], &[], Arc::clone(&calls)));
         let runs = Arc::new(EngineRunRegistry::default());
         let engine = EmulatingEngine::new_over_with(inner, Arc::clone(&runs));
-        let mut run = Run::new("r-5", RunKind::Job, tmp.path());
+        let mut run = Run::new("r-5", RunKind::Job, &workdir);
         run.context_id = Some("ctx-5".to_string());
         run.engine = "mock".to_string();
         runs.register(run.clone());
 
+        // No config attached (test/registry wrapper): the compact record is
+        // still written and the endpoint answers Ok -- the restart is
+        // best-effort and deferred, never an engine gap.
         engine.compact(&run).await.unwrap();
 
+        assert!(
+            compact::compact_meta_path(&run).exists(),
+            "compact must write its record file"
+        );
+        let record: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(compact::compact_meta_path(&run)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            record["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("add a")),
+            "compact summary must capture the worktree history"
+        );
+
+        // No restart was attempted: the wrapper has no config, so the mock's
+        // start_job was never called.
         let recorded = calls.lock().unwrap().clone();
-        let start = recorded
-            .iter()
-            .find(|c| c.starts_with("start_job|"))
-            .cloned()
-            .expect("compact must restart the job");
-        // The restart carries the compacted-context prompt and the old conv id.
-        assert!(start.starts_with("start_job|ctx-5|"), "{start}");
-        assert!(start.contains("engine compacted context"), "{start}");
-        // The registry now holds the updated context id for the run.
-        let updated = runs.lookup("r-5").unwrap();
-        assert_eq!(updated.context_id.as_deref(), Some("mock-started"));
+        assert!(
+            recorded.iter().all(|c| !c.starts_with("start_job|")),
+            "compact without a config must not attempt a restart: {recorded:?}"
+        );
     }
 
     #[tokio::test]

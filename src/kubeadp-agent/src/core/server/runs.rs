@@ -17,19 +17,22 @@
 //! run id; the contract is exercised by tests that register runs directly
 //! through the same registry.
 
-use axum::extract::Extension;
+use axum::extract::{Extension, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-use crate::core::server::{ApiJson, ApiPath};
+use crate::core::config::Config;
+use crate::core::job::JobMetadata;
+use crate::core::output::CommandOutput;
+use crate::core::server::{ApiJson, ApiPath, AppState};
 use crate::engine::capability::{CapEndpointKey, Capability};
 use crate::engine::emulate::{EmulatingEngine, EngineRunRegistry};
 use crate::engine::errors::EngineError;
 use crate::engine::run::Run;
-use crate::engine::{Engine, EngineRegistry};
+use crate::engine::{Engine, EngineRegistry, RunKind};
 
 /// Resolves `run` and its emulation wrapper, gating `key` on the engine's
 /// reported capability (an `Unsupported` endpoint answers 501).
@@ -42,6 +45,40 @@ fn resolve_run_control(
     let run = runs.lookup(run_id).ok_or_else(|| EngineError::NotFound {
         run: run_id.to_string(),
     })?;
+    let engine = registry
+        .emulating(&run.engine)
+        .ok_or_else(|| EngineError::UnknownEngine {
+            engine: run.engine.clone(),
+        })?;
+    if engine.capability(key) == Capability::Unsupported {
+        return Err(EngineError::unsupported(run.engine.clone(), key));
+    }
+    Ok((run, engine))
+}
+
+/// Resolves a JOB to its `Run` view and emulation wrapper, gating `key` on
+/// the engine's reported capability (an `Unsupported` endpoint answers 501).
+///
+/// The job surface (`/api/v1/jobs/{id}/...`) resolves the job row on demand
+/// ([`crate::core::job::JobMetadata::resolve`], prefix-tolerant) and builds
+/// the trait `Run` from it; the engine is the row's recorded engine (falling
+/// back to the config's job default, then "agy" for rows written before
+/// engine selection existed). No in-memory registry is consulted, so the
+/// routes keep working across process restarts and agree with `status`/
+/// `retry`/`kill`, which all resolve the row the same way.
+fn resolve_job_run_control(
+    config: &Config,
+    registry: &EngineRegistry,
+    job_id: &str,
+    key: CapEndpointKey,
+) -> Result<(Run, Arc<EmulatingEngine>), EngineError> {
+    let meta = JobMetadata::resolve(&config.state_root, job_id)
+        .map_err(|e| EngineError::Internal(format!("failed to resolve job '{job_id}': {e}")))?;
+    let engine = match meta.engine.as_deref() {
+        Some(e) => e.to_string(),
+        None => registry.default_for(RunKind::Job).clone(),
+    };
+    let run = Run::from_job(&meta, &engine);
     let engine = registry
         .emulating(&run.engine)
         .ok_or_else(|| EngineError::UnknownEngine {
@@ -182,6 +219,219 @@ pub async fn todo_run(
     };
     match result {
         Ok(todos) => Json(json!({ "run_id": run_id, "todos": todos })).into_response(),
+        Err(err) => crate::engine::errors::to_response(&err),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Job-scoped run control (`/api/v1/jobs/{job_id}/...`, HL-71 S2).
+//
+// The job surface resolves the job row on demand (prefix-tolerant) and gates
+// on the recorded engine's reported capability; the same emulation wrapper
+// the run surface uses fronts the endpoint, so claude/agy jobs answer
+// interrupt/pause/message/fork/compact/revert/todo with real behaviour --
+// never 501 because of the engine. `/api/v1/runs/{id}/*` resolves no runs in
+// production (the run registry is populated only by tests); the job-scoped
+// routes are the production surface.
+// ---------------------------------------------------------------------------
+
+/// `POST /api/v1/jobs/{id}/interrupt` -- interrupt a running job (emulated:
+/// process-group SIGTERM -> SIGKILL, no kill bookkeeping).
+pub async fn interrupt_job(
+    State(config): State<AppState>,
+    Extension(registry): Extension<Arc<EngineRegistry>>,
+    ApiPath(job_id): ApiPath<String>,
+) -> Response {
+    let result = match resolve_job_run_control(&config, &registry, &job_id, "interrupt") {
+        Ok((run, engine)) => engine.interrupt(&run).await,
+        Err(err) => Err(err),
+    };
+    match result {
+        Ok(()) => {
+            let mut output = CommandOutput::new(json!({
+                "job_id": job_id,
+                "interrupted": true,
+            }));
+            output.push_out(format!("Job '{job_id}' interrupted."));
+            Json(output).into_response()
+        }
+        Err(err) => crate::engine::errors::to_response(&err),
+    }
+}
+
+/// `POST /api/v1/jobs/{id}/pause` -- pause/resume a job. `{"paused": true}`
+/// pauses (the E4 per-run flag; messages queue), `false` resumes.
+pub async fn pause_job(
+    State(config): State<AppState>,
+    Extension(registry): Extension<Arc<EngineRegistry>>,
+    ApiPath(job_id): ApiPath<String>,
+    ApiJson(body): ApiJson<PauseBody>,
+) -> Response {
+    let paused = body.paused;
+    let result = match resolve_job_run_control(&config, &registry, &job_id, "pause") {
+        Ok((run, engine)) => engine.pause(&run, paused).await,
+        Err(err) => Err(err),
+    };
+    match result {
+        Ok(()) => {
+            let mut output = CommandOutput::new(json!({
+                "job_id": job_id,
+                "paused": paused,
+            }));
+            let verb = if paused { "paused" } else { "resumed" };
+            output.push_out(format!("Job '{job_id}' {verb}."));
+            Json(output).into_response()
+        }
+        Err(err) => crate::engine::errors::to_response(&err),
+    }
+}
+
+/// The `message` request body for `POST /api/v1/jobs/{id}/message`.
+#[derive(Debug, Deserialize)]
+pub struct MessageBody {
+    #[serde(default)]
+    pub message: String,
+}
+
+/// `POST /api/v1/jobs/{id}/message` -- deliver a message to a running job.
+/// Engines without a native mid-run channel (the batch harnesses) queue it to
+/// the job worktree's `.engine-message-queue`, delivered at the next turn.
+pub async fn message_job(
+    State(config): State<AppState>,
+    Extension(registry): Extension<Arc<EngineRegistry>>,
+    ApiPath(job_id): ApiPath<String>,
+    ApiJson(body): ApiJson<MessageBody>,
+) -> Response {
+    let message = body.message;
+    let result = match resolve_job_run_control(&config, &registry, &job_id, "a2a.send_message") {
+        Ok((run, engine)) => engine.send_message(&run, &message).await,
+        Err(err) => Err(err),
+    };
+    match result {
+        Ok(()) => {
+            let mut output = CommandOutput::new(json!({
+                "job_id": job_id,
+                "queued": true,
+            }));
+            output.push_out(format!("Message queued for job '{job_id}'."));
+            Json(output).into_response()
+        }
+        Err(err) => crate::engine::errors::to_response(&err),
+    }
+}
+
+/// `POST /api/v1/jobs/{id}/compact` -- compact a job's context (emulated
+/// summarise-then-restart).
+pub async fn compact_job(
+    State(config): State<AppState>,
+    Extension(registry): Extension<Arc<EngineRegistry>>,
+    ApiPath(job_id): ApiPath<String>,
+) -> Response {
+    let result = match resolve_job_run_control(&config, &registry, &job_id, "compact") {
+        Ok((run, engine)) => engine.compact(&run).await,
+        Err(err) => Err(err),
+    };
+    match result {
+        Ok(()) => {
+            let mut output = CommandOutput::new(json!({
+                "job_id": job_id,
+                "compacted": true,
+            }));
+            output.push_out(format!("Job '{job_id}' compacted."));
+            Json(output).into_response()
+        }
+        Err(err) => crate::engine::errors::to_response(&err),
+    }
+}
+
+/// `POST /api/v1/jobs/{id}/fork` -- fork a job into a new run (emulated
+/// worktree copy seeded from the source job's worktree), returning the new
+/// run id.
+pub async fn fork_job(
+    State(config): State<AppState>,
+    Extension(registry): Extension<Arc<EngineRegistry>>,
+    ApiPath(job_id): ApiPath<String>,
+) -> Response {
+    let result = match resolve_job_run_control(&config, &registry, &job_id, "fork") {
+        Ok((from, engine)) => {
+            let placeholder = Run::new(
+                format!("{}:pending", from.id),
+                from.kind,
+                from.workdir.clone(),
+            );
+            engine
+                .fork(&placeholder, &from)
+                .await
+                .map(|new_id| (from, new_id))
+        }
+        Err(err) => Err(err),
+    };
+    match result {
+        Ok((from, new_id)) => {
+            let mut output = CommandOutput::new(json!({
+                "job_id": job_id,
+                "run_id": new_id,
+                "forked_from": from.id,
+            }));
+            output.push_out(format!("Forked job '{job_id}' as run '{new_id}'."));
+            Json(output).into_response()
+        }
+        Err(err) => crate::engine::errors::to_response(&err),
+    }
+}
+
+/// `POST /api/v1/jobs/{id}/revert` -- revert a job's worktree to its latest
+/// engine checkpoint (`{"commit": ""}` unreverts).
+pub async fn revert_job(
+    State(config): State<AppState>,
+    Extension(registry): Extension<Arc<EngineRegistry>>,
+    ApiPath(job_id): ApiPath<String>,
+    ApiJson(body): ApiJson<RevertBody>,
+) -> Response {
+    let commit = body.commit.clone();
+    let result = match resolve_job_run_control(&config, &registry, &job_id, "revert") {
+        Ok((run, engine)) => engine.revert(&run, &commit).await,
+        Err(err) => Err(err),
+    };
+    match result {
+        Ok(()) => {
+            let mut output = CommandOutput::new(json!({
+                "job_id": job_id,
+                "reverted": !commit.is_empty(),
+                "commit": commit,
+            }));
+            let verb = if commit.is_empty() {
+                "unreverted"
+            } else {
+                "reverted"
+            };
+            output.push_out(format!("Job '{job_id}' {verb}."));
+            Json(output).into_response()
+        }
+        Err(err) => crate::engine::errors::to_response(&err),
+    }
+}
+
+/// `GET /api/v1/jobs/{id}/todo` -- the job's structured todo list (collected
+/// from its event stream by the emulation layer).
+pub async fn todo_job(
+    State(config): State<AppState>,
+    Extension(registry): Extension<Arc<EngineRegistry>>,
+    ApiPath(job_id): ApiPath<String>,
+) -> Response {
+    let result = match resolve_job_run_control(&config, &registry, &job_id, "todo") {
+        Ok((run, engine)) => Ok(engine.todo_for(&run)),
+        Err(err) => Err(err),
+    };
+    match result {
+        Ok(todos) => {
+            let mut output = CommandOutput::new(json!({
+                "job_id": job_id,
+                "todos": todos,
+            }));
+            output.push_out(format!("Job '{job_id}' has {} todo item(s).", todos.len()));
+            Json(output).into_response()
+        }
         Err(err) => crate::engine::errors::to_response(&err),
     }
 }

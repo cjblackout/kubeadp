@@ -9,6 +9,41 @@ use crate::core::config::Config;
 use crate::core::job::{compute_status, list_jobs, JobMetadata, JobStatus};
 use crate::core::output::CommandOutput;
 
+/// The engines a job row can report. Legacy rows (written before engine
+/// selection existed) have `engine == None` and are agy jobs by definition
+/// (the same default `compute_status` applies), so `agy` matches both explicit
+/// agy rows and `None`/legacy rows.
+const VALID_ENGINES: &[&str] = &["agy", "claude"];
+
+/// The effective engine label of a job row for display and filtering.
+fn effective_engine(job: &JobMetadata) -> &str {
+    job.engine.as_deref().unwrap_or("agy")
+}
+
+/// Parses the `--engine` value (blank/absent = no filter). An unrecognized
+/// engine is a typed 400 error listing the valid engines.
+fn parse_engine_filter(engine: &Option<String>) -> Result<Option<String>> {
+    let Some(raw) = engine.as_deref() else {
+        return Ok(None);
+    };
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if !VALID_ENGINES.contains(&value) {
+        return Err(crate::core::error::AgentRunError::invalid(
+            "invalid_engine",
+            format!(
+                "unknown engine '{}': valid engines are {}",
+                value,
+                VALID_ENGINES.join(", ")
+            ),
+        )
+        .into());
+    }
+    Ok(Some(value.to_string()))
+}
+
 /// Parses the `--status` values (repeatable, each value itself
 /// comma-separated) into the set of allowed statuses. Blank/empty values
 /// are ignored; an unrecognized name is a typed 400 error listing the valid
@@ -88,6 +123,16 @@ pub fn run(config: &Config, args: &ListArgs) -> Result<CommandOutput> {
         Some(set) => rows.into_iter().filter(|(_, s)| set.contains(s)).collect(),
         None => rows,
     };
+    // Engine filter (ANDs with project and status). `agy` also matches
+    // legacy `engine IS NULL` rows, which are agy jobs by definition.
+    let engine_filter = parse_engine_filter(&args.engine)?;
+    let rows: Vec<(&JobMetadata, JobStatus)> = match &engine_filter {
+        Some(engine) => rows
+            .into_iter()
+            .filter(|(job, _)| effective_engine(job) == engine.as_str())
+            .collect(),
+        None => rows,
+    };
 
     if rows.is_empty() {
         let mut output = CommandOutput::new(json!({ "jobs": [] }));
@@ -107,14 +152,15 @@ pub fn run(config: &Config, args: &ListArgs) -> Result<CommandOutput> {
     let mut job_entries = Vec::with_capacity(rows.len());
     let mut output = CommandOutput::new(json!({ "jobs": job_entries }));
 
-    // Print table header
+    // Print table header. The ENGINE column sits between ACTIVITY and PROMPT
+    // so the fixed-width cells (id..activity) keep their historical offsets.
     output.push_out(format!(
-        "{:<10} {:<16} {:<16} {:<20} {:<8} {:<10} PROMPT",
-        "JOB ID", "PROJECT", "STATUS", "CREATED", "AGE", "ACTIVITY"
+        "{:<10} {:<16} {:<16} {:<20} {:<8} {:<10} {:<6} PROMPT",
+        "JOB ID", "PROJECT", "STATUS", "CREATED", "AGE", "ACTIVITY", "ENGINE"
     ));
     output.push_out(format!(
-        "{:-<10} {:-<16} {:-<16} {:-<20} {:-<8} {:-<10} {:-<35}",
-        "", "", "", "", "", "", ""
+        "{:-<10} {:-<16} {:-<16} {:-<20} {:-<8} {:-<10} {:-<6} {:-<35}",
+        "", "", "", "", "", "", "", ""
     ));
 
     for (job, status) in &rows {
@@ -215,13 +261,14 @@ pub fn run(config: &Config, args: &ListArgs) -> Result<CommandOutput> {
         };
 
         output.push_out(format!(
-            "{:<10} {:<16} {:<16} {:<20} {:<8} {:<10} {}",
+            "{:<10} {:<16} {:<16} {:<20} {:<8} {:<10} {:<6} {}",
             job.job_id,
             job.project,
             running_status_str,
             created_str,
             age_str,
             activity_str,
+            effective_engine(job),
             truncated_prompt
         ));
 
@@ -353,6 +400,7 @@ mod tests {
                 &config,
                 &ListArgs {
                     project: filter,
+                    engine: None,
                     status: Vec::new(),
                 },
             )
@@ -376,6 +424,7 @@ mod tests {
             &config,
             &ListArgs {
                 project: Some("otherproj".to_string()),
+                engine: None,
                 status: Vec::new(),
             },
         )
@@ -404,6 +453,7 @@ mod tests {
                 &config,
                 &ListArgs {
                     project: None,
+                    engine: None,
                     status,
                 },
             )
@@ -420,6 +470,7 @@ mod tests {
             &config,
             &ListArgs {
                 project: None,
+                engine: None,
                 status: vec!["running".into(), ",".into()],
             },
         )
@@ -431,6 +482,7 @@ mod tests {
             &config,
             &ListArgs {
                 project: Some("proj-a".into()),
+                engine: None,
                 status: vec!["running".into()],
             },
         )
@@ -442,6 +494,7 @@ mod tests {
             &config,
             &ListArgs {
                 project: None,
+                engine: None,
                 status: vec!["bogus".into()],
             },
         )
@@ -460,6 +513,202 @@ mod tests {
             .find_map(|e| e.downcast_ref::<crate::core::error::AgentRunError>())
             .expect("typed error in the chain");
         assert_eq!(typed.code, "invalid_status");
+        assert_eq!(typed.kind.status_code(), 400);
+    }
+
+    /// Saves a job row for the engine-filter tests (extends the shared
+    /// `save_job` shape with an explicit engine).
+    fn save_engine_job(
+        state_root: &std::path::Path,
+        job_id: &str,
+        exit_code: i32,
+        engine: Option<&str>,
+    ) {
+        let meta = JobMetadata {
+            job_id: job_id.to_string(),
+            project: "proj-a".to_string(),
+            prompt: "p".to_string(),
+            resolved_prompt: "p".to_string(),
+            model: None,
+            effort: None,
+            sandbox: false,
+            mode: "accept-edits".to_string(),
+            add_dirs: vec![],
+            print_timeout: None,
+            created_at: chrono::Utc::now(),
+            worktree_path: std::path::PathBuf::from("/tmp/missing-wt"),
+            branch: String::new(),
+            base_ref: "main".to_string(),
+            conversation_id: None,
+            retry_count: 0,
+            pid: None,
+            pid_start_time: None,
+            exit_code: Some(exit_code),
+            status: None,
+            hindsight: None,
+            auto_recall: None,
+            auto_retain: None,
+            retry_prompt: None,
+            read_only: false,
+            external_worktree: false,
+            hindsight_bank: None,
+            proxy: None,
+            max_runtime: None,
+            started_at: None,
+            hindsight_query: None,
+            sandbox_info: None,
+            engine: engine.map(str::to_string),
+        };
+        meta.save(state_root).unwrap();
+    }
+
+    #[test]
+    fn test_list_engine_column_and_filter() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        ensure_state_store(&state_dir).unwrap();
+        let config = Config {
+            state_root: state_dir.clone(),
+            ..Default::default()
+        };
+
+        // Three rows: a legacy agy (engine NULL), an explicit agy, and a
+        // claude. The agy rows carry an agy SUCCESS line (status Done); the
+        // claude row carries a claude stream-json success `result` line (its
+        // own taxonomy, status Done).
+        let agy_done = r#"{"conversation_id":"c1","status":"SUCCESS","response":"ok"}"#;
+        let claude_done = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"c1"}"#;
+        save_engine_job(&state_dir, "engjob01", 0, None);
+        save_engine_job(&state_dir, "engjob02", 0, Some("agy"));
+        save_engine_job(&state_dir, "engjob03", 0, Some("claude"));
+        let log_dir = JobMetadata::log_dir(&state_dir);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(JobMetadata::log_path(&state_dir, "engjob01"), agy_done).unwrap();
+        std::fs::write(JobMetadata::log_path(&state_dir, "engjob02"), agy_done).unwrap();
+        std::fs::write(JobMetadata::log_path(&state_dir, "engjob03"), claude_done).unwrap();
+
+        // Unfiltered: every row carries its ENGINE cell (agy defaults for the
+        // legacy row), in the expected column position (field 7).
+        let out = run(
+            &config,
+            &ListArgs {
+                project: None,
+                engine: None,
+                status: Vec::new(),
+            },
+        )
+        .unwrap();
+        let text = out.stdout_lines.join("\n");
+        for (id, expected_engine) in [
+            ("engjob01", "agy"),
+            ("engjob02", "agy"),
+            ("engjob03", "claude"),
+        ] {
+            let row = text
+                .lines()
+                .find(|l| l.starts_with(id))
+                .unwrap_or_else(|| panic!("missing row for {id}"));
+            let fields: Vec<&str> = row.split_whitespace().collect();
+            assert_eq!(
+                fields[7], expected_engine,
+                "ENGINE cell (field 7) for {id}: {row}"
+            );
+        }
+
+        // --engine claude keeps only the claude row.
+        let out = run(
+            &config,
+            &ListArgs {
+                project: None,
+                engine: Some("claude".to_string()),
+                status: Vec::new(),
+            },
+        )
+        .unwrap();
+        let jobs = out.data["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["job_id"], "engjob03");
+
+        // --engine agy keeps both the explicit and the legacy (NULL) rows.
+        let out = run(
+            &config,
+            &ListArgs {
+                project: None,
+                engine: Some("agy".to_string()),
+                status: Vec::new(),
+            },
+        )
+        .unwrap();
+        let jobs = out.data["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        for job in jobs {
+            assert_ne!(job["job_id"], "engjob03");
+        }
+
+        // --engine ANDs with --status (claude + done keeps it, claude +
+        // running hides it).
+        let out = run(
+            &config,
+            &ListArgs {
+                project: None,
+                engine: Some("claude".to_string()),
+                status: vec!["done".to_string()],
+            },
+        )
+        .unwrap();
+        assert_eq!(out.data["jobs"].as_array().unwrap().len(), 1);
+        let out = run(
+            &config,
+            &ListArgs {
+                project: None,
+                engine: Some("claude".to_string()),
+                status: vec!["failed".to_string()],
+            },
+        )
+        .unwrap();
+        assert!(out.data["jobs"].as_array().unwrap().is_empty());
+
+        // A blank/absent --engine is no filter.
+        for engine in [None, Some(String::new()), Some("   ".to_string())] {
+            let out = run(
+                &config,
+                &ListArgs {
+                    project: None,
+                    engine,
+                    status: Vec::new(),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                out.data["jobs"].as_array().unwrap().len(),
+                3,
+                "blank/absent engine filter must not hide jobs"
+            );
+        }
+
+        // An unknown engine is a typed error listing the valid engines.
+        let err = run(
+            &config,
+            &ListArgs {
+                project: None,
+                engine: Some("bogus-engine".to_string()),
+                status: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown engine 'bogus-engine'"),
+            "error must name the bad engine: {msg}"
+        );
+        for name in VALID_ENGINES {
+            assert!(msg.contains(name), "error must list {name}: {msg}");
+        }
+        let typed = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<crate::core::error::AgentRunError>())
+            .expect("typed error in the chain");
+        assert_eq!(typed.code, "invalid_engine");
         assert_eq!(typed.kind.status_code(), 400);
     }
 
@@ -489,20 +738,22 @@ mod tests {
             &config,
             &ListArgs {
                 project: None,
+                engine: None,
                 status: Vec::new(),
             },
         )
         .unwrap();
 
-        // Header keeps the old columns in order and gains AGE/ACTIVITY
-        // immediately before PROMPT.
+        // Header keeps the old columns in order and gains AGE/ACTIVITY and
+        // ENGINE immediately before PROMPT (AGE/ACTIVITY keep their
+        // historical offsets so positional parsers stay stable).
         let header = out
             .stdout_lines
             .first()
             .expect("table header is the first line")
             .clone();
-        let order: [&str; 7] = [
-            "JOB ID", "PROJECT", "STATUS", "CREATED", "AGE", "ACTIVITY", "PROMPT",
+        let order: [&str; 8] = [
+            "JOB ID", "PROJECT", "STATUS", "CREATED", "AGE", "ACTIVITY", "ENGINE", "PROMPT",
         ];
         let mut pos = 0usize;
         for name in order {

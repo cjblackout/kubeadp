@@ -347,6 +347,37 @@ pub fn run(config: &Config, args: &RetryArgs) -> Result<CommandOutput> {
         }
     }
 
+    // E4 emulation (HL-71 S2) -- deliver queued mid-run messages (written via
+    // `/api/v1/jobs/{id}/message` or `agent-run message <id>`) on the resume
+    // turn: the `.engine-message-queue` in the job worktree is drained into
+    // THIS attempt's prompt so the continuation carries them, and the file is
+    // removed (the queue contract: drained on the next turn). The engine
+    // feature guards the emulation layer's on-disk queue helpers.
+    //
+    // The drain runs BEFORE the reference-line stamp below, so the queued
+    // text stays the last user-authored content of the prompt (the ref line
+    // is the very last line, as every turn's).
+    #[cfg(feature = "engine")]
+    {
+        if let Some(prompt) = retry_prompt.as_mut() {
+            let engine = meta.engine.as_deref().unwrap_or("agy").to_string();
+            let run = crate::engine::run::Run::from_job(&meta, &engine);
+            match crate::engine::emulate::queue::drain(&run) {
+                Ok(queued) if !queued.is_empty() => {
+                    let delivered = format!("\n\n{}", queued.join("\n"));
+                    *prompt = format!("{prompt}{delivered}");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "agent-run: job '{}': could not drain the message queue: {e}",
+                        meta.job_id
+                    );
+                }
+            }
+        }
+    }
+
     // Stamp this attempt with its own turn number so every turn the engine
     // sends is uniquely attributable (and so a plain retry of an already
     // tokenized stored prompt refreshes the line instead of stacking it).

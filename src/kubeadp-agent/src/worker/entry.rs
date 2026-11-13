@@ -196,6 +196,15 @@ pub async fn run() -> Result<()> {
             registry.register(std::sync::Arc::new(
                 crate::engine::claude::ClaudeEngine::new(state.claude_path.clone(), None),
             ));
+            // The emulation layer drives job-mode control against the real job
+            // rows, so the wrappers get the host config (HL-71 S2: the
+            // emulated interrupt terminates the job's child process group).
+            registry.attach_config(Arc::clone(&state));
+            // Arm the E4 emulation for every control endpoint each inner
+            // engine lacks: claude interrupt/pause/fork/compact/revert and agy
+            // fork/compact/revert become emulated (never unsupported), so no
+            // /api/v1/jobs control route answers 501 because of the engine.
+            registry.enable_all_emulated();
             let engines = std::sync::Arc::new(registry);
             server::obs::add_observability(
                 server::router_with_engines(state.clone(), auth, rc_state.clone(), engines),

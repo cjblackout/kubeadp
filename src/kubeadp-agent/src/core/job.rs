@@ -888,14 +888,12 @@ pub fn get_process_start_time(pid: u32) -> Option<u64> {
 /// Conservative process-identity check for rows that have NO recorded
 /// `pid_start_time` (rows written before that column existed): the PID is
 /// only accepted as the job's own if its `/proc/<pid>/cmdline` still looks
-/// like a job process (the `agy` binary, the engine itself, or a test
+/// like a job process (the `agy`/`claude` engine, the always-on
+/// `sandbox-exec` wrapper they run under, the engine itself, or a test
 /// runner process such as `sleep`).
 ///
-/// This is the config-free mirror of
-/// `commands::kill::is_pid_plausible_job_process` (which additionally consults
-/// `Config` for the configured agy filename and falls back to
-/// `/proc/<pid>/exe`). Rows without a start time must not pass the identity
-/// check unconditionally: a reused PID would make a dead job look `Running`
+/// Rows without a start time must not pass the identity check
+/// unconditionally: a reused PID would make a dead job look `Running`
 /// (inflating the max-parallel count) or let a kill target an unrelated
 /// process.
 pub(crate) fn is_job_process_cmdline(pid: u32) -> bool {
@@ -905,6 +903,8 @@ pub(crate) fn is_job_process_cmdline(pid: u32) -> bool {
     };
     let s = String::from_utf8_lossy(&bytes);
     s.contains("agy")
+        || s.contains("claude")
+        || s.contains("sandbox-exec")
         || s.contains("agent-run")
         || s.contains("agent_core")
         || s.contains("kubeadp_agent")
@@ -1390,8 +1390,19 @@ pub(crate) fn claude_structured_text(line: &str) -> Option<(StructuredStatus, St
         "result" => {
             let is_err = value.get("subtype").and_then(|s| s.as_str()) == Some("error")
                 || value.get("is_error") == Some(&serde_json::Value::Bool(true));
+            // Defect 2 (HL-71 S1): an error `result` line carries its reason in
+            // the `result` field (the live claude 2.1.322 error shape):
+            //   {"type":"result","subtype":"error","is_error":true,
+            //    "result":"Failed to authenticate: OAuth session expired ..."}
+            // with no `error` field at all. Surface that text in preference to
+            // the empty `error` field so `agent-run result` reports the reason.
             let text = if is_err {
-                value.get("error").and_then(|e| e.as_str()).unwrap_or("")
+                value
+                    .get("result")
+                    .and_then(|r| r.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| value.get("error").and_then(|e| e.as_str()))
+                    .unwrap_or("")
             } else {
                 value.get("result").and_then(|r| r.as_str()).unwrap_or("")
             }
@@ -1416,6 +1427,99 @@ pub(crate) fn claude_structured_text(line: &str) -> Option<(StructuredStatus, St
         }
         _ => None,
     }
+}
+
+/// True when `log` carries a claude stream-json shape: a `[claude-code:...]`
+/// marker line or any `assistant`/`result`/`system` JSON event line. The
+/// reason-fallback scan (_HL-71 S1_) only applies to such logs, so an agy
+/// job's unstructured tail (agent chatter) can never be mistaken for an
+/// error reason.
+fn looks_like_claude_stream(log: &str) -> bool {
+    log.lines().any(|line| {
+        if line.trim_start().starts_with("[claude-code:") {
+            return true;
+        }
+        json_object_line(line).is_some_and(|value| {
+            matches!(
+                value.get("type").and_then(|t| t.as_str()),
+                Some("assistant" | "result" | "system")
+            )
+        })
+    })
+}
+
+/// Returns the concatenated text content of the LAST synthetic `assistant`
+/// message in `log` -- the claude message with `model:"<synthetic>"` that a
+/// failing run emits to carry its reason text without a real model
+/// attribution (e.g. "Failed to authenticate: OAuth session expired ...").
+/// `None` when no such message carries any text.
+fn last_synthetic_assistant_text(log: &str) -> Option<String> {
+    for line in log.lines().rev() {
+        let Some(value) = json_object_line(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        let message = value.get("message");
+        if message
+            .and_then(|m| m.get("model"))
+            .and_then(|m| m.as_str())
+            != Some("<synthetic>")
+        {
+            continue;
+        }
+        let content = message
+            .and_then(|m| m.get("content"))
+            .or_else(|| value.get("content"));
+        let Some(blocks) = content.and_then(|c| c.as_array()) else {
+            continue;
+        };
+        let text: String = blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect();
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// Returns the last line of `log` that is neither blank nor a JSON-object
+/// event line -- the plain-text stderr tail of a failed run (e.g. a
+/// `[claude-code:...]` marker or a raw error line).
+fn last_non_json_line(log: &str) -> Option<String> {
+    log.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && json_object_line(l).is_none())
+        .map(ToOwned::to_owned)
+}
+
+/// Defect 2 fallback chain (_HL-71 S1_): when a claude job failed but its log
+/// carries NO terminal error `result` line (the `result` command's
+/// `final_error_text` scan finds nothing), surface a reason instead of an
+/// empty `error`:
+///
+/// 1. the text of the last synthetic `assistant` message
+///    (`model:"<synthetic>"` -- claude's reason-carrying message), else
+/// 2. the last non-JSON log line (the `[claude-code:...]` marker / stderr
+///    tail).
+///
+/// Only applies to claude-shaped logs; returns `None` otherwise so agy and
+/// quota-classified jobs are untouched.
+pub(crate) fn claude_fallback_error_text(log: &str) -> Option<String> {
+    let last_attempt = last_attempt_log(log);
+    if !looks_like_claude_stream(last_attempt) {
+        return None;
+    }
+    if let Some(text) = last_synthetic_assistant_text(last_attempt) {
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    last_non_json_line(last_attempt)
 }
 
 /// Status classification for a claude stream-json job log (HL-91 E5).
@@ -3874,6 +3978,370 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
         assert_eq!(
             reloaded.started_at.and_then(|t| t.timestamp_nanos_opt()),
             unbounded.started_at.and_then(|t| t.timestamp_nanos_opt())
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // claude engine classification (HL-71 slice S1): `compute_status` on a
+    // claude row goes through `determine_status_from_claude`, whose rules are
+    // unit-tested here on stream-json log shapes (the black-box suite T172+
+    // drives the same paths end to end through the HTTP/CLI surface).
+    // ---------------------------------------------------------------------
+
+    /// The canonical claude stream-json terminal shapes the fake harness
+    /// emits (see `tests/cli/fake-claude.sh`): a non-error `result` line
+    /// carries `subtype` + `result`; an error `result` carries
+    /// `subtype:"error"` + `error`; a quota failure surfaces the upstream text
+    /// on the error line.
+    const CLAUDE_RESULT_OK: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"CLAUDE-DONE","session_id":"cl1"}"#;
+    const CLAUDE_RESULT_ERR: &str =
+        r#"{"type":"result","subtype":"error","is_error":true,"error":"boom","session_id":"cl1"}"#;
+    const CLAUDE_SYSTEM_ERR: &str =
+        r#"{"type":"system","subtype":"error","message":"boom","session_id":"cl1"}"#;
+    const CLAUDE_QUOTA: &str = r#"{"type":"result","subtype":"error","is_error":true,"error":"upstream 429 resource_exhausted: rate limit exceeded","session_id":"cl1"}"#;
+
+    #[test]
+    fn test_determine_status_from_claude_done() {
+        // A non-error terminal `result` is Done regardless of the exit code.
+        assert_eq!(
+            determine_status_from_claude(Some(0), CLAUDE_RESULT_OK),
+            JobStatus::Done
+        );
+        assert_eq!(
+            determine_status_from_claude(Some(1), CLAUDE_RESULT_OK),
+            JobStatus::Done,
+            "a success result line outranks a stray non-zero exit"
+        );
+    }
+
+    #[test]
+    fn test_determine_status_from_claude_failed() {
+        // An error `result` line is Failed for any exit code, and so is a
+        // `system`/error line.
+        assert_eq!(
+            determine_status_from_claude(Some(1), CLAUDE_RESULT_ERR),
+            JobStatus::Failed
+        );
+        assert_eq!(
+            determine_status_from_claude(Some(0), CLAUDE_RESULT_ERR),
+            JobStatus::Failed,
+            "an error result line is Failed regardless of exit code"
+        );
+        assert_eq!(
+            determine_status_from_claude(None, CLAUDE_SYSTEM_ERR),
+            JobStatus::Failed
+        );
+    }
+
+    #[test]
+    fn test_determine_status_from_claude_quota() {
+        // A quota/rate-limit signal on the terminal error line wins over the
+        // plain Failed classification.
+        assert_eq!(
+            determine_status_from_claude(Some(1), CLAUDE_QUOTA),
+            JobStatus::QuotaExhausted
+        );
+    }
+
+    #[test]
+    fn test_determine_status_from_claude_killed() {
+        // A kill (137/143) with no error line is SelfTerminated, mirroring
+        // the agy taxonomy: `kill` marks the row Killed via mark_job_killed,
+        // but the signal-based fall-through must agree.
+        assert_eq!(
+            determine_status_from_claude(Some(137), ""),
+            JobStatus::SelfTerminated
+        );
+        assert_eq!(
+            determine_status_from_claude(Some(143), ""),
+            JobStatus::SelfTerminated
+        );
+        // A kill whose log DOES show an error line is Failed, not
+        // SelfTerminated.
+        assert_eq!(
+            determine_status_from_claude(Some(137), CLAUDE_RESULT_ERR),
+            JobStatus::Failed
+        );
+    }
+
+    #[test]
+    fn test_determine_status_from_claude_incomplete_vs_self_terminated() {
+        // Exit 0 with no terminal success line is Incomplete.
+        assert_eq!(
+            determine_status_from_claude(Some(0), "no result line here"),
+            JobStatus::Incomplete
+        );
+        // No exit code and no error line is SelfTerminated (cut short).
+        assert_eq!(
+            determine_status_from_claude(None, ""),
+            JobStatus::SelfTerminated
+        );
+        // Non-zero exit (non-kill signal) with no error line is Failed.
+        assert_eq!(determine_status_from_claude(Some(3), ""), JobStatus::Failed);
+    }
+
+    #[test]
+    fn test_determine_status_from_claude_rejects_stale_attempt() {
+        // A terminal `result` from a superseded attempt must not classify the
+        // current one (last_attempt scoping, as in the agy scan).
+        let stale_then_fail = format!(
+            "{}\n==================== RETRY AT 2024-01-01T00:00:00Z ====================\n{}",
+            CLAUDE_RESULT_OK, CLAUDE_RESULT_ERR
+        );
+        assert_eq!(
+            determine_status_from_claude(Some(1), &stale_then_fail),
+            JobStatus::Failed,
+            "a stale success from a previous attempt must not win over the latest error"
+        );
+        let stale_err_then_ok = format!(
+            "{}\n==================== RETRY AT 2024-01-01T00:00:00Z ====================\n{}",
+            CLAUDE_RESULT_ERR, CLAUDE_RESULT_OK
+        );
+        assert_eq!(
+            determine_status_from_claude(Some(0), &stale_err_then_ok),
+            JobStatus::Done,
+            "a stale error from a previous attempt must not override the latest success"
+        );
+    }
+
+    #[test]
+    fn test_claude_structured_text_success() {
+        // The `result` command surfaces the text payload: a success `result`
+        // line yields its `result` text as Success.
+        let (status, text) = claude_structured_text(CLAUDE_RESULT_OK).unwrap();
+        assert_eq!(status, StructuredStatus::Success);
+        assert_eq!(text, "CLAUDE-DONE");
+        assert!(
+            claude_structured_text(
+                r#"{"type":"assistant","content":[{"type":"text","text":"mid"}]}"#
+            )
+            .is_none(),
+            "assistant lines are not terminal result lines"
+        );
+    }
+
+    #[test]
+    fn test_claude_structured_text_error() {
+        // An error `result` line yields its `error` text as Error; a
+        // `system`/error line yields its `message`.
+        let (status, text) = claude_structured_text(CLAUDE_RESULT_ERR).unwrap();
+        assert_eq!(status, StructuredStatus::Error);
+        assert_eq!(text, "boom");
+        let (status, text) = claude_structured_text(CLAUDE_SYSTEM_ERR).unwrap();
+        assert_eq!(status, StructuredStatus::Error);
+        assert_eq!(text, "boom");
+    }
+
+    #[test]
+    fn test_claude_structured_text_error_carries_result_field() {
+        // Defect 2 (HL-71 S1): the real claude error shape carries the reason
+        // in the `result` field with NO `error` field at all (an
+        // authentication/session failure, e.g. "Failed to authenticate: OAuth
+        // session expired ..."). The text surfacing must prefer `result` so
+        // `agent-run result` reports the reason instead of the empty string.
+        let authfail = r#"{"type":"result","subtype":"error","is_error":true,"result":"Failed to authenticate: OAuth session expired and could not be refreshed","session_id":"cl1"}"#;
+        let (status, text) = claude_structured_text(authfail).unwrap();
+        assert_eq!(status, StructuredStatus::Error);
+        assert_eq!(
+            text,
+            "Failed to authenticate: OAuth session expired and could not be refreshed"
+        );
+        assert_eq!(
+            determine_status_from_claude(Some(1), authfail),
+            JobStatus::Failed,
+            "the auth/expired-session error shape must classify the job failed"
+        );
+
+        // An error `result` that carries BOTH fields keeps the `result` text
+        // (it is the run's terminal message) over `error`.
+        let both = r#"{"type":"result","subtype":"error","is_error":true,"result":"model no-such-model-xyz is not recognized","error":"x","session_id":"cl1"}"#;
+        let (status, text) = claude_structured_text(both).unwrap();
+        assert_eq!(status, StructuredStatus::Error);
+        assert_eq!(text, "model no-such-model-xyz is not recognized");
+
+        // A blank `result` on an error line falls back to `error` (unchanged
+        // behaviour).
+        let blank = r#"{"type":"result","subtype":"error","is_error":true,"result":"","error":"boom","session_id":"cl1"}"#;
+        let (_, text) = claude_structured_text(blank).unwrap();
+        assert_eq!(text, "boom");
+    }
+
+    #[test]
+    fn test_extract_final_response_error_shapes() {
+        // The full failed-claude log from the live bug: a synthetic assistant
+        // message (model "<synthetic>") carrying the reason text, a
+        // `[claude-code:...]` log line, and a final error `result` whose
+        // `result` field holds the same text. `extract_final_response` must
+        // surface that text (so `agent-run result --json` reports it), and the
+        // job must classify `failed`.
+        let authfail_log = r#"[claude-code:unrecognized_model] Failed to authenticate: OAuth session expired and could not be refreshed
+{"type":"assistant","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"Failed to authenticate: OAuth session expired and could not be refreshed"}]},"session_id":"cl1"}
+{"type":"result","subtype":"error","is_error":true,"result":"Failed to authenticate: OAuth session expired and could not be refreshed","session_id":"cl1"}
+"#;
+        assert_eq!(
+            extract_final_response(authfail_log).as_deref(),
+            Some("Failed to authenticate: OAuth session expired and could not be refreshed"),
+            "the auth-failure reason must be surfaced from the error result"
+        );
+        assert_eq!(
+            determine_status_from_claude(Some(1), authfail_log),
+            JobStatus::Failed,
+            "the auth-failure log must classify the job failed"
+        );
+
+        // The unrecognized-model variant (same shape, different message).
+        let model_log = r#"[claude-code:unrecognized_model] Error: model not recognized
+{"type":"assistant","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"Error: model not recognized"}]},"session_id":"cl1"}
+{"type":"result","subtype":"error","is_error":true,"result":"Error: model not recognized","session_id":"cl1"}
+"#;
+        assert_eq!(
+            extract_final_response(model_log).as_deref(),
+            Some("Error: model not recognized")
+        );
+        assert_eq!(
+            determine_status_from_claude(Some(1), model_log),
+            JobStatus::Failed
+        );
+    }
+
+    #[test]
+    fn test_claude_fallback_error_text_chain() {
+        // Defect 2 fallback chain (_HL-71 S1_). When a claude job fails but
+        // the log has NO terminal error `result` line, the error reason must
+        // still surface: link 1 = the last synthetic `assistant` message text,
+        // link 2 = the last non-JSON log line. A non-claude log must NOT match
+        // (an agy tail of plain chatter is not an error reason).
+
+        // Link 1: only the synthetic assistant message carries the reason; no
+        // agent_error `result` line at all.
+        let synthetic_only = r#"[claude-code:unrecognized_model] Failed to authenticate: OAuth session expired
+{"type":"assistant","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"Failed to authenticate: OAuth session expired and could not be refreshed"}]},"session_id":"cl1"}
+"#;
+        assert_eq!(
+            claude_fallback_error_text(synthetic_only).as_deref(),
+            Some("Failed to authenticate: OAuth session expired and could not be refreshed"),
+            "synthetic assistant text must be the reason fallback"
+        );
+
+        // Link 1 must pick the LAST synthetic message when several exist.
+        let multi = r#"{"type":"assistant","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"first reason"}]},"session_id":"cl1"}
+{"type":"assistant","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"final reason"}]},"session_id":"cl1"}
+"#;
+        assert_eq!(
+            claude_fallback_error_text(multi).as_deref(),
+            Some("final reason"),
+            "the last synthetic assistant text wins"
+        );
+
+        // Link 2: claude-shaped log (a `[claude-code:...]` marker), no
+        // synthetic message -> the last non-JSON line is the reason. The
+        // JSON event itself is excluded.
+        let marker_only = "[claude-code:unrecognized_model] Error: model not recognized\n{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"x\",\"session_id\":\"cl1\"}\n";
+        assert_eq!(
+            claude_fallback_error_text(marker_only).as_deref(),
+            Some("[claude-code:unrecognized_model] Error: model not recognized"),
+            "the last non-JSON line is the marker text"
+        );
+
+        // A claude log whose last non-JSON line is chatter still surfaces that
+        // line (no better signal; the job did fail).
+        let chatter = "some plain agent chatter\n{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"cl1\"}\n";
+        assert_eq!(
+            claude_fallback_error_text(chatter).as_deref(),
+            Some("some plain agent chatter")
+        );
+
+        // Non-claude logs must never match: no marker and no claude JSON event
+        // (an agy run, or pure chatter) -> None.
+        let agy_tail = "agent chatter only\nno structured terminal line\n";
+        assert_eq!(
+            claude_fallback_error_text(agy_tail),
+            None,
+            "an agy-chatter tail must never be surfaced as a claude reason"
+        );
+        let agy_structured = r#"{"conversation_id":"c1","status":"SUCCESS","response":"done"}
+"#;
+        assert_eq!(
+            claude_fallback_error_text(agy_structured),
+            None,
+            "an agy structured log must not match the claude fallback"
+        );
+
+        // The fallback respects the last-attempt boundary (a synthetic failed
+        // message in a superseded attempt must not be surfaced).
+        let retried = format!(
+            "{}\n==================== RETRY AT 2026-01-01T00:00:00Z ====================\n",
+            r#"{"type":"assistant","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"first attempt failed"}]},"session_id":"cl1"}"#
+        );
+        assert_eq!(
+            claude_fallback_error_text(&retried),
+            None,
+            "a synthetic reason from a superseded attempt is not surfaced"
+        );
+        let retried2 = "first attempt chatter\n==================== RETRY AT 2026-01-01T00:00:00Z ====================\n[claude-code:unrecognized_model] Error: second attempt model\n".to_owned();
+        assert_eq!(
+            claude_fallback_error_text(&retried2).as_deref(),
+            Some("[claude-code:unrecognized_model] Error: second attempt model"),
+            "the last non-JSON line of the LAST attempt is the reason"
+        );
+    }
+
+    #[test]
+    fn test_compute_status_dispatches_on_engine_field() {
+        // The recorded `engine` selects the status taxonomy whose stream the
+        // job log carries (agy's classifier also recognises claude's
+        // stream-json `result` lines via the shared `scan_final_structured`,
+        // so the divergence is the OTHER direction): a claude row is
+        // classified ONLY by claude terminal shapes, so an agy-shaped log on
+        // a claude row is Incomplete, while the same log on an agy row is
+        // Done. This proves `compute_status` dispatches on `meta.engine`.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let agy_done = r#"{"conversation_id":"c1","status":"SUCCESS","response":"ok"}"#;
+
+        let mut claude_meta = make_test_metadata("cledsp01", "proj", 0);
+        claude_meta.engine = Some("claude".to_string());
+        claude_meta.pid = None;
+        claude_meta.exit_code = Some(0);
+        claude_meta.status = None;
+        claude_meta.save(temp_dir.path()).unwrap();
+        std::fs::create_dir_all(JobMetadata::log_dir(temp_dir.path())).unwrap();
+        let log_path = JobMetadata::log_path(temp_dir.path(), "cledsp01");
+        std::fs::write(&log_path, agy_done).unwrap();
+        assert_eq!(
+            compute_status(&claude_meta, temp_dir.path()),
+            JobStatus::Incomplete,
+            "a claude row must not take the agy taxonomy (agy-shaped log -> Incomplete)"
+        );
+
+        // The same agy-shaped log on an agy row is Done (agy path unchanged).
+        let mut agy_meta = make_test_metadata("agedsp01", "proj", 0);
+        agy_meta.pid = None;
+        agy_meta.exit_code = Some(0);
+        agy_meta.status = None;
+        agy_meta.save(temp_dir.path()).unwrap();
+        let log_path = JobMetadata::log_path(temp_dir.path(), "agedsp01");
+        std::fs::write(&log_path, agy_done).unwrap();
+        assert_eq!(
+            compute_status(&agy_meta, temp_dir.path()),
+            JobStatus::Done,
+            "an agy/default row keeps the agy taxonomy (agy-shaped log -> Done)"
+        );
+
+        // And the claude taxonomy's own happy path (a claude stream-json
+        // success on a claude row) is Done.
+        let mut claude_meta2 = make_test_metadata("cledsp02", "proj", 0);
+        claude_meta2.engine = Some("claude".to_string());
+        claude_meta2.pid = None;
+        claude_meta2.exit_code = Some(0);
+        claude_meta2.status = None;
+        claude_meta2.save(temp_dir.path()).unwrap();
+        let log_path = JobMetadata::log_path(temp_dir.path(), "cledsp02");
+        std::fs::write(&log_path, CLAUDE_RESULT_OK).unwrap();
+        assert_eq!(
+            compute_status(&claude_meta2, temp_dir.path()),
+            JobStatus::Done,
+            "a claude row with a claude stream-json success is Done"
         );
     }
 }
