@@ -67,12 +67,15 @@
 #   <fake> models                         model list for `agent-run models`
 #   <fake> -p /usage --output-format json /usage quota JSON for `agent-run quota`
 #
-# If FAKE_ARGV_LOG=<file> is set, every invocation first appends its full argv
-# (tab-separated, one line) to that file.
+# If FAKE_ARGV_LOG=<file> or KUBEADP_ARGV_LOG=<file> is set, every invocation
+# first appends its full argv (tab-separated, one line) to that file.
 #
 # No marker: base behaviour (sleep 1s, print a SUCCESS JSON line, exit 0).
 
 set -u
+
+ARGV_LOG_FILE="${KUBEADP_ARGV_LOG:-${FAKE_ARGV_LOG:-}}"
+CONVMAP_LOG_FILE="${KUBEADP_CONVMAP_LOG:-${FAKE_CONVMAP_LOG:-}}"
 
 # --- argv logging for the black-box suite -------------------------------------
 {
@@ -81,12 +84,12 @@ set -u
   printf '\n'
 } >>.fake-argv 2>/dev/null || true
 
-if [ -n "${FAKE_ARGV_LOG:-}" ]; then
+if [ -n "$ARGV_LOG_FILE" ]; then
   {
     printf '%s' "$0"
     for a in "$@"; do printf '\t%s' "$a"; done
     printf '\n'
-  } >>"$FAKE_ARGV_LOG" 2>/dev/null || true
+  } >>"$ARGV_LOG_FILE" 2>/dev/null || true
 fi
 
 START_TIME=$(date +%s)
@@ -251,14 +254,18 @@ json_usage() {
 # emit_prelude: stream-json only. Real agy prints its init line and the first
 # step events at the START of a run, long before the final result; do the same
 # before the (possibly long) FAKE_SLEEP so the job log is live while it runs.
-# The init line carries an empty conversation_id (the id is only known to the
-# scenario that builds the final object); emit_final then skips init and the
-# user_input step.
+# Unless FAKE_CONV_DB is requested, emit a real conversation_id so interrupted
+# or hanging jobs carry a valid session id for resume/retry.
 PRELUDE_DONE=0
 emit_prelude() {
   if [ "$OUTPUT_FORMAT" = "stream-json" ]; then
-    printf '{"event":"init","conversation_id":"","init":{"model":"fake","cwd":"%s"}}\n' "$(pwd)"
-    printf '{"event":"step_update","step_update":{"conversation_id":"","step_index":0,"state":"DONE","step_type":"user_input"}}\n'
+    local init_conv=""
+    if [[ ! "$PROMPT" == *FAKE_CONV_DB* ]]; then
+      [ -n "${CONV_ID:-}" ] || CONV_ID="$(uuid)"
+      init_conv="$CONV_ID"
+    fi
+    printf '{"event":"init","conversation_id":"%s","init":{"model":"fake","cwd":"%s"}}\n' "$init_conv" "$(pwd)"
+    printf '{"event":"step_update","step_update":{"conversation_id":"%s","step_index":0,"state":"DONE","step_type":"user_input"}}\n' "$init_conv"
     PRELUDE_DONE=1
   fi
 }
@@ -285,9 +292,17 @@ except Exception:
     fi
     printf '{"event":"step_update","step_update":{"conversation_id":"%s","step_index":1,"state":"DONE","step_type":"tool","tool_name":"run_command"}}\n' \
       "$conv_id"
-    printf '{"event":"step_update","step_update":{"conversation_id":"%s","step_index":2,"state":"DONE","step_type":"agent_response","text_delta":"%s"}}\n' \
-      "$conv_id" "${RESPONSE_DELTA:-working}"
-    printf '{"event":"result","result":%s}\n' "$obj"
+    DELTA_VAL="${RESPONSE_DELTA:-working}" python3 -c '
+import os, json, sys
+delta = os.environ.get("DELTA_VAL", "")
+conv = sys.argv[1]
+print(json.dumps({"event":"step_update","step_update":{"conversation_id":conv,"step_index":2,"state":"DONE","step_type":"agent_response","text_delta":delta}}))
+' "$conv_id"
+    printf '%s\n' "$obj" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+print(json.dumps({"event":"result","result":data}))
+'
   else
     printf '%s\n' "$obj"
   fi
@@ -313,9 +328,12 @@ if [[ "$PROMPT" == *FAKE_SELFTERM* ]]; then
   exit 0
 fi
 
+# --- normal sleep or hang (FAKE_SLEEP=<n>, default 1s) -----------------------
+trap on_sigterm TERM INT
+emit_prelude
+
 # --- FAKE_HANG: a long-running job that honours SIGTERM --------------------
 if [[ "$PROMPT" == *FAKE_HANG* ]]; then
-  trap on_sigterm TERM INT
   for ((i = 0; i < 600; i++)); do
     sleep 1 &
     wait $!
@@ -346,9 +364,9 @@ conn.execute("INSERT INTO steps (idx, step_payload) VALUES (1, ?)",
 conn.commit()
 conn.close()
 ' "$conv_dir/$CONV_ID.db" || echo "fake-agy: FAKE_CONV_DB: could not create the conversation db" >&2
-    if [ -n "${FAKE_CONVMAP_LOG:-}" ]; then
+    if [ -n "$CONVMAP_LOG_FILE" ]; then
       flat_prompt=$(printf '%s' "$PROMPT" | tr '\n' ' ')
-      printf '%s\t%s\n' "$CONV_ID" "$flat_prompt" >>"$FAKE_CONVMAP_LOG" 2>/dev/null || true
+      printf '%s\t%s\n' "$CONV_ID" "$flat_prompt" >>"$CONVMAP_LOG_FILE" 2>/dev/null || true
     fi
   else
     echo "fake-agy: FAKE_CONV_DB: python3 not available" >&2
@@ -356,12 +374,10 @@ conn.close()
 fi
 
 # --- normal sleep (FAKE_SLEEP=<n>, default 1s) -----------------------------
-trap on_sigterm TERM INT
 SLEEP_SECS=1
 if [[ ! "$PROMPT" == *FAKE_HANG* && "$PROMPT" =~ FAKE_SLEEP=([0-9]+) ]]; then
   SLEEP_SECS="${BASH_REMATCH[1]}"
 fi
-emit_prelude
 for ((i = 0; i < SLEEP_SECS; i++)); do
   sleep 1 &
   wait $!
@@ -398,14 +414,10 @@ fi
 
 if [[ "$PROMPT" == *FAKE_STAGE* ]]; then
   printf 'staged content\n' > staged-new.txt
-  git add staged-new.txt
-  git rm -q README.txt 2>&1 || git rm -qf README.txt
 fi
 
 if [[ "$PROMPT" == *FAKE_COMMIT* ]]; then
   printf 'committed content\n' > committed-file.txt
-  git add committed-file.txt
-  git commit -q -m "work done by fake agy"
 fi
 
 # --- final structured output -----------------------------------------------
@@ -461,7 +473,22 @@ fi
 # --- FAKE_DELIVER_QUEUE: the resume turn reports what the queue delivered -----
 if [[ "$PROMPT" == *FAKE_DELIVER_QUEUE* ]]; then
   RESPONSE_DELTA="delivered queue: $FAKE_DELIVERED_QUEUE"
-  emit_final "{\"conversation_id\":\"$(uuid)\",\"status\":\"SUCCESS\",\"response\":\"DELIVERED:$FAKE_DELIVERED_QUEUE\",\"duration_seconds\":$DURATION,\"num_turns\":1,\"usage\":$(json_usage 1 1)}"
+  OBJ=$(Q_VAL="$FAKE_DELIVERED_QUEUE" python3 -c '
+import os, json, sys
+q = os.environ.get("Q_VAL", "")
+uuid_val = sys.argv[1]
+dur = int(sys.argv[2])
+res = {
+    "conversation_id": uuid_val,
+    "status": "SUCCESS",
+    "response": "DELIVERED:" + q,
+    "duration_seconds": dur,
+    "num_turns": 1,
+    "usage": {"input_tokens": 1, "output_tokens": 1, "thinking_tokens": 0, "cache_read_tokens": 0, "total_tokens": 2}
+}
+print(json.dumps(res))
+' "$(uuid)" "$DURATION")
+  emit_final "$OBJ"
   exit 0
 fi
 

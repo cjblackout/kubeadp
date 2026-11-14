@@ -51,15 +51,18 @@
 #   FAKE_NOJSON      plain text only, exit 0, no structured result -> status incomplete
 #   FAKE_BADUTF8     print a line containing a raw 0xff byte before the success result
 #
-# If FAKE_ARGV_LOG=<file> is set, every invocation first appends its full argv
-# (tab-separated, one line) to that file, and FAKE_PROMPT_LOG=<file> appends the
-# raw received stdin line (the stream-json user envelope, tab-prefixed) so a
-# test can assert the exact prompt the runner delivered over stdin.
+# If FAKE_ARGV_LOG=<file> or KUBEADP_ARGV_LOG=<file> is set, every invocation
+# first appends its full argv (tab-separated, one line) to that file, and
+# FAKE_PROMPT_LOG=<file> appends the raw received stdin line (the stream-json
+# user envelope, tab-prefixed) so a test can assert the exact prompt the runner
+# delivered over stdin.
 #
 # No marker: base behaviour (read the prompt, sleep 1s, print an assistant +
 # success result line, exit 0).
 
 set -u
+
+ARGV_LOG_FILE="${KUBEADP_ARGV_LOG:-${FAKE_ARGV_LOG:-}}"
 
 # --- argv logging for the black-box suite -------------------------------------
 {
@@ -68,12 +71,12 @@ set -u
   printf '\n'
 } >>.fake-argv 2>/dev/null || true
 
-if [ -n "${FAKE_ARGV_LOG:-}" ]; then
+if [ -n "$ARGV_LOG_FILE" ]; then
   {
     printf '%s' "$0"
     for a in "$@"; do printf '\t%s' "$a"; done
     printf '\n'
-  } >>"$FAKE_ARGV_LOG" 2>/dev/null || true
+  } >>"$ARGV_LOG_FILE" 2>/dev/null || true
 fi
 
 RESUME_ID=""
@@ -246,14 +249,10 @@ if [ -n "$PROMPT" ]; then
 
   if [[ "$PROMPT" == *FAKE_STAGE* ]]; then
     printf 'staged content\n' > staged-new.txt
-    git add staged-new.txt
-    git rm -q README.txt 2>&1 || git rm -qf README.txt
   fi
 
   if [[ "$PROMPT" == *FAKE_COMMIT* ]]; then
     printf 'committed content\n' > committed-file.txt
-    git add committed-file.txt
-    git commit -q -m "work done by fake claude"
   fi
 fi
 

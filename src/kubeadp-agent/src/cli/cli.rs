@@ -440,4 +440,44 @@ mod tests {
         let args = parsed_start(&["--engine", "agy"]);
         assert_eq!(args.engine.as_deref(), Some("agy"));
     }
+
+    fn parsed_pause(extra: &[&str]) -> super::PauseArgs {
+        let mut argv = vec![
+            "agent-run".to_string(),
+            "pause".to_string(),
+            "abc123".to_string(),
+        ];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        let cli = Cli::try_parse_from(&argv).expect("parse should succeed");
+        match cli.command {
+            Commands::Pause(args) => args,
+            other => panic!("expected the pause subcommand, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pause_flag_variants() {
+        // 1. Default without flag: pauses (true)
+        let args = parsed_pause(&[]);
+        assert!(args.paused);
+        assert_eq!(args.job_id, "abc123");
+
+        // 2. Bare `--paused`: pauses (true)
+        let args = parsed_pause(&["--paused"]);
+        assert!(args.paused);
+
+        // 3. `--paused false`: resumes (false)
+        let args = parsed_pause(&["--paused", "false"]);
+        assert!(!args.paused);
+
+        // 4. `--paused=false`: resumes (false)
+        let args = parsed_pause(&["--paused=false"]);
+        assert!(!args.paused);
+
+        // 5. `--paused true` and `--paused=true`: pauses (true)
+        let args = parsed_pause(&["--paused", "true"]);
+        assert!(args.paused);
+        let args = parsed_pause(&["--paused=true"]);
+        assert!(args.paused);
+    }
 }

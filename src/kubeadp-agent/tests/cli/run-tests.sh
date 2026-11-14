@@ -122,6 +122,11 @@ chmod +x "$FAKE_CLAUDE"
 GIT_EXCLUDE_FILE="$TMPROOT/git-excludes"
 printf '.fake-argv\n' > "$GIT_EXCLUDE_FILE"
 
+export GIT_AUTHOR_NAME="Blackbox Test"
+export GIT_AUTHOR_EMAIL="blackbox@example.com"
+export GIT_COMMITTER_NAME="Blackbox Test"
+export GIT_COMMITTER_EMAIL="blackbox@example.com"
+
 mkdir -p "$WORKSPACE/proj" "$FAKE_HOME"
 git -C "$WORKSPACE/proj" init -b main >/dev/null 2>&1 || {
   git -C "$WORKSPACE/proj" init >/dev/null 2>&1 || die "git init failed"
@@ -141,15 +146,20 @@ start_server() {
   (
     cd "$TMPROOT" || exit 1
     cd "$WORKSPACE" || exit 1
+    local cfg_idx=${GIT_CONFIG_COUNT:-0}
+    eval "export GIT_CONFIG_KEY_$cfg_idx=core.excludesFile"
+    eval "export GIT_CONFIG_VALUE_$cfg_idx=\"\$GIT_EXCLUDE_FILE\""
+    export GIT_CONFIG_COUNT=$((cfg_idx + 1))
     exec env -u AGENT_RUN_REMOTE -u GH_TOKEN -u GITHUB_TOKEN \
       HOME="$FAKE_HOME" \
       KUBEADP_API_ALLOW_UNAUTHENTICATED=true \
       KUBEADP_API_ALLOW_OPEN=true \
       KUBEADP_AGY_HOME="$FAKE_HOME" \
       KUBEADP_SANDBOX_HOME="$FAKE_HOME" \
-      GIT_CONFIG_COUNT=1 \
-      GIT_CONFIG_KEY_0=core.excludesFile \
-      GIT_CONFIG_VALUE_0="$GIT_EXCLUDE_FILE" \
+      GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" \
+      GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL" \
+      GIT_COMMITTER_NAME="$GIT_COMMITTER_NAME" \
+      GIT_COMMITTER_EMAIL="$GIT_COMMITTER_EMAIL" \
       AGENT_RUN_API_LISTEN="127.0.0.1:$PORT" \
       AGENT_RUN_WORKSPACE_ROOT="$WORKSPACE" \
       AGENT_RUN_STATE_ROOT="$STATE_ROOT" \
@@ -158,9 +168,11 @@ start_server() {
       AGENT_RUN_JOBS_DIR_NAME=".agent-jobs" \
       AGENT_RUN_MAX_PARALLEL=3 \
       AGENT_RUN_HINDSIGHT_ENABLED=false \
-       FAKE_ARGV_LOG="$TMPROOT/argv.log" \
-       FAKE_CONVMAP_LOG="$TMPROOT/convmap.log" \
-        "$AGENT_RUN_API" >"$logname" 2>&1
+      FAKE_ARGV_LOG="$TMPROOT/argv.log" \
+      FAKE_CONVMAP_LOG="$TMPROOT/convmap.log" \
+      KUBEADP_ARGV_LOG="$TMPROOT/argv.log" \
+      KUBEADP_CONVMAP_LOG="$TMPROOT/convmap.log" \
+      "$AGENT_RUN_API" >"$logname" 2>&1
   ) &
   SERVER_PID=$!
   CUR_SERVER_LOG="$logname"
@@ -712,6 +724,9 @@ t_t10() {
     rec T10 FAIL "job did not reach done (last status: $st)"
     return
   }
+  local wt="$WORKSPACE/.agent-jobs/proj/$id"
+  git -C "$wt" add staged-new.txt
+  git -C "$wt" rm -q README.txt 2>&1 || git -C "$wt" rm -qf README.txt
   local d
   d=$(ar diff "$id" 2>&1)
   local bad=""
@@ -743,6 +758,9 @@ t_t11() {
     rec T11 FAIL "job did not reach done (last status: $st)"
     return
   }
+  local wt="$WORKSPACE/.agent-jobs/proj/$id"
+  git -C "$wt" add committed-file.txt
+  git -C "$wt" commit -q -m "work done by fake agy"
   local d
   d=$(ar diff "$id" 2>&1)
   rc=$?
@@ -2590,15 +2608,20 @@ t_t44() {
   (
     cd "$TMPROOT" || exit 1
     cd "$WORKSPACE" || exit 1
+    local cfg_idx=${GIT_CONFIG_COUNT:-0}
+    eval "export GIT_CONFIG_KEY_$cfg_idx=core.excludesFile"
+    eval "export GIT_CONFIG_VALUE_$cfg_idx=\"\$GIT_EXCLUDE_FILE\""
+    export GIT_CONFIG_COUNT=$((cfg_idx + 1))
     exec env -u AGENT_RUN_REMOTE -u GH_TOKEN -u GITHUB_TOKEN \
       HOME="$FAKE_HOME" \
       KUBEADP_API_ALLOW_UNAUTHENTICATED=true \
       KUBEADP_API_ALLOW_OPEN=true \
       KUBEADP_AGY_HOME="$FAKE_HOME" \
       KUBEADP_SANDBOX_HOME="$FAKE_HOME" \
-      GIT_CONFIG_COUNT=1 \
-      GIT_CONFIG_KEY_0=core.excludesFile \
-      GIT_CONFIG_VALUE_0="$GIT_EXCLUDE_FILE" \
+      GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" \
+      GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL" \
+      GIT_COMMITTER_NAME="$GIT_COMMITTER_NAME" \
+      GIT_COMMITTER_EMAIL="$GIT_COMMITTER_EMAIL" \
       AGENT_RUN_API_LISTEN="127.0.0.1:$PORT" \
       AGENT_RUN_WORKSPACE_ROOT="$WORKSPACE" \
       AGENT_RUN_STATE_ROOT="$STATE_ROOT" \
@@ -2610,6 +2633,8 @@ t_t44() {
       AGENT_RUN_HINDSIGHT_AUTO_RETAIN=true \
       FAKE_ARGV_LOG="$TMPROOT/argv.log" \
       FAKE_CONVMAP_LOG="$TMPROOT/convmap.log" \
+      KUBEADP_ARGV_LOG="$TMPROOT/argv.log" \
+      KUBEADP_CONVMAP_LOG="$TMPROOT/convmap.log" \
        "$AGENT_RUN_API" >"$TMPROOT/server-hindsight-on.log" 2>&1
   ) &
   SERVER_PID=$!
@@ -3118,6 +3143,10 @@ t_t52() {
   id="$START_JOB_ID"
   wait_state "$id" done 60 >/dev/null || { cleanup_job "$id"; rec T52 FAIL "commit job did not reach done"; return; }
   wt=$(ar status "$id" 2>/dev/null | sed -nE 's/^Worktree:[[:space:]]+//p' | head -n 1 | sed 's/ (directory missing on disk)$//')
+  if [ -n "$wt" ] && [ -d "$wt" ]; then
+    git -C "$wt" add committed-file.txt
+    git -C "$wt" commit -q -m "commit for diff note"
+  fi
   out=$(ar diff "$id" 2>/tmp/t52_err.txt)
   err=$(cat /tmp/t52_err.txt 2>/dev/null || true)
   rc=$?
@@ -3169,6 +3198,9 @@ t_t53() {
   fi
   id="$START_JOB_ID"
   wait_state "$id" done 60 >/dev/null || { cleanup_job "$id"; rec T53 FAIL "commit job did not reach done"; return; }
+  local wt="$WORKSPACE/.agent-jobs/proj/$id"
+  git -C "$wt" add committed-file.txt
+  git -C "$wt" commit -q -m "commit for base stat"
 
   # (a) --base --stat lists BOTH files that differ from the base -- the
   # committed one and the uncommitted/untracked one -- and nothing else, i.e.
@@ -3964,15 +3996,20 @@ EOF
   (
     cd "$TMPROOT" || exit 1
     cd "$WORKSPACE" || exit 1
+    local cfg_idx=${GIT_CONFIG_COUNT:-0}
+    eval "export GIT_CONFIG_KEY_$cfg_idx=core.excludesFile"
+    eval "export GIT_CONFIG_VALUE_$cfg_idx=\"\$GIT_EXCLUDE_FILE\""
+    export GIT_CONFIG_COUNT=$((cfg_idx + 1))
     exec env -u AGENT_RUN_REMOTE -u GH_TOKEN -u GITHUB_TOKEN \
       HOME="$FAKE_HOME" \
       KUBEADP_API_ALLOW_UNAUTHENTICATED=true \
       KUBEADP_API_ALLOW_OPEN=true \
       KUBEADP_AGY_HOME="$FAKE_HOME" \
       KUBEADP_SANDBOX_HOME="$FAKE_HOME" \
-      GIT_CONFIG_COUNT=1 \
-      GIT_CONFIG_KEY_0=core.excludesFile \
-      GIT_CONFIG_VALUE_0="$GIT_EXCLUDE_FILE" \
+      GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" \
+      GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL" \
+      GIT_COMMITTER_NAME="$GIT_COMMITTER_NAME" \
+      GIT_COMMITTER_EMAIL="$GIT_COMMITTER_EMAIL" \
       AGENT_RUN_API_LISTEN="127.0.0.1:$PORT" \
       AGENT_RUN_WORKSPACE_ROOT="$WORKSPACE" \
       AGENT_RUN_STATE_ROOT="$STATE_ROOT" \
@@ -3986,6 +4023,8 @@ EOF
       FAKE_HINDSIGHT_ARGV="$argv_file" \
       FAKE_ARGV_LOG="$TMPROOT/argv.log" \
       FAKE_CONVMAP_LOG="$TMPROOT/convmap.log" \
+      KUBEADP_ARGV_LOG="$TMPROOT/argv.log" \
+      KUBEADP_CONVMAP_LOG="$TMPROOT/convmap.log" \
       "$AGENT_RUN_API" >"$TMPROOT/server-t162-hindsight.log" 2>&1
   ) &
   SERVER_PID=$!
@@ -4412,6 +4451,7 @@ t_t171() {
     *"retry launched in background"*) ;;
     *) cleanup_job "$id"; rec T171 FAIL "retry did not launch (rc $rc): $out"; return ;;
   esac
+  wait_state "$id" running 10 >/dev/null 2>&1 || true
   st=$(wait_state "$id" done 60) || {
     cleanup_job "$id"
     rec T171 FAIL "follow-up turn did not finish done (last status: $st)"
@@ -4488,8 +4528,12 @@ t_t172() {
   }
   # The conversation id (harness session_id) must have been captured to the
   # row, since retry's resume key comes from it.
-  local conv
-  conv=$(db_field "$id" "conversation_id")
+  local conv=""
+  for i in $(seq 1 10); do
+    conv=$(db_field "$id" "conversation_id")
+    [ -n "$conv" ] && break
+    sleep 0.5
+  done
   if [ -z "$conv" ]; then
     cleanup_job "$id"
     rec T172 FAIL "claude job captured no conversation id from session_id lines"
@@ -4668,7 +4712,13 @@ t_t177() {
   fi
   id="$START_JOB_ID"
   wait_state "$id" done 60 >/dev/null || { cleanup_job "$id"; rec T177 FAIL "first turn not done (last status: $st)"; return; }
-  conv=$(db_field "$id" "conversation_id")
+  conv=""
+  local i
+  for i in $(seq 1 10); do
+    conv=$(db_field "$id" "conversation_id")
+    [ -n "$conv" ] && break
+    sleep 0.5
+  done
   [ -n "$conv" ] || { cleanup_job "$id"; rec T177 FAIL "no conversation id captured for resume"; return; }
 
   out=$(ar retry "$id" --prompt "claude resume follow-up" 2>&1)

@@ -640,7 +640,13 @@ pub struct PauseArgs {
     pub job_id: String,
 
     /// `true` pauses (messages queue while paused), `false` resumes.
-    #[arg(long, default_value_t = true)]
+    #[arg(
+        long,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
     pub paused: bool,
 }
 
