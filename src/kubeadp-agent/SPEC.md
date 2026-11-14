@@ -1269,6 +1269,27 @@ having to read a mailbox.
   root key and the API bearer stay hidden from the agent; in `relay` network
   mode the pod-local API is unreachable and the receive side fails closed.
 
+### 7.14.1 Receive methods: non-blocking and blocking
+
+Two receive methods work on the same inbox. Both acknowledge a row exactly once
+(§7.14), so a message is delivered by whichever method claims it first.
+
+| Method | Blocks the agent | Triggered by | Channels | Use |
+|---|---|---|---|---|
+| Non-blocking injection | no | the harness | `hook`, `tool_result`, `idle_turn`, `interrupt` (§7.14) | the default for every agent: the agent calls nothing and waits for nothing, the framed message appears in its context at the next boundary (after a tool call, at prompt submit, at turn end) |
+| Blocking receive | yes, at most 25 s per call | the agent | `wait_message` (§8) | optional, for an agent that has nothing else to do until a reply arrives |
+
+- Sending is always non-blocking: `send_message` and `reply` return when the
+  message is queued or injected and never wait for an answer.
+- No agent may depend on `wait_message` to receive a message, and no instruction
+  file tells an agent to wait or to poll for messages.
+- A message consumed by `wait_message` is not injected a second time: an agent
+  that calls `wait_message` in a loop sees its messages there and not through the
+  hooks.
+- Claude Code shows hook context (`additionalContext`) to the model only, not in
+  the user's transcript; agy's `systemMessage` is shown. A user-visible echo for
+  Claude Code sessions is planned.
+
 ### 7.15 Audit and retention
 - Every accepted, rejected-after-authorization, sent, injected, expired and
   dropped message writes metadata to `a2a_audit` (§2.3): `from_agent_id`,
