@@ -4482,10 +4482,15 @@ EOF
 
     local auth_code=""
     if [ "$noauth_code" = "401" ]; then
-        auth_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
-            "http://${listen}/api/v1/sessions/sess67/message" \
-            -H "Authorization: Bearer sekret-token" \
-            -H 'Content-Type: application/json' -d '{"text":"allowed"}')
+        # The session may not hold a live PTY yet (409 not_running): retry until it does.
+        for _ in $(seq 1 100); do
+            auth_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+                "http://${listen}/api/v1/sessions/sess67/message" \
+                -H "Authorization: Bearer sekret-token" \
+                -H 'Content-Type: application/json' -d '{"text":"allowed"}')
+            if [ "$auth_code" != "409" ]; then break; fi
+            sleep 0.1
+        done
     fi
 
     stop_supervisor "$spid"
