@@ -364,6 +364,9 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 /// Messages allowed per (session, sender) per minute.
 pub const MESSAGE_RATE_MAX: usize = 30;
 const MESSAGE_RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Maximum distinct `(session, sender)` keys tracked simultaneously so spoofed
+/// claimed A2A sender strings cannot grow the rate-limiter map without bound.
+const MAX_TRACKED_SENDERS: usize = 1024;
 
 /// Sliding-window rate limiter: at most `MESSAGE_RATE_MAX` injected messages
 /// per (session, sender) within `MESSAGE_RATE_WINDOW`, with `Retry-After` on
@@ -387,6 +390,18 @@ impl MessageRateLimiter {
     pub fn record(&mut self, session: &str, sender: &str, now: Instant) -> Option<u64> {
         self.cleanup(now);
         let key = format!("{session}\x1f{sender}");
+        if !self.per_sender.contains_key(&key) && self.per_sender.len() >= MAX_TRACKED_SENDERS {
+            // Evict the entry with the oldest last-seen timestamp so a flood of
+            // distinct claimed senders stays bounded in memory.
+            if let Some(oldest_key) = self
+                .per_sender
+                .iter()
+                .min_by_key(|(_, ts)| ts.last().copied().unwrap_or(now))
+                .map(|(k, _)| k.clone())
+            {
+                self.per_sender.remove(&oldest_key);
+            }
+        }
         let window = self.per_sender.entry(key).or_default();
         if window.len() >= MESSAGE_RATE_MAX {
             let oldest = window[0];
@@ -631,6 +646,9 @@ pub fn deliver_message(
             // The PTY write is bounded by a deadline (see PtyInput::write_all):
             // a stuck child that never drains its input queue turns into a
             // timeout instead of wedging the tokio worker / session thread.
+            // Assemble the complete frame in one contiguous buffer so the write
+            // is issued as a single batch rather than split across multiple
+            // write_all calls.
             let deadline = Instant::now() + crate::orchestrate::pty::PTY_WRITE_TOTAL_DEADLINE;
             let written = if engine == "agy" {
                 // A single NDJSON user line (framed JSON, embedded newlines
@@ -638,13 +656,26 @@ pub fn deliver_message(
                 // stream-json stdin consumes as the next turn.
                 let line =
                     crate::core::a2a_live::frame_user_line(&String::from_utf8_lossy(&payload));
-                slot.write_all(line.as_bytes(), deadline)
-                    .and_then(|_| slot.write_all(b"\r", deadline))
+                let mut frame = Vec::with_capacity(line.len() + 1);
+                frame.extend_from_slice(line.as_bytes());
+                frame.push(b'\r');
+                slot.write_all(&frame, deadline)
             } else {
-                slot.write_all(PASTE_START, deadline)
-                    .and_then(|_| slot.write_all(&payload, deadline))
-                    .and_then(|_| slot.write_all(PASTE_END, deadline))
-                    .and_then(|_| slot.write_all(b"\r", deadline))
+                let mut frame =
+                    Vec::with_capacity(PASTE_START.len() + payload.len() + PASTE_END.len() + 1);
+                frame.extend_from_slice(PASTE_START);
+                frame.extend_from_slice(&payload);
+                frame.extend_from_slice(PASTE_END);
+                frame.push(b'\r');
+                let res = slot.write_all(&frame, deadline);
+                if res.is_err() {
+                    // Best-effort close the bracketed paste if a partial write
+                    // opened PASTE_START before timing out, so the terminal is
+                    // not left wedged inside paste mode.
+                    let close_deadline = Instant::now() + Duration::from_millis(50);
+                    let _ = slot.write_all(PASTE_END, close_deadline);
+                }
+                res
             };
             written.is_ok()
         }
@@ -1135,6 +1166,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bearer_token_from_env_file_and_inline() {
+        let _guard = crate::test_env_lock();
         // File env takes precedence over inline env.
         let dir = tempfile::tempdir().unwrap();
         let token_file = dir.path().join("token");

@@ -283,9 +283,9 @@ COPY --from=cli-tools /payload/. /
 # the signal contract both old pods documented.
 ENTRYPOINT ["/usr/local/bin/tini", "--", "/usr/local/bin/kubeadp-agent"]
 
-# Documentation only (no runtime effect): the worker role's default listener
-# (kubeadp_agent::worker DEFAULT_LISTEN) is 0.0.0.0:8001, as in the old
-# agent-run-api image.
-EXPOSE 8001
+# Documentation only (no runtime effect): both the worker and orchestrator
+# roles listen on 0.0.0.0:8002 by default (DEFAULT_LISTEN in worker and
+# orchestrate).
+EXPOSE 8002
 
 USER agent

@@ -233,9 +233,8 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// tests could otherwise read each other's half-applied environment.
 #[cfg(test)]
 pub(crate) mod testenv {
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
     /// Every env var the crate's tests touch. A guard clears all of these and
     /// restores them on drop, so a test can never leak a variable into a
     /// sibling test (e.g. `KUBEADP_A2A_INBOX_TOKEN` leaking into the direct
@@ -267,7 +266,7 @@ pub(crate) mod testenv {
         /// the lock). Scope it tightly (a block) so it is dropped before the
         /// next guard.
         pub fn set(pairs: &[(&str, Option<&str>)]) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = crate::test_env_lock();
             let prior = VARS
                 .iter()
                 .map(|var| (*var, std::env::var(*var).ok()))

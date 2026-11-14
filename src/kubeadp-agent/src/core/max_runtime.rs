@@ -85,6 +85,12 @@ pub(crate) struct DueJob {
     log_path: PathBuf,
 }
 
+/// Maximum number of job IDs retained in the in-memory log-deduplication set
+/// before clearing older entries. Prevents unbounded memory growth over the
+/// worker daemon's lifetime while preserving deduplication across overlapping
+/// enforcement passes.
+const MAX_LOGGED_JOB_IDS: usize = 4096;
+
 /// Job ids whose `max runtime exceeded` log line has already been appended
 /// (best-effort, in-memory). Without the dedup a race between two
 /// overlapping passes could append the line twice for the same job; a
@@ -104,6 +110,9 @@ fn already_logged(job_id: &str) -> bool {
 
 fn remember_logged(job_id: &str) {
     if let Ok(mut set) = logged_job_ids().lock() {
+        if set.len() >= MAX_LOGGED_JOB_IDS && !set.contains(job_id) {
+            set.clear();
+        }
         let _ = set.insert(job_id.to_string());
     }
 }

@@ -141,7 +141,11 @@ pub fn add_observability(
 
 /// `GET /readyz` -- liveness/compatibility probe (never-auth).
 async fn readyz_handler(Extension(ready): Extension<Readiness>) -> Response {
-    match ready() {
+    let result = match tokio::task::spawn_blocking(move || ready()).await {
+        Ok(res) => res,
+        Err(join_err) => Err(format!("readiness probe task panicked: {join_err}")),
+    };
+    match result {
         Ok(()) => Json(json!({ "status": "ready" })).into_response(),
         Err(reason) => {
             eprintln!("[agent-run] readyz: not ready ({reason})");
@@ -174,8 +178,11 @@ async fn metrics_handler(
 
     // Group the caller's gauges deterministically (status labels sort
     // lexically) so repeated scrapes render in a stable order.
+    let raw_states = tokio::task::spawn_blocking(move || state_metrics())
+        .await
+        .unwrap_or_default();
     let mut states: BTreeMap<String, u64> = BTreeMap::new();
-    for (label, value) in state_metrics() {
+    for (label, value) in raw_states {
         *states.entry(label).or_default() += value;
     }
 

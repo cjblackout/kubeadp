@@ -1957,7 +1957,7 @@ mod tests {
     #[test]
     fn apply_a2a_self_name_sets_per_job_identity() {
         // Serialize env mutation.
-        let _g = crate::core::lock_test_env();
+        let _g = crate::test_env_lock();
         // Save/restore the env vars this test touches.
         let saved = ["A2A_SELF_PREFIX", "A2A_SELF_NAME", "HOME"]
             .iter()

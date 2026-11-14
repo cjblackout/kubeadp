@@ -125,7 +125,15 @@ fn parse_duration_secs(s: &str) -> Option<u64> {
 /// and the API error code behind a transport/HTTP failure.
 fn debug_env_on() -> bool {
     std::env::var_os("AGENT_RUN_DEBUG")
-        .map(|v| !v.is_empty() && v != "0")
+        .map(|v| {
+            let s = v.to_string_lossy();
+            let trimmed = s.trim();
+            !trimmed.is_empty()
+                && !matches!(
+                    trimmed.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+        })
         .unwrap_or(false)
 }
 
@@ -1594,13 +1602,22 @@ fn tail(agent: &ureq::Agent, base: &str, job_id: &str, deadline: Option<Instant>
                 if retries >= TAIL_LOG_WAIT_RETRIES {
                     fatal(&error, false);
                 }
+                if let Some(deadline) = deadline {
+                    if Instant::now() >= deadline {
+                        eprintln!(
+                            "\nTimed out waiting for the job to finish: job still running (exit code 3)."
+                        );
+                        exit(3);
+                    }
+                }
                 std::thread::sleep(TAIL_LOG_WAIT_INTERVAL);
             }
         }
     }
 
     // 3. Poll for new bytes; check the job status on the old local tail's
-    //    cadence (first tick plus every 7th tick).
+    //    cadence (first tick plus every 7th tick), or immediately when the
+    //    caller's --timeout deadline is reached.
     let mut poll_count: u64 = 0;
     loop {
         if let LogRead::Bytes(bytes, new_pos) = read_log(agent, &log_url(pos), false) {
@@ -1611,7 +1628,8 @@ fn tail(agent: &ureq::Agent, base: &str, job_id: &str, deadline: Option<Instant>
         // polling status.
 
         poll_count += 1;
-        if tail_status_check_due(poll_count) {
+        let deadline_reached = deadline.map(|d| Instant::now() >= d).unwrap_or(false);
+        if tail_status_check_due(poll_count) || deadline_reached {
             let status_output = call(agent, "GET", &job_url(base, job_id, ""), None, false);
             if let Some(status_str) = status_output.data.get("status").and_then(Value::as_str) {
                 if let Some(status) = JobStatus::parse(status_str) {

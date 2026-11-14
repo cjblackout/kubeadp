@@ -19,6 +19,7 @@ pub struct EnvConfig {
     pub session_args: Option<String>,
     pub home: Option<PathBuf>,
     pub max_crashes: Option<usize>,
+    pub sandbox: Option<String>,
 }
 
 fn get_non_empty_env(key: &str) -> Option<String> {
@@ -46,6 +47,7 @@ impl EnvConfig {
                 .or_else(|| Some(PathBuf::from("/home/coder"))),
             max_crashes: get_non_empty_env("CLAUDE_MAX_CRASHES")
                 .and_then(|v| v.parse::<usize>().ok()),
+            sandbox: get_non_empty_env("CLAUDE_SANDBOX"),
         }
     }
 }
@@ -239,6 +241,8 @@ pub fn resolve_supervisor_config_with_env(
         .unwrap_or_default();
 
     let env_max_crashes = env.max_crashes.unwrap_or(0);
+    let generated_sandbox =
+        parse_bool_value(env.sandbox.as_deref(), base.default_sandbox.unwrap_or(true));
 
     let mut generated_candidates = Vec::new();
 
@@ -283,7 +287,7 @@ pub fn resolve_supervisor_config_with_env(
             kill_grace_secs: 5.0,
             pty_eof_grace_secs: 10.0,
             kill_wait_secs: 15.0,
-            sandbox: true,
+            sandbox: generated_sandbox,
             grants: None,
             base_backoff_secs: 2.0,
             max_backoff_secs: 60.0,
@@ -343,7 +347,7 @@ pub fn resolve_supervisor_config_with_env(
                     kill_grace_secs: 5.0,
                     pty_eof_grace_secs: 10.0,
                     kill_wait_secs: 15.0,
-                    sandbox: true,
+                    sandbox: generated_sandbox,
                     grants: None,
                     base_backoff_secs: 2.0,
                     max_backoff_secs: 60.0,
@@ -834,6 +838,21 @@ mod tests {
 
     #[test]
     fn test_empty_and_whitespace_env_vars_treated_as_unset() {
+        let _guard = crate::test_env_lock();
+        let keys = [
+            "CLAUDE_WORKSPACES",
+            "CLAUDE_WORKSPACE_ROOT",
+            "CLAUDE_REMOTE_PREFIX",
+            "CLAUDE_DEFAULT_SESSION",
+            "CLAUDE_DEFAULT_SESSION_ID",
+            "CLAUDE_SESSION_ARGS",
+            "CLAUDE_MAX_CRASHES",
+            "CLAUDE_SANDBOX",
+            "HOME",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|&k| (k, std::env::var(k).ok())).collect();
+
         std::env::set_var("CLAUDE_WORKSPACES", "   ");
         std::env::set_var("CLAUDE_WORKSPACE_ROOT", "   ");
         std::env::set_var("CLAUDE_REMOTE_PREFIX", " \t ");
@@ -841,6 +860,7 @@ mod tests {
         std::env::set_var("CLAUDE_DEFAULT_SESSION_ID", " \n ");
         std::env::set_var("CLAUDE_SESSION_ARGS", "   ");
         std::env::set_var("CLAUDE_MAX_CRASHES", "   ");
+        std::env::set_var("CLAUDE_SANDBOX", "   ");
         std::env::set_var("HOME", "   ");
 
         let env = EnvConfig::from_process_env();
@@ -851,20 +871,69 @@ mod tests {
         assert_eq!(env.default_session_id, None);
         assert_eq!(env.session_args, None);
         assert_eq!(env.max_crashes, None);
+        assert_eq!(env.sandbox, None);
         assert_eq!(env.home, Some(PathBuf::from("/home/coder")));
 
-        // Clean up
-        std::env::remove_var("CLAUDE_WORKSPACES");
-        std::env::remove_var("CLAUDE_WORKSPACE_ROOT");
-        std::env::remove_var("CLAUDE_REMOTE_PREFIX");
-        std::env::remove_var("CLAUDE_DEFAULT_SESSION");
-        std::env::remove_var("CLAUDE_DEFAULT_SESSION_ID");
-        std::env::remove_var("CLAUDE_SESSION_ARGS");
-        std::env::remove_var("CLAUDE_MAX_CRASHES");
-        std::env::remove_var("HOME");
+        for &k in &keys {
+            std::env::remove_var(k);
+        }
 
         let env_unset = EnvConfig::from_process_env();
         assert_eq!(env_unset.home, Some(PathBuf::from("/home/coder")));
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn test_generated_workspace_sessions_respect_sandbox_switch() {
+        let temp_dir = std::env::temp_dir().join(format!("test_ws_sandbox_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let ws_dir = temp_dir.join("repo-a");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        // 1. Default: sandbox is true for both default and generated workspace sessions.
+        let env_default = EnvConfig {
+            default_session: Some("true".to_string()),
+            workspaces: Some(ws_dir.display().to_string()),
+            ..Default::default()
+        };
+        let cfg_default =
+            resolve_supervisor_config_with_env(SupervisorConfig::default(), &env_default).unwrap();
+        assert_eq!(cfg_default.sessions.len(), 2);
+        assert!(cfg_default.sessions.iter().all(|s| s.sandbox));
+
+        // 2. SupervisorConfig.default_sandbox = Some(false) disables sandbox on generated sessions.
+        let base_off = SupervisorConfig {
+            default_sandbox: Some(false),
+            ..Default::default()
+        };
+        let cfg_base_off =
+            resolve_supervisor_config_with_env(base_off.clone(), &env_default).unwrap();
+        assert!(cfg_base_off.sessions.iter().all(|s| !s.sandbox));
+
+        // 3. EnvConfig.sandbox ("CLAUDE_SANDBOX") overrides base.default_sandbox.
+        let env_override_off = EnvConfig {
+            sandbox: Some("false".to_string()),
+            ..env_default.clone()
+        };
+        let cfg_env_off =
+            resolve_supervisor_config_with_env(SupervisorConfig::default(), &env_override_off)
+                .unwrap();
+        assert!(cfg_env_off.sessions.iter().all(|s| !s.sandbox));
+
+        let env_override_on = EnvConfig {
+            sandbox: Some("true".to_string()),
+            ..env_default
+        };
+        let cfg_env_on = resolve_supervisor_config_with_env(base_off, &env_override_on).unwrap();
+        assert!(cfg_env_on.sessions.iter().all(|s| s.sandbox));
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

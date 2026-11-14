@@ -192,16 +192,40 @@ pub fn wait_until_ready(
     poll_interval: Duration,
     shutdown: &AtomicBool,
 ) -> (bool, String) {
+    wait_until_ready_with_pause(
+        binary,
+        env_vars,
+        session_name,
+        poll_interval,
+        shutdown,
+        shutdown,
+    )
+}
+
+/// Like [`wait_until_ready`], but also aborts promptly when `paused` is set
+/// (e.g. by `POST /api/v1/sessions/{name}/stop` or `/restart`), returning
+/// `(false, "paused")`.
+pub fn wait_until_ready_with_pause(
+    binary: &Path,
+    env_vars: &HashMap<String, String>,
+    session_name: &str,
+    poll_interval: Duration,
+    shutdown: &AtomicBool,
+    paused: &AtomicBool,
+) -> (bool, String) {
     let mut last_reason: Option<String> = None;
     let timeout = Duration::from_secs(30);
 
-    while !shutdown.load(Ordering::SeqCst) {
+    while !shutdown.load(Ordering::SeqCst) && !paused.load(Ordering::SeqCst) {
         let (ready, reason) = claude_readiness(binary, env_vars, timeout, shutdown);
         if ready {
             return (true, reason);
         }
         if reason == "shutdown" {
             return (false, "shutdown".to_string());
+        }
+        if paused.load(Ordering::SeqCst) {
+            return (false, "paused".to_string());
         }
 
         if last_reason.as_deref() != Some(&reason) {
@@ -223,17 +247,24 @@ pub fn wait_until_ready(
             last_reason = Some(reason.clone());
         }
 
-        // Sleep poll_interval in 100ms chunks to respond immediately to shutdown
+        // Sleep poll_interval in 100ms chunks to respond immediately to shutdown or pause
         let poll_start = Instant::now();
         while poll_start.elapsed() < poll_interval {
             if shutdown.load(Ordering::SeqCst) {
                 return (false, "shutdown".to_string());
             }
+            if paused.load(Ordering::SeqCst) {
+                return (false, "paused".to_string());
+            }
             thread::sleep(Duration::from_millis(100));
         }
     }
 
-    (false, "shutdown".to_string())
+    if paused.load(Ordering::SeqCst) && !shutdown.load(Ordering::SeqCst) {
+        (false, "paused".to_string())
+    } else {
+        (false, "shutdown".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -482,5 +513,37 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_wait_until_ready_with_pause_aborts_on_paused() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let paused_c = Arc::clone(&paused);
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            paused_c.store(true, Ordering::SeqCst);
+        });
+
+        let before = std::time::Instant::now();
+        let (ready, reason) = wait_until_ready_with_pause(
+            Path::new("/nonexistent/binary/path/12345"),
+            &HashMap::new(),
+            "test-pause-ready",
+            Duration::from_secs(30),
+            &shutdown,
+            &paused,
+        );
+        let elapsed = before.elapsed();
+        let _ = handle.join();
+
+        assert!(!ready);
+        assert_eq!(reason, "paused");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "paused abort took too long: {:?}",
+            elapsed
+        );
     }
 }

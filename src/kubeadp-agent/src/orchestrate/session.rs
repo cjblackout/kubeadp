@@ -6,7 +6,6 @@ use crate::orchestrate::pty::{
     kill_process_group_with_grace, poll_and_read_pty, signal_process_group, spawn_in_pty,
     KillResult, Pty,
 };
-use crate::orchestrate::readiness::wait_until_ready;
 use crate::orchestrate::session_file::{
     classify_transcript, get_transcript_fingerprint, output_contains_resume_not_found,
     quarantine_corrupt_session_file, ResumeFailTracker, TranscriptStatus, RESUME_NOT_FOUND_ERROR,
@@ -159,6 +158,10 @@ pub fn run_session_loop(
                     &session_name,
                     &format!("Session loop caught panic: {}. Recovering...", panic_msg),
                 );
+
+                // Reclaim any PTY master fd stored before the panic so a closed
+                // raw fd cannot remain published in `pty_input` during backoff.
+                pty_input.lock().unwrap_or_else(|e| e.into_inner()).take();
 
                 // Terminate child process group if child was running
                 let pid = child_pid_tracker.load(Ordering::SeqCst);
@@ -575,12 +578,13 @@ fn run_session_iteration(
             shutdown,
         )
     } else {
-        wait_until_ready(
+        crate::orchestrate::readiness::wait_until_ready_with_pause(
             &session.claude_binary,
             &session.env,
             &session.name,
             Duration::from_secs_f64(session.readiness_poll_secs),
             shutdown,
+            paused,
         )
     };
 
@@ -592,7 +596,7 @@ fn run_session_iteration(
     }
 
     if !ready {
-        return !shutdown.load(Ordering::SeqCst);
+        return !shutdown.load(Ordering::SeqCst) && !paused.load(Ordering::SeqCst);
     }
 
     // 2b. Inject the per-project CLAUDE.md into the workdir before spawning.
@@ -955,11 +959,19 @@ fn run_session_iteration(
     // Slave is duplicated in child, close supervisor's copy of slave
     pty.close_slave();
     // Publish the master fd so the sessions API can type messages into the
-    // live child; drained on the shutdown path below.
+    // live child; drained on the shutdown path below (and via the drop guard
+    // if an unexpected unwind occurs before `pty` is dropped).
+    struct PtySlotGuard<'a>(&'a Mutex<crate::orchestrate::pty::PtyInput>);
+    impl Drop for PtySlotGuard<'_> {
+        fn drop(&mut self) {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
+    }
     pty_input
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .put(pty.master);
+    let _pty_slot_guard = PtySlotGuard(pty_input);
 
     let child_pid = child.id();
     child_pid_tracker.store(child_pid, Ordering::SeqCst);
@@ -1088,7 +1100,7 @@ fn run_session_iteration(
     // 8. Clean up process & master fd
     // Reclaim the shared PTY slot (any in-flight API message races the close
     // and drops cleanly) before the master fd is closed.
-    pty_input.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(_pty_slot_guard);
     pty.close_master();
 
     if captured_status.is_none() {
@@ -1520,7 +1532,7 @@ fn handle_spawn_error(
     let backoff_duration = swb.record_restart_and_delay(now_epoch);
     let sleep_start = Instant::now();
     while sleep_start.elapsed() < backoff_duration {
-        if shutdown.load(Ordering::SeqCst) {
+        if shutdown.load(Ordering::SeqCst) || paused.load(Ordering::SeqCst) {
             break;
         }
         thread::sleep(Duration::from_millis(50));

@@ -625,15 +625,14 @@ fn run_supervisor(config_path: Option<PathBuf>) {
         thread::sleep(Duration::from_millis(50));
     }
 
-    // Escalate with SIGKILL to any remaining child processes
-    let latest_pids: Vec<u32> = {
+    // Escalate with SIGKILL only to child processes still tracked as live in
+    // session state after the grace window (processes reaped during
+    // shutdown_grace cleared their `pid` in state and must not be signaled
+    // again, avoiding PID reuse hazards).
+    let tracked_pids: Vec<u32> = {
         let st = state.lock().unwrap_or_else(|e| e.into_inner());
         st.sessions.values().filter_map(|s| s.pid).collect()
     };
-    let mut tracked_pids: Vec<u32> = active_pids;
-    tracked_pids.extend(latest_pids);
-    tracked_pids.sort_unstable();
-    tracked_pids.dedup();
 
     for &pid in &tracked_pids {
         let _ = signal_process_group(pid, libc::SIGKILL);

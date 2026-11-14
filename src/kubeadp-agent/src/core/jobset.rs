@@ -1383,17 +1383,12 @@ mod tests {
     }
     use std::sync::Arc;
 
-    /// Serializes tests that mutate the process-global jobset env vars
-    /// (`KUBEADP_JOBSET_ID` / `KUBEADP_JOBSET_SECRET_FILE`), so parallel test
-    /// threads do not clobber each other's environment.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Runs `f` while holding the jobset env lock. Tests that read or mutate the
-    /// jobset env vars (via `host_jobset` / `JobsetCredential::from_env` or
-    /// `set_var`/`remove_var`) must run under this so they do not race each
-    /// other on the process environment.
+    /// Runs `f` while holding the shared crate-wide test env lock. Tests that
+    /// read or mutate the jobset env vars (via `host_jobset` /
+    /// `JobsetCredential::from_env` or `set_var`/`remove_var`) must run under
+    /// this so they do not race each other on the process environment.
     fn with_env_guard<R>(f: impl FnOnce() -> R) -> R {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_env_lock();
         f()
     }
 

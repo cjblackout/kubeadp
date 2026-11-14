@@ -55,7 +55,11 @@ pub fn prepare_agy_home(home: &Path, mcp_source: Option<&Path>) -> Result<(), St
         installed = merge_a2a_entry(&bytes, &a2a_mcp_command())?;
     }
     let target = config_dir.join("mcp_config.json");
-    let tmp = config_dir.join(".mcp_config.json.tmp");
+    let tmp = config_dir.join(format!(
+        ".mcp_config.json.tmp.{}.{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
     let write = || -> std::io::Result<()> {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(&installed)?;

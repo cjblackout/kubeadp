@@ -215,13 +215,9 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// Serializes tests that mutate the process environment (they run under
-    /// `RUST_TEST_THREADS` > 1 and would otherwise race on the shared env).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Acquires the env lock for the duration of `f`.
+    /// Acquires the shared crate-wide env lock for the duration of `f`.
     fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env_lock();
         f()
     }
 

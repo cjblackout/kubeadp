@@ -223,6 +223,10 @@ struct SessionMessageSink {
     ladder: LadderConfig,
     /// The escalation-ladder watchers (one per session).
     ladders: crate::core::a2a::delivery::LadderWatchers,
+    /// Sessions with a queued `interrupt: true` message whose immediate PTY
+    /// write could not complete (e.g. session was in `Starting` or `Backoff`).
+    /// Retained until the watcher injects the batch or the inbox drains.
+    interrupt_pending: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl SessionMessageSink {
@@ -236,6 +240,7 @@ impl SessionMessageSink {
             inbox_root,
             ladder,
             ladders: crate::core::a2a::delivery::LadderWatchers::new(),
+            interrupt_pending: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -366,10 +371,36 @@ impl SessionMessageSink {
         let ladder = self.ladder;
         let name = session.to_string();
         let idle_dir = self.inbox_dir(session);
+        let interrupt_pending = Arc::clone(&self.interrupt_pending);
+        let idle_interrupt_pending = Arc::clone(&self.interrupt_pending);
+        let idle_name = session.to_string();
         self.ladders.ensure(
             session,
-            move || Self::ladder_pass(state.as_ref(), &inbox_root, &ladder, &name, false),
-            move || Inbox::new(&idle_dir).uninjected_count() == 0,
+            move || {
+                let is_interrupt = interrupt_pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&name);
+                let step =
+                    Self::ladder_pass(state.as_ref(), &inbox_root, &ladder, &name, is_interrupt);
+                if matches!(step, LadderStep::Interrupt | LadderStep::Injected) {
+                    interrupt_pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&name);
+                }
+                step
+            },
+            move || {
+                let empty = Inbox::new(&idle_dir).uninjected_count() == 0;
+                if empty {
+                    idle_interrupt_pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&idle_name);
+                }
+                empty
+            },
         );
     }
 }
@@ -440,17 +471,29 @@ impl crate::core::a2a::MessageSink for SessionMessageSink {
         // through the same atomic claim as the ladder. A message is marked
         // injected only when the PTY write was accepted; otherwise (session
         // not running, budget throttled) it stays queued and the watcher
-        // below delivers it.
+        // below delivers it with `interrupt = true` preserved.
         if meta.interrupt {
-            let _ = Self::ladder_pass(
+            self.interrupt_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(task_id.to_string());
+            let step = Self::ladder_pass(
                 self.state.as_ref(),
                 &self.inbox_root,
                 &self.ladder,
                 task_id,
                 true,
             );
-            if Inbox::new(&inbox_dir).uninjected_count() == 0 {
-                return Ok(());
+            if matches!(step, LadderStep::Interrupt | LadderStep::Injected)
+                || Inbox::new(&inbox_dir).uninjected_count() == 0
+            {
+                self.interrupt_pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(task_id);
+                if Inbox::new(&inbox_dir).uninjected_count() == 0 {
+                    return Ok(());
+                }
             }
         }
 
@@ -1064,6 +1107,115 @@ mod tests {
         assert!(
             sink.ladders.is_active(session),
             "the queued message keeps a ladder watcher"
+        );
+        assert!(
+            sink.interrupt_pending.lock().unwrap().contains(session),
+            "interrupt flag must remain pending while queued"
+        );
+    }
+
+    #[test]
+    fn interrupt_queued_during_starting_delivers_on_interrupt_channel_when_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state-root");
+        let session = "homelab";
+        let mut state = SupervisorState::new(100);
+        let mut s = SessionState::new(session.to_string());
+        s.status = SessionStatus::Starting;
+        state.sessions.insert(session.to_string(), s);
+
+        let controls = SessionControlRegistry::new();
+        let sess_cfg = crate::orchestrate::config::SessionConfig {
+            name: session.to_string(),
+            workdir: std::path::PathBuf::from("/tmp"),
+            session_id: "id-1".to_string(),
+            engine: None,
+            claude_binary: std::path::PathBuf::from("claude"),
+            claude_args: vec![],
+            agy_binary: std::path::PathBuf::from("agy"),
+            env: std::collections::HashMap::new(),
+            session_file: None,
+            transcript_path: None,
+            memory_file: None,
+            readiness_poll_secs: 5.0,
+            hang_timeout_secs: 0.0,
+            kill_grace_secs: 5.0,
+            pty_eof_grace_secs: 10.0,
+            kill_wait_secs: 15.0,
+            sandbox: true,
+            grants: None,
+            base_backoff_secs: 2.0,
+            max_backoff_secs: 60.0,
+            healthy_run_secs: 30.0,
+            max_crashes: 5,
+            crash_window_secs: 60.0,
+            prefix_output: false,
+            failed_cooldown_secs: 300.0,
+            backoff_window_secs: 600.0,
+            resume_fail_quarantine_after: 5,
+            resume_fail_uptime_secs: 5.0,
+        };
+        let control = Arc::new(crate::orchestrate::session_control::SessionControl::new(
+            sess_cfg,
+        ));
+        controls.insert(Arc::clone(&control));
+
+        let api_state = sessions_api::SessionsApiState::new(
+            Arc::new(std::sync::Mutex::new(state)),
+            controls,
+            Arc::new(crate::orchestrate::session_log::SessionLogs::from_env()),
+        );
+        // High ack_secs (3600s) proves delivery happens via interrupt escalation,
+        // not via IdleTurn aging.
+        let ladder = LadderConfig {
+            ack_secs: 3600,
+            force_secs: 7200,
+            ttl_secs: 14400,
+        };
+        let sink = SessionMessageSink::new(Arc::clone(&api_state), root.clone(), ladder);
+
+        // Queue while Starting (no PTY yet).
+        crate::core::a2a::MessageSink::deliver_with_meta(
+            &sink,
+            session,
+            "peer-agent",
+            "urgent-during-backoff",
+            "msg-int-1",
+            DeliveryMeta {
+                hop: 0,
+                interrupt: true,
+            },
+        )
+        .expect("accepted into inbox");
+
+        assert!(
+            sink.interrupt_pending.lock().unwrap().contains(session),
+            "interrupt_pending must be recorded when initial write fails"
+        );
+
+        // Now attach a live PTY and transition session to Running.
+        let pty = crate::orchestrate::pty::Pty::open().expect("open pty");
+        control.pty_input.lock().unwrap().put(pty.master);
+        {
+            let mut st = api_state.supervisor_state.lock().unwrap();
+            st.sessions.get_mut(session).unwrap().status = SessionStatus::Running;
+        }
+
+        // Wait briefly for the watcher pass to deliver the interrupt message.
+        let inbox = Inbox::new(crate::core::a2a::inbox::inbox_dir_for(&root, session));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !inbox.injected("msg-int-1") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        control.pty_input.lock().unwrap().take();
+
+        assert!(
+            inbox.injected("msg-int-1"),
+            "watcher must inject queued interrupt message without waiting for ack_secs"
+        );
+        assert!(
+            !sink.interrupt_pending.lock().unwrap().contains(session),
+            "interrupt_pending must be cleared after injection"
         );
     }
 }

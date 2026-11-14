@@ -217,14 +217,25 @@ pub fn apply_relay_env(
 }
 
 /// Returns `true` when the literal IP is refused as a relay destination:
-/// loopback and link-local are host-local services the agent must not reach
+/// loopback, link-local, unspecified (`0.0.0.0`, `::`), broadcast, and
+/// IPv4-mapped IPv6 forms (`::ffff:127.0.0.1`, `::ffff:169.254.0.0/16`,
+/// `::ffff:0.0.0.0`) are host-local services the agent must not reach
 /// through the relay.
 pub fn ip_refused(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast()
+        }
         // `is_unicast_link_local` (fe80::/10) is not on stable, so the prefix
-        // is tested on the first segment of the address.
-        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80,
+        // is tested on the first segment of the address. Also unwrap IPv4-mapped
+        // IPv6 addresses (`::ffff:a.b.c.d`) so dual-stack sockets cannot reach
+        // IPv4 loopback/link-local/unspecified targets.
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_refused(IpAddr::V4(v4));
+            }
+            v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
     }
 }
 
@@ -860,9 +871,17 @@ mod tests {
         assert!(ip_refused("127.0.0.1".parse().unwrap()));
         assert!(ip_refused("127.255.255.254".parse().unwrap()));
         assert!(ip_refused("169.254.1.1".parse().unwrap()));
+        assert!(ip_refused("0.0.0.0".parse().unwrap()));
+        assert!(ip_refused("255.255.255.255".parse().unwrap()));
         assert!(ip_refused("::1".parse().unwrap()));
+        assert!(ip_refused("::".parse().unwrap()));
+        assert!(ip_refused("fe80::1".parse().unwrap()));
+        assert!(ip_refused("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(ip_refused("::ffff:169.254.169.254".parse().unwrap()));
+        assert!(ip_refused("::ffff:0.0.0.0".parse().unwrap()));
         assert!(!ip_refused("8.8.8.8".parse().unwrap()));
         assert!(!ip_refused("fd00::1".parse().unwrap()));
+        assert!(!ip_refused("::ffff:8.8.8.8".parse().unwrap()));
     }
 
     #[test]

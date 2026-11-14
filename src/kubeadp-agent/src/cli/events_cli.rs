@@ -122,6 +122,9 @@ pub fn parse_event(buf: &str) -> Result<(Option<SseEvent>, String), ()> {
         match line.split_once(':') {
             Some(("event", value)) => event_name = Some(value.trim()),
             Some(("data", value)) => data = Some(value.trim_start_matches(' ')),
+            // Standard SSE control fields (`id`, `retry`) carry no payload for
+            // `watch` but are valid wire lines and must not abort the block.
+            Some(("id" | "retry", _)) => {}
             // A line outside the `field: value` shape (e.g. a non-SSE
             // error body): stop parsing rather than guess.
             _ => return Err(()),
@@ -203,6 +206,10 @@ fn spawn_reader(response: ureq::Response) -> std::sync::mpsc::Receiver<WatchOutc
     orx
 }
 
+/// Maximum size of a single unparsed SSE event block (16 MiB) before the
+/// reader treats the stream as malformed/corrupted and drops it.
+const MAX_SSE_EVENT_BUF_BYTES: usize = 16 * 1024 * 1024;
+
 /// Drives the read loop: accumulate wire lines, hand each complete event to
 /// the output sinks (log -> stdout, status -> stderr banner), and stop at
 /// the `end` event, EOF, or a read error.
@@ -225,10 +232,23 @@ fn read_events(lines: &mut SseLines) -> WatchOutcome {
         };
         buf.push_str(&line);
         buf.push('\n');
+        if buf.len() > MAX_SSE_EVENT_BUF_BYTES {
+            eprintln!("watch: SSE event buffer exceeded maximum size without terminating");
+            return WatchOutcome::Dropped;
+        }
+        // Only invoke `parse_event` once a blank line terminates the event
+        // block, avoiding O(N^2) rescans and allowing malformed blocks to be
+        // discarded instead of wedging `buf` forever.
+        if !line.trim_end_matches('\r').is_empty() {
+            continue;
+        }
         match parse_event(&buf) {
             Err(()) => {
-                // Incomplete event (or a non-SSE body): keep reading; the
-                // body closing turns this into `Dropped`.
+                // A blank-line-terminated block failed to parse (malformed
+                // non-SSE line): clear the corrupted block so subsequent
+                // events can still be processed and `buf` does not grow
+                // without bound.
+                buf.clear();
             }
             Ok((event, rest)) => {
                 buf = rest;
@@ -452,6 +472,31 @@ mod tests {
     #[test]
     fn malformed_line_is_an_error() {
         assert_eq!(parse_event("not an sse line\n\n"), Err(()));
+    }
+
+    #[test]
+    fn standard_sse_id_and_retry_fields_are_ignored() {
+        let buf = "id: 42\nretry: 1000\nevent: end\ndata: {\"status\":\"done\"}\n\n";
+        assert_eq!(
+            parse_event(buf),
+            Ok((
+                Some(SseEvent::End {
+                    status: JobStatus::Done
+                }),
+                String::new()
+            ))
+        );
+    }
+
+    #[test]
+    fn read_events_recovers_after_malformed_block() {
+        let raw = b"not an sse line\n\nevent: end\ndata: {\"status\":\"done\"}\n\n";
+        let reader: Box<dyn std::io::Read + Send + Sync> = Box::new(&raw[..]);
+        let mut lines: SseLines = std::io::BufReader::new(reader).lines();
+        assert_eq!(
+            read_events(&mut lines),
+            WatchOutcome::Terminal(JobStatus::Done)
+        );
     }
 
     #[test]

@@ -515,6 +515,12 @@ pub struct SupervisorConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agy_path: Option<PathBuf>,
 
+    /// Default `sandbox` setting for generated sessions (the legacy default
+    /// session and `CLAUDE_WORKSPACES` workspace sessions) when not overridden
+    /// by `CLAUDE_SANDBOX`. Defaults to `true` when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_sandbox: Option<bool>,
+
     #[serde(default)]
     pub sessions: Vec<SessionConfig>,
 }
@@ -529,6 +535,7 @@ impl Default for SupervisorConfig {
             claude_config_dir: None,
             default_session_engine: None,
             agy_path: None,
+            default_sandbox: None,
             sessions: Vec::new(),
         }
     }

@@ -332,11 +332,8 @@ async fn run_server(
 mod tests {
     use super::*;
 
-    /// Serializes the env-mutating tests.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env_lock();
         f()
     }
 

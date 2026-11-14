@@ -88,15 +88,13 @@ pub fn write_plugin(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(&marker)
         .map_err(|e| format!("failed to create {}: {e}", marker.display()))?;
     let manifest = marker.join("plugin.json");
-    write_if_changed(
-        &manifest,
-        &serde_json::to_string_pretty(&plugin_json()).unwrap_or_default(),
-    )?;
+    let manifest_json = serde_json::to_string_pretty(&plugin_json())
+        .map_err(|e| format!("failed to serialize plugin.json: {e}"))?;
+    write_if_changed(&manifest, &manifest_json)?;
     let hooks = dir.join("hooks.json");
-    write_if_changed(
-        &hooks,
-        &serde_json::to_string_pretty(&hooks_json()).unwrap_or_default(),
-    )?;
+    let hooks_json_str = serde_json::to_string_pretty(&hooks_json())
+        .map_err(|e| format!("failed to serialize hooks.json: {e}"))?;
+    write_if_changed(&hooks, &hooks_json_str)?;
     Ok(())
 }
 
@@ -108,10 +106,18 @@ fn write_if_changed(path: &Path, content: &str) -> Result<(), String> {
             return Ok(());
         }
     }
-    let tmp = path.with_extension(format!("tmp-{}", now_unix()));
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{}-{}",
+        std::process::id(),
+        now_unix(),
+        rand::random::<u32>()
+    ));
     std::fs::write(&tmp, content.as_bytes())
         .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("failed to publish {}: {e}", path.display()))
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("failed to publish {}: {e}", path.display())
+    })
 }
 
 /// Installs the plugin for the worker's runs (the content is
