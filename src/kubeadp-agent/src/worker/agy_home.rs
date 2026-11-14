@@ -120,6 +120,14 @@ mod tests {
         M.get_or_init(|| std::sync::Mutex::new(()))
     }
 
+    /// Acquires `env_mutex()` (recovering from poison) and removes
+    /// `AGENT_RUN_A2A_MCP_ENABLED` so tests start with a clean environment.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        let guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(A2A_MCP_ENABLED_ENV);
+        guard
+    }
+
     fn command() -> Vec<String> {
         vec![
             "/usr/local/bin/kubeadp-agent".to_string(),
@@ -129,6 +137,7 @@ mod tests {
 
     #[test]
     fn creates_dirs_and_copies_the_config() {
+        let _guard = lock_env();
         let t = tempfile::tempdir().unwrap();
         let src = t.path().join("src.json");
         fs::write(&src, b"{\"mcpServers\":{}}").unwrap();
@@ -140,6 +149,7 @@ mod tests {
 
     #[test]
     fn overwrites_a_stale_config() {
+        let _guard = lock_env();
         let t = tempfile::tempdir().unwrap();
         let home = t.path().join("home");
         fs::create_dir_all(home.join(".gemini/config")).unwrap();
@@ -155,6 +165,7 @@ mod tests {
 
     #[test]
     fn unset_source_only_creates_the_dirs() {
+        let _guard = lock_env();
         let t = tempfile::tempdir().unwrap();
         prepare_agy_home(t.path(), None).unwrap();
         assert!(t.path().join(".gemini/config").is_dir());
@@ -163,6 +174,7 @@ mod tests {
 
     #[test]
     fn missing_source_is_an_error_but_dirs_exist() {
+        let _guard = lock_env();
         let t = tempfile::tempdir().unwrap();
         let err = prepare_agy_home(t.path(), Some(&t.path().join("nope.json"))).unwrap_err();
         assert!(err.contains("cannot read MCP config source"));
@@ -171,6 +183,7 @@ mod tests {
 
     #[test]
     fn leaves_agy_credentials_alone() {
+        let _guard = lock_env();
         let t = tempfile::tempdir().unwrap();
         let cli = t.path().join(".gemini/antigravity-cli");
         fs::create_dir_all(&cli).unwrap();
@@ -237,8 +250,7 @@ mod tests {
 
     #[test]
     fn enable_flag_defaults_false_and_parses_bools() {
-        let _guard = env_mutex().lock().unwrap();
-        std::env::remove_var(A2A_MCP_ENABLED_ENV);
+        let _guard = lock_env();
         assert!(!a2a_mcp_enabled());
         std::env::set_var(A2A_MCP_ENABLED_ENV, "true");
         assert!(a2a_mcp_enabled());
@@ -255,8 +267,7 @@ mod tests {
 
     #[test]
     fn prepare_agy_home_merges_a2a_when_enabled_and_is_noop_when_disabled() {
-        let _guard = env_mutex().lock().unwrap();
-        std::env::remove_var(A2A_MCP_ENABLED_ENV);
+        let _guard = lock_env();
         let t = tempfile::tempdir().unwrap();
         let src = t.path().join("src.json");
         let source_json = r#"{"mcpServers":{"keep":{"serverUrl":"http://k/mcp"}}}"#;
