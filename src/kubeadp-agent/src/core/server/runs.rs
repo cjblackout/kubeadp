@@ -72,8 +72,21 @@ fn resolve_job_run_control(
     job_id: &str,
     key: CapEndpointKey,
 ) -> Result<(Run, Arc<EmulatingEngine>), EngineError> {
-    let meta = JobMetadata::resolve(&config.state_root, job_id)
-        .map_err(|e| EngineError::Internal(format!("failed to resolve job '{job_id}': {e}")))?;
+    let meta = JobMetadata::resolve(&config.state_root, job_id).map_err(|e| {
+        if let Some(err) = e.downcast_ref::<crate::core::error::AgentRunError>() {
+            if matches!(err.kind, crate::core::error::ErrorKind::NotFound) {
+                return EngineError::NotFound {
+                    run: job_id.to_string(),
+                };
+            }
+        }
+        let msg = e.to_string();
+        let clean = match msg.find(" (no job record in ") {
+            Some(idx) => &msg[..idx],
+            None => msg.as_str(),
+        };
+        EngineError::Internal(format!("failed to resolve job '{job_id}': {clean}"))
+    })?;
     let engine = match meta.engine.as_deref() {
         Some(e) => e.to_string(),
         None => registry.default_for(RunKind::Job).clone(),
@@ -628,6 +641,18 @@ mod tests {
         register_run(run("exists", RunKind::Job, "/workspace/proj", "rterm"));
         let res = app
             .oneshot(post("/api/v1/runs/nope/interrupt", "{}"))
+            .await
+            .unwrap();
+        let (status, body) = body_json(res).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn unknown_job_on_run_control_route_answers_404_not_500() {
+        let app = run_control_app();
+        let res = app
+            .oneshot(post("/api/v1/jobs/nope-job/interrupt", "{}"))
             .await
             .unwrap();
         let (status, body) = body_json(res).await;

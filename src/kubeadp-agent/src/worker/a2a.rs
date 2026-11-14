@@ -629,15 +629,10 @@ impl JobMessageSink {
         Ok(())
     }
 
-    /// The explicit `interrupt` escalation (design §7.14, last resort): the
-    /// kill-and-resume of §7.11. Applies the per-job storm limit
-    /// (`a2a_interrupt_min_secs`, 0 = off), then resumes with the joined
-    /// pending messages -- claimed ATOMICALLY so only one concurrent
-    /// interrupt (or ladder pass) resumes for the same message -- marked
-    /// injected through the `interrupt` channel. Runs under the job's gate.
-    fn escalate_interrupt(&self, task_id: &str) -> Result<(), SdkA2AError> {
-        let job = self.slot(task_id);
-        let gate = job.gate.lock().expect("gate lock poisoned");
+    /// Checks whether the per-job interrupt storm limit (`a2a_interrupt_min_secs`,
+    /// 0 = off) currently rejects an explicit `interrupt: true` request, under
+    /// `last_interrupt` lock.
+    fn check_interrupt_rate_limit(&self, job: &JobSlot) -> Result<(), SdkA2AError> {
         let min_secs = self.config.a2a_interrupt_min_secs;
         if min_secs > 0 {
             let last = *job
@@ -648,16 +643,28 @@ impl JobMessageSink {
                 let since = last.elapsed().as_secs();
                 if since < min_secs {
                     let retry_after = min_secs.saturating_sub(since).max(1);
-                    drop(gate);
                     return Err(a2a_rate_limited(format!(
                         "interrupt rate limit: this job was interrupted {since}s ago; retry in {retry_after}s",
                     )));
                 }
             }
         }
-        *job.last_interrupt
-            .lock()
-            .expect("last_interrupt lock poisoned") = Some(Instant::now());
+        Ok(())
+    }
+
+    /// The explicit `interrupt` escalation (design §7.14, last resort): the
+    /// kill-and-resume of §7.11. Applies the per-job storm limit
+    /// (`a2a_interrupt_min_secs`, 0 = off), then resumes with the joined
+    /// pending messages -- claimed ATOMICALLY so only one concurrent
+    /// interrupt (or ladder pass) resumes for the same message -- marked
+    /// injected through the `interrupt` channel. Runs under the job's gate.
+    fn escalate_interrupt(&self, task_id: &str) -> Result<(), SdkA2AError> {
+        let job = self.slot(task_id);
+        let gate = job.gate.lock().expect("gate lock poisoned");
+        if let Err(err) = self.check_interrupt_rate_limit(&job) {
+            drop(gate);
+            return Err(err);
+        }
         let meta = JobMetadata::resolve(&self.config.state_root, task_id)
             .map_err(|_| SdkA2AError::task_not_found(task_id))?;
         let inbox = self.inbox(task_id);
@@ -666,6 +673,9 @@ impl JobMessageSink {
             drop(gate);
             return Ok(());
         }
+        *job.last_interrupt
+            .lock()
+            .expect("last_interrupt lock poisoned") = Some(Instant::now());
         let joined = join_framed(&claimed);
         let result = Self::resume_with(&self.config, &meta, &joined);
         if result.is_ok() {
@@ -716,11 +726,13 @@ impl MessageSink for JobMessageSink {
         // The explicit last resort (interrupt: true, trusted metadata): the
         // storm limit applies before the enqueue, then escalate immediately.
         if meta.interrupt {
+            let job = self.slot(task_id);
+            self.check_interrupt_rate_limit(&job)?;
             self.enqueue(task_id, sender, text, message_id, meta)?;
             self.mark_seen(task_id, message_id);
             let result = self.escalate_interrupt(task_id);
             if result.is_err() {
-                // The interrupt did not apply (storm limit, failed resume)
+                // The interrupt did not apply (concurrent storm limit, failed resume)
                 // but the message IS queued: it must not sit unwatched, so
                 // the ladder delivers it at the next boundary / idle turn.
                 self.ensure_ladder(task_id);
@@ -1298,7 +1310,9 @@ mod tests {
                 .is_ok(),
             "the first interrupt must resume the job"
         );
-        // A second interrupt within the configured interval is rate-limited.
+        // A second interrupt within the configured interval is rate-limited
+        // BEFORE enqueueing or consuming the message id, so the caller can
+        // retry the same message id after the window expires.
         let err = sink
             .deliver_with_meta("ratelimit", "sender", "second", "m2", interrupt)
             .unwrap_err();
@@ -1307,6 +1321,14 @@ mod tests {
             err.message.contains("rate limit"),
             "the refusal must say it is rate-limited, got: {}",
             err.message
+        );
+        assert!(
+            !sink.is_seen("ratelimit", "m2"),
+            "a rate-limited interrupt must not consume the message id"
+        );
+        assert!(
+            sink.inbox("ratelimit").pending().is_empty(),
+            "a rate-limited interrupt must not enqueue before the storm limit check"
         );
     }
 

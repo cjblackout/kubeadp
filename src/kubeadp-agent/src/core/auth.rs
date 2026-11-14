@@ -133,6 +133,10 @@ pub struct AuthResult {
 /// stdout/stderr transcripts.
 struct InProgress {
     child: Mutex<Child>,
+    /// Keeps the auth child registered with the process-wide zombie reaper
+    /// for the entire duration of the flow (including while parked awaiting
+    /// `submit_code`).
+    _tracked: crate::core::reaper::TrackedChild,
     /// Parent side of the PTY the child's stdin is attached to. Writing a
     /// line here delivers it to agy's stdin. Kept open for the flow's
     /// whole life (closing it would hang up agy's terminal); dropped when
@@ -346,6 +350,7 @@ impl AuthManager {
         // the slot: kill this child and report the conflict.
         let in_progress = InProgress {
             child: Mutex::new(child),
+            _tracked,
             pty_master,
             out_lines,
             err_lines,
@@ -743,8 +748,12 @@ fn transcript(
     all
 }
 
+/// Maximum lines retained per stream (stdout/stderr) during an OAuth flow so
+/// a misbehaving child cannot grow the in-memory transcript without bound.
+const MAX_AUTH_TRANSCRIPT_LINES: usize = 512;
+
 /// Captures one pipe line-by-line on a detached thread, appending each line
-/// to the shared transcript.
+/// to the shared transcript up to [`MAX_AUTH_TRANSCRIPT_LINES`].
 fn spawn_line_reader<R>(pipe: R, lines: Arc<Mutex<Vec<String>>>)
 where
     R: Read + Send + 'static,
@@ -753,7 +762,13 @@ where
         let reader = BufReader::new(pipe);
         for line in reader.lines() {
             match line {
-                Ok(text) => lines.lock().unwrap().push(strip_terminal(&text)),
+                Ok(text) => {
+                    let cleaned = strip_terminal(&text);
+                    let mut guard = lines.lock().unwrap();
+                    if guard.len() < MAX_AUTH_TRANSCRIPT_LINES {
+                        guard.push(cleaned);
+                    }
+                }
                 Err(_) => break,
             }
         }

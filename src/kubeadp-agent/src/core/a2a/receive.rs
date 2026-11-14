@@ -281,21 +281,28 @@ impl RemoteInbox {
     /// POSTs `body` to a relative endpoint with the bearer token, returning
     /// the response body text on success (HTTP 200). Nil on any error.
     ///
-    /// Runs on a fresh OS thread: the `reqwest` blocking client creates (and
-    /// later drops) its OWN tokio runtime, which is forbidden inside an
+    /// Runs on a fresh OS thread: the `reqwest` blocking client uses its OWN
+    /// internal tokio runtime, which is forbidden to block_on inside an
     /// already-running async context (the `mcp-a2a` tool handlers and the
-    /// hook path all live inside a tokio runtime). The thread is as cheap as
-    /// the nested-runtime construction it replaces and keeps the call
-    /// strictly synchronous for the caller.
+    /// hook path all live inside a tokio runtime). The blocking client itself
+    /// (and its connection pool + background runtime thread) is shared across
+    /// calls via a `OnceLock` so `wait_message` polling does not construct a
+    /// new runtime and TCP connection on every 500 ms tick.
     fn post(&self, path: &str, body: &str) -> Option<String> {
+        static CLIENT: std::sync::OnceLock<Option<reqwest::blocking::Client>> =
+            std::sync::OnceLock::new();
         let url = format!("{}{}", self.base(), path);
         let token = self.token.clone();
         let body = body.to_string();
         std::thread::spawn(move || {
-            let client = reqwest::blocking::Client::builder()
-                .timeout(HTTP_TIMEOUT)
-                .build()
-                .ok()?;
+            let client = CLIENT
+                .get_or_init(|| {
+                    reqwest::blocking::Client::builder()
+                        .timeout(HTTP_TIMEOUT)
+                        .build()
+                        .ok()
+                })
+                .as_ref()?;
             let resp = client
                 .post(url)
                 .header("content-type", "application/json")

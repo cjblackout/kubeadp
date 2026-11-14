@@ -597,11 +597,12 @@ impl JobsetRegistry {
     }
 
     /// Ends a jobset: marks `jobset_id` ended (so its old credentials stop
-    /// verifying) and returns the new epoch it was bumped to. The new epoch is
-    /// one past the highest epoch any member of the jobset holds (or 1 for an
-    /// empty jobset). Idempotent: an already-ended jobset returns its ended
-    /// epoch. Returns `None` when the jobset is not known (no member),
-    /// distinguishing it from the ended case so the caller can 404.
+    /// verifying), removes live memberships of that jobset from `entries`, and
+    /// returns the new epoch it was bumped to. The new epoch is one past the
+    /// highest epoch any member of the jobset holds (or 1 for an empty jobset).
+    /// Idempotent: an already-ended jobset returns its ended epoch. Returns
+    /// `None` when the jobset is not known (no member), distinguishing it from
+    /// the ended case so the caller can 404.
     pub fn end_jobset(&self, jobset_id: &str) -> Option<u64> {
         if let Some(already) = self.ended_epoch(jobset_id) {
             return Some(already);
@@ -609,13 +610,17 @@ impl JobsetRegistry {
         if !self.has_member_of(jobset_id) {
             return None;
         }
-        let max_member_epoch = self
-            .snapshot()
-            .values()
-            .filter(|e| e.jobset_id == jobset_id)
-            .map(|e| e.epoch)
-            .max()
-            .unwrap_or(0);
+        let max_member_epoch = {
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            let max_ep = entries
+                .values()
+                .filter(|e| e.jobset_id == jobset_id)
+                .map(|e| e.epoch)
+                .max()
+                .unwrap_or(0);
+            entries.retain(|_, e| e.jobset_id != jobset_id);
+            max_ep
+        };
         let new_epoch = max_member_epoch + 1;
         let mut map = self.ended.lock().unwrap_or_else(|e| e.into_inner());
         map.insert(jobset_id.to_string(), new_epoch);
@@ -779,8 +784,19 @@ pub fn register_agent_into(agent_id: &str, jobset_id: &str) -> Result<JobsetCred
             "refusing to join an empty jobset id: provide a non-empty 'jobset_id'".to_string(),
         );
     }
+    if global_registry().is_ended(jobset_id) {
+        return Err(format!(
+            "refusing to join jobset '{jobset_id}': jobset has already been ended"
+        ));
+    }
     // A retry keeps its original jobset (and secret) unchanged.
     if let Some(existing) = global_registry().get(agent_id) {
+        if global_registry().is_ended(&existing.jobset_id) {
+            return Err(format!(
+                "refusing to join jobset '{}': jobset has already been ended",
+                existing.jobset_id
+            ));
+        }
         return Ok(JobsetCredential {
             jobset_id: existing.jobset_id,
             secret: existing.secret,
@@ -2230,6 +2246,13 @@ mod tests {
 
                 // An unknown jobset -> None (the route 404s).
                 assert!(end_jobset("does-not-exist").expect("no io error").is_none());
+
+                // Joining an ended jobset via register_agent_into is refused (SPEC §7.2).
+                let err = register_agent_into("new-agent", &cred.jobset_id).unwrap_err();
+                assert!(
+                    err.contains("already been ended"),
+                    "ended jobset must refuse new members, got: {err}"
+                );
                 clear_root_key_env();
             });
         });

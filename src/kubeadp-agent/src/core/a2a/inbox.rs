@@ -464,6 +464,16 @@ impl Inbox {
         self.state_root.as_deref()
     }
 
+    /// The TTL (seconds) for uninjected messages in this inbox.
+    pub fn ttl_secs(&self) -> u64 {
+        self.ttl_secs
+    }
+
+    /// The claim lease window (seconds) for this inbox.
+    pub fn lease_secs(&self) -> u64 {
+        self.lease
+    }
+
     /// The dedupe key of a message: (run id, message id). Injected ids are
     /// deduplicated through the same key (the row's own `injected_at`).
     fn key(&self, message_id: &str) -> (String, String) {
@@ -1003,15 +1013,10 @@ impl Inbox {
     /// Injects every pending message through `channel` (marks each one) and
     /// returns the messages THIS call won, oldest first. This is the
     /// acknowledgement: each returned message has its row marked. Exactly
-    /// once: a message another channel injected first is not returned.
+    /// once: a message another channel claimed or injected first is not
+    /// returned.
     pub fn drain(&self, channel: &str) -> Vec<QueuedMessage> {
-        let mut out = Vec::new();
-        for msg in self.pending() {
-            if self.mark_injected(&msg.message_id, channel) {
-                out.push(msg);
-            }
-        }
-        out
+        self.drain_capped(channel, usize::MAX)
     }
 
     /// Like [`Inbox::drain`], but stops before the first message that does
@@ -1023,13 +1028,7 @@ impl Inbox {
     /// reasonable budget.
     pub fn drain_capped(&self, channel: &str, max_bytes: usize) -> Vec<QueuedMessage> {
         let mut out = Vec::new();
-        let mut budget = max_bytes;
-        for msg in self.pending() {
-            let sep = if out.is_empty() { 0 } else { 2 };
-            if msg.framed.len() + sep > budget {
-                break;
-            }
-            budget -= msg.framed.len() + sep;
+        for msg in self.claim_capped(max_bytes) {
             if self.mark_injected(&msg.message_id, channel) {
                 out.push(msg);
             }

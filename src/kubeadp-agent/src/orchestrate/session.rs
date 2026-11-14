@@ -875,6 +875,13 @@ fn run_session_iteration(
     // session's grants filter), so it passes through.
     #[cfg(feature = "a2a")]
     cmd.env(crate::core::a2a::inbox::INBOX_ENV, &a2a_inbox_dir);
+    // Record the attempt's start timestamp BEFORE minting the per-run inbox
+    // token and saving `session_state` so `start_time_epoch` in SQLite and the
+    // HMAC-bound token given to the child agree on the exact second (N3).
+    let start_epoch = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     // HL-113 phase 3: the sandbox has NO database grant, so the receive side
     // reaches its inbox through the pod-local HTTP API. Hand it the per-run
     // token (derived host-side from the jobset root key; the sandbox never
@@ -882,9 +889,7 @@ fn run_session_iteration(
     // falls back to the (now ungranted) direct inbox, which a sandboxed
     // agent simply finds empty.
     #[cfg(feature = "a2a")]
-    if let Some(token) =
-        crate::core::a2a::http::token_for_run(&a2a_inbox_dir, crate::core::a2a::inbox::now_unix())
-    {
+    if let Some(token) = crate::core::a2a::http::token_for_run(&a2a_inbox_dir, start_epoch) {
         cmd.env(crate::core::a2a::receive::INBOX_TOKEN_ENV, token);
     }
     // N4: hand the sandboxed receive side the REAL inbox API address — the
@@ -930,10 +935,6 @@ fn run_session_iteration(
 
     // 6. Spawn child process (fix #8: spawn from session thread for PDEATHSIG)
     let start_time_instant = Instant::now();
-    let start_epoch = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     let start_rfc3339 = crate::orchestrate::logging::rfc3339_now();
 
     let mut child = match spawn_in_pty(cmd, &pty, session_secret_fd) {

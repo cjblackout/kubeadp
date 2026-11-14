@@ -320,6 +320,9 @@ fn var_for_section_key(section: &str, key: &str) -> Option<String> {
         ("worker", "a2a_interrupt_min_secs") => {
             Some("AGENT_RUN_A2A_INTERRUPT_MIN_SECS".to_string())
         }
+        ("worker", "a2a_ack_secs") => Some("AGENT_RUN_A2A_ACK_SECS".to_string()),
+        ("worker", "a2a_force_secs") => Some("AGENT_RUN_A2A_FORCE_SECS".to_string()),
+        ("worker", "a2a_inbox_ttl_secs") => Some("AGENT_RUN_A2A_INBOX_TTL_SECS".to_string()),
         ("worker", "a2a_live_stdin") => Some("AGENT_RUN_A2A_LIVE_STDIN".to_string()),
         ("worker", "a2a_live_idle_secs") => Some("AGENT_RUN_A2A_LIVE_IDLE_SECS".to_string()),
         ("worker", "a2a_mcp_enabled") => Some("AGENT_RUN_A2A_MCP_ENABLED".to_string()),
@@ -442,6 +445,9 @@ fn section_keys(section: &str) -> Vec<&'static str> {
             "agy_mcp_source",
             "default_engine",
             "a2a_interrupt_min_secs",
+            "a2a_ack_secs",
+            "a2a_force_secs",
+            "a2a_inbox_ttl_secs",
             "a2a_live_stdin",
             "a2a_live_idle_secs",
             "a2a_mcp_enabled",

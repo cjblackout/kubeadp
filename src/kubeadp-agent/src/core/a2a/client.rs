@@ -237,25 +237,36 @@ impl A2aClientCtx {
     /// file), the client attaches the per-jobset credential to every outgoing
     /// request (see [`JobsetCredentialInterceptor`]) so the target agent can
     /// verify membership.
+    /// Interceptors for `entry`, honoring the N9 secret-header guard: the
+    /// jobset credential interceptor is attached ONLY when `base` is an
+    /// explicitly configured peer (`A2A_PEERS` or `A2A_URL_OVERRIDES`) or an
+    /// HTTPS endpoint, never when `entry` was merely discovered by Service
+    /// label over plain HTTP.
+    fn interceptors_for(
+        &self,
+        entry: &AgentEntry,
+        base: &str,
+        override_configured: bool,
+    ) -> Vec<Arc<dyn CallInterceptor>> {
+        let mut interceptors = self.interceptors.clone();
+        let static_peer = self
+            .static_peer_keys
+            .contains(&(entry.namespace.clone(), entry.name.clone()));
+        if secret_header_allowed(base, override_configured, static_peer) {
+            if let Some(js) = &self.jobset_interceptor {
+                interceptors.push(Arc::clone(js));
+            }
+        }
+        interceptors
+    }
+
     fn client_for(&self, entry: &AgentEntry) -> Result<A2AClient<RestTransport>, String> {
         let override_base = url_override(&entry.name, &entry.namespace);
         let base = override_base.clone().unwrap_or_else(|| entry.url.clone());
         let http = a2a_client::default_reqwest_client(None)
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
         let transport = RestTransport::new(http, base.trim_end_matches('/').to_string());
-        // The jobset secret header goes ONLY to the peers it may go to (N9):
-        // an explicitly configured peer (a static `A2A_PEERS` entry or an
-        // `A2A_URL_OVERRIDES` mapping) or an HTTPS endpoint. Never to a peer
-        // merely discovered by Service label over plain HTTP.
-        let mut interceptors = self.interceptors.clone();
-        let static_peer = self
-            .static_peer_keys
-            .contains(&(entry.namespace.clone(), entry.name.clone()));
-        if secret_header_allowed(&base, override_base.is_some(), static_peer) {
-            if let Some(js) = &self.jobset_interceptor {
-                interceptors.push(Arc::clone(js));
-            }
-        }
+        let interceptors = self.interceptors_for(entry, &base, override_base.is_some());
         Ok(A2AClient::new(transport).with_interceptors(interceptors))
     }
 
@@ -737,13 +748,14 @@ pub fn is_valid_self_name(s: &str) -> bool {
     }
 }
 
-/// The interceptors to attach to outgoing requests, built once from the
-/// environment: the per-jobset credential when this agent is a jobset member
-/// (and the operator bearer credential when one is configured, added later).
+/// The always-on interceptors to attach to outgoing requests, built once from
+/// the environment. The per-jobset credential interceptor is held separately
+/// on [`A2aClientCtx::jobset_interceptor`] and attached conditionally by
+/// [`A2aClientCtx::interceptors_for`] (only when [`secret_header_allowed`]
+/// permits it), so plain-HTTP Service-discovered peers never receive the
+/// jobset secret and allowed peers receive it exactly once.
 fn interceptors_from_env() -> Vec<Arc<dyn CallInterceptor>> {
-    jobset_credential_interceptor()
-        .map(|i| vec![Arc::new(i) as Arc<dyn CallInterceptor>])
-        .unwrap_or_default()
+    Vec::new()
 }
 
 fn read_incluster_creds() -> (Option<String>, Option<String>, Option<String>) {
@@ -1277,5 +1289,72 @@ mod tests {
             }
         )
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn interceptors_for_omits_jobset_secret_on_plain_http_discovered_peer_and_avoids_duplication(
+    ) {
+        let cred = crate::core::jobset::JobsetCredential {
+            jobset_id: "js-1".to_string(),
+            secret: "secret-1".to_string(),
+            epoch: crate::core::jobset::EPOCH_ZERO,
+        };
+        let js_interceptor: Arc<dyn CallInterceptor> = Arc::new(
+            JobsetCredentialInterceptor::from_credential(&cred).expect("valid credential"),
+        );
+
+        let discovered_http = AgentEntry {
+            name: "discovered".to_string(),
+            namespace: "ops".to_string(),
+            url: "http://discovered.ops.svc:8080".to_string(),
+            card: None,
+        };
+        let discovered_https = AgentEntry {
+            name: "secure".to_string(),
+            namespace: "ops".to_string(),
+            url: "https://secure.ops.svc:8443".to_string(),
+            card: None,
+        };
+        let static_http = AgentEntry {
+            name: "pinned".to_string(),
+            namespace: "ops".to_string(),
+            url: "http://pinned.ops.svc:8080".to_string(),
+            card: None,
+        };
+
+        let mut static_keys = HashSet::new();
+        static_keys.insert(("ops".to_string(), "pinned".to_string()));
+
+        let mut ctx = ctx_with(vec![]);
+        ctx.interceptors = interceptors_from_env();
+        ctx.jobset_interceptor = Some(js_interceptor);
+        ctx.static_peer_keys = Arc::new(static_keys);
+
+        // Plain-HTTP discovered peer: jobset secret must NOT be attached (N9).
+        let list_http = ctx.interceptors_for(&discovered_http, &discovered_http.url, false);
+        assert!(
+            list_http.is_empty(),
+            "plain-HTTP Service-discovered peer must not receive jobset secret headers"
+        );
+
+        // HTTPS peer: attached exactly once (never duplicated).
+        let list_https = ctx.interceptors_for(&discovered_https, &discovered_https.url, false);
+        assert_eq!(list_https.len(), 1);
+        let mut params: ServiceParams = HashMap::new();
+        for ic in &list_https {
+            ic.before("SendMessage", &mut params).await.unwrap();
+        }
+        assert_eq!(
+            params
+                .get(crate::core::jobset::JOBSET_SECRET_HEADER)
+                .unwrap()
+                .len(),
+            1,
+            "jobset secret header must be injected once, not duplicated"
+        );
+
+        // Static peer over plain HTTP: attached once.
+        let list_static = ctx.interceptors_for(&static_http, &static_http.url, false);
+        assert_eq!(list_static.len(), 1);
     }
 }

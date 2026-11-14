@@ -152,16 +152,37 @@ impl InboxHttpState {
     /// finished, or never started). This is the expiry (N3): a token is valid
     /// only while the run it addresses is live, and it is rejected once the
     /// run finished.
+    ///
+    /// Serves both worker jobs (`jobs` table via `JobMetadata::load` — exact
+    /// run id match, never a prefix match) and orchestrator sessions
+    /// (`session_state` table via `load_supervisor_state`).
     fn live_run_token(&self, run_id: &str) -> Result<String, String> {
-        let meta = crate::core::job::JobMetadata::resolve(&self.state_root, run_id)
-            .map_err(|e| format!("run '{run_id}' has no metadata: {e:#}"))?;
-        if meta.status != Some(crate::core::job::JobStatus::Running) {
-            return Err(format!("run '{run_id}' is not live"));
-        }
-        let started_at = meta
-            .started_at
-            .ok_or_else(|| format!("run '{run_id}' never started"))?;
-        let secs = u64::try_from(started_at.timestamp()).unwrap_or(0);
+        let secs = match crate::core::job::JobMetadata::load(&self.state_root, run_id) {
+            Ok(meta) => {
+                if meta.status != Some(crate::core::job::JobStatus::Running) {
+                    return Err(format!("run '{run_id}' is not live"));
+                }
+                let started_at = meta
+                    .started_at
+                    .ok_or_else(|| format!("run '{run_id}' never started"))?;
+                u64::try_from(started_at.timestamp()).unwrap_or(0)
+            }
+            Err(_) => {
+                let st = crate::orchestrate::state::load_supervisor_state(&self.state_root)
+                    .ok()
+                    .flatten()
+                    .ok_or_else(|| format!("run '{run_id}' has no metadata"))?;
+                let sess = st
+                    .sessions
+                    .get(run_id)
+                    .ok_or_else(|| format!("run '{run_id}' has no metadata"))?;
+                if sess.status != crate::orchestrate::state::SessionStatus::Running {
+                    return Err(format!("run '{run_id}' is not live"));
+                }
+                sess.start_time_epoch
+                    .ok_or_else(|| format!("run '{run_id}' never started"))?
+            }
+        };
         self.token_for(run_id, secs)
             .ok_or_else(|| "no A2A inbox key configured; the endpoint is closed".to_string())
     }
@@ -418,7 +439,8 @@ fn claim_leased(inbox: &Inbox, max_bytes: usize) -> Vec<ClaimedMessage> {
 /// With `claim=true` runs inside the caller's `BEGIN IMMEDIATE` transaction
 /// and marks each returned row `claimed_at`; with `claim=false` it is a
 /// read-only peek outside any transaction. Claimable rows are queued
-/// (`injected_at IS NULL`) and either never claimed or past their lease.
+/// (`injected_at IS NULL`), not yet expired (`(?3 - queued_at) < ?4`), and
+/// either never claimed or past their lease.
 #[allow(clippy::too_many_arguments)]
 fn internal_list_in_txn(
     conn: &rusqlite::Connection,
@@ -428,19 +450,21 @@ fn internal_list_in_txn(
     now: u64,
     run_id: &str,
 ) -> Result<Vec<ClaimedMessage>, String> {
-    let lease = crate::core::a2a::inbox::CLAIM_LEASE_SECS;
+    let ttl = inbox.ttl_secs().min(i64::MAX as u64) as i64;
+    let lease = inbox.lease_secs() as i64;
     let mut stmt = conn
         .prepare(
             "SELECT message_id, sender, framed, hop, context_id, task_id, queued_at
              FROM a2a_message
              WHERE run_id=?1 AND fake=?2 AND injected_at IS NULL
-               AND (claimed_at IS NULL OR (?3 - claimed_at) >= ?4)
+               AND (?3 - queued_at) < ?4
+               AND (claimed_at IS NULL OR (?3 - claimed_at) >= ?5)
              ORDER BY queued_at, message_id",
         )
         .map_err(|e| format!("failed to prepare the A2A inbox query: {e}"))?;
     let rows = stmt
         .query_map(
-            rusqlite::params![run_id, i64::from(inbox.fake()), now, lease],
+            rusqlite::params![run_id, i64::from(inbox.fake()), now, ttl, lease],
             |row| {
                 Ok(ClaimedMessage {
                     message_id: row.get(0)?,
@@ -1213,5 +1237,53 @@ mod tests {
             !evil_root.exists(),
             "the host must not create a state database under a client-chosen path"
         );
+    }
+
+    #[tokio::test]
+    async fn live_orchestrator_session_authenticates_and_expired_messages_are_hidden() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("root");
+        crate::core::job::ensure_state_store(&root).unwrap();
+
+        let now = crate::core::a2a::inbox::now_unix();
+        let mut sup = crate::orchestrate::state::SupervisorState::new(1234);
+        let mut sess = crate::orchestrate::state::SessionState::new("homelab".to_string());
+        sess.status = crate::orchestrate::state::SessionStatus::Running;
+        sess.start_time_epoch = Some(now);
+        sup.sessions.insert("homelab".to_string(), sess);
+        crate::orchestrate::state::save_supervisor_state(&root, &sup).unwrap();
+
+        let state = InboxHttpState::with_key(key(), &root);
+        let app = inbox_http_router(state.clone());
+        let token = state
+            .live_run_token("homelab")
+            .expect("live orchestrator session token");
+        let dir = inbox_dir(&root, "homelab");
+        let inbox = Inbox::new(dir.clone());
+
+        let mut expired = msg("m-expired", "too old");
+        expired.queued_at = now.saturating_sub(crate::core::a2a::inbox::DEFAULT_TTL_SECS + 10);
+        inbox.enqueue(expired).unwrap();
+        inbox.enqueue(msg("m-fresh", "fresh")).unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/a2a-inbox/peek")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(
+                        json!({"inbox": dir.to_str().unwrap()}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["count"], 1, "expired message must not be served");
+        assert_eq!(body["messages"][0]["message_id"], "m-fresh");
     }
 }
