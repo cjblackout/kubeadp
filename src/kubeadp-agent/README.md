@@ -149,6 +149,7 @@ Variables that are read at runtime and have no configuration-file key. Environme
 |---|---|---|
 | `KUBEADP_API_ALLOW_OPEN` | A2A routes (both long-lived roles) | Boolean; with no operator token configured the A2A routes stay open only when `true` — without it the server refuses to mount them and exits with an error naming this variable (fail closed). Has no configuration-file key. |
 | `KUBEADP_AGY_HOME` | Conversation recovery / `agy` home | Path override for `Config::agy_home` holding `agy`'s own state (`~/.gemini/antigravity-cli`). Passes into the sandbox via `KUBEADP_*`. |
+| `KUBEADP_SANDBOX_HOME` | Sandbox policy | Path override for `Config::sandbox_home` (default `/home/agent`) granted `shared_rw` in sandboxed worker jobs. |
 | `A2A_NAMESPACES` | A2A discovery (`mcp-a2a`, A2A client) | Comma-separated namespaces to scan for Services labelled `a2a.homelab/agent=true`, in addition to the pod's own namespace. |
 | `A2A_PEERS` | A2A discovery (`mcp-a2a`, A2A client) | Static peer registry, comma-separated `name=url` or `namespace/name=url`; needs no Kubernetes service account, so a sandboxed job without an SA token still reaches configured peers. |
 | `A2A_SELF_NAME` | A2A card and client | Outbound sender identity and the `name` field of the agent card (precedence over `POD_NAME`/`HOSTNAME`). Default: `kubeadp-agent`. |

@@ -119,6 +119,9 @@ FAKE_CLAUDE="$TMPROOT/fake-claude.sh"
 cp "$SCRIPT_DIR/fake-claude.sh" "$FAKE_CLAUDE" || die "could not copy fake-claude.sh"
 chmod +x "$FAKE_CLAUDE"
 
+GIT_EXCLUDE_FILE="$TMPROOT/git-excludes"
+printf '.fake-argv\n' > "$GIT_EXCLUDE_FILE"
+
 mkdir -p "$WORKSPACE/proj" "$FAKE_HOME"
 git -C "$WORKSPACE/proj" init -b main >/dev/null 2>&1 || {
   git -C "$WORKSPACE/proj" init >/dev/null 2>&1 || die "git init failed"
@@ -143,6 +146,10 @@ start_server() {
       KUBEADP_API_ALLOW_UNAUTHENTICATED=true \
       KUBEADP_API_ALLOW_OPEN=true \
       KUBEADP_AGY_HOME="$FAKE_HOME" \
+      KUBEADP_SANDBOX_HOME="$FAKE_HOME" \
+      GIT_CONFIG_COUNT=1 \
+      GIT_CONFIG_KEY_0=core.excludesFile \
+      GIT_CONFIG_VALUE_0="$GIT_EXCLUDE_FILE" \
       AGENT_RUN_API_LISTEN="127.0.0.1:$PORT" \
       AGENT_RUN_WORKSPACE_ROOT="$WORKSPACE" \
       AGENT_RUN_STATE_ROOT="$STATE_ROOT" \
@@ -2588,6 +2595,10 @@ t_t44() {
       KUBEADP_API_ALLOW_UNAUTHENTICATED=true \
       KUBEADP_API_ALLOW_OPEN=true \
       KUBEADP_AGY_HOME="$FAKE_HOME" \
+      KUBEADP_SANDBOX_HOME="$FAKE_HOME" \
+      GIT_CONFIG_COUNT=1 \
+      GIT_CONFIG_KEY_0=core.excludesFile \
+      GIT_CONFIG_VALUE_0="$GIT_EXCLUDE_FILE" \
       AGENT_RUN_API_LISTEN="127.0.0.1:$PORT" \
       AGENT_RUN_WORKSPACE_ROOT="$WORKSPACE" \
       AGENT_RUN_STATE_ROOT="$STATE_ROOT" \
@@ -3958,6 +3969,10 @@ EOF
       KUBEADP_API_ALLOW_UNAUTHENTICATED=true \
       KUBEADP_API_ALLOW_OPEN=true \
       KUBEADP_AGY_HOME="$FAKE_HOME" \
+      KUBEADP_SANDBOX_HOME="$FAKE_HOME" \
+      GIT_CONFIG_COUNT=1 \
+      GIT_CONFIG_KEY_0=core.excludesFile \
+      GIT_CONFIG_VALUE_0="$GIT_EXCLUDE_FILE" \
       AGENT_RUN_API_LISTEN="127.0.0.1:$PORT" \
       AGENT_RUN_WORKSPACE_ROOT="$WORKSPACE" \
       AGENT_RUN_STATE_ROOT="$STATE_ROOT" \

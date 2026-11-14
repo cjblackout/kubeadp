@@ -18,6 +18,7 @@ pub const DEFAULT_GC_MAX_AGE_DAYS: u64 = 14;
 pub const DEFAULT_MAX_PARALLEL: u32 = 3;
 pub const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 25;
 pub const DEFAULT_LAUNCH_TIMEOUT_SECS: u64 = 20;
+pub const DEFAULT_SANDBOX_HOME: &str = "/home/agent";
 pub const DEFAULT_STALL_MINUTES: u64 = 20;
 /// Minimum interval (seconds) between two A2A `SendMessage` interrupts of the
 /// SAME job: an incoming message that would interrupt a job whose previous
@@ -288,7 +289,7 @@ impl Default for Config {
             state_root,
             repos_root: expand_path(DEFAULT_REPOS_ROOT_TEMPLATE, &workspace_root),
             agy_home: None,
-            sandbox_home: PathBuf::from("/home/agent"),
+            sandbox_home: PathBuf::from(DEFAULT_SANDBOX_HOME),
             gc_max_age_days: DEFAULT_GC_MAX_AGE_DAYS,
             max_parallel: DEFAULT_MAX_PARALLEL,
             shutdown_grace_secs: DEFAULT_SHUTDOWN_GRACE_SECS,
@@ -461,6 +462,12 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .map(|s| expand_path(&s, &workspace_root));
+
+        // 8d. Resolve sandbox_home (KUBEADP_SANDBOX_HOME override)
+        let sandbox_home = match env_vars.get("KUBEADP_SANDBOX_HOME").map(|s| s.trim()) {
+            Some(raw) if !raw.is_empty() => expand_path(raw, &workspace_root),
+            _ => PathBuf::from(DEFAULT_SANDBOX_HOME),
+        };
 
         // 9. Resolve gc_max_age_days
         let gc_max_age_days = if let Some(env_val) = env_vars.get("AGENT_RUN_GC_MAX_AGE_DAYS") {
@@ -958,7 +965,7 @@ impl Config {
             state_root,
             repos_root,
             agy_home,
-            sandbox_home: PathBuf::from("/home/agent"),
+            sandbox_home,
             gc_max_age_days,
             max_parallel,
             shutdown_grace_secs,
@@ -1791,5 +1798,33 @@ no_proxy = "file-no-proxy"
         ]);
         let cfg = Config::load_with_env(&env_blank).unwrap();
         assert_eq!(cfg.agy_home, None);
+    }
+
+    #[test]
+    fn test_kubeadp_sandbox_home_env_knob() {
+        let temp_dir = tempdir().unwrap();
+        let state_root = temp_dir.path().join("state").to_str().unwrap().to_string();
+
+        // 1. Unset by default -> DEFAULT_SANDBOX_HOME (/home/agent)
+        let env_unset = env_with(&[("AGENT_RUN_STATE_ROOT", &state_root)]);
+        let cfg = Config::load_with_env(&env_unset).unwrap();
+        assert_eq!(cfg.sandbox_home, PathBuf::from(DEFAULT_SANDBOX_HOME));
+
+        // 2. Set to path -> PathBuf
+        let custom_home = temp_dir.path().join("custom_sandbox_home");
+        let env_set = env_with(&[
+            ("AGENT_RUN_STATE_ROOT", &state_root),
+            ("KUBEADP_SANDBOX_HOME", custom_home.to_str().unwrap()),
+        ]);
+        let cfg = Config::load_with_env(&env_set).unwrap();
+        assert_eq!(cfg.sandbox_home, custom_home);
+
+        // 3. Whitespace-only -> default /home/agent
+        let env_blank = env_with(&[
+            ("AGENT_RUN_STATE_ROOT", &state_root),
+            ("KUBEADP_SANDBOX_HOME", "   "),
+        ]);
+        let cfg = Config::load_with_env(&env_blank).unwrap();
+        assert_eq!(cfg.sandbox_home, PathBuf::from(DEFAULT_SANDBOX_HOME));
     }
 }

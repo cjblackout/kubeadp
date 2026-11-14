@@ -143,6 +143,7 @@ Every sandboxed policy automatically applies access restrictions to host credent
 - **Operator Token File (`KUBEADP_API_TOKEN_FILE`)**: Hidden via mount overmounting. Sandboxed processes cannot inspect host API bearer tokens.
 - **Jobset Root Key File (`KUBEADP_JOBSET_ROOT_KEY_FILE`)**: Hidden via mount overmounting. Derived secrets are supplied exclusively via private file descriptors.
 - **Agy Home Directory Override (`KUBEADP_AGY_HOME`)**: Overrides `Config::agy_home` (directory holding agy's state and SQLite conversation store at `.gemini/antigravity-cli/conversations`) for conversation recovery and testing. Allowed across the sandbox via `KUBEADP_*`.
+- **Sandbox Home Directory Override (`KUBEADP_SANDBOX_HOME`)**: Overrides `Config::sandbox_home` (default `/home/agent`) granted `shared_rw` in sandboxed worker jobs.
 - **Secret Channel**: Temporary credentials pass into the sandbox via an inherited file descriptor (`secret.fd`), written to a mode `0400` private file inside the agent's private temporary directory.
 
 #### Writable paths nested under read-only paths (gVisor)
