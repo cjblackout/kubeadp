@@ -25,6 +25,8 @@
 #   FAKE_QUOTA       print a quota/rate-limit banner (matches the
 #                    QUOTA_MARKERS in agent-core/src/job.rs), exit 1
 #                                                            -> status quota-exhausted
+#   FAKE_NO_CONV     emit no conversation id in the stream prelude (a job that
+#                    never learned its id, e.g. killed before the first step)
 #   FAKE_HANG        sleep 600s; on SIGTERM/SIGINT print the interrupted JSON
 #                    and exit 1                                  -> kill target
 #   FAKE_WRITE=<f>   write file <f> into the current dir (the worktree),
@@ -260,7 +262,7 @@ PRELUDE_DONE=0
 emit_prelude() {
   if [ "$OUTPUT_FORMAT" = "stream-json" ]; then
     local init_conv=""
-    if [[ ! "$PROMPT" == *FAKE_CONV_DB* ]]; then
+    if [[ ! "$PROMPT" == *FAKE_CONV_DB* && ! "$PROMPT" == *FAKE_NO_CONV* ]]; then
       [ -n "${CONV_ID:-}" ] || CONV_ID="$(uuid)"
       init_conv="$CONV_ID"
     fi
@@ -296,12 +298,12 @@ except Exception:
 import os, json, sys
 delta = os.environ.get("DELTA_VAL", "")
 conv = sys.argv[1]
-print(json.dumps({"event":"step_update","step_update":{"conversation_id":conv,"step_index":2,"state":"DONE","step_type":"agent_response","text_delta":delta}}))
+print(json.dumps({"event":"step_update","step_update":{"conversation_id":conv,"step_index":2,"state":"DONE","step_type":"agent_response","text_delta":delta}}, separators=(",", ":")))
 ' "$conv_id"
     printf '%s\n' "$obj" | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
-print(json.dumps({"event":"result","result":data}))
+print(json.dumps({"event":"result","result":data}, separators=(",", ":")))
 '
   else
     printf '%s\n' "$obj"
@@ -486,7 +488,7 @@ res = {
     "num_turns": 1,
     "usage": {"input_tokens": 1, "output_tokens": 1, "thinking_tokens": 0, "cache_read_tokens": 0, "total_tokens": 2}
 }
-print(json.dumps(res))
+print(json.dumps(res, separators=(",", ":")))
 ' "$(uuid)" "$DURATION")
   emit_final "$OBJ"
   exit 0

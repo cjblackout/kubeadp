@@ -168,10 +168,10 @@ start_server() {
       AGENT_RUN_JOBS_DIR_NAME=".agent-jobs" \
       AGENT_RUN_MAX_PARALLEL=3 \
       AGENT_RUN_HINDSIGHT_ENABLED=false \
-      FAKE_ARGV_LOG="$TMPROOT/argv.log" \
-      FAKE_CONVMAP_LOG="$TMPROOT/convmap.log" \
-      KUBEADP_ARGV_LOG="$TMPROOT/argv.log" \
-      KUBEADP_CONVMAP_LOG="$TMPROOT/convmap.log" \
+      FAKE_ARGV_LOG="$FAKE_HOME/argv.log" \
+      FAKE_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
+      KUBEADP_ARGV_LOG="$FAKE_HOME/argv.log" \
+      KUBEADP_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
       "$AGENT_RUN_API" >"$logname" 2>&1
   ) &
   SERVER_PID=$!
@@ -565,7 +565,7 @@ t_t06() {
 }
 
 t_t07() {
-  start_job "FAKE_HANG long running prompt"
+  start_job "FAKE_HANG FAKE_NO_CONV long running prompt"
   if [ "$START_RC" -ne 0 ]; then
     rec T07 FAIL "start exited $START_RC: $START_OUT"
     return
@@ -1639,8 +1639,8 @@ t_t28() {
   fi
   # The model list must really come from the server's agy (fake-agy): the
   # invocation of the models subcommand must have been logged by the fake.
-  if [ -f "$TMPROOT/argv.log" ] && ! tail -n 1 "$TMPROOT/argv.log" | grep -q "models"; then
-    rec T28 FAIL "fake-agy argv log shows no recent 'models' invocation (list not served by the server's agy): $(tail -n 1 "$TMPROOT/argv.log")"
+  if [ -f "$FAKE_HOME/argv.log" ] && ! tail -n 1 "$FAKE_HOME/argv.log" | grep -q "models"; then
+    rec T28 FAIL "fake-agy argv log shows no recent 'models' invocation (list not served by the server's agy): $(tail -n 1 "$FAKE_HOME/argv.log")"
     return
   fi
   rec T28 PASS "models lists all three fake agy models with their labels (LABEL table, served by the server's agy)"
@@ -2050,7 +2050,7 @@ t_t36() {
   wait_state "$id" done 60 >/dev/null || { cleanup_job "$id"; rec T36 FAIL "job did not reach done"; return; }
   local tag out rc st
   tag="T36-FOLLOWUP-$(date +%s%N | tail -c 7)"
-  : > "$TMPROOT/argv.log"
+  : > "$FAKE_HOME/argv.log"
   out=$(ar retry "$id" --prompt "please apply $tag now" 2>&1)
   rc=$?
   if [ $rc -ne 0 ]; then
@@ -2162,10 +2162,10 @@ t_t37() {
     rec T37 FAIL "follow-up retry did not finish done (last: $st)"
     return
   }
-  argv2=$(grep -F "t37 follow-up turn" "$TMPROOT/argv.log" | tail -n 1)
+  argv2=$(grep -F "t37 follow-up turn" "$FAKE_HOME/argv.log" | tail -n 1)
   if [ -z "$argv2" ]; then
     cleanup_job "$id"
-    rec T37 FAIL "the follow-up prompt never reached agy (argv log tail: $(tail -n 3 "$TMPROOT/argv.log"))"
+    rec T37 FAIL "the follow-up prompt never reached agy (argv log tail: $(tail -n 3 "$FAKE_HOME/argv.log"))"
     return
   fi
   case "$argv2" in
@@ -2333,9 +2333,9 @@ t_t41() {
 # db created while that prompt was running embeds the marker)
 convmap_id_for() {
   local marker="$1" i line id
-  [ -f "$TMPROOT/convmap.log" ] || return 0
+  [ -f "$FAKE_HOME/convmap.log" ] || return 0
   for i in $(seq 1 60); do
-    line=$(grep -F -- "$marker" "$TMPROOT/convmap.log" 2>/dev/null | head -n 1)
+    line=$(grep -F -- "$marker" "$FAKE_HOME/convmap.log" 2>/dev/null | head -n 1)
     [ -n "$line" ] && break
     sleep 0.5
   done
@@ -2435,10 +2435,10 @@ t_t42() {
     return
   fi
   wait_state "$a_id" terminal 60 >/dev/null
-  argv=$(grep -F -- $'\tt42 resume turn' "$TMPROOT/argv.log" 2>/dev/null | tail -n 1)
+  argv=$(grep -F -- $'\tt42 resume turn' "$FAKE_HOME/argv.log" 2>/dev/null | tail -n 1)
   if [ -z "$argv" ]; then
     cleanup_job "$a_id"; cleanup_job "$b_id"
-    rec T42 FAIL "the resume prompt never reached agy (argv log tail: $(tail -n 3 "$TMPROOT/argv.log"))"
+    rec T42 FAIL "the resume prompt never reached agy (argv log tail: $(tail -n 3 "$FAKE_HOME/argv.log"))"
     return
   fi
   case "$argv" in
@@ -2501,10 +2501,10 @@ t_t43() {
     *) cleanup_job "$id"; rec T43 FAIL "retry --prompt did not launch (rc $rc): $r1"; return ;;
   esac
   wait_state "$id" terminal 60 >/dev/null
-  argv=$(grep -F -- $'\tt43 resume turn' "$TMPROOT/argv.log" 2>/dev/null | tail -n 1)
+  argv=$(grep -F -- $'\tt43 resume turn' "$FAKE_HOME/argv.log" 2>/dev/null | tail -n 1)
   if [ -z "$argv" ]; then
     cleanup_job "$id"
-    rec T43 FAIL "the resume prompt never reached agy (argv log tail: $(tail -n 3 "$TMPROOT/argv.log"))"
+    rec T43 FAIL "the resume prompt never reached agy (argv log tail: $(tail -n 3 "$FAKE_HOME/argv.log"))"
     return
   fi
   case "$argv" in
@@ -2631,10 +2631,10 @@ t_t44() {
       AGENT_RUN_HINDSIGHT_ENABLED=true \
       AGENT_RUN_HINDSIGHT_AUTO_RECALL=true \
       AGENT_RUN_HINDSIGHT_AUTO_RETAIN=true \
-      FAKE_ARGV_LOG="$TMPROOT/argv.log" \
-      FAKE_CONVMAP_LOG="$TMPROOT/convmap.log" \
-      KUBEADP_ARGV_LOG="$TMPROOT/argv.log" \
-      KUBEADP_CONVMAP_LOG="$TMPROOT/convmap.log" \
+      FAKE_ARGV_LOG="$FAKE_HOME/argv.log" \
+      FAKE_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
+      KUBEADP_ARGV_LOG="$FAKE_HOME/argv.log" \
+      KUBEADP_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
        "$AGENT_RUN_API" >"$TMPROOT/server-hindsight-on.log" 2>&1
   ) &
   SERVER_PID=$!
@@ -4021,10 +4021,10 @@ EOF
       AGENT_RUN_HINDSIGHT_AUTO_RETAIN=false \
       AGENT_RUN_HINDSIGHT_PATH="$fake_hindsight" \
       FAKE_HINDSIGHT_ARGV="$argv_file" \
-      FAKE_ARGV_LOG="$TMPROOT/argv.log" \
-      FAKE_CONVMAP_LOG="$TMPROOT/convmap.log" \
-      KUBEADP_ARGV_LOG="$TMPROOT/argv.log" \
-      KUBEADP_CONVMAP_LOG="$TMPROOT/convmap.log" \
+      FAKE_ARGV_LOG="$FAKE_HOME/argv.log" \
+      FAKE_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
+      KUBEADP_ARGV_LOG="$FAKE_HOME/argv.log" \
+      KUBEADP_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
       "$AGENT_RUN_API" >"$TMPROOT/server-t162-hindsight.log" 2>&1
   ) &
   SERVER_PID=$!
@@ -4697,7 +4697,7 @@ t_t176() {
 # per invocation), and the result reports the resumed turn's text.
 t_t177() {
   local id conv out res argvf rc count newlines
-  argvf="$TMPROOT/argv.log"
+  argvf="$FAKE_HOME/argv.log"
   # Take a snapshot of the claude invocation count before this test so the
   # assertions below only look at THIS test's invocations (the log is shared
   # with agy jobs and earlier claude tests).
