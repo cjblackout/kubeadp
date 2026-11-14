@@ -1372,7 +1372,13 @@ async fn end_jobset_job(ApiPath(jobset_id): ApiPath<String>) -> Response {
         .await
     {
         Ok(Some(epoch)) => {
-            Json(json!({ "jobset_id": jobset_id, "ended": true, "epoch": epoch })).into_response()
+            // The CLI decodes every /api/v1 answer as a CommandOutput: data plus the
+            // lines to print.
+            let mut output = CommandOutput::new(
+                json!({ "jobset_id": jobset_id, "ended": true, "epoch": epoch }),
+            );
+            output.push_out(format!("Jobset '{jobset_id}' ended (epoch {epoch})."));
+            Json(output).into_response()
         }
         Ok(None) => error_to_response(anyhow::Error::new(
             crate::core::error::AgentRunError::not_found(
@@ -3719,8 +3725,15 @@ mod tests {
         let res = app.oneshot(post_json_request(&uri, "{}")).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK, "known jobset ends with 200");
         let value: Value = serde_json::from_str(&body_string(res.into_body()).await).unwrap();
-        assert_eq!(value["ended"], true);
-        assert!(value["epoch"].as_u64().unwrap() > cred.epoch);
+        assert_eq!(value["data"]["ended"], true);
+        assert!(value["data"]["epoch"].as_u64().unwrap() > cred.epoch);
+        assert!(
+            value["stdout_lines"][0]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ended"),
+            "the CLI prints the first stdout line"
+        );
         // Ended in the registry -> verification now rejects.
         assert!(crate::core::jobset::global_registry().is_ended(&cred.jobset_id));
         crate::core::jobset::drop_agent(&format!("job-end-{}", std::process::id()));

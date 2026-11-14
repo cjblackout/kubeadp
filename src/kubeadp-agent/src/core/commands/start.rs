@@ -640,7 +640,11 @@ pub fn run(config: &Config, args: &StartArgs) -> Result<CommandOutput> {
             );
         }
         discard_new_job_row(config, &job_id);
-        return Err(e).context("Failed to register the job's jobset membership");
+        // The reason (e.g. "jobset has already been ended") is part of the message: the
+        // API body only carries the top-level error text, not the cause chain.
+        return Err(anyhow::anyhow!(
+            "Failed to register the job's jobset membership: {e:#}"
+        ));
     }
 
     let worktree_for_cleanup = worktree_path.clone();
