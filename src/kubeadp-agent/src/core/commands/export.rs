@@ -261,6 +261,10 @@ pub fn run(config: &Config, args: &ExportArgs) -> Result<ExportData> {
         .into());
     }
 
+    // Auto-repair a dangling worktree (e.g. a legacy worktree whose git-sync
+    // admin dir was wiped) before validating its `.git` pointer.
+    crate::core::repos::auto_repair_worktree(config, &meta);
+
     // Never run git in a worktree agent-run owns whose .git pointer does not
     // resolve inside the project's repos root / workspace checkout (a
     // tampered/stale pointer could redirect the export into an

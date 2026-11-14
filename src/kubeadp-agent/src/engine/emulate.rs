@@ -561,7 +561,9 @@ fn fork_workdir(source: &Path, new_id: &str) -> Result<PathBuf, EngineError> {
 
 /// Copies a worktree directory into `dst` (best effort; the `.git` entry is
 /// left out so the fork is an independent directory, not a second worktree of
-/// the same repository).
+/// the same repository). Symlinks are recreated as symlinks rather than
+/// followed so a self-referential symlink cannot trigger infinite recursion
+/// and a symlink to an external path cannot materialize external file contents.
 fn copy_worktree(src: &Path, dst: &Path) -> std::io::Result<()> {
     if !src.is_dir() {
         return Err(std::io::Error::new(
@@ -578,9 +580,15 @@ fn copy_worktree(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
         let from = entry.path();
         let to = dst.join(&name);
-        if from.is_dir() {
+        let meta = std::fs::symlink_metadata(&from)?;
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            let link_target = std::fs::read_link(&from)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&link_target, &to)?;
+        } else if file_type.is_dir() {
             copy_worktree(&from, &to)?;
-        } else {
+        } else if file_type.is_file() {
             std::fs::copy(&from, &to)?;
         }
     }
@@ -1100,6 +1108,32 @@ mod tests {
         assert!(
             !forked.workdir.join(".git").exists(),
             "the fork must not carry the source .git dir"
+        );
+    }
+
+    #[test]
+    fn copy_worktree_preserves_symlinks_without_following_cycles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("file.txt"), "hello\n").unwrap();
+        // A directory symlink loop (`loop -> .`) would infinitely recurse if followed.
+        std::os::unix::fs::symlink(".", src.join("loop")).unwrap();
+        std::os::unix::fs::symlink("file.txt", src.join("rel_link")).unwrap();
+
+        copy_worktree(&src, &dst).expect("copy_worktree must succeed on symlinks and cycles");
+        let loop_meta = std::fs::symlink_metadata(dst.join("loop")).unwrap();
+        assert!(loop_meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(dst.join("loop")).unwrap(),
+            std::path::PathBuf::from(".")
+        );
+        let rel_meta = std::fs::symlink_metadata(dst.join("rel_link")).unwrap();
+        assert!(rel_meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(dst.join("rel_link")).unwrap(),
+            std::path::PathBuf::from("file.txt")
         );
     }
 }

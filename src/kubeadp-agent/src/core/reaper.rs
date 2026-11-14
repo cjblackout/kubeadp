@@ -213,8 +213,33 @@ pub fn reap_round() -> ReapRound {
     let st = state();
     // Guard pass: any tracked zombie means an owner is inside its own
     // `Child::wait` window; stepping out of the way this round is what makes
-    // the blind drain below race-free.
+    // the blind drain below race-free. Under `cfg(test)` when `test_reap_only`
+    // scopes the drain to a single target pid, only that pid is drained, so
+    // an unrelated test's transient tracked zombie cannot cause this round to
+    // skip (and cannot be stolen anyway).
     let tracked: BTreeSet<u32> = st.tracked.lock().unwrap().clone();
+    #[cfg(test)]
+    if let Some(only_pid) = test_reap_only() {
+        let only = only_pid as u32;
+        if tracked.contains(&only) && proc_pid_state(only) == Some('Z') {
+            return ReapRound {
+                skipped: true,
+                stashed: Vec::new(),
+                orphans: 0,
+            };
+        }
+    } else {
+        for pid in &tracked {
+            if proc_pid_state(*pid) == Some('Z') {
+                return ReapRound {
+                    skipped: true,
+                    stashed: Vec::new(),
+                    orphans: 0,
+                };
+            }
+        }
+    }
+    #[cfg(not(test))]
     for pid in &tracked {
         if proc_pid_state(*pid) == Some('Z') {
             return ReapRound {
@@ -577,6 +602,36 @@ mod tests {
         assert!(is_tracked(424_242));
         untrack_child(424_242);
         assert!(!is_tracked(424_242));
+    }
+
+    #[test]
+    fn reaper_scoped_drain_ignores_unrelated_tracked_zombie() {
+        let _lock = lock_proc_child_tests();
+        let unrelated = spawn_exiting_child();
+        track_child(unrelated);
+        wait_zombie(unrelated);
+
+        let target = spawn_exiting_child();
+        wait_zombie(target);
+        let _reap_only = set_test_reap_only(target);
+
+        let round = reap_round();
+        assert!(
+            !round.skipped,
+            "scoped reap_round must not skip because of an unrelated tracked zombie"
+        );
+        assert!(
+            !std::path::Path::new(&format!("/proc/{target}")).exists(),
+            "target zombie must be reaped"
+        );
+
+        let mut status: i32 = 0;
+        let r = unsafe { libc::waitpid(unrelated as i32, &mut status, 0) };
+        assert_eq!(
+            r, unrelated as i32,
+            "unrelated tracked zombie must remain intact for its owner"
+        );
+        untrack_child(unrelated);
     }
 
     #[test]

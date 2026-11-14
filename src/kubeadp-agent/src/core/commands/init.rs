@@ -191,6 +191,7 @@ mod tests {
 
     #[test]
     fn test_init_from_env_writes_mode_0600() {
+        let _env_lock = crate::core::lock_test_env();
         let tmp = tempdir().unwrap();
         let to_path = tmp.path().join("secret.txt");
         std::env::set_var("AGENT_RUN_INIT_TEST_SECRET", "s3cret-value");

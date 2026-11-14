@@ -30,57 +30,160 @@ fn engine_stem(path: &Path) -> String {
 /// is always permitted. The process group is signaled first (the agy child is a
 /// session/process-group leader, see `detached_session`), falling back to the
 /// single PID when the group no longer exists (ESRCH).
+/// Extracts executable/command basenames from a NUL-separated `/proc/<pid>/cmdline`
+/// buffer so launch targets are matched as command tokens rather than arbitrary
+/// substrings inside flag values or file paths.
+///
+/// Inspects:
+/// - `argv[0]` basename,
+/// - when `argv[0]` is a shell (`sh`, `bash`, `dash`) or env/runtime wrapper
+///   (`env`, `python3`, `node`), the first non-flag positional script basename
+///   or `-c` command's leading word,
+/// - any token immediately following `--` (for `sandbox-exec --policy ... -- <bin>`),
+/// - `argv[1]` when `argv[0]` is `kubeadp-agent` / `agent-run` (`sandbox-exec`).
+pub(crate) fn cmdline_matches_expected_targets(cmdline: &[u8], expected: &[&str]) -> bool {
+    let args: Vec<&str> = cmdline
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| std::str::from_utf8(s).ok())
+        .collect();
+    if args.is_empty() {
+        return false;
+    }
+
+    let matches_target = |candidate: &str| -> bool {
+        let base = Path::new(candidate.trim())
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or(candidate.trim())
+            .to_ascii_lowercase();
+        if base.is_empty() {
+            return false;
+        }
+        expected.iter().any(|&t| {
+            !t.is_empty()
+                && (base == t
+                    || base
+                        .strip_prefix(t)
+                        .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('.')))
+        })
+    };
+
+    // 1. Direct executable (`argv[0]`).
+    if matches_target(args[0]) {
+        return true;
+    }
+
+    // 2. Subcommand or wrapped binary after `--` (e.g. `sandbox-exec ... -- /path/to/claude`).
+    for (idx, &arg) in args.iter().enumerate() {
+        if arg == "--" {
+            if let Some(&wrapped) = args.get(idx + 1) {
+                if matches_target(wrapped) {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Some(&subcmd) = args.get(1) {
+        if subcmd == "sandbox-exec" && matches_target(subcmd) {
+            return true;
+        }
+    }
+
+    // 3. Interpreter / shell invocation (`sh /tmp/.../fake-agy.sh` or `sh -c "sleep 30"`).
+    let argv0_base = Path::new(args[0])
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or(args[0])
+        .to_ascii_lowercase();
+    if matches!(argv0_base.as_str(), "sh" | "bash" | "dash" | "zsh" | "env") {
+        let mut i = 1;
+        while i < args.len() {
+            let a = args[i];
+            if a == "-c" {
+                if let Some(&script) = args.get(i + 1) {
+                    for sep in script.split([';', '&', '|', '\n']) {
+                        if let Some(first_word) = sep.split_whitespace().next() {
+                            if matches_target(first_word) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                break;
+            } else if !a.starts_with('-') && !a.contains('=') {
+                if matches_target(a) {
+                    return true;
+                }
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    false
+}
+
 /// Lightweight sanity check to guard against PID reuse before signaling.
 ///
-/// Verifies /proc/<pid>/cmdline or /proc/<pid>/exe still looks like an expected
+/// Verifies `/proc/<pid>/cmdline` or `/proc/<pid>/exe` still looks like an expected
 /// agent process: the engine the job actually used (`agy` for agy jobs, the
 /// `claude` harness for claude jobs), the always-on `sandbox-exec` wrapper both
 /// engines run under, the `agent-run`/`kubeadp-agent` launchers, or test
 /// runner processes like `sleep`.
 ///
-/// The whole command line is compared (prefix-free) against the launch-target
-/// tokens, so a `claude` job whose recorded PID is the `sandbox-exec` wrapper
+/// Command basenames are compared against the launch-target tokens, so a
+/// `claude` job whose recorded PID is the `sandbox-exec` wrapper
 /// (`sandbox-exec --policy <file> -- /usr/local/bin/claude ...`) passes while
-/// an unrelated process whose executable happens to share a substring cannot
-/// masquerade as one. PID reuse safety is still primarily anchored on the
-/// recorded start time; this check only rejects grossly unrelated processes.
+/// an unrelated process whose arguments happen to contain a target name as a
+/// substring cannot masquerade as one. Fails closed (`false`) when neither
+/// `/proc/<pid>/cmdline` nor `/proc/<pid>/exe` can be inspected.
 pub(crate) fn is_pid_plausible_job_process(config: &Config, pid: u32) -> bool {
-    // The launch targets the job's engines define. Both engines run through the
-    // always-on `sandbox-exec` wrapper, so the wrapper token counts for either
-    // engine (the recorded PID is the wrapper's process, and its cmdline names
-    // the wrapped engine binary).
-    let mut expected: Vec<String> = vec![
-        engine_stem(&config.agy_path),
-        engine_stem(&config.claude_path),
-        "agy".to_string(),
-        "claude".to_string(),
-        "sandbox-exec".to_string(),
-        "agent-run".to_string(),
-        "sleep".to_string(),
+    let agy_stem = engine_stem(&config.agy_path);
+    let claude_stem = engine_stem(&config.claude_path);
+    let mut expected: Vec<&str> = vec![
+        "agy",
+        "claude",
+        "sandbox-exec",
+        "agent-run",
+        "kubeadp-agent",
+        "kubeadp_agent",
+        "agent_core",
+        "sleep",
     ];
-    // An empty stem (a path without a filename) must never make the substring
-    // match unconditional (`"".contains() == true`).
-    expected.retain(|t| !t.is_empty());
+    if !agy_stem.is_empty() {
+        expected.push(agy_stem.as_str());
+    }
+    if !claude_stem.is_empty() {
+        expected.push(claude_stem.as_str());
+    }
 
     let cmdline_path = format!("/proc/{}/cmdline", pid);
     if let Ok(cmdline) = std::fs::read(&cmdline_path) {
-        let s = String::from_utf8_lossy(&cmdline);
-        if !s.is_empty() {
-            let lower = s.to_ascii_lowercase();
-            return expected.iter().any(|t| lower.contains(t.as_str()));
+        if !cmdline.is_empty() {
+            return cmdline_matches_expected_targets(&cmdline, &expected);
         }
     }
 
     let exe_path = format!("/proc/{}/exe", pid);
     if let Ok(target) = std::fs::read_link(&exe_path) {
         let path_str = target.to_string_lossy();
-        if expected.iter().any(|t| path_str.contains(t.as_str())) {
-            return true;
-        }
-        return false;
+        let clean = path_str.strip_suffix(" (deleted)").unwrap_or(&path_str);
+        let base = Path::new(clean)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or(clean)
+            .to_ascii_lowercase();
+        return expected.iter().any(|&t| {
+            !t.is_empty()
+                && (base == t
+                    || base
+                        .strip_prefix(t)
+                        .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('.')))
+        });
     }
 
-    true
+    false
 }
 
 /// Tracks the identity of an OS process to prevent signaling or waiting on recycled PIDs.
@@ -1185,6 +1288,57 @@ mod tests {
         assert!(
             is_pid_alive(live_unrelated_pid),
             "the recycled PID's process must NOT have been signalled"
+        );
+    }
+
+    #[test]
+    fn test_cmdline_matches_expected_targets_rejects_argument_substrings() {
+        let expected = &[
+            "agy",
+            "claude",
+            "sandbox-exec",
+            "agent-run",
+            "kubeadp-agent",
+            "sleep",
+        ];
+
+        // Unrelated command whose arguments contain "claude", "agy", or "sleep"
+        // as path segments or flag values must NOT match.
+        let unrelated_python =
+            b"python3\0/workspace/claude-eval/run_agy_benchmark.py\0--sleep=10\0";
+        assert!(
+            !cmdline_matches_expected_targets(unrelated_python, expected),
+            "argument substring must not match as a job process"
+        );
+
+        let unrelated_cat = b"/usr/bin/cat\0/tmp/agent-run-notes.txt\0";
+        assert!(
+            !cmdline_matches_expected_targets(unrelated_cat, expected),
+            "file path argument containing agent-run must not match"
+        );
+
+        // Legitimate invocations must match.
+        let direct_claude = b"/usr/local/bin/claude\0-p\0hello\0";
+        assert!(cmdline_matches_expected_targets(direct_claude, expected));
+
+        let sandbox_wrapped =
+            b"/usr/local/bin/kubeadp-agent\0sandbox-exec\0--policy\0/tmp/p.json\0--\0/usr/bin/env\0claude\0";
+        assert!(cmdline_matches_expected_targets(sandbox_wrapped, expected));
+
+        let sh_fake_agy = b"/bin/sh\0/tmp/test/fake-agy.sh\0--print\0";
+        assert!(cmdline_matches_expected_targets(
+            sh_fake_agy,
+            &["agy", "fake-agy.sh"]
+        ));
+
+        let sh_c_sleep = b"sh\0-c\0sleep 30\0";
+        assert!(cmdline_matches_expected_targets(sh_c_sleep, expected));
+
+        // Non-existent PID fails closed (`false`).
+        let cfg = Config::default();
+        assert!(
+            !is_pid_plausible_job_process(&cfg, u32::MAX),
+            "unreadable /proc/<pid> must fail closed"
         );
     }
 }

@@ -1461,11 +1461,9 @@ mod tests {
     /// temp dir (never the real user's config).
     ///
     /// The runtime dir is a process-global env var, so all tests that touch it
-    /// are serialized through this mutex (the `cli/client.rs` pattern).
-    static RUNTIME_DIR_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// are serialized through the shared test env mutex.
     fn with_runtime_dir<F: FnOnce(&Path)>(f: F) {
-        let _guard = RUNTIME_DIR_MUTEX.lock().unwrap();
+        let _guard = crate::core::lock_test_env();
         let _d = DirtyEnv;
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var(
@@ -1504,6 +1502,7 @@ mod tests {
 
     #[test]
     fn refresh_token_reads_file_each_call_and_trims() {
+        let _lock = crate::core::lock_test_env();
         let _d = DirtyEnv;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("token");
@@ -1523,8 +1522,7 @@ mod tests {
 
     #[test]
     fn refresh_token_reads_from_env_var() {
-        static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = crate::core::lock_test_env();
         std::env::set_var("KUBEADP_REPO_SYNC_TEST_ONLY_REFRESH_TOKEN", "env-secret");
         let cfg = RepoSyncConfig {
             token_env: Some("KUBEADP_REPO_SYNC_TEST_ONLY_REFRESH_TOKEN".to_string()),

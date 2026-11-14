@@ -44,6 +44,7 @@ struct RepoLock {
 
 impl RepoLock {
     fn acquire(repo_dir: &Path) -> Result<Self> {
+        use std::io::Write;
         let path = repo_dir.join(LOCK_FILE);
         let deadline = Instant::now() + LOCK_TIMEOUT;
         loop {
@@ -52,13 +53,21 @@ impl RepoLock {
                 .write(true)
                 .open(&path)
             {
-                Ok(_) => return Ok(Self { path }),
+                Ok(mut f) => {
+                    let _ = writeln!(f, "{}", std::process::id());
+                    return Ok(Self { path });
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = fs::metadata(&path)
-                        .and_then(|m| m.modified())
+                    let holder_alive = fs::read_to_string(&path)
                         .ok()
-                        .and_then(|t| SystemTime::now().duration_since(t).ok())
-                        .is_some_and(|age| age.as_secs() > STALE_LOCK_SECS);
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .is_some_and(crate::core::job::is_pid_alive);
+                    let stale = !holder_alive
+                        && fs::metadata(&path)
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .and_then(|t| SystemTime::now().duration_since(t).ok())
+                            .is_some_and(|age| age.as_secs() > STALE_LOCK_SECS);
                     if stale {
                         let _ = fs::remove_file(&path);
                     } else if Instant::now() > deadline {

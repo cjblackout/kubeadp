@@ -103,6 +103,12 @@ struct JobHandle {
     terminal: Option<RunStatus>,
 }
 
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        crate::core::reaper::untrack_child(self.child.id());
+    }
+}
+
 /// The claude engine.
 pub struct ClaudeEngine {
     /// The claude binary path.
@@ -285,10 +291,12 @@ impl Engine for ClaudeEngine {
         if jobs.contains_key(&run_id) {
             // The freshly spawned child must not be leaked by replacing the
             // handle; it is a new process for a workdir that already has a
-            // live job, so it is killed and reaped.
+            // live job, so it is killed, reaped, and untracked.
             let mut stray = child;
+            let stray_pid = stray.id();
             let _ = stray.kill();
             let _ = stray.wait();
+            crate::core::reaper::untrack_child(stray_pid);
             return Err(EngineError::Conflict(format!(
                 "a claude job for workdir '{}' is already running",
                 spec.workdir.display()
@@ -342,6 +350,7 @@ impl Engine for ClaudeEngine {
             Some(_) => false,
             None => match handle.child.try_wait() {
                 Ok(Some(status)) => {
+                    crate::core::reaper::untrack_child(handle.child.id());
                     handle.terminal = Some(if status.success() {
                         RunStatus::Done
                     } else {
@@ -399,6 +408,7 @@ impl Engine for ClaudeEngine {
         }
         match handle.child.try_wait() {
             Ok(Some(status)) => {
+                crate::core::reaper::untrack_child(handle.child.id());
                 let outcome = if status.success() {
                     RunStatus::Done
                 } else {
@@ -737,6 +747,7 @@ exit 0
     #[cfg(feature = "test-hooks")]
     #[test]
     fn start_job_runs_fake_claude_and_captures_status_events_session() {
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         let tmp = tempfile::tempdir().unwrap();
         let engine = job_engine_with(&tmp);
         let spec = job_spec(tmp.path(), "say hi");
@@ -827,6 +838,7 @@ exit 0
     #[cfg(feature = "test-hooks")]
     #[test]
     fn resume_job_spawns_with_resume_flag() {
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         let tmp = tempfile::tempdir().unwrap();
         let engine = job_engine_with(&tmp);
         let spec = job_spec(tmp.path(), "first prompt");
@@ -890,6 +902,7 @@ exit 0
     #[cfg(feature = "test-hooks")]
     #[test]
     fn resume_requires_exited_child() {
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         let tmp = tempfile::tempdir().unwrap();
         // A fake claude that never exits: the resume is refused while the
         // child is still running.
@@ -928,6 +941,7 @@ exit 0
     #[cfg(feature = "test-hooks")]
     #[test]
     fn start_job_same_workdir_conflicts() {
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         let tmp = tempfile::tempdir().unwrap();
         let engine = job_engine_with(&tmp);
         let spec = job_spec(tmp.path(), "one");

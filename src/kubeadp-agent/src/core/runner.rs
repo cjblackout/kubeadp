@@ -555,24 +555,34 @@ pub fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
 /// just created. `access(X_OK)` mirrors exactly what the sandbox's `execvpe`
 /// will enforce for the (same-uid) agent.
 pub fn validate_executable_paths(config: &Config) -> Result<()> {
-    if config.agy_path.is_absolute() {
-        if !config.agy_path.exists() {
+    validate_engine_executable_path(config, None)
+}
+
+/// Validates the configured engine executable path for `engine` (`Some("claude")`
+/// checks `config.claude_path`; all other values check `config.agy_path`).
+pub fn validate_engine_executable_path(config: &Config, engine: Option<&str>) -> Result<()> {
+    let (label, path) = if engine == Some("claude") {
+        ("claude", &config.claude_path)
+    } else {
+        ("agy", &config.agy_path)
+    };
+    if path.is_absolute() {
+        if !path.exists() {
             bail!(
-                "Configured agy binary does not exist at '{}'",
-                config.agy_path.display()
+                "Configured {label} binary does not exist at '{}'",
+                path.display()
             );
         }
-        let Ok(c_path) = std::ffi::CString::new(config.agy_path.as_os_str().as_encoded_bytes())
-        else {
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
             bail!(
-                "Configured agy binary path '{}' contains an interior NUL byte",
-                config.agy_path.display()
+                "Configured {label} binary path '{}' contains an interior NUL byte",
+                path.display()
             );
         };
         if unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } != 0 {
             bail!(
-                "Configured agy binary is not executable at '{}'",
-                config.agy_path.display()
+                "Configured {label} binary is not executable at '{}'",
+                path.display()
             );
         }
     }
@@ -619,49 +629,63 @@ pub(crate) fn detached_session(cmd: &mut Command) {
 /// only the PATH of that file (`KUBEADP_JOBSET_SECRET_FILE`), never the secret.
 /// A jobset member whose `memfd` cannot be created fails loudly (the launch is
 /// aborted): it must not run without its secret channel.
-fn attach_session_and_secret(cmd: &mut Command, secret: Option<String>) {
-    let secret_fd: Option<std::os::fd::OwnedFd> = secret.as_deref().map(|s| {
-        use std::ffi::CString;
-        use std::os::fd::FromRawFd;
-        let bytes = s.as_bytes();
-        let name = CString::new("kubeadp-agent-jobset-secret").expect("static, no NUL");
-        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-        if fd < 0 {
-            panic!(
-                "jobset secret memfd_create failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        let mut off = 0usize;
-        while off < bytes.len() {
-            let n = unsafe {
-                libc::write(
-                    fd,
-                    bytes[off..].as_ptr() as *const libc::c_void,
-                    bytes.len() - off,
-                )
-            };
-            if n < 0 {
-                let _ = unsafe { libc::close(fd) };
-                panic!(
-                    "jobset secret memfd write failed: {}",
-                    std::io::Error::last_os_error()
-                );
+fn attach_session_and_secret(cmd: &mut Command, mut secret: Option<String>) -> Result<()> {
+    let secret_fd: Option<std::os::fd::OwnedFd> = match secret.as_mut() {
+        Some(s) => {
+            use std::ffi::CString;
+            use std::os::fd::FromRawFd;
+            let name = CString::new("kubeadp-agent-jobset-secret").expect("static, no NUL");
+            let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+            if fd < 0 {
+                let err = std::io::Error::last_os_error();
+                // Zeroize the launcher's copy even on failure.
+                for b in unsafe { s.as_bytes_mut() } {
+                    unsafe { std::ptr::write_volatile(b, 0) };
+                }
+                std::sync::atomic::compiler_fence(Ordering::SeqCst);
+                bail!("jobset secret memfd_create failed: {err}");
             }
-            off += n as usize;
+            let bytes = s.as_bytes();
+            let mut off = 0usize;
+            while off < bytes.len() {
+                let n = unsafe {
+                    libc::write(
+                        fd,
+                        bytes[off..].as_ptr() as *const libc::c_void,
+                        bytes.len() - off,
+                    )
+                };
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    let _ = unsafe { libc::close(fd) };
+                    for b in unsafe { s.as_bytes_mut() } {
+                        unsafe { std::ptr::write_volatile(b, 0) };
+                    }
+                    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+                    bail!("jobset secret memfd write failed: {err}");
+                }
+                off += n as usize;
+            }
+            // Zeroize the launcher's in-memory copy of the secret now that it
+            // has been written to the anonymous memfd (SPEC §6.5 / §10.4).
+            for b in unsafe { s.as_bytes_mut() } {
+                unsafe { std::ptr::write_volatile(b, 0) };
+            }
+            std::sync::atomic::compiler_fence(Ordering::SeqCst);
+            // Rewind the shared file offset: the child reads the secret from fd 3
+            // (a dup of this memfd) via `read_secret_fd`, which reads from the
+            // current offset to EOF. Without the rewind the child sees an empty
+            // secret and cannot authenticate as a jobset member.
+            if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } != 0 {
+                let err = std::io::Error::last_os_error();
+                let _ = unsafe { libc::close(fd) };
+                bail!("jobset secret memfd lseek failed: {err}");
+            }
+            Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
         }
-        // Rewind the shared file offset: the child reads the secret from fd 3
-        // (a dup of this memfd) via `read_secret_fd`, which reads from the
-        // current offset to EOF. Without the rewind the child sees an empty
-        // secret and cannot authenticate as a jobset member.
-        assert_eq!(
-            unsafe { libc::lseek(fd, 0, libc::SEEK_SET) },
-            0,
-            "jobset secret memfd lseek failed: {}",
-            std::io::Error::last_os_error()
-        );
-        unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
-    });
+        None => None,
+    };
+    drop(secret);
     // SAFETY: the closure runs in the forked child between fork and exec and
     // only makes async-signal-safe calls (`dup2`/`close`/`fcntl`/`setsid` plus
     // errno inspection); no allocation, locking, or non-reentrant calls. The
@@ -684,7 +708,9 @@ fn attach_session_and_secret(cmd: &mut Command, secret: Option<String>) {
                 }
                 // `dup2(src, src)` is a no-op that would leave fd 3's CLOEXEC
                 // set; clear the FD flags so fd 3 survives the exec.
-                let _ = libc::fcntl(3, libc::F_SETFD, 0);
+                if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             if libc::setsid() == -1 {
                 let err = std::io::Error::last_os_error();
@@ -696,6 +722,7 @@ fn attach_session_and_secret(cmd: &mut Command, secret: Option<String>) {
             Ok(())
         });
     }
+    Ok(())
 }
 
 /// Marks this process as a child subreaper (`prctl(PR_SET_CHILD_SUBREAPER, 1)`).
@@ -855,7 +882,7 @@ pub fn launch_background_job_with_timeout(
     poll_interval: Duration,
 ) -> Result<u32> {
     // 0. Validate executable paths upfront before creating state files
-    validate_executable_paths(config)?;
+    validate_engine_executable_path(config, meta.engine.as_deref())?;
 
     // 0a. The prompt travels as a single argv element to agy; a prompt longer
     // than PROMPT_ARGV_MAX_BYTES would make execve fail with E2BIG, surfacing
@@ -1152,7 +1179,7 @@ pub fn run_internal_runner(
     // fd 3 in the same `pre_exec` (the sandbox writes it into the private tmp
     // as a 0400 file). `None` secret = a plain job, identical to the old
     // `detached_session` behavior.
-    attach_session_and_secret(&mut spawn_cmd, jobset_secret);
+    attach_session_and_secret(&mut spawn_cmd, jobset_secret)?;
     // Live mode: the job's stdin is a pipe the worker owns; A2A messages (and
     // the initial prompt) are written into it as NDJSON lines. The pipe
     // survives the sandbox wrapper (fds 0-2 are kept open by the backends), so
@@ -1930,8 +1957,7 @@ mod tests {
     #[test]
     fn apply_a2a_self_name_sets_per_job_identity() {
         // Serialize env mutation.
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::core::lock_test_env();
         // Save/restore the env vars this test touches.
         let saved = ["A2A_SELF_PREFIX", "A2A_SELF_NAME", "HOME"]
             .iter()
@@ -2106,6 +2132,21 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_executable_paths(&ok_config).is_ok());
+
+        // A claude job checks claude_path, not agy_path.
+        let claude_only_config = Config {
+            agy_path: PathBuf::from("/nonexistent/agy-binary"),
+            claude_path: PathBuf::from("/bin/sh"),
+            ..Default::default()
+        };
+        assert!(validate_engine_executable_path(&claude_only_config, Some("claude")).is_ok());
+        assert!(validate_engine_executable_path(&config, Some("claude")).is_ok());
+        let bad_claude_config = Config {
+            agy_path: PathBuf::from("/bin/sh"),
+            claude_path: PathBuf::from("/nonexistent/claude-binary"),
+            ..Default::default()
+        };
+        assert!(validate_engine_executable_path(&bad_claude_config, Some("claude")).is_err());
     }
 
     #[test]

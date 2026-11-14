@@ -985,14 +985,17 @@ pub(crate) fn is_job_process_cmdline(pid: u32) -> bool {
         Ok(b) if !b.is_empty() => b,
         _ => return false,
     };
-    let s = String::from_utf8_lossy(&bytes);
-    s.contains("agy")
-        || s.contains("claude")
-        || s.contains("sandbox-exec")
-        || s.contains("agent-run")
-        || s.contains("agent_core")
-        || s.contains("kubeadp_agent")
-        || s.contains("sleep")
+    const EXPECTED: &[&str] = &[
+        "agy",
+        "claude",
+        "sandbox-exec",
+        "agent-run",
+        "kubeadp-agent",
+        "kubeadp_agent",
+        "agent_core",
+        "sleep",
+    ];
+    crate::core::commands::kill::cmdline_matches_expected_targets(&bytes, EXPECTED)
 }
 
 /// Computes the live job status.

@@ -250,9 +250,16 @@ pub fn current_version() -> i64 {
 /// migration above the database's `PRAGMA user_version`, in order, and
 /// leaves the version recorded. Re-running on an up-to-date database is a
 /// no-op; two concurrent processes migrating the same database are safe
-/// (migrations are additive and idempotent).
+/// (migrations are additive and idempotent). Refuses a database whose
+/// `user_version` exceeds [`current_version`] (created by a newer binary).
 pub fn migrate(conn: &Connection) -> Result<i64> {
     let mut version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let max_known = current_version();
+    if version > max_known {
+        anyhow::bail!(
+            "state database schema user_version ({version}) is newer than the highest migration known to this binary ({max_known})"
+        );
+    }
     for migration in MIGRATIONS {
         if migration.version <= version {
             continue;
@@ -361,5 +368,17 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, current_version());
+    }
+
+    #[test]
+    fn migrate_refuses_future_user_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        let future = current_version() + 5;
+        conn.pragma_update(None, "user_version", future).unwrap();
+        let err = migrate(&conn).unwrap_err().to_string();
+        assert!(
+            err.contains(&future.to_string()) && err.contains(&current_version().to_string()),
+            "error must name both the database user_version and known max version, got: {err}"
+        );
     }
 }

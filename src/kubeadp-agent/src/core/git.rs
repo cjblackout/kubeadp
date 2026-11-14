@@ -241,8 +241,10 @@ pub fn worktree_gitdir_in_expected_roots(
 
 /// The roots a worktree's `.git` pointer is allowed to resolve inside for a
 /// project (see [`worktree_gitdir_in_expected_roots`]): the private
-/// bare-repo root and, for legacy worktrees still attached to the git-sync
-/// checkout, the project's workspace checkout.
+/// bare-repo root, the `repo-sync` root `<workspace_root>/.roots/<project>`
+/// (where `<workspace_root>/<project>` is a symlink into `.roots/<project>/.worktrees/<sha>`
+/// and its `.git` points into `.roots/<project>/.git`), and, for legacy
+/// worktrees still attached to the checkout, the project's workspace checkout.
 pub fn expected_worktree_roots(
     config: &crate::core::config::Config,
     project: &str,
@@ -250,7 +252,35 @@ pub fn expected_worktree_roots(
     let mut roots = vec![config.repos_root.clone()];
     let checkout = config.workspace_root.join(project);
     if checkout != config.repos_root {
+        // When `checkout` is itself a linked worktree (e.g. repo-sync's
+        // `.roots/<project>/.worktrees/<sha>`), also allow the common `.git`
+        // directory its `gitdir:` pointer resolves into.
+        if let Some(target) = worktree_gitdir_target(&checkout) {
+            let raw = Path::new(&target);
+            let resolved = if raw.is_absolute() {
+                raw.to_path_buf()
+            } else {
+                checkout.join(raw)
+            };
+            let folded = resolved.components().fold(PathBuf::new(), |mut acc, c| {
+                acc.push(c);
+                acc
+            });
+            // `<repo>/.git/worktrees/<name>` -> allow `<repo>/.git` and `<repo>`.
+            if let Some(worktrees_dir) = folded.parent() {
+                if let Some(git_dir) = worktrees_dir.parent() {
+                    roots.push(git_dir.to_path_buf());
+                    if let Some(repo_root) = git_dir.parent() {
+                        roots.push(repo_root.to_path_buf());
+                    }
+                }
+            }
+        }
         roots.push(checkout);
+    }
+    let reposync_root = config.workspace_root.join(".roots").join(project);
+    if !roots.contains(&reposync_root) {
+        roots.push(reposync_root);
     }
     roots
 }
@@ -3632,5 +3662,55 @@ mod tests {
             .unwrap();
         assert!(st.success());
         assert!(worktree_gitdir_target(&selfc).is_none());
+    }
+
+    #[test]
+    fn test_expected_worktree_roots_accepts_reposync_roots_layout() {
+        let temp = tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let repos_root = temp.path().join("repos");
+        let roots_proj = workspace_root.join(".roots").join("homelab");
+        let roots_git_wt = roots_proj.join(".git").join("worktrees").join("job123");
+        let roots_sha_wt = roots_proj.join(".worktrees").join("deadbeef");
+        std::fs::create_dir_all(&roots_git_wt).unwrap();
+        std::fs::create_dir_all(&roots_sha_wt).unwrap();
+        std::fs::write(
+            roots_sha_wt.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                roots_proj
+                    .join(".git")
+                    .join("worktrees")
+                    .join("deadbeef")
+                    .display()
+            ),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            ".roots/homelab/.worktrees/deadbeef",
+            workspace_root.join("homelab"),
+        )
+        .unwrap();
+
+        let wt = workspace_root
+            .join(".agent-jobs")
+            .join("homelab")
+            .join("job123");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", roots_git_wt.display()),
+        )
+        .unwrap();
+
+        let config = crate::core::config::Config {
+            workspace_root,
+            repos_root,
+            ..Default::default()
+        };
+        let allowed = expected_worktree_roots(&config, "homelab");
+        worktree_gitdir_in_expected_roots(&wt, &allowed).expect(
+            "worktree attached to /workspace/.roots/<project>/.git/worktrees/<id> must be accepted",
+        );
     }
 }

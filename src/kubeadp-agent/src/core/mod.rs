@@ -45,3 +45,11 @@ pub mod server;
 
 #[cfg(feature = "a2a")]
 pub mod a2a;
+
+/// Shared process-wide mutex for unit tests that mutate or depend on
+/// process-global environment variables (`std::env::set_var` / `remove_var`).
+#[cfg(test)]
+pub fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
