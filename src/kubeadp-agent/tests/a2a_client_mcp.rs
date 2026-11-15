@@ -166,17 +166,16 @@ async fn mcp_client(
 }
 
 /// The e2e tests mutate process-global env vars (`A2A_URL_OVERRIDES`,
-/// `A2A_SELF_NAME`). A shared mutex serializes them so parallel runners cannot
+/// `A2A_SELF_NAME`). The crate-wide test env lock serializes them so parallel runners cannot
 /// clobber each other's overrides.
-fn env_mutex() -> &'static tokio::sync::Mutex<()> {
-    use std::sync::OnceLock;
-    static M: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    M.get_or_init(|| tokio::sync::Mutex::new(()))
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    kubeadp_agent::test_env_lock()
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn mcp_a2a_tools_round_trip() {
-    let _guard = env_mutex().lock().await;
+    let _guard = env_lock();
     // The in-process A2A server (peer) on an ephemeral port.
     let backend = FakeBackend::with(vec![task("t-1", "ctx-1", TaskState::Working)]);
     let sink = Arc::new(RecordingSink::default());
@@ -378,8 +377,9 @@ async fn mcp_a2a_tools_round_trip() {
 
 /// The `max_hop` limit surfaces as a tool error on send, not a panic.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn mcp_a2a_send_refuses_beyond_max_hop() {
-    let _guard = env_mutex().lock().await;
+    let _guard = env_lock();
     let backend = FakeBackend::with(vec![task("t-1", "ctx-1", TaskState::Working)]);
     let base = serve(backend, Arc::new(RecordingSink::default())).await;
     let port: u64 = base.rsplit(':').next().unwrap().parse().unwrap();
@@ -426,8 +426,9 @@ async fn mcp_a2a_send_refuses_beyond_max_hop() {
 /// `send_message`/`reply` accept a `namespace/name` pair to disambiguate
 /// same-named agents across namespaces; a bare ambiguous name is an error.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn mcp_a2a_name_vs_namespace_name_resolution() {
-    let _guard = env_mutex().lock().await;
+    let _guard = env_lock();
     // Two peer servers, one per namespace, both named "worker".
     let backend_a = FakeBackend::with(vec![task("t-a", "ctx-a", TaskState::Working)]);
     let base_a = serve(backend_a, Arc::new(RecordingSink::default())).await;

@@ -180,8 +180,7 @@ mod tests {
     /// self-name is honoured as-is.
     #[test]
     fn static_peers_ctx_registers_configured_peers() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_env_lock();
         use crate::core::a2a::client::A2A_PEERS_ENV;
 
         std::env::set_var(

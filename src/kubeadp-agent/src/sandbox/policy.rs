@@ -961,6 +961,7 @@ mod tests {
 
     #[test]
     fn test_hide_operator_token_file_reads_env() {
+        let _guard = crate::test_env_lock();
         // `hide_operator_token_file` maps the configured `KUBEADP_API_TOKEN_FILE`
         // path into the `hide` list. Asserted via the pure `with_hidden_path`
         // on the same resolved value (avoids mutating the process env, which is

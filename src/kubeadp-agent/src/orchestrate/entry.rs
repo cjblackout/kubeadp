@@ -46,22 +46,26 @@ fn register_signals() {
 fn print_help() {
     eprintln!(
         "Usage:
-  agent-orchestrate [run] [--config <path>]
-  agent-orchestrate print-config [--config <path>]
-  agent-orchestrate status [--config <path>] [--state-file <path>] [--stale-threshold-secs <secs>]
-  agent-orchestrate --help
+  kubeadp-agent orchestrator [run] [--config <path>]
+  kubeadp-agent orchestrator print-config [--config <path>]
+  kubeadp-agent orchestrator status [--config <path>] [--state-file <path>] [--stale-threshold-secs <secs>]
+  kubeadp-agent orchestrator --help
 "
     );
 }
 
 pub fn run() {
     let args: Vec<String> = env::args().collect();
+    run_with_args(&args[1..]);
+}
+
+pub fn run_with_args(args: &[String]) {
     let mut cmd = "run";
     let mut config_path: Option<PathBuf> = None;
     let mut state_file_override: Option<PathBuf> = None;
     let mut stale_thresh_override: Option<f64> = None;
 
-    let mut i = 1;
+    let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "run" => {

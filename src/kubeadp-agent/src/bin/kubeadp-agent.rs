@@ -1,7 +1,8 @@
-//! kubeadp-agent: role dispatcher.
+//! kubeadp-agent: role dispatcher and subcommand router.
 //!
-//! Selects the long-lived role from the `KUBEADP_ROLE` environment variable:
-//! - `orchestrator` -> the agent-orchestrate process supervisor
+//! Selects the long-lived role from the `KUBEADP_ROLE` environment variable
+//! or a subcommand (`orchestrator` / `worker`):
+//! - `orchestrator` -> the agent orchestrator process supervisor
 //! - `worker`       -> the agent-run API daemon (remote job execution)
 //!
 //! The `mcp-a2a` subcommand (first argument) runs the A2A **sending** side as
@@ -45,11 +46,37 @@ fn apply_config_for(role: &str) {
     }
 }
 
+fn run_orchestrator(args: &[String]) -> ! {
+    apply_config_for("orchestrator");
+    kubeadp_agent::orchestrate::entry::run_with_args(args);
+    exit(0);
+}
+
+fn run_worker() -> ! {
+    apply_config_for("worker");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    if let Err(e) = rt.block_on(kubeadp_agent::worker::entry::run()) {
+        eprintln!("kubeadp-agent (worker): {e:#}");
+        exit(1);
+    }
+    exit(0);
+}
+
 fn main() {
     // Subcommands handled before the role dispatch: explicit, self-describing
     // entries that need no KUBEADP_ROLE.
     let first_arg = std::env::args().nth(1);
     match first_arg.as_deref() {
+        Some("orchestrator") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            run_orchestrator(&args);
+        }
+        Some("worker") => {
+            run_worker();
+        }
         Some("sandbox-exec") => {
             let args: Vec<String> = std::env::args().skip(2).collect();
             kubeadp_agent::sandbox::cli::run_sandbox_exec(&args);
@@ -92,19 +119,11 @@ fn main() {
 
     match std::env::var("KUBEADP_ROLE").as_deref() {
         Ok("orchestrator") => {
-            apply_config_for("orchestrator");
-            kubeadp_agent::orchestrate::entry::run();
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            run_orchestrator(&args);
         }
         Ok("worker") => {
-            apply_config_for("worker");
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build tokio runtime");
-            if let Err(e) = rt.block_on(kubeadp_agent::worker::entry::run()) {
-                eprintln!("kubeadp-agent (worker): {e:#}");
-                exit(1);
-            }
+            run_worker();
         }
         Ok(other) => {
             eprintln!(

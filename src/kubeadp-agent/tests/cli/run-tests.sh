@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Black-box test suite for agent-run (CLI shim + API server + core engine).
+# Black-box test suite for agent-run (CLI shim + worker API daemon + core engine).
 #
 # Run with:  bash run-tests.sh
 #
-# The suite starts its OWN private agent-run-api server on 127.0.0.1 (default
+# The suite starts its OWN private worker server on 127.0.0.1 (default
 # port 18002) with a scripted fake `agy` (fake-agy.sh), a fresh git project
 # and a temp state root. It never talks to any other server and never uses a
 # real agy login.
 #
 # Environment knobs:
-#   BIN_DIR  dir holding prebuilt `agent-run` and `agent-run-api` binaries.
-#            Unset: both crates are built with `cargo build --release` into
+#   BIN_DIR  dir holding prebuilt `agent-run` and `kubeadp-agent` binaries.
+#            Unset: both binaries are built with `cargo build --release` into
 #            CARGO_TARGET_DIR (default $HOME/.cache/agent-run-blackbox-target)
 #            and the results copied to $HOME/.cache/agent-run-blackbox/bin.
 #   PORT     listen port for the private server (default 18002)
@@ -88,18 +88,16 @@ else
     mkdir -p "$BIN_DIR"
     echo "Building agent-run (release)..."
     (cd "$CRATE_DIR" && cargo build --release --bin agent-run) || die "cargo build (agent-run) failed"
-    echo "Building agent-run-api (release)..."
-    (cd "$CRATE_DIR" && cargo build --release --bin agent-run-api) || die "cargo build (agent-run-api) failed"
+    echo "Building kubeadp-agent (release)..."
+    (cd "$CRATE_DIR" && cargo build --release --bin kubeadp-agent) || die "cargo build (kubeadp-agent) failed"
     cp "$CARGO_TARGET_DIR/release/agent-run" "$BIN_DIR/" || die "could not copy agent-run binary"
-    cp "$CARGO_TARGET_DIR/release/agent-run-api" "$BIN_DIR/" || die "could not copy agent-run-api binary"
+    cp "$CARGO_TARGET_DIR/release/kubeadp-agent" "$BIN_DIR/" || die "could not copy kubeadp-agent binary"
   fi
 fi
 AGENT_RUN="$BIN_DIR/agent-run"
-AGENT_RUN_API="$BIN_DIR/agent-run-api"
 KUBEADP_AGENT="$BIN_DIR/kubeadp-agent"
 [ -x "$AGENT_RUN" ] || die "agent-run binary not found/executable at $AGENT_RUN"
-[ -x "$AGENT_RUN_API" ] || die "agent-run-api binary not found/executable at $AGENT_RUN_API"
-[ -x "$KUBEADP_AGENT" ] || die "kubeadp-agent binary not found/executable at $KUBEADP_AGENT (needed by sandbox-exec launcher)"
+[ -x "$KUBEADP_AGENT" ] || die "kubeadp-agent binary not found/executable at $KUBEADP_AGENT"
 
 # --- temp world ---------------------------------------------------------------
 TMPROOT=$(mktemp -d 2>/dev/null) || die "mktemp -d failed"
@@ -172,7 +170,8 @@ start_server() {
       FAKE_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
       KUBEADP_ARGV_LOG="$FAKE_HOME/argv.log" \
       KUBEADP_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
-      "$AGENT_RUN_API" >"$logname" 2>&1
+      KUBEADP_ROLE=worker \
+      "$KUBEADP_AGENT" >"$logname" 2>&1
   ) &
   SERVER_PID=$!
   CUR_SERVER_LOG="$logname"
@@ -2635,7 +2634,8 @@ t_t44() {
       FAKE_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
       KUBEADP_ARGV_LOG="$FAKE_HOME/argv.log" \
       KUBEADP_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
-       "$AGENT_RUN_API" >"$TMPROOT/server-hindsight-on.log" 2>&1
+      KUBEADP_ROLE=worker \
+       "$KUBEADP_AGENT" >"$TMPROOT/server-hindsight-on.log" 2>&1
   ) &
   SERVER_PID=$!
   CUR_SERVER_LOG="$TMPROOT/server-hindsight-on.log"
@@ -4025,7 +4025,8 @@ EOF
       FAKE_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
       KUBEADP_ARGV_LOG="$FAKE_HOME/argv.log" \
       KUBEADP_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
-      "$AGENT_RUN_API" >"$TMPROOT/server-t162-hindsight.log" 2>&1
+      KUBEADP_ROLE=worker \
+      "$KUBEADP_AGENT" >"$TMPROOT/server-t162-hindsight.log" 2>&1
   ) &
   SERVER_PID=$!
   CUR_SERVER_LOG="$TMPROOT/server-t162-hindsight.log"
@@ -5939,7 +5940,7 @@ echo "port:      $PORT"
 echo "temp root: $TMPROOT"
 
 start_server
-[ -n "$SERVER_PID" ] || die "failed to launch agent-run-api"
+[ -n "$SERVER_PID" ] || die "failed to launch worker server"
 wait_for_server
 echo "server healthy (pid $SERVER_PID)"
 

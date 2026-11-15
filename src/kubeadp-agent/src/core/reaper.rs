@@ -516,6 +516,7 @@ mod tests {
 
     #[test]
     fn reaper_reaps_untracked_zombie() {
+        let _env_lock = crate::test_env_lock();
         let _lock = lock_proc_child_tests();
         let before = orphan_reap_count();
         let pid = spawn_exiting_child();
@@ -529,10 +530,14 @@ mod tests {
             !round.skipped,
             "no tracked child is a zombie, so the round must not skip"
         );
-        assert!(
-            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-            "the reaper must have reaped the untracked zombie {pid}"
-        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the reaper must have reaped the untracked zombie {pid}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             orphan_reap_count() >= before.saturating_add(1),
             "orphan counter must advance ({before} -> {})",

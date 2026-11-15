@@ -17,18 +17,18 @@ Unified agent execution stack. It provides a process supervisor and REST API (`o
 
 The package provides the following binaries:
 
-- `kubeadp-agent`: Dispatcher binary. When invoked without subcommands, it reads the `KUBEADP_ROLE` environment variable:
-  - `KUBEADP_ROLE=orchestrator`: Runs the session supervisor and management API.
-  - `KUBEADP_ROLE=worker`: Runs the background job API daemon.
+- `kubeadp-agent`: Dispatcher binary. Role comes from `KUBEADP_ROLE` or subcommands:
+  - `KUBEADP_ROLE=orchestrator` or subcommand `orchestrator`: Runs the session supervisor and management API.
+  - `KUBEADP_ROLE=worker` or subcommand `worker`: Runs the background job API daemon.
   - An unset or invalid `KUBEADP_ROLE` exits with code 2.
 - `agent-run`: Remote CLI client communicating with the API daemon over HTTP.
-- `agent-orchestrate`: Direct binary entry point for the orchestrator role.
-- `agent-run-api`: Direct binary entry point for the worker role.
 
 ### Subcommands
 
 The `kubeadp-agent` binary supports subcommands that run directly without requiring `KUBEADP_ROLE`:
 
+- `kubeadp-agent orchestrator [run|print-config|status] [flags...]`: Runs or inspects the orchestrator role.
+- `kubeadp-agent worker`: Runs the background job API worker daemon.
 - `kubeadp-agent mcp-a2a`: Standard I/O Model Context Protocol (MCP) server providing client tools for talking to peer A2A agents (`list_agents`, `send_message`, `reply`, `get_task`).
 - `kubeadp-agent repo-sync [--once|--loop]`: Synchronizes Git repositories into local checkouts using atomic worktrees and symlinks.
 - `kubeadp-agent sandbox-exec --policy <file|-> -- <cmd> [args...]`: Executes `<cmd>` inside a sandboxed environment according to the specified policy.
@@ -49,7 +49,7 @@ The `kubeadp-agent` binary supports subcommands that run directly without requir
 
 ## Configuration File
 
-The long-lived roles of `kubeadp-agent` (`orchestrator` and `worker`), as well as `agent-orchestrate` and `agent-run-api`, can be configured via a TOML file.
+The long-lived roles of `kubeadp-agent` (`orchestrator` and `worker`) can be configured via a TOML file.
 
 File resolution:
 1. `KUBEADP_CONFIG_FILE` environment variable specifies an explicit path. An empty string is an error.
@@ -59,6 +59,8 @@ File resolution:
 Environment variables take precedence over settings in the configuration file.
 
 The file contains three sections: `[common]`, `[orchestrator]`, and `[worker]`. Unknown, misplaced, or duplicate keys produce a configuration error and exit code 1. A `[repo_sync]` section is rejected in this file; repo-sync has its own file (see [DOCS.md](DOCS.md), section 6).
+
+Session names defined in orchestrator session configuration (`config`) are validated at load time and must not look like a job id (exactly 8 lowercase hexadecimal characters), preventing run id ambiguity.
 
 ### Configuration Keys
 

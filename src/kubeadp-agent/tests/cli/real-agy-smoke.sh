@@ -128,21 +128,21 @@ if [ -n "$BIN_DIR" ]; then
   BIN_DIR="$BIN_DIR"
 else
   BIN_DIR="$HOME/.cache/agent-run-blackbox/bin"
-  if [ ! -x "$BIN_DIR/agent-run" ] || [ ! -x "$BIN_DIR/agent-run-api" ]; then
+  if [ ! -x "$BIN_DIR/agent-run" ] || [ ! -x "$BIN_DIR/kubeadp-agent" ]; then
     export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/agent-run-blackbox-target}"
     mkdir -p "$BIN_DIR" || die "could not create $BIN_DIR"
     echo "Building agent-run (release)..."
     (cd "$CRATE_DIR" && cargo build --release --bin agent-run) || die "cargo build (agent-run) failed"
-    echo "Building agent-run-api (release)..."
-    (cd "$CRATE_DIR" && cargo build --release --bin agent-run-api) || die "cargo build (agent-run-api) failed"
+    echo "Building kubeadp-agent (release)..."
+    (cd "$CRATE_DIR" && cargo build --release --bin kubeadp-agent) || die "cargo build (kubeadp-agent) failed"
     cp "$CARGO_TARGET_DIR/release/agent-run" "$BIN_DIR/" || die "could not copy agent-run binary"
-    cp "$CARGO_TARGET_DIR/release/agent-run-api" "$BIN_DIR/" || die "could not copy agent-run-api binary"
+    cp "$CARGO_TARGET_DIR/release/kubeadp-agent" "$BIN_DIR/" || die "could not copy kubeadp-agent binary"
   fi
 fi
 AGENT_RUN="$BIN_DIR/agent-run"
-AGENT_RUN_API="$BIN_DIR/agent-run-api"
+KUBEADP_AGENT="$BIN_DIR/kubeadp-agent"
 [ -x "$AGENT_RUN" ] || die "agent-run binary not found/executable at $AGENT_RUN"
-[ -x "$AGENT_RUN_API" ] || die "agent-run-api binary not found/executable at $AGENT_RUN_API"
+[ -x "$KUBEADP_AGENT" ] || die "kubeadp-agent binary not found/executable at $KUBEADP_AGENT"
 
 # --- work dirs (token dir is mode 700 and survives across runs) ----------------
 mkdir -p "$WS" "$STATE" "$AGY_TEST_HOME" || die "could not create $WS / $STATE / $AGY_TEST_HOME"
@@ -250,7 +250,8 @@ start_server() {
       AGENT_RUN_JOBS_DIR_NAME=".agent-jobs" \
       AGENT_RUN_MAX_PARALLEL=2 \
       AGENT_RUN_HINDSIGHT_ENABLED=false \
-      "$AGENT_RUN_API" >"$SERVER_LOG" 2>&1
+      KUBEADP_ROLE=worker \
+      "$KUBEADP_AGENT" >"$SERVER_LOG" 2>&1
   ) &
   SERVER_PID=$!
 }

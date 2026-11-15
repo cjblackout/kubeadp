@@ -3,8 +3,8 @@
 # build and `docker push` (see .github/workflows/build-kubeadp-agent.yml).
 # Covers BOTH old images' checks in one superset:
 #   ai-server:      claude, node, npm, npx, git, tini, code-server (dropped:
-#                   code-server is gone from the image), agent-orchestrate
-#   agent-run-api:  agent-run-api boot on /healthz, agy, git, curl, gcc, make,
+#                   code-server is gone from the image), orchestrator role
+#   agent-run-api:  worker role boot on /healthz, agy, git, curl, gcc, make,
 #                   pkg-config
 #   new:            the role dispatcher (bogus role -> exit 2), agent-run,
 #                   ttyd (version + listen-and-serve)
@@ -133,33 +133,32 @@ check pkg-config 'pkg-config --version'
 # supported (it is a Node-backed CLI; --version may fall back to --help).
 check_version agy /usr/local/libexec/agy
 
-# agent-run and agent-orchestrate come with the image (workers reach jobs, the
-# orchestrator runs the supervisor). agent-orchestrate --help must print its
-# usage and exit 0.
+# agent-run comes with the image (workers reach jobs).
+# kubeadp-agent orchestrator --help must print its usage and exit 0.
 check_version agent-run
-check_exec agent-orchestrate /usr/local/bin/agent-orchestrate
-check agent-orchestrate-help 'agent-orchestrate --help'
+check kubeadp-agent-orchestrator-help 'kubeadp-agent orchestrator --help'
 
-# --- agent-run-api (worker role) boot check ----------------------------------
+# --- worker role boot check ----------------------------------
 # Same bounded boot check as docker/agent-run-api/smoke-test.sh: the API server
-# binary must answer /healthz on a loopback port within ~5s.
-if [ -x "/usr/local/bin/agent-run-api" ]; then
-  ara_bin="/usr/local/bin/agent-run-api"
+# must answer /healthz on a loopback port within ~5s.
+if command -v kubeadp-agent >/dev/null 2>&1; then
+  worker_bin="kubeadp-agent"
 else
-  ara_bin=""
+  worker_bin=""
 fi
-if [ -z "$ara_bin" ]; then
-  fail "agent-run-api-boot" "not executable: /usr/local/bin/agent-run-api"
+if [ -z "$worker_bin" ]; then
+  fail "worker-boot" "not executable: kubeadp-agent"
 else
   ara_work=$(mktemp -d)
   ara_state=$(mktemp -d)
   ara_port=$($TCMD python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()' 2>/dev/null || echo $((20000 + RANDOM % 10000)))
+  KUBEADP_ROLE=worker \
   KUBEADP_API_ALLOW_UNAUTHENTICATED=1 \
   KUBEADP_API_ALLOW_OPEN=1 \
   AGENT_RUN_API_LISTEN="127.0.0.1:$ara_port" \
   AGENT_RUN_WORKSPACE_ROOT="$ara_work" \
   AGENT_RUN_STATE_ROOT="$ara_state" \
-  "$ara_bin" >/dev/null 2>&1 &
+  "$worker_bin" >/dev/null 2>&1 &
   ara_pid=$!
 
   boot_ok=0
@@ -190,9 +189,9 @@ else
   rm -rf "$ara_work" "$ara_state"
 
   if [ "$boot_ok" -eq 1 ]; then
-    echo "ok agent-run-api-boot: healthz responded on 127.0.0.1:$ara_port"
+    echo "ok worker-boot: healthz responded on 127.0.0.1:$ara_port"
   else
-    fail "agent-run-api-boot" "failed to answer on 127.0.0.1:$ara_port within 5s"
+    fail "worker-boot" "failed to answer on 127.0.0.1:$ara_port within 5s"
   fi
 fi
 

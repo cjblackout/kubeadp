@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # run-tests.sh: Black-box integration test suite for agent-orchestrate
 # Needs a PTY and the sandbox launcher: run it where PTYs are available (e.g. inside the
-# worker pod) with CARGO_TARGET_DIR=<dir> holding debug/agent-orchestrate and a sibling
-# debug/kubeadp-agent; the suite builds only when that binary is missing.
+# worker pod) with CARGO_TARGET_DIR=<dir> holding debug/kubeadp-agent; the suite builds only when that binary is missing.
 set -uo pipefail
 
 for v in $(compgen -v | grep ^KUBEADP); do unset "$v"; done
+export KUBEADP_ROLE=orchestrator
 export KUBEADP_API_ALLOW_UNAUTHENTICATED=true
 export KUBEADP_API_ALLOW_OPEN=true
 # Unset ambient supervisor and entrypoint environment variables to ensure test hermeticity
@@ -15,10 +15,12 @@ unset AGENT_ORCHESTRATE_CONFIG CLAUDE_SUPERVISOR_CONFIG CLAUDE_DEFAULT_SESSION \
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-if [ -n "${CARGO_TARGET_DIR:-}" ]; then
-    BIN="${CARGO_TARGET_DIR}/debug/agent-orchestrate"
+if [ -n "${BIN_DIR:-}" ] && [ -x "${BIN_DIR}/kubeadp-agent" ]; then
+    BIN="${BIN_DIR}/kubeadp-agent"
+elif [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    BIN="${CARGO_TARGET_DIR}/debug/kubeadp-agent"
 else
-    BIN="${CRATE_DIR}/target/debug/agent-orchestrate"
+    BIN="${CRATE_DIR}/target/debug/kubeadp-agent"
 fi
 
 # Test tracking
@@ -61,11 +63,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Building agent-orchestrate crate..."
-# A prebuilt binary (CARGO_TARGET_DIR/debug/agent-orchestrate) is used as is; the
+echo "Building kubeadp-agent binary..."
+# A prebuilt binary (CARGO_TARGET_DIR/debug/kubeadp-agent) is used as is; the
 # suite only builds when it is missing.
 if [ ! -x "$BIN" ]; then
-    cargo build --manifest-path "${CRATE_DIR}/Cargo.toml" --features test-hooks --quiet
+    cargo build --manifest-path "${CRATE_DIR}/Cargo.toml" --bin kubeadp-agent --features test-hooks --quiet
 fi
 stop_supervisor() {
     local pid="$1"

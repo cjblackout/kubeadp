@@ -15,20 +15,20 @@ agent runs, process supervision, Hindsight memory), the engine layer (one trait 
 front of every agent harness), the session supervisor (PTY sessions with an
 agent-run-compatible REST API), the per-pod state store (one SQLite database),
 jobset messaging (authenticated agent-to-agent messaging over the A2A protocol,
-`mcp-a2a`), the process sandbox, and the remote CLI (`agent-run`). It ships four
-binaries — `kubeadp-agent`, `agent-run`, `agent-orchestrate`, `agent-run-api` —
-from one image; the long-lived roles are selected by `KUBEADP_ROLE`.
+`mcp-a2a`), the process sandbox, and the remote CLI (`agent-run`). It ships two
+binaries — `kubeadp-agent` and `agent-run` —
+from one image; the long-lived roles are selected by `KUBEADP_ROLE` or subcommands.
 
 ### 1.2 Roles
-- **orchestrator** (`KUBEADP_ROLE=orchestrator`): runs the session supervisor;
+- **orchestrator** (`KUBEADP_ROLE=orchestrator` or subcommand `orchestrator`): runs the session supervisor;
   serves the shared `/api/v1` surface (jobs, run-control, capabilities), the
   sessions API and the A2A surface.
-- **worker** (`KUBEADP_ROLE=worker`): the job-execution daemon (`agent-run-api`);
+- **worker** (`KUBEADP_ROLE=worker` or subcommand `worker`): the job-execution daemon;
   serves the shared `/api/v1` surface and the A2A surface.
 - A role selects defaults and which supervisor loops start. It never restricts
   the engine: every role registers every engine built into the image (§3.1).
 - **dispatcher rule**: `KUBEADP_ROLE` unset or any other value must print a clear
-  message and exit with code `2`. Subcommands (`sandbox-exec`, `sandbox-probe`,
+  message and exit with code `2`. Subcommands (`orchestrator`, `worker`, `sandbox-exec`, `sandbox-probe`,
   `relay-inner`, `relay-connect`, `mcp-a2a`, `a2a-hook`, `repo-sync`) dispatch on
   the first argument and never require `KUBEADP_ROLE`; their exit codes are fixed
   in §6, §7.14, §8 and §9.4.
@@ -461,7 +461,7 @@ pod restart (restored at start); the legacy JSON state file is imported once
 (`*.migrated`). Schema migrations are numbered and additive
 (`src/state/migrations.rs`, `PRAGMA user_version`). Heartbeat written every
 `heartbeat_interval_secs`, stale after `stale_heartbeat_secs`.
-`agent-orchestrate status` exit codes: `0` healthy, `1`
+`kubeadp-agent orchestrator status` exit codes: `0` healthy, `1`
 stale heartbeat, `2` a session `failed`/thread died, `3` supervisor state
 unreadable / no state in the database,
 `4` supervisor stopped or a session stopped. `/healthz` → `200 {"status":"ok"}`;
@@ -1557,7 +1557,7 @@ application layer does not rely on the network being the only gate.
 
 ### 11.1 One image, two roles
 A single image `ghcr.io/cjblackout/homelab/kubeadp-agent` serves both roles,
-built with features `a2a` (plus `cli,server`), containing all four binaries and
+built with features `a2a` (plus `cli,server`), containing `kubeadp-agent` and `agent-run` and
 the engine harnesses (`claude`, `agy` at `/usr/local/libexec/agy`, `ttyd`,
 `tini`). `KUBEADP_ROLE` invalid exits 2. Every on-main image build bumps the
 single `kubeadp-agent` version key and rewrites the worker's image line; the
@@ -1712,7 +1712,7 @@ automated coverage of §12.2.
 The image smoke test (as image user, no root, no network, per-command timeout)
 must verify: role dispatcher exit 2 on an invalid role; `--version`/exec of
 claude, node, npm, npx, tini, ttyd, git, curl, gcc, make, pkg-config, agy,
-`agent-run`, `agent-orchestrate`; a bounded worker-API boot answering
+`agent-run`; `kubeadp-agent orchestrator --help`; a bounded worker-API boot answering
 `/healthz`; ttyd serving HTTP; a dangling-symlink scan of the image paths.
 
 ### 12.6 Engine conformance suite

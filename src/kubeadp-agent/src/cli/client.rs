@@ -2595,7 +2595,9 @@ mod tests {
 
     // -- timeout tests (no real network) ----------------------------------
 
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env_lock()
+    }
 
     // -- operator-token file: the CLI middleware ----------------------------------
 
@@ -2614,7 +2616,7 @@ mod tests {
 
     #[test]
     fn bearer_token_from_file_is_presented_on_requests() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         with_token_file("T\n", || {
             let (base, requests, handle) = spawn_http_stub(
                 |_line, _rest| (200, r#"{"ok":true}"#.to_string()),
@@ -2638,7 +2640,7 @@ mod tests {
 
     #[test]
     fn no_authorization_header_when_token_file_unset() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         std::env::remove_var("KUBEADP_API_TOKEN_FILE");
         let (base, requests, handle) = spawn_http_stub(
             |_line, _rest| (200, r#"{"ok":true}"#.to_string()),
@@ -2658,7 +2660,7 @@ mod tests {
 
     #[test]
     fn unreadable_token_file_is_a_clear_error_without_the_token() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         std::env::set_var("KUBEADP_API_TOKEN_FILE", "/nonexistent/token-file-xyzzy");
         let err = resolve_api_token().unwrap_err();
         std::env::remove_var("KUBEADP_API_TOKEN_FILE");
@@ -2674,7 +2676,7 @@ mod tests {
 
     #[test]
     fn empty_token_file_is_a_clear_error_without_the_token() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty-token");
         std::fs::write(&path, "   \n").unwrap();
@@ -2695,7 +2697,7 @@ mod tests {
     /// Test that read_timeout_env parses positive integers and rejects non-positive or invalid strings.
     #[test]
     fn read_timeout_env_handles_valid_and_invalid_values() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
 
         std::env::set_var("TEST_TIMEOUT_ENV", "42");
         assert_eq!(read_timeout_env("TEST_TIMEOUT_ENV"), Some(42));
@@ -2739,7 +2741,7 @@ mod tests {
     /// must fail within approximately the configured read timeout (set tiny via env).
     #[test]
     fn timeout_wedged_server_call_fails_within_configured_timeout() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         // Set ordinary timeout to 1 second via env var (tiny).
         std::env::set_var("AGENT_RUN_HTTP_TIMEOUT_SECS", "1");
 
@@ -2794,7 +2796,7 @@ mod tests {
     fn timeout_slow_wait_endpoint_succeeds_within_wait_timeout() {
         use std::io::Write as _;
 
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
         // Set ordinary timeout to 1 second via env var.
         std::env::set_var("AGENT_RUN_HTTP_TIMEOUT_SECS", "1");
 
@@ -3036,7 +3038,7 @@ mod tests {
     /// the message, the HTTP status, and the machine-readable code.
     #[test]
     fn failure_message_extracts_status_and_code_from_typed_error_body() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
@@ -3074,7 +3076,7 @@ mod tests {
     /// A non-JSON error body still yields the trimmed text with no code.
     #[test]
     fn failure_message_without_code_field_carries_no_code() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
@@ -3240,7 +3242,7 @@ mod tests {
 
     #[test]
     fn test_remote_control_read_timeout_resolution() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
 
         // 1. Unset -> base 200 s
         std::env::remove_var("AGENT_RUN_HTTP_TIMEOUT_SECS");

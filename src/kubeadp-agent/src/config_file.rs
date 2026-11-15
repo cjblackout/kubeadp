@@ -741,6 +741,7 @@ a2a_live_idle_secs = 300
 
     #[test]
     fn test_absent_file_means_empty_map() {
+        let _guard = crate::test_env_lock();
         let dir = std::env::temp_dir().join(format!(
             "kubeadp-cfg-absent-{}-{}",
             std::process::id(),
@@ -759,6 +760,7 @@ a2a_live_idle_secs = 300
 
     #[test]
     fn test_empty_path_value_is_error() {
+        let _guard = crate::test_env_lock();
         std::env::set_var("KUBEADP_CONFIG_FILE", "   ");
         let err = config_file_map().unwrap_err();
         assert!(err.contains("must not be empty"), "{err}");
@@ -767,6 +769,7 @@ a2a_live_idle_secs = 300
 
     #[test]
     fn test_apply_to_env_env_wins_and_only_allowed_sections() {
+        let _guard = crate::test_env_lock();
         // Scratch map: an unset variable is applied, a set one keeps its value.
         let vars = parse(base_file());
         std::env::remove_var("AGENT_RUN_MAX_PARALLEL");

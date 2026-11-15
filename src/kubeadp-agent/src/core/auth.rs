@@ -1495,6 +1495,7 @@ mod tests {
 
     #[test]
     fn test_auth_env_is_minimal_no_git_or_hindsight_vars() {
+        let _g = crate::test_env_lock();
         let tmp = tempdir().unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
@@ -1533,6 +1534,8 @@ mod tests {
             "unexpected: {err}"
         );
         wait_for_pid_gone(wait_for_file(&pid_file).parse().unwrap());
+        std::env::remove_var("AGENT_RUN_TEST_GH_TOKEN");
+        std::env::remove_var("AGENT_RUN_TEST_HINDSIGHT_URL");
     }
 
     #[test]

@@ -102,6 +102,22 @@ fn default_resume_fail_uptime() -> f64 {
 /// Maximum allowed value for any duration field (30 days in seconds).
 const MAX_DURATION_SECS: f64 = 30.0 * 24.0 * 3600.0;
 
+/// Validates a session name.
+/// Returns `Err` if the name looks like a job id (exactly 8 lowercase hexadecimal characters).
+pub fn validate_session_name(name: &str) -> Result<(), String> {
+    if name.len() == 8
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(format!(
+            "Configuration error: session name '{}' looks like a job id (8 lowercase hex characters); session names and job ids share the run id namespace and must be distinguishable",
+            name
+        ));
+    }
+    Ok(())
+}
+
 /// Validates a single f64 duration field.
 /// Returns `Err(message)` if the value is negative, non-finite, or > 30 days.
 pub fn validate_duration_field(
@@ -455,6 +471,7 @@ impl SessionConfig {
     /// no `Duration::from_secs_f64` can panic later.
     pub fn validate_durations(&self) -> Result<(), String> {
         let n = &self.name;
+        validate_session_name(n)?;
         validate_duration_field("readiness_poll_secs", n, self.readiness_poll_secs)?;
         validate_duration_field("hang_timeout_secs", n, self.hang_timeout_secs)?;
         validate_duration_field("kill_grace_secs", n, self.kill_grace_secs)?;
@@ -1141,6 +1158,25 @@ session_id = "id-b"
     fn test_validation_valid_session() {
         let s = make_session("valid");
         assert!(s.validate_durations().is_ok());
+    }
+
+    #[test]
+    fn test_validation_rejects_session_name_looking_like_job_id() {
+        // 8 lowercase hex characters looks like a job id
+        assert!(validate_session_name("0c99f41a").is_err());
+        assert!(validate_session_name("12345678").is_err());
+        assert!(validate_session_name("abcdef01").is_err());
+
+        // Less or more than 8 chars, uppercase, or non-hex are fine
+        assert!(validate_session_name("0c99f41").is_ok());
+        assert!(validate_session_name("0c99f41a0").is_ok());
+        assert!(validate_session_name("0C99F41A").is_ok());
+        assert!(validate_session_name("homelab").is_ok());
+        assert!(validate_session_name("session-1").is_ok());
+
+        let s = make_session("0c99f41a");
+        let err = s.validate_durations().unwrap_err();
+        assert!(err.contains("looks like a job id"), "err: {err}");
     }
 
     #[test]

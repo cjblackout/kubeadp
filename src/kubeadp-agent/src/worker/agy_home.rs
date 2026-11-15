@@ -117,17 +117,10 @@ mod tests {
     use super::*;
 
     /// The merge tests that touch the process env are serialized so parallel
-    /// runners cannot clobber each other's `AGENT_RUN_A2A_MCP_ENABLED`.
-    fn env_mutex() -> &'static std::sync::Mutex<()> {
-        use std::sync::OnceLock;
-        static M: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        M.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
-    /// Acquires `env_mutex()` (recovering from poison) and removes
+    /// Acquires the crate-wide test env lock (recovering from poison) and removes
     /// `AGENT_RUN_A2A_MCP_ENABLED` so tests start with a clean environment.
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        let guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let guard = crate::test_env_lock();
         std::env::remove_var(A2A_MCP_ENABLED_ENV);
         guard
     }

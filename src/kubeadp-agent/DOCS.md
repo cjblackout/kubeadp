@@ -8,9 +8,9 @@ Complete technical reference for configuration, HTTP API endpoints, execution en
 
 The `kubeadp-agent` system operates across three distinct operational contexts:
 
-1. **Worker Daemon (`KUBEADP_ROLE=worker` or `agent-run-api`)**:
+1. **Worker Daemon (`KUBEADP_ROLE=worker` or `kubeadp-agent worker`)**:
    Runs background agent jobs inside isolated Git worktrees. Manages job lifecycle, process supervision, output streaming via Server-Sent Events (SSE), SQLite state storage, and A2A interrupt-and-resume workflows.
-2. **Orchestrator Supervisor (`KUBEADP_ROLE=orchestrator` or `agent-orchestrate`)**:
+2. **Orchestrator Supervisor (`KUBEADP_ROLE=orchestrator` or `kubeadp-agent orchestrator`)**:
    Supervises interactive terminal sessions inside dedicated Unix pseudo-terminals (PTYs). Manages process lifecycles, exponential backoff, crash thresholds, log ring buffers, bracketed-paste message injection, and session-level A2A communication.
 3. **Remote Client (`agent-run`)**:
    Command-line HTTP client communicating with worker and supervisor instances over `/api/v1`. Translates CLI invocations into REST requests and renders structured responses or raw byte streams.
@@ -446,6 +446,7 @@ Per-session backoff, retry, and supervision options:
 
 | Key | Default | Meaning |
 |---|---|---|
+| `name` | required | Session name. Validated at load time: cannot look like a job id (8 lowercase hexadecimal characters) as session names and job ids share the run id namespace. |
 | `readiness_poll_secs` | `5.0` (env-generated sessions: `30.0`) | Interval between auth readiness checks. |
 | `hang_timeout_secs` | `0.0` (off) | Seconds of silent PTY inactivity before kill and restart. |
 | `kill_grace_secs` | `5.0` | Grace between SIGTERM and SIGKILL escalation. |
@@ -464,9 +465,9 @@ Per-session backoff, retry, and supervision options:
 
 Restart delay is `min(base_backoff_secs * 2^n, max_backoff_secs)` where `n` is the restarts already in the window (the first restart in the window uses `base_backoff_secs`), with +0..+25% jitter applied on top.
 
-The supervisor and per-session state (pid, heartbeat, status, restart counts, last exit reason, engine) is stored in the shared per-pod SQLite state database `<state_root>/state.sqlite` (the same database that holds the `jobs` table, one db per pod): a single `supervisor_state` row (pid, started, heartbeat, status, schema version) plus one `session_state` row per session. Writes are transactional and only the supervisor process writes; readers (`agent-orchestrate status`) use read-only connections with `synchronous=NORMAL` keeping the heartbeat cadence from hammering the disk. The state survives a pod restart: at start the supervisor restores the previous session state (crash accounting, last exit reason) from the database. The legacy JSON state file (`state_file`, `/tmp/claude-supervisor-state.json` — `/tmp` is wiped at every pod restart) is imported once at start and renamed to `*.migrated`. The schema evolves through the numbered, additive migrations in `src/state/migrations.rs` (tracked by `PRAGMA user_version`).
+The supervisor and per-session state (pid, heartbeat, status, restart counts, last exit reason, engine) is stored in the shared per-pod SQLite state database `<state_root>/state.sqlite` (the same database that holds the `jobs` table, one db per pod): a single `supervisor_state` row (pid, started, heartbeat, status, schema version) plus one `session_state` row per session. Writes are transactional and only the supervisor process writes; readers (`kubeadp-agent orchestrator status`) use read-only connections with `synchronous=NORMAL` keeping the heartbeat cadence from hammering the disk. The state survives a pod restart: at start the supervisor restores the previous session state (crash accounting, last exit reason) from the database. The legacy JSON state file (`state_file`, `/tmp/claude-supervisor-state.json` — `/tmp` is wiped at every pod restart) is imported once at start and renamed to `*.migrated`. The schema evolves through the numbered, additive migrations in `src/state/migrations.rs` (tracked by `PRAGMA user_version`).
 
-The `agent-orchestrate status` probe exits `0` (healthy), `1` (heartbeat stale), `2` (a session is `failed` or a session thread died), `3` (supervisor state unreadable / no state in the database), or `4` (supervisor stopped or a session is `stopped`). It prints the same state JSON document as before.
+The `kubeadp-agent orchestrator status` probe exits `0` (healthy), `1` (heartbeat stale), `2` (a session is `failed` or a session thread died), `3` (supervisor state unreadable / no state in the database), or `4` (supervisor stopped or a session is `stopped`). It prints the same state JSON document as before.
 
 ---
 
@@ -640,3 +641,20 @@ What the suite pins:
 
 The suite is a companion to `PARITY.md` (the agy-vs-claude parity record) and
 belongs to the CI gate's `cargo test --locked --features a2a,test-hooks`.
+
+---
+
+## 9. Test Suites and Black-Box Verification
+
+Both black-box integration test suites (the 90-case `agent-run` CLI suite and the 69-case `agent-orchestrate` session suite) can be executed together via a single documented command:
+
+```bash
+bash src/kubeadp-agent/tests/cli/run-all.sh
+```
+
+Environment knobs:
+- `BIN_DIR`: Directory containing prebuilt binaries (`agent-run`, `agent-run-api`, `agent-orchestrate`, `kubeadp-agent`). When set, local cargo rebuilds are skipped and both test suites execute directly against these binaries.
+- `PORT`: Port for the CLI private mock server (default `18002`).
+- `KEEP=1`: Retains temporary workspace, database, and log files upon exit.
+- `ONLY`: Space-separated list of test IDs to run in the CLI suite (e.g. `ONLY="T02 T07"`).
+

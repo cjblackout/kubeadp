@@ -119,12 +119,3 @@ name = "agent-run"
 path = "src/bin/agent-run.rs"
 required-features = ["cli"]
 
-[[bin]]
-name = "agent-orchestrate"
-path = "src/bin/agent-orchestrate.rs"
-required-features = ["server"]
-
-[[bin]]
-name = "agent-run-api"
-path = "src/bin/agent-run-api.rs"
-required-features = ["server"]

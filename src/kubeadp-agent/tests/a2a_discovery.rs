@@ -56,7 +56,9 @@ fn svc(name: &str, ns: &str, port: u64, labeled: bool) -> serde_json::Value {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn discovery_filters_by_label_and_derives_url() {
+    let _g = kubeadp_agent::test_env_lock();
     let body = serde_json::json!({
         "kind": "ServiceList",
         "items": [
@@ -87,7 +89,9 @@ async fn discovery_filters_by_label_and_derives_url() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn build_ctx_builds_registry_with_url_and_card() {
+    let _g = kubeadp_agent::test_env_lock();
     let body = serde_json::json!({
         "kind": "ServiceList",
         "items": [ svc("alpha", "ops", 8081, true) ]
@@ -113,7 +117,9 @@ async fn build_ctx_builds_registry_with_url_and_card() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn send_message_only_accepts_registry_names() {
+    let _g = kubeadp_agent::test_env_lock();
     // A URL-looking agent argument is not a registry name -> refused before
     // any network call.
     let body = serde_json::json!({ "kind": "ServiceList", "items": [] });

@@ -6,9 +6,8 @@
 # cut-over (HL-70 phase 3).
 #
 # What it contains (superset of both old images, one role per pod via env):
-#   - the `kubeadp-agent` binary (role chosen by KUBEADP_ROLE=orchestrator|worker;
-#     unset/other exits 2) and the thin wrappers agent-run, agent-orchestrate and
-#     agent-run-api -- all four binaries of src/kubeadp-agent
+#   - the `kubeadp-agent` binary (role chosen by KUBEADP_ROLE=orchestrator|worker
+#     or subcommand; unset/other exits 2) and the CLI agent-run
 #   - BOTH harness engines: claude-code (+ its node runtime) as docker/ai-server/
 #     builds it, and agy at the core's default agy_path /usr/local/libexec/agy as
 #     docker/agent-run-api/ installs it
@@ -92,10 +91,10 @@ RUN apt_update() { for i in 1 2 3 4 5 6; do apt-get -o Acquire::Retries=5 update
          "https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64" \
       && chmod 755 /payload/usr/local/bin/tini
 
-# Stage 2: build all four binaries of the one agent package (src/kubeadp-agent).
+# Stage 2: build the binaries of the one agent package (src/kubeadp-agent).
 # rust:1-slim-bookworm is the pinned slim variant both old images use. The
 # default feature set is cli+server, which is what the image needs: the server
-# binary requires `server`, agent-run and the wrappers require cli/server.
+# binary requires `server`, agent-run requires cli.
 # BUILD_SHA is compiled in from AGENT_RUN_BUILD_SHA exactly as the old
 # agent-run-builder/api-builder stages did for the agent-run-api binary.
 # Released binaries are stripped, as today. Only src/kubeadp-agent is copied.
@@ -138,17 +137,13 @@ RUN for i in 1 2 3 4 5 6; do \
       [ "$i" -gt 1 ] && { sleep 10; echo "cargo fetch retry $i" >&2; }; \
       cargo fetch --locked && break; \
     done \
-    && cargo build --release --locked --features a2a --bin kubeadp-agent --bin agent-run --bin agent-orchestrate --bin agent-run-api \
-    && strip target/release/kubeadp-agent target/release/agent-run target/release/agent-orchestrate target/release/agent-run-api \
+    && cargo build --release --locked --features a2a --bin kubeadp-agent --bin agent-run \
+    && strip target/release/kubeadp-agent target/release/agent-run \
     && mkdir -p /payload/usr/local/bin \
     && cp -a target/release/kubeadp-agent /payload/usr/local/bin/kubeadp-agent \
     && cp -a target/release/agent-run /payload/usr/local/bin/agent-run \
-    && cp -a target/release/agent-orchestrate /payload/usr/local/bin/agent-orchestrate \
-    && cp -a target/release/agent-run-api /payload/usr/local/bin/agent-run-api \
     && test -x /payload/usr/local/bin/kubeadp-agent \
     && test -x /payload/usr/local/bin/agent-run \
-    && test -x /payload/usr/local/bin/agent-orchestrate \
-    && test -x /payload/usr/local/bin/agent-run-api \
     && rm -rf /build/kubeadp-agent/target
 
 # Stage 3: Build & install Node.js v26 and the npm-based claude-code CLI,
@@ -266,7 +261,7 @@ ENV PIP_CACHE_DIR=/workspace/.cache/pip
 ENV GOTOOLCHAIN=local
 ENV PATH="/opt/tools/bin:/opt/tools/go/bin:/opt/tools/rust/bin:/opt/tools/python/bin:/opt/tools/node/bin:${CARGO_HOME}/bin:${PATH}"
 
-# The four binaries of the one agent package (one root-merge COPY, stripped).
+# The binaries of the one agent package (one root-merge COPY, stripped).
 COPY --from=agent-builder /payload/. /
 
 # tools-builder payload: node runtime + npm tree + claude-code (orchestrator

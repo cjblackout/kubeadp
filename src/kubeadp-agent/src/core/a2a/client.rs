@@ -1017,6 +1017,7 @@ mod tests {
 
     #[test]
     fn discovery_namespaces_merges_and_dedupes() {
+        let _g = crate::test_env_lock();
         std::env::remove_var("A2A_NAMESPACES");
         assert_eq!(discovery_namespaces(Some("pod")), vec!["pod"]);
         std::env::set_var("A2A_NAMESPACES", "pod, ops,other");
@@ -1049,8 +1050,7 @@ mod tests {
     #[test]
     fn static_peers_parses_and_filters() {
         // Serialize env mutation.
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_env_lock();
 
         std::env::set_var(
             A2A_PEERS_ENV,

@@ -18,11 +18,10 @@ own-build images).
 The union of both old images, pinned the same way each old image pinned its
 parts:
 
-- The four binaries of `src/kubeadp-agent` built with `--features a2a`:
+- The binaries of `src/kubeadp-agent` built with `--features a2a`:
   - `kubeadp-agent` — the role dispatcher; role chosen by `KUBEADP_ROLE`
-    (`orchestrator` or `worker`); unset or any other value exits with code 2.
-  - `agent-run`, `agent-orchestrate`, `agent-run-api` — the thin wrappers, kept
-    so existing commands/supervisors keep working unchanged.
+    (`orchestrator` or `worker`) or subcommand (`orchestrator` / `worker`); unset or any other value exits with code 2.
+  - `agent-run` — the remote CLI client.
 - Both harness engines:
   - claude-code (npm `@anthropic-ai/claude-code`) plus its node runtime, built
     exactly as `docker/ai-server/Dockerfile`'s `tools-builder` stage does;

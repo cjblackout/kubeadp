@@ -183,8 +183,7 @@ fn result_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
 
 /// One env-var lock for the tests that touch `KUBEADP_A2A_INBOX_DIR`.
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    kubeadp_agent::test_env_lock()
 }
 
 /// Ages the stored message past the TTL by rewriting its `queued_at` in the

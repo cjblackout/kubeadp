@@ -3714,13 +3714,16 @@ mod tests {
     /// new (bumped) epoch and marks it ended (verify now rejects).
     #[tokio::test]
     async fn test_end_jobset_route_ends_known_jobset() {
+        let cred = {
+            let _guard = crate::test_env_lock();
+            std::env::remove_var(crate::core::jobset::ROOT_KEY_FILE_ENV);
+            crate::core::jobset::register_agent(&format!("job-end-{}", std::process::id()))
+        };
         // The route runs its work on a blocking-pool thread and drives the
         // process-wide registry (like production), so the agent is registered
         // there under an id unique to this process. Tests that need an empty
         // registry use `with_isolated_registry` (a per-thread registry), which
         // this process-wide registration cannot affect.
-        std::env::remove_var(crate::core::jobset::ROOT_KEY_FILE_ENV);
-        let cred = crate::core::jobset::register_agent(&format!("job-end-{}", std::process::id()));
         let app = test_router();
         let uri = format!("/api/v1/jobsets/{}/end", cred.jobset_id);
         let res = app.oneshot(post_json_request(&uri, "{}")).await.unwrap();
