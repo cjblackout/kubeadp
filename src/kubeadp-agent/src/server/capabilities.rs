@@ -6,11 +6,11 @@
 //! table plus each engine's `capabilities()` report and never reaches a live
 //! engine process.
 //!
-//! The route is registered in [`crate::core::server::router_with_rc`] (behind
+//! The route is registered in [`crate::server::router_with_rc`] (behind
 //! the same bearer layer as every other `/api/v1` route), carrying the engine
 //! registry as an axum `Extension<Arc<EngineRegistry>>`. `router_with_rc`
 //! supplies an empty registry by default; the engine-aware entry point
-//! [`crate::core::server::router_with_engines`] lets the role entry points
+//! [`crate::server::router_with_engines`] lets the role entry points
 //! pass their configured registry through (E3/E5). Like the rest of E1,
 //! nothing routes through the engine trait yet: with no engines registered
 //! the endpoint returns an empty list.

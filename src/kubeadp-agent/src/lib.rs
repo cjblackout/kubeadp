@@ -37,6 +37,9 @@ pub mod mcp_a2a;
 pub mod orchestrate;
 pub mod sandbox;
 #[cfg(feature = "server")]
+pub mod server;
+pub mod state;
+#[cfg(feature = "server")]
 pub mod worker;
 
 #[cfg(test)]

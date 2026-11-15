@@ -122,7 +122,7 @@ file; the exceptions are listed at the end of this section.
 - The store must open with WAL journal mode, a 5 s busy timeout (a second
   concurrent writer waits instead of failing with `SQLITE_BUSY`) and
   `synchronous=NORMAL`.
-- Schema changes are numbered, additive migrations (`core/migrations.rs`),
+- Schema changes are numbered, additive migrations (`state/migrations.rs`),
   tracked by `PRAGMA user_version`, applied in ascending order inside one
   transaction each, at every open. A migration never drops or rewrites a column
   of an earlier one. A column add must tolerate a concurrent process having
@@ -459,7 +459,7 @@ one `session_state` row per session. Writes are transactional, one writer
 keeps the heartbeat cadence from hammering the disk. The state survives a
 pod restart (restored at start); the legacy JSON state file is imported once
 (`*.migrated`). Schema migrations are numbered and additive
-(`src/core/migrations.rs`, `PRAGMA user_version`). Heartbeat written every
+(`src/state/migrations.rs`, `PRAGMA user_version`). Heartbeat written every
 `heartbeat_interval_secs`, stale after `stale_heartbeat_secs`.
 `agent-orchestrate status` exit codes: `0` healthy, `1`
 stale heartbeat, `2` a session `failed`/thread died, `3` supervisor state
@@ -1662,7 +1662,7 @@ a2a,test-hooks`.
   one root; retention pruning; token never in argv/logs.
 - `config_file.rs`: worker honors a config file; environment wins over file;
   invalid config file is a fatal startup error.
-- State store (unit, `core/migrations.rs`): migrations ascending and contiguous;
+- State store (unit, `state/migrations.rs`): migrations ascending and contiguous;
   fresh database; idempotent re-run; upgrade of a pre-framework `jobs` database;
   one-time import of `jobsets.json` and of the legacy supervisor JSON; refusal
   of a newer `user_version`.

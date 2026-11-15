@@ -670,21 +670,21 @@ mod tests {
         let log_path = JobMetadata::log_path(&config.state_root, job_id);
 
         std::fs::write(&log_path, b"hello").unwrap();
-        let (bytes, offset) = crate::core::server::read_log_bytes(&config, job_id, 0).unwrap();
+        let (bytes, offset) = crate::server::read_log_bytes(&config, job_id, 0).unwrap();
         assert_eq!(bytes, b"hello");
         assert_eq!(offset, 5);
 
         // Resume from the event's offset: only the appended bytes.
         std::fs::write(&log_path, b"hello world").unwrap();
-        let (bytes, offset) = crate::core::server::read_log_bytes(&config, job_id, offset).unwrap();
+        let (bytes, offset) = crate::server::read_log_bytes(&config, job_id, offset).unwrap();
         assert_eq!(bytes, b" world");
         assert_eq!(offset, 11);
 
         // An offset at/after EOF yields no text (nothing re-sent).
-        let (bytes, offset) = crate::core::server::read_log_bytes(&config, job_id, 11).unwrap();
+        let (bytes, offset) = crate::server::read_log_bytes(&config, job_id, 11).unwrap();
         assert!(bytes.is_empty());
         assert_eq!(offset, 11);
-        let (bytes, _) = crate::core::server::read_log_bytes(&config, job_id, 999).unwrap();
+        let (bytes, _) = crate::server::read_log_bytes(&config, job_id, 999).unwrap();
         assert!(bytes.is_empty());
     }
 
@@ -809,7 +809,7 @@ mod tests {
             state_root: tmp.path().join("state"),
             ..Default::default()
         };
-        let app = crate::core::server::router(Arc::new(config), Arc::new(AuthManager::new()));
+        let app = crate::server::router(Arc::new(config), Arc::new(AuthManager::new()));
         let res = app
             .oneshot(
                 axum::http::Request::builder()
@@ -852,7 +852,7 @@ mod tests {
         meta.status = Some(JobStatus::Done);
         meta.save(&config.state_root).unwrap();
 
-        let app = crate::core::server::router(Arc::new(config), Arc::new(AuthManager::new()));
+        let app = crate::server::router(Arc::new(config), Arc::new(AuthManager::new()));
         let res = app
             .oneshot(
                 axum::http::Request::builder()
@@ -924,7 +924,7 @@ mod tests {
         meta.save(&config.state_root).unwrap();
         let resume = 11; // == the length written above
 
-        let app = crate::core::server::router(Arc::new(config), Arc::new(AuthManager::new()));
+        let app = crate::server::router(Arc::new(config), Arc::new(AuthManager::new()));
         let res = app
             .oneshot(
                 axum::http::Request::builder()
@@ -940,7 +940,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
             res.headers()
-                .get(crate::core::server::LOG_OFFSET_HEADER)
+                .get(crate::server::LOG_OFFSET_HEADER)
                 .unwrap()
                 .to_str()
                 .unwrap(),
@@ -983,7 +983,7 @@ mod tests {
         meta.started_at = Some(Utc::now() - chrono::Duration::seconds(100));
         meta.save(&config.state_root).unwrap();
 
-        let app = crate::core::server::router(Arc::new(config), Arc::new(AuthManager::new()));
+        let app = crate::server::router(Arc::new(config), Arc::new(AuthManager::new()));
         let res = app
             .oneshot(
                 axum::http::Request::builder()
@@ -1025,7 +1025,7 @@ mod tests {
         let (config, meta) = seed_job(&tmp, "79abcd00");
         std::fs::write(JobMetadata::log_path(&config.state_root, &meta.job_id), b"").unwrap();
 
-        let app = crate::core::server::router(Arc::new(config), Arc::new(AuthManager::new()));
+        let app = crate::server::router(Arc::new(config), Arc::new(AuthManager::new()));
         // The hostile knob: parsed by an older server, unknown to this one.
         let res = app
             .oneshot(

@@ -1,10 +1,9 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{params, Connection, Row};
+use rusqlite::{Connection, Row};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration as StdDuration;
 
 /// Status of an agent-run job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
@@ -185,121 +184,10 @@ pub fn state_db_path(state_root: &Path) -> PathBuf {
 /// (e.g. a running internal runner plus status/tail/kill commands) can safely
 /// share the database with SQLite's own locking.
 pub fn open_state_db(state_root: &Path) -> Result<Connection> {
-    let path = state_db_path(state_root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create state directory {}", parent.display()))?;
-    }
-    let conn = Connection::open(&path)
-        .with_context(|| format!("Failed to open state database at {}", path.display()))?;
-    // N12: the state database holds message text (and job state) and must
-    // not be readable by other users. Tighten to 0600 right after creation;
-    // the -wal/-shm siblings SQLite creates alongside are tightened after the
-    // migrations below (the WAL is created by the journal-mode switch).
-    tighten_state_db_permissions(&path);
-    // The busy timeout MUST be set before any other pragma: two connections
-    // that open the same NEW database at the same time (e.g. parallel tests,
-    // or the worker and a CLI process) race the first `PRAGMA journal_mode =
-    // WAL` on a fresh file, and without a timeout that pragma fails
-    // immediately with SQLITE_BUSY instead of waiting for the other opener to
-    // finish. A plain busy timeout of several seconds absorbs the initial
-    // creation window and also the normal WAL writer contention
-    // (e.g. `start` inserting a job while a job monitor thread updates
-    // another job's PID/exit code).
-    conn.busy_timeout(StdDuration::from_secs(5))
-        .with_context(|| {
-            format!(
-                "Failed to set busy timeout on state database at {}",
-                path.display()
-            )
-        })?;
-    // Enable WAL with a short bounded retry: the busy timeout above lets a
-    // concurrent opener's exclusive file-lock window pass, but on some SQLite
-    // builds/configs `journal_mode` reports SQLITE_BUSY against a lock that a
-    // repeated attempt clears immediately. Real corruption is never a busy
-    // error -- SQLITE_NOTADB / malformed-header errors surface unchanged on
-    // the last attempt.
-    set_wal_with_retry(&conn, &path)?;
-    crate::core::migrations::migrate(&conn).with_context(|| {
-        format!(
-            "Failed to migrate state database at {} (is the file corrupted?)",
-            path.display()
-        )
-    })?;
-    // N12: the migrations above created the -wal/-shm siblings (WAL mode) --
-    // tighten those too, best effort.
-    tighten_state_db_permissions(&path);
-    Ok(conn)
+    let db = crate::state::StateDb::open(state_root)?;
+    db.connection()
 }
 
-/// N12: tightens the state database file (and its `-wal`/`-shm` siblings,
-/// when present) to mode 0600. Best effort: a filesystem that does not
-/// support permission bits leaves the files untouched.
-fn tighten_state_db_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let tighten = |p: PathBuf| {
-        if let Ok(meta) = fs::metadata(&p) {
-            let mut perms = meta.permissions();
-            if perms.mode() & 0o777 != 0o600 {
-                perms.set_mode(0o600);
-                let _ = fs::set_permissions(&p, perms);
-            }
-        }
-    };
-    tighten(path.to_path_buf());
-    let mut sibling = path.as_os_str().to_owned();
-    sibling.push("-wal");
-    tighten(PathBuf::from(sibling));
-    let mut sibling = path.as_os_str().to_owned();
-    sibling.push("-shm");
-    tighten(PathBuf::from(sibling));
-}
-
-/// Whether a `rusqlite` error is a transient lock (busy/locked) rather than a
-/// real database problem (corruption, schema mismatch, ...).
-fn is_busy_locked(err: &rusqlite::Error) -> bool {
-    matches!(
-        err,
-        rusqlite::Error::SqliteFailure(e, _)
-            if e.code == rusqlite::ErrorCode::DatabaseBusy
-                || e.code == rusqlite::ErrorCode::DatabaseLocked
-    )
-}
-
-/// Runs `PRAGMA journal_mode = WAL` with a bounded retry on transient
-/// SQLITE_BUSY / SQLITE_LOCKED (a concurrent opener of a brand-new database
-/// can hold the exclusive creation lock). Keeps the corrupt-file detection
-/// for real corruption: the error is only reported once the retry budget is
-/// exhausted.
-fn set_wal_with_retry(conn: &Connection, path: &Path) -> Result<()> {
-    const ATTEMPTS: usize = 8;
-    const BACKOFF_MS: &[u64] = &[5, 10, 20, 40, 80, 160, 320];
-    for attempt in 0..ATTEMPTS {
-        match conn.pragma_update(None, "journal_mode", "WAL") {
-            Ok(()) => return Ok(()),
-            Err(e) if is_busy_locked(&e) && attempt + 1 < ATTEMPTS => {
-                let ms = BACKOFF_MS
-                    .get(attempt)
-                    .copied()
-                    .unwrap_or_else(|| BACKOFF_MS[BACKOFF_MS.len() - 1]);
-                std::thread::sleep(StdDuration::from_millis(ms));
-            }
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "Failed to enable WAL journal mode on state database at {} (is the file corrupted?)",
-                        path.display()
-                    )
-                });
-            }
-        }
-    }
-    unreachable!("the retry loop always returns")
-}
-
-/// Ensures the full state directory layout exists under `state_root`: the root
-/// directory itself, the `logs/` subdirectory, and the SQLite state database
-/// with its `jobs` table. Idempotent -- safe to run repeatedly.
 pub fn ensure_state_store(state_root: &Path) -> Result<()> {
     fs::create_dir_all(state_root)
         .with_context(|| format!("Failed to create state directory {}", state_root.display()))?;
@@ -315,7 +203,7 @@ pub fn ensure_state_store(state_root: &Path) -> Result<()> {
 
 /// Maps one database row to a `JobMetadata` value. Column order must match the
 /// SELECT list in `JobMetadata::load`.
-fn row_to_job(row: &Row<'_>) -> rusqlite::Result<JobMetadata> {
+pub(crate) fn row_to_job(row: &Row<'_>) -> rusqlite::Result<JobMetadata> {
     let add_dirs_json: String = row.get(8)?;
     let created_at_ns: i64 = row.get(10)?;
     let status: Option<String> = row.get(18)?;
@@ -387,286 +275,28 @@ impl JobMetadata {
     }
 
     pub fn save(&self, state_root: &Path) -> Result<()> {
-        let add_dirs_json = serde_json::to_string(&self.add_dirs)
-            .context("Failed to serialize add_dirs to JSON")?;
-        let conn = open_state_db(state_root)?;
-        conn.execute(
-            "INSERT INTO jobs (
-                job_id, project, prompt, resolved_prompt, model, effort, sandbox, mode,
-                add_dirs, print_timeout, created_at, worktree_path, branch, base_ref,
-                conversation_id, retry_count, pid, exit_code, status, hindsight,
-                auto_recall, auto_retain, retry_prompt, read_only, external_worktree,
-                pid_start_time, hindsight_bank, proxy, max_runtime, started_at,
-                hindsight_query, sandbox_info, engine
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33
-            )
-            ON CONFLICT(job_id) DO UPDATE SET
-                project = excluded.project,
-                prompt = excluded.prompt,
-                resolved_prompt = excluded.resolved_prompt,
-                model = excluded.model,
-                effort = excluded.effort,
-                sandbox = excluded.sandbox,
-                mode = excluded.mode,
-                add_dirs = excluded.add_dirs,
-                print_timeout = excluded.print_timeout,
-                created_at = excluded.created_at,
-                worktree_path = excluded.worktree_path,
-                branch = excluded.branch,
-                base_ref = excluded.base_ref,
-                conversation_id = excluded.conversation_id,
-                retry_count = excluded.retry_count,
-                pid = excluded.pid,
-                exit_code = excluded.exit_code,
-                status = excluded.status,
-                hindsight = excluded.hindsight,
-                auto_recall = excluded.auto_recall,
-                auto_retain = excluded.auto_retain,
-                retry_prompt = excluded.retry_prompt,
-                read_only = excluded.read_only,
-                external_worktree = excluded.external_worktree,
-                pid_start_time = excluded.pid_start_time,
-                hindsight_bank = excluded.hindsight_bank,
-                proxy = excluded.proxy,
-                max_runtime = excluded.max_runtime,
-                started_at = excluded.started_at,
-                hindsight_query = excluded.hindsight_query,
-                sandbox_info = excluded.sandbox_info,
-                engine = excluded.engine",
-            params![
-                self.job_id,
-                self.project,
-                self.prompt,
-                self.resolved_prompt,
-                self.model,
-                self.effort,
-                self.sandbox as i64,
-                self.mode,
-                add_dirs_json,
-                self.print_timeout,
-                self.created_at.timestamp_nanos_opt().unwrap_or(0),
-                self.worktree_path.to_string_lossy().to_string(),
-                self.branch,
-                self.base_ref,
-                self.conversation_id,
-                self.retry_count,
-                self.pid,
-                self.exit_code,
-                self.status.map(|s| s.as_str().to_string()),
-                self.hindsight.map(|b| b as i64),
-                self.auto_recall.map(|b| b as i64),
-                self.auto_retain.map(|b| b as i64),
-                self.retry_prompt,
-                self.read_only as i64,
-                self.external_worktree as i64,
-                self.pid_start_time.map(|t| t as i64),
-                self.hindsight_bank,
-                self.proxy,
-                self.max_runtime.and_then(|d: chrono::Duration| d.num_nanoseconds()),
-                self.started_at.and_then(|t| t.timestamp_nanos_opt()),
-                self.hindsight_query,
-                self.sandbox_info
-                    .as_ref()
-                    .and_then(|s| serde_json::to_string(s).ok()),
-                self.engine,
-            ],
-        )
-        .with_context(|| {
-            format!(
-                "Failed to save job metadata '{}' to {}",
-                self.job_id,
-                state_db_path(state_root).display()
-            )
-        })?;
-        Ok(())
+        let db = crate::state::StateDb::open(state_root)?;
+        db.jobs().save(self)
     }
 
-    /// Inserts this job as a NEW row using a plain `INSERT` that fails on an
-    /// existing `job_id` (instead of upserting like `save`).
-    ///
-    /// `save` is an upsert: a colliding job id silently overwrites whatever
-    /// job already holds that row. For the initial creation of a new job,
-    /// a collision must be a hard error, not a silent destroy of the other
-    /// job's state. All subsequent updates of an existing job keep using
-    /// `save`.
     pub fn insert_new(&self, state_root: &Path) -> Result<()> {
-        let add_dirs_json = serde_json::to_string(&self.add_dirs)
-            .context("Failed to serialize add_dirs to JSON")?;
-        let conn = open_state_db(state_root)?;
-        conn.execute(
-            "INSERT INTO jobs (
-                job_id, project, prompt, resolved_prompt, model, effort, sandbox, mode,
-                add_dirs, print_timeout, created_at, worktree_path, branch, base_ref,
-                conversation_id, retry_count, pid, exit_code, status, hindsight,
-                auto_recall, auto_retain, retry_prompt, read_only, external_worktree,
-                pid_start_time, hindsight_bank, proxy, max_runtime, started_at,
-                hindsight_query, sandbox_info, engine
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33
-            )",
-            params![
-                self.job_id,
-                self.project,
-                self.prompt,
-                self.resolved_prompt,
-                self.model,
-                self.effort,
-                self.sandbox as i64,
-                self.mode,
-                add_dirs_json,
-                self.print_timeout,
-                self.created_at.timestamp_nanos_opt().unwrap_or(0),
-                self.worktree_path.to_string_lossy().to_string(),
-                self.branch,
-                self.base_ref,
-                self.conversation_id,
-                self.retry_count,
-                self.pid,
-                self.exit_code,
-                self.status.map(|s| s.as_str().to_string()),
-                self.hindsight.map(|b| b as i64),
-                self.auto_recall.map(|b| b as i64),
-                self.auto_retain.map(|b| b as i64),
-                self.retry_prompt,
-                self.read_only as i64,
-                self.external_worktree as i64,
-                self.pid_start_time.map(|t| t as i64),
-                self.hindsight_bank,
-                self.proxy,
-                self.max_runtime.and_then(|d: chrono::Duration| d.num_nanoseconds()),
-                self.started_at.and_then(|t| t.timestamp_nanos_opt()),
-                self.hindsight_query,
-                self.sandbox_info
-                    .as_ref()
-                    .and_then(|s| serde_json::to_string(s).ok()),
-                self.engine,
-            ],
-        )
-        .map_err(|e| -> anyhow::Error {
-            if e.to_string().contains("UNIQUE constraint failed") {
-                use crate::core::error::AgentRunError;
-                AgentRunError::invalid(
-                    "job_id_already_exists",
-                    format!(
-                        "Refusing to insert new job '{}': job id '{}' already exists in {} (a generated id collision must fail, never overwrite the existing job's row)",
-                        self.job_id,
-                        self.job_id,
-                        state_db_path(state_root).display()
-                    ),
-                )
-                .into()
-            } else {
-                anyhow::Error::from(e)
-            }
-        })
-        .with_context(|| {
-            format!(
-                "Failed to insert job metadata '{}' into {}",
-                self.job_id,
-                state_db_path(state_root).display()
-            )
-        })?;
-        Ok(())
+        let db = crate::state::StateDb::open(state_root)?;
+        db.jobs().insert_new(self)
     }
 
     pub fn load(state_root: &Path, job_id: &str) -> Result<Self> {
-        let conn = open_state_db(state_root)?;
-        let mut stmt = conn
-            .prepare("SELECT job_id, project, prompt, resolved_prompt, model, effort, sandbox, mode, add_dirs, print_timeout, created_at, worktree_path, branch, base_ref, conversation_id, retry_count, pid, exit_code, status, hindsight, auto_recall, auto_retain, retry_prompt, read_only, external_worktree, pid_start_time, hindsight_bank, proxy, max_runtime, started_at, hindsight_query, sandbox_info, engine FROM jobs WHERE job_id = ?1")
-            .with_context(|| format!("Failed to read job metadata for '{}' from {}", job_id, state_db_path(state_root).display()))?;
-        let mut rows = stmt
-            .query_map(params![job_id], row_to_job)
-            .with_context(|| {
-                format!(
-                    "Failed to query job '{}' from {}",
-                    job_id,
-                    state_db_path(state_root).display()
-                )
-            })?;
-        match rows.next() {
-            Some(Ok(meta)) => Ok(meta),
-            Some(Err(e)) => bail!(
-                "Corrupted or unreadable job metadata for '{}' in {}: {}",
-                job_id,
-                state_db_path(state_root).display(),
-                e
-            ),
-            None => {
-                let err = crate::core::error::AgentRunError::not_found(
-                    "job_not_found",
-                    format!(
-                        "No such job found: '{}' (no job record in {})",
-                        job_id,
-                        state_db_path(state_root).display()
-                    ),
-                );
-                Err(anyhow::Error::from(err))
-            }
-        }
+        let db = crate::state::StateDb::open(state_root)?;
+        db.jobs().load(job_id)
     }
 
-    /// Loads a job record, resolving a unique ID prefix if the given ID is not
-    /// an exact match. Ambiguous prefixes are rejected with the matching IDs.
     pub fn resolve(state_root: &Path, job_id: &str) -> Result<Self> {
-        if let Ok(meta) = Self::load(state_root, job_id) {
-            return Ok(meta);
-        }
-        let conn = open_state_db(state_root)?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT job_id FROM jobs WHERE job_id LIKE ?1 ESCAPE '\\' ORDER BY length(job_id)",
-            )
-            .with_context(|| format!("Failed to resolve job prefix '{}'", job_id))?;
-        let escaped_prefix = format!("{}%", escape_like(job_id));
-        let ids: Vec<String> = stmt
-            .query_map(params![escaped_prefix], |r| r.get(0))
-            .with_context(|| {
-                format!(
-                    "Failed to query job prefix '{}' in {}",
-                    job_id,
-                    state_db_path(state_root).display()
-                )
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .with_context(|| format!("Failed to read job prefix matches for '{}'", job_id))?;
-        match ids.len() {
-            0 => Err(anyhow::Error::from(
-                crate::core::error::AgentRunError::not_found(
-                    "job_not_found",
-                    format!(
-                        "No such job found: '{}' (no job record in {})",
-                        job_id,
-                        state_db_path(state_root).display()
-                    ),
-                ),
-            )),
-            1 => Self::load(state_root, &ids[0]),
-            _ => Err(anyhow::Error::from(
-                crate::core::error::AgentRunError::invalid(
-                    "job_id_ambiguous",
-                    format!(
-                        "Job ID prefix '{}' is ambiguous; matches: {}",
-                        job_id,
-                        ids.join(", ")
-                    ),
-                ),
-            )),
-        }
+        let db = crate::state::StateDb::open(state_root)?;
+        db.jobs().resolve(job_id)
     }
 
-    /// Deletes the job's record from the state database. A missing job is not an error.
     pub fn delete(state_root: &Path, job_id: &str) -> Result<()> {
-        let conn = open_state_db(state_root)?;
-        conn.execute("DELETE FROM jobs WHERE job_id = ?1", params![job_id])
-            .with_context(|| {
-                format!(
-                    "Failed to delete job record '{}' from {}",
-                    job_id,
-                    state_db_path(state_root).display()
-                )
-            })?;
-        Ok(())
+        let db = crate::state::StateDb::open(state_root)?;
+        db.jobs().delete(job_id)
     }
 }
 
@@ -679,21 +309,8 @@ pub fn set_job_sandbox(
     job_id: &str,
     sandbox: &crate::sandbox::SandboxInfo,
 ) -> Result<()> {
-    let conn = open_state_db(state_root)?;
-    let json =
-        serde_json::to_string(sandbox).context("Failed to serialize sandbox info to JSON")?;
-    conn.execute(
-        "UPDATE jobs SET sandbox_info = ?2 WHERE job_id = ?1",
-        params![job_id, json],
-    )
-    .with_context(|| {
-        format!(
-            "Failed to update sandbox info for job '{}' in {}",
-            job_id,
-            state_db_path(state_root).display()
-        )
-    })?;
-    Ok(())
+    let db = crate::state::StateDb::open(state_root)?;
+    db.jobs().set_job_sandbox(job_id, sandbox)
 }
 
 /// Atomically writes a job's final status, exit code, and conversation ID,
@@ -727,52 +344,14 @@ pub fn save_final_status_unless_killed(
     conversation_id: Option<&str>,
     expected_retry_count: Option<u32>,
 ) -> Result<bool> {
-    let conn = open_state_db(state_root)?;
-
-    // conversation_id is persisted unconditionally (when the runner actually
-    // extracted one) regardless of the status race below: it's discovered
-    // from the log at the same moment as the exit code, a killed job can
-    // still have a real conversation_id worth recording, and unlike
-    // status/exit_code it was never the subject of the kill.rs/runner race
-    // this function exists to close -- skipping it here would silently lose
-    // it (clean/gc's agy conversation cleanup needs it to purge conversation
-    // artifacts, and only extracts it from the log itself as a fallback in
-    // `retry`, not in `clean`/`gc`).
-    if let Some(conv_id) = conversation_id {
-        conn.execute(
-            "UPDATE jobs SET conversation_id = ?2 WHERE job_id = ?1",
-            params![job_id, conv_id],
-        )
-        .with_context(|| {
-            format!(
-                "Failed to save conversation_id for job '{}' in {}",
-                job_id,
-                state_db_path(state_root).display()
-            )
-        })?;
-    }
-
-    let updated = match expected_retry_count {
-        Some(expected) => conn.execute(
-            "UPDATE jobs SET status = ?2, exit_code = ?3 \
-             WHERE job_id = ?1 AND retry_count = ?4 \
-             AND (status IS NULL OR status != 'killed')",
-            params![job_id, status.as_str().to_string(), exit_code, expected],
-        ),
-        None => conn.execute(
-            "UPDATE jobs SET status = ?2, exit_code = ?3 \
-             WHERE job_id = ?1 AND (status IS NULL OR status != 'killed')",
-            params![job_id, status.as_str().to_string(), exit_code],
-        ),
-    }
-    .with_context(|| {
-        format!(
-            "Failed to save final status for job '{}' in {}",
-            job_id,
-            state_db_path(state_root).display()
-        )
-    })?;
-    Ok(updated > 0)
+    let db = crate::state::StateDb::open(state_root)?;
+    db.jobs().save_final_status_unless_killed(
+        job_id,
+        status,
+        exit_code,
+        conversation_id,
+        expected_retry_count,
+    )
 }
 
 /// Atomically marks a job row as killed: a targeted UPDATE of `status` and
@@ -818,23 +397,8 @@ pub fn save_final_status_unless_killed(
 /// different retry attempt, is gone, or finished successfully on its own
 /// (status `done`/`killed` or a recorded exit code of 0).
 pub fn mark_job_killed(state_root: &Path, job_id: &str, expected_retry_count: u32) -> Result<bool> {
-    let conn = open_state_db(state_root)?;
-    let updated = conn
-        .execute(
-            "UPDATE jobs SET status = 'killed', exit_code = 137 \
-             WHERE job_id = ?1 AND retry_count = ?2 \
-             AND (status IS NULL OR status NOT IN ('done', 'killed')) \
-             AND (exit_code IS NULL OR exit_code <> 0)",
-            params![job_id, expected_retry_count],
-        )
-        .with_context(|| {
-            format!(
-                "Failed to mark job '{}' as killed in {}",
-                job_id,
-                state_db_path(state_root).display()
-            )
-        })?;
-    Ok(updated > 0)
+    let db = crate::state::StateDb::open(state_root)?;
+    db.jobs().mark_job_killed(job_id, expected_retry_count)
 }
 
 /// Records a recovered `conversation_id` on a job row that has none.
@@ -855,21 +419,8 @@ pub fn restore_conversation_id(
     job_id: &str,
     conversation_id: &str,
 ) -> Result<bool> {
-    let conn = open_state_db(state_root)?;
-    let updated = conn
-        .execute(
-            "UPDATE jobs SET conversation_id = ?1 WHERE job_id = ?2 AND conversation_id IS NULL",
-            params![conversation_id, job_id],
-        )
-        .with_context(|| {
-            format!(
-                "Failed to record recovered conversation_id '{}' for job '{}' in {}",
-                conversation_id,
-                job_id,
-                state_db_path(state_root).display()
-            )
-        })?;
-    Ok(updated > 0)
+    let db = crate::state::StateDb::open(state_root)?;
+    db.jobs().restore_conversation_id(job_id, conversation_id)
 }
 
 /// Generates a short, unique, filesystem-safe job id (8-char lowercase hex).
@@ -887,21 +438,8 @@ pub fn generate_job_id() -> String {
 /// upsert, so a colliding id must be detected BEFORE the first write, not
 /// silently absorbed into another job's row.
 pub fn job_id_exists(state_root: &Path, job_id: &str) -> Result<bool> {
-    let conn = open_state_db(state_root)?;
-    let exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id = ?1)",
-            params![job_id],
-            |row| row.get(0),
-        )
-        .with_context(|| {
-            format!(
-                "Failed to check job id '{}' in {}",
-                job_id,
-                state_db_path(state_root).display()
-            )
-        })?;
-    Ok(exists)
+    let db = crate::state::StateDb::open(state_root)?;
+    db.jobs().exists(job_id)
 }
 
 /// Generates a job id that is guaranteed (at call time) not to exist in the
@@ -1871,28 +1409,8 @@ pub fn extract_conversation_id(log: &str) -> Option<String> {
 /// Returns all job records from the state database, optionally filtered by
 /// project name, sorted newest first.
 pub fn list_jobs(state_root: &Path, project_filter: Option<&str>) -> Result<Vec<JobMetadata>> {
-    let conn = open_state_db(state_root)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT job_id, project, prompt, resolved_prompt, model, effort, sandbox, mode, add_dirs, print_timeout, created_at, worktree_path, branch, base_ref, conversation_id, retry_count, pid, exit_code, status, hindsight, auto_recall, auto_retain, retry_prompt, read_only, external_worktree, pid_start_time, hindsight_bank, proxy, max_runtime, started_at, hindsight_query, sandbox_info, engine \
-              FROM jobs WHERE ?1 IS NULL OR project = ?1 ORDER BY created_at DESC, job_id DESC",
-        )
-        .with_context(|| format!("Failed to prepare job list query in {}", state_db_path(state_root).display()))?;
-
-    let mut results = Vec::new();
-    let rows = stmt
-        .query_map(params![project_filter], row_to_job)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to query jobs from {}: {}",
-                state_db_path(state_root).display(),
-                e
-            )
-        })?;
-    for row in rows {
-        results.push(row?);
-    }
-    Ok(results)
+    let db = crate::state::StateDb::open(state_root)?;
+    db.jobs().list(project_filter)
 }
 
 /// The effective max-runtime limit for a job: the per-job value wins over

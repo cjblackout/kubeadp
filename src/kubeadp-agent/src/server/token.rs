@@ -1,6 +1,6 @@
 //! Operator-token handling for the agent-run API surface.
 //!
-//! The [`crate::core::server::auth`] layer compares bearer credentials in
+//! The [`crate::server::auth`] layer compares bearer credentials in
 //! constant time. Instead of comparing raw token strings (whose lengths
 //! differ legitimately and would give away the token length in the timing
 //! of a length short-circuit), both the configured token and the presented

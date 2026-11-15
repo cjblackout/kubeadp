@@ -13,7 +13,7 @@
 //!   counter of completed responses by status class for the whole router.
 //!
 //! [`add_observability`] wraps an authenticated router (everything a
-//! [`crate::core::server::router`] carries, i.e. every `/api/v1` route) with the
+//! [`crate::server::router`] carries, i.e. every `/api/v1` route) with the
 //! bearer-auth layer and appends the unauthenticated `public` routes last.
 
 use std::collections::BTreeMap;

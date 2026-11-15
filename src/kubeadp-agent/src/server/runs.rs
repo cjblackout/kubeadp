@@ -27,12 +27,12 @@ use std::sync::Arc;
 use crate::core::config::Config;
 use crate::core::job::JobMetadata;
 use crate::core::output::CommandOutput;
-use crate::core::server::{ApiJson, ApiPath, AppState};
 use crate::engine::capability::{CapEndpointKey, Capability};
 use crate::engine::emulate::{EmulatingEngine, EngineRunRegistry};
 use crate::engine::errors::EngineError;
 use crate::engine::run::Run;
 use crate::engine::{Engine, EngineRegistry, RunKind};
+use crate::server::{ApiJson, ApiPath, AppState};
 
 /// Resolves `run` and its emulation wrapper, gating `key` on the engine's
 /// reported capability (an `Unsupported` endpoint answers 501).
@@ -454,10 +454,10 @@ mod tests {
     use super::*;
     use crate::core::auth::AuthManager;
     use crate::core::config::Config;
-    use crate::core::server::{obs, RemoteControlState};
     use crate::engine::capability::CapabilityTable;
     use crate::engine::run::{RunKind, RunStatus, TodoItem};
     use crate::engine::Engine;
+    use crate::server::{obs, RemoteControlState};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::Router;
@@ -526,13 +526,13 @@ mod tests {
 
     fn run_control_app_with(registry: std::sync::Arc<crate::engine::EngineRegistry>) -> Router {
         obs::add_observability(
-            crate::core::server::router_with_engines(
+            crate::server::router_with_engines(
                 std::sync::Arc::new(Config::default()),
                 std::sync::Arc::new(AuthManager::new()),
                 RemoteControlState::default(),
                 registry,
             ),
-            crate::core::server::auth::AuthState::none(),
+            crate::server::auth::AuthState::none(),
             std::sync::Arc::new(|| Ok(())),
             std::sync::Arc::new(Vec::new),
         )

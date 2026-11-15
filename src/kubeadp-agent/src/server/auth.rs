@@ -160,7 +160,7 @@ impl AuthState {
 /// surface share one credential. With no token configured (the
 /// `api_allow_unauthenticated` path) the verifier is `None`; the mount sites
 /// then refuse to serve the A2A routes unless `KUBEADP_API_ALLOW_OPEN` is set
-/// (`crate::core::server::token::a2a_open_permitted`), so `None` never means
+/// (`crate::server::token::a2a_open_permitted`), so `None` never means
 /// an accidentally open surface.
 ///
 /// The raw token is never retained: the verifier closes over only the
@@ -470,8 +470,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn full_router(state: AuthState) -> axum::Router {
-        crate::core::server::obs::add_observability(
-            crate::core::server::router(
+        crate::server::obs::add_observability(
+            crate::server::router(
                 std::sync::Arc::new(crate::core::config::Config::default()),
                 std::sync::Arc::new(crate::core::auth::AuthManager::new()),
             ),

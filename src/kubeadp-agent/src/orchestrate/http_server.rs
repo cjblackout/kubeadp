@@ -29,10 +29,8 @@ use crate::orchestrate::server::router_with_rc;
 use crate::orchestrate::server::RemoteControlState;
 use crate::orchestrate::session_control::SessionControlRegistry;
 use crate::orchestrate::session_log::SessionLogs;
-use crate::orchestrate::sessions_api::{
-    bearer_token_from_env, router as sessions_router, SessionsApiState,
-};
 use crate::orchestrate::state::SupervisorState;
+use crate::server::sessions::{bearer_token_from_env, router as sessions_router, SessionsApiState};
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:8002";
 
