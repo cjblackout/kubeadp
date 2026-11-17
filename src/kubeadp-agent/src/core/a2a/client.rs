@@ -67,6 +67,11 @@ pub const MAX_HOP: u32 = 4;
 pub const META_SENDER: &str = "a2a.sender";
 /// Metadata key for the hop counter.
 pub const META_HOP: &str = "a2a.hop";
+/// The peer-side cap on an inline message text (the A2A ingress size limit,
+/// derived from the one PTY-delivery cap minus the framing overhead): the
+/// client refuses an inline payload above it before the network round trip
+/// (never truncates, never a generic failure).
+pub use super::ingress::MAX_INGRESS_TEXT_BYTES;
 /// Metadata key for the signed one-time HOP TOKEN the sender mints for every
 /// outgoing message (the receiver reads the hop ONLY from this verified
 /// token; the claimed `a2a.hop` is ignored). Re-exported from [`crate::core::a2a::ingress`].
@@ -86,6 +91,83 @@ pub const SA_NAMESPACE_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccou
 pub const CARD_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// Hard size cap on fetched agent cards (64 KB). Bodies exceeding this are rejected.
 pub const MAX_CARD_BYTES: usize = 64 * 1024;
+
+/// Default of the bounded `get_task` result's history: at most the last N
+/// history entries are kept. The tool argument `history_length` is clamped
+/// into `0..=[GET_TASK_HISTORY_MAX]`.
+pub const GET_TASK_HISTORY_DEFAULT: usize = 10;
+/// Cap of the bounded `get_task` result's history (the tool argument
+/// `history_length` is clamped into `0..=50`).
+pub const GET_TASK_HISTORY_MAX: usize = 50;
+/// Fixed cap (characters) per message/artifact/status text in a bounded
+/// `get_task` result; longer texts are cut with an explicit marker
+/// (see [`truncate_text`]).
+pub const TASK_TEXT_MAX_CHARS: usize = 500;
+/// The explicit truncation marker of a cut text (`...[truncated: N characters
+/// omitted]`), so a cut is never silent.
+pub const TASK_TEXT_MARKER: &str = "...[truncated:";
+
+/// Truncate a text to `max_chars` characters with an explicit marker naming
+/// the omitted remainder (`...[truncated: N characters omitted]`).
+pub fn truncate_text(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max_chars).collect();
+    format!(
+        "{cut} {TASK_TEXT_MARKER} {omitted} characters omitted]",
+        omitted = count - max_chars
+    )
+}
+
+/// Truncate every string in a task response longer than
+/// [`TASK_TEXT_MAX_CHARS`] characters (history message parts, artifacts, the
+/// status message) with the [`truncate_text`] marker. The top-level `id`
+/// stays verbatim: an identifier must never be cut.
+fn truncate_task_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            if s.chars().count() > TASK_TEXT_MAX_CHARS {
+                *s = truncate_text(s, TASK_TEXT_MAX_CHARS);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(truncate_task_strings),
+        serde_json::Value::Object(map) => {
+            for (key, v) in map.iter_mut() {
+                if key == "id" && v.is_string() {
+                    continue;
+                }
+                truncate_task_strings(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Bound a peer task response for the `get_task` tool: the task state plus at
+/// most the last `history_length` history entries (A2A history is ordered,
+/// the last entries are the most recent; 0 = none), every message/artifact/
+/// status text truncated to [`TASK_TEXT_MAX_CHARS`] characters with an
+/// explicit marker, and `history_truncated: true` plus `history_total` when
+/// entries were cut. The result never depends on the history size; the
+/// response cap is applied by the MCP layer on top.
+pub fn bound_task(value: serde_json::Value, history_length: usize) -> serde_json::Value {
+    let mut value = value;
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(history) = obj.get("history").and_then(|h| h.as_array()).cloned() {
+            let total = history.len();
+            if total > history_length {
+                let kept: Vec<serde_json::Value> = history[total - history_length..].to_vec();
+                obj.insert("history".to_string(), serde_json::json!(kept));
+                obj.insert("history_truncated".to_string(), serde_json::json!(true));
+                obj.insert("history_total".to_string(), serde_json::json!(total));
+            }
+        }
+    }
+    truncate_task_strings(&mut value);
+    value
+}
 
 /// Validate a Kubernetes name / namespace as an RFC 1123 label.
 /// Must be 1-63 lowercase alphanumeric characters or '-', starting and ending
@@ -297,6 +379,17 @@ impl A2aClientCtx {
         if text.is_empty() {
             return Err("message text must not be empty".to_string());
         }
+        // The peer's A2A ingress refuses text above the cap (it never
+        // truncates), so refuse here with the limit named: an inline payload
+        // above the cap must be split into smaller messages or handed over by
+        // the orchestrator (see DOCS.md 4.5). The error names the byte limit.
+        if text.len() > super::ingress::MAX_INGRESS_TEXT_BYTES {
+            return Err(format!(
+                "message text too large: {} bytes; the A2A ingress cap is {} bytes -- split the content across smaller messages or let the orchestrator collect the work",
+                text.len(),
+                super::ingress::MAX_INGRESS_TEXT_BYTES
+            ));
+        }
         let hop = self.next_hop(incoming_hop)?;
         let mut message = Message::new(Role::User, vec![Part::text(text)]);
         // The hop token binds the message id the receiver replays against;
@@ -358,6 +451,13 @@ impl A2aClientCtx {
         let task_id = task_id.or(suffix_task);
 
         let message = self.build_send_message(text, context_id, task_id, incoming_hop)?;
+        // The outgoing hop the message carries (the sender's summary).
+        let hop = message
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(META_HOP))
+            .and_then(|h| h.as_u64())
+            .unwrap_or(0) as u32;
 
         let req = SendMessageRequest {
             message,
@@ -371,19 +471,27 @@ impl A2aClientCtx {
             .send_message(&req)
             .await
             .map_err(|e| format!("send_message to {agent}: {e}"))?;
-        Ok(match resp {
-            SendMessageResponse::Task(task) => serde_json::to_value(task)
-                .map_err(|e| format!("failed to encode response task: {e}"))?,
-            SendMessageResponse::Message(msg) => serde_json::to_value(msg)
-                .map_err(|e| format!("failed to encode response message: {e}"))?,
-        })
+        // The fixed-shape success summary: the message WAS delivered, so the
+        // result must never depend on the peer task's history/artifact size
+        // (an oversized full task once replaced a delivered message with the
+        // response-cap error). Fields: id, contextId, status.state, hop,
+        // delivered, delivery.
+        Ok(send_summary(&resp, hop))
     }
 
     /// Fetch the current state of a task from the given agent (by name or
     /// namespace/name). `agent` may also be `<name>/<task_id>`, in which case
     /// the suffix is the task id (and an empty `task_id` argument is filled
-    /// from it).
-    pub async fn get_task(&self, agent: &str, task_id: &str) -> Result<serde_json::Value, String> {
+    /// from it). `history_length` (optional) is the number of history entries
+    /// the bounded result keeps (`0..=GET_TASK_HISTORY_MAX`, default
+    /// [`GET_TASK_HISTORY_DEFAULT`]); the result is bounded by [`bound_task`]
+    /// and never depends on the peer task's history size.
+    pub async fn get_task(
+        &self,
+        agent: &str,
+        task_id: &str,
+        history_length: Option<usize>,
+    ) -> Result<serde_json::Value, String> {
         let (entry, suffix_task) = self
             .resolve_agent_task(agent)
             .ok_or_else(|| format!("no A2A agent named '{agent}' in the registry"))?;
@@ -403,8 +511,70 @@ impl A2aClientCtx {
             .get_task(&req)
             .await
             .map_err(|e| format!("get_task on {agent}: {e}"))?;
-        serde_json::to_value(task).map_err(|e| format!("failed to encode task: {e}"))
+        // The bounded result: task state plus at most the last N history
+        // entries, every text truncated with an explicit marker (never the
+        // response-cap error for a valid task).
+        let history_length = history_length
+            .unwrap_or(GET_TASK_HISTORY_DEFAULT)
+            .min(GET_TASK_HISTORY_MAX);
+        let value =
+            serde_json::to_value(task).map_err(|e| format!("failed to encode task: {e}"))?;
+        Ok(bound_task(value, history_length))
     }
+}
+
+/// The delivery a successful send can tell from the peer's response: a task
+/// state `submitted` (the message sits in the peer's durable A2A inbox, the
+/// escalation ladder picks the transport) is `queued`; anything else (the
+/// peer accepted the message into its live input channel) is `injected`.
+/// `resume_after_ack` is not knowable at send time (the ladder picks it after
+/// the ack window); a terminal/unknown target refuses the send (the tool
+/// error).
+fn delivery_of_response(resp: &SendMessageResponse) -> &'static str {
+    let state = match resp {
+        SendMessageResponse::Task(t) => {
+            serde_json::to_value(&t.status.state).unwrap_or(serde_json::Value::Null)
+        }
+        SendMessageResponse::Message(_) => serde_json::Value::Null,
+    };
+    if state == serde_json::json!("TASK_STATE_SUBMITTED") {
+        "queued"
+    } else {
+        "injected"
+    }
+}
+
+/// The fixed-shape result of a successful `send_message`/`reply`:
+/// `{id, contextId, status: {state}, hop, delivered, delivery}` -- small,
+/// fixed, never dependent on the peer task's history/artifact size.
+fn send_summary(resp: &SendMessageResponse, hop: u32) -> serde_json::Value {
+    let (id, context_id, state) = match resp {
+        SendMessageResponse::Task(t) => (
+            serde_json::json!(t.id),
+            if t.context_id.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(t.context_id)
+            },
+            serde_json::to_value(&t.status.state).unwrap_or(serde_json::Value::Null),
+        ),
+        SendMessageResponse::Message(m) => (
+            serde_json::json!(m.message_id),
+            m.context_id
+                .as_ref()
+                .map(|c| serde_json::json!(c))
+                .unwrap_or(serde_json::Value::Null),
+            serde_json::Value::Null,
+        ),
+    };
+    serde_json::json!({
+        "id": id,
+        "contextId": context_id,
+        "status": { "state": state },
+        "hop": hop,
+        "delivered": true,
+        "delivery": delivery_of_response(resp),
+    })
 }
 
 /// A [`CallInterceptor`] that attaches the per-jobset credential to every
@@ -1356,5 +1526,105 @@ mod tests {
         // Static peer over plain HTTP: attached once.
         let list_static = ctx.interceptors_for(&static_http, &static_http.url, false);
         assert_eq!(list_static.len(), 1);
+    }
+
+    /// An inline message text above the A2A ingress cap is refused with the
+    /// limit named (never silently truncated), before any network round trip.
+    #[test]
+    fn oversize_inline_text_is_refused_with_the_limit_named() {
+        let ctx = ctx_with(vec![("alpha", "ops", "http://alpha.ops.svc:8080")]);
+        let cap = super::super::ingress::MAX_INGRESS_TEXT_BYTES;
+        let over = "x".repeat(cap + 1);
+        let err = ctx.build_send_message(&over, None, None, None).unwrap_err();
+        assert!(
+            err.contains("too large"),
+            "the refusal names the size: {err}"
+        );
+        assert!(
+            err.contains(&cap.to_string()),
+            "the error names the limit: {err}"
+        );
+        // A text at the cap passes the pre-send check.
+        let at_cap = "x".repeat(cap);
+        assert!(ctx.build_send_message(&at_cap, None, None, None).is_ok());
+    }
+
+    /// truncate_text cuts with an explicit marker naming the omitted
+    /// remainder.
+    #[test]
+    fn truncate_text_marks_the_cut() {
+        assert_eq!(truncate_text("short", 100), "short");
+        let cut = truncate_text(&"a".repeat(600), 500);
+        assert!(cut.starts_with(&"a".repeat(500)));
+        assert!(cut.contains(TASK_TEXT_MARKER));
+        assert!(cut.contains("100 characters omitted"));
+    }
+
+    /// The bounded `get_task` result: at most the last N history entries
+    /// (0 = none), the cut marked with history_truncated/history_total.
+    #[test]
+    fn bound_task_keeps_the_last_history_entries_and_marks_the_cut() {
+        let history: Vec<serde_json::Value> = (0..25)
+            .map(|i| {
+                serde_json::json!({
+                    "message_id": format!("m{i}"),
+                    "parts": [{ "text": format!("text {i}") }],
+                })
+            })
+            .collect();
+        let task = serde_json::json!({
+            "id": "t-1",
+            "contextId": "ctx-1",
+            "status": { "state": "TASK_STATE_WORKING" },
+            "history": history,
+        });
+        // Default N = 10: the LAST 10 entries kept (m15..m24), the cut marked.
+        let bounded = bound_task(task.clone(), GET_TASK_HISTORY_DEFAULT);
+        let kept = bounded["history"].as_array().unwrap();
+        assert_eq!(kept.len(), 10);
+        assert_eq!(kept[0]["message_id"], "m15", "the LAST entries are kept");
+        assert_eq!(kept[9]["message_id"], "m24");
+        assert_eq!(bounded["history_truncated"], true);
+        assert_eq!(bounded["history_total"], 25);
+
+        // history_length 0: no history at all, the cut marked.
+        let bounded = bound_task(task.clone(), 0);
+        assert_eq!(bounded["history"].as_array().unwrap().len(), 0);
+        assert_eq!(bounded["history_truncated"], true);
+        assert_eq!(bounded["history_total"], 25);
+
+        // A history that fits is served verbatim without the cut fields.
+        let bounded = bound_task(task, GET_TASK_HISTORY_MAX);
+        assert_eq!(bounded["history"].as_array().unwrap().len(), 25);
+        assert!(bounded.get("history_truncated").is_none());
+        assert!(bounded.get("history_total").is_none());
+    }
+
+    /// Long texts (message parts, artifacts, the status message) are
+    /// truncated to the fixed length with the explicit marker; identifiers
+    /// stay verbatim.
+    #[test]
+    fn bound_task_truncates_long_texts_with_the_marker() {
+        let long = "x".repeat(2000);
+        let task = serde_json::json!({
+            "id": "t-1",
+            "metadata": { "statusMessage": long },
+            "artifacts": [{ "parts": [{ "text": long }] }],
+            "history": [{ "parts": [{ "text": long }] }],
+        });
+        let bounded = bound_task(task, 10);
+        let text = serde_json::to_string(&bounded).unwrap();
+        assert!(text.contains(TASK_TEXT_MARKER), "marker: {text}");
+        assert!(text.len() < 4096, "bounded: {}", text.len());
+        assert_eq!(bounded["id"], "t-1", "the id stays verbatim");
+        let artifact_text = bounded["artifacts"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(artifact_text.contains(TASK_TEXT_MARKER));
+        assert!(
+            artifact_text.chars().count() < TASK_TEXT_MAX_CHARS + 100,
+            "fixed length: {} chars",
+            artifact_text.chars().count()
+        );
     }
 }

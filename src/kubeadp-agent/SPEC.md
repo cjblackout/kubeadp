@@ -1263,6 +1263,25 @@ having to read a mailbox.
   injects at the first boundary after the agent (re)starts. An
   operator-`killed` job is never woken: its queued messages are expired and
   the sender's task fails.
+- **Work hand-over between peers**: an agent's job worktree is NOT accessible
+  to other agents (a job's sandbox grants only its own worktree; there is no
+  worktree field, no path sharing and no mechanism that exposes it). The
+  supported ways to hand work over are: (a) the relevant code or a small diff
+  sent INLINE in an A2A message — at most `MAX_INGRESS_TEXT_BYTES` (7536
+  bytes) of text; a larger inline payload is refused by `send_message` with
+  an error naming the limit, never silently truncated; (b) anything larger:
+  the orchestrator collects each job's result (`agent-run diff`) and combines
+  it — an agent tells the orchestrator by A2A that a part is ready ONLY when
+  it needs it combined (that is a hand-over request, not a status update).
+- **Idle and terminal peers**: a message to a job whose turn has ended stays
+  `queued` (the send result reports `delivery: "queued"`) and is delivered
+  after the `a2a_ack_secs` ack window (default 45 s) through the `idle_turn`
+  step — a finished job is resumed (no kill), a running live-stdin job gets
+  the message on its pipe at the next turn; `interrupt: true` senders get the
+  kill-and-resume. A message to a `killed`, cleaned or unknown job is NOT
+  delivered: the send answers `a2a_send_failed` with the peer's reason
+  (`delivery: "terminal"`), and the message never leaves the queue state
+  visible to the sender.
 - **Security**: injected text is always the framed block of §7.12; the inbox
   API authenticates with the expiring per-run token and its request body only
   names the run (the host serves its own state root); the state store, the
@@ -1334,20 +1353,45 @@ messages and one of its receive channels.
   malformed file makes every tool answer the tool error
   `{code:"a2a_no_credentials"}` without any network request (fail closed); it
   never sends an unauthenticated or bearer-authenticated request.
-- `list_agents` (read-only, idempotent): `{agents:[{agent_id, kind, state,
-  jobsets:[...]}]}` — the union of `GET /a2a/agents` over every peer (§7.7) and
-  every jobset of the caller: exactly the agents sharing at least one jobset
-  with the caller, without the caller itself.
-- `send_message` `{to, text, jobset?, interrupt?, context_id?, task_id?,
-  incoming_hop?}`: `to` is an agent id. `jobset` selects the jobset to
-  authorize with; omitted, the tool selects a jobset shared with `to` (the
-  caller's default jobset first, then lexicographic). No shared jobset → tool
-  error `{code:"no_shared_jobset"}`. Sends hop = `incoming_hop` + 1 and refuses
-  `incoming_hop ≥ MAX_HOP` locally. Result `{delivery:"queued"|"injected",
-  task_id}`; error `{code:"a2a_send_failed", message, max_hop}`.
-- `reply` `{to, text, jobset?, incoming_hop?}`: `send_message` to the verified
-  sender and jobset shown in a received frame; error `{code:"a2a_reply_failed"}`.
-- `get_task` `{agent, task_id}`; error `{code:"a2a_gettask_failed"}`.
+- `list_agents` (read-only, idempotent): takes no arguments; returns the
+  discovered peer agents `{agents:[{name, namespace, url, card?}]}` — the
+  Services labelled `a2a.homelab/agent=true` plus the static `A2A_PEERS`
+  entries (`card` = the best-effort fetched agent card). A jobset-scoped list
+  (`GET /a2a/agents`, §7.7) is planned.
+- `send_message` `{agent, text, context_id?, task_id?, incoming_hop?}`:
+  `agent` is a bare Service name from `list_agents` (resolved within the own
+  namespace, else unique) or a `namespace/name` pair. The three-part
+  addressing is `agent` (which peer) + `task_id` (which run on it): a worker
+  job id (8 hex characters, also reachable as the per-job sender identity
+  `<agent>/<job_id>`) or an orchestrator session name; without `task_id` the
+  message addresses the agent itself. `text` above
+  `MAX_INGRESS_TEXT_BYTES` (7536 bytes, the A2A ingress cap minus framing) is
+  refused with the limit named before any network request (never truncated);
+  `incoming_hop` + 1 must be ≤ `MAX_HOP` (4). Result (fixed shape, never
+  dependent on the peer task's history size)
+  `{id, contextId, status:{state}, hop, delivered:true, delivery}` with
+  `delivery` = `queued` (the peer's durable inbox; the escalation ladder
+  injects at the next boundary or, past the ack window with the peer's turn
+  ended, through `idle_turn`) or `injected` (the peer's live input channel, a
+  session PTY paste); a send to a killed/unknown target answers
+  `{code:"a2a_send_failed", message, max_hop, delivery:"terminal"}`.
+  `resume_after_ack` is not knowable at send time (the ladder picks it after
+  the ack window).
+- `reply` `{to, text, context_id?, task_id?, incoming_hop?}`: `send_message`
+  addressed to the `claimed sender` copied verbatim from the framed header of
+  the message being replied to (the per-job form `<agent>/<task_id>` splits
+  automatically); same result shape; error
+  `{code:"a2a_reply_failed", message, max_hop, delivery?:"terminal"}`.
+- `get_task` `{agent, task_id?, history_length?}`: `task_id` may be omitted
+  when `agent` names it in the per-job form `<name>/<task_id>`.
+  `history_length` (integer, 0-50, default 10, larger clamped) is how many of
+  the LAST history entries the result keeps. The result is bounded for any
+  history size: the task state plus at most the last `history_length`
+  entries, every message/artifact/status text truncated to 500 characters
+  with the marker `...[truncated: N characters omitted]`, and
+  `history_truncated: true` plus `history_total` when entries were cut; a
+  valid task is never answered with the response-cap error. Error
+  `{code:"a2a_gettask_failed", message}`.
 - `wait_message` `{timeout_s?}`: a blocking receive through the pod-local
   delivery API (§7.14); the RESULT is the queued message(s) (`{messages:[{
   from_agent_id, jobset_id, message_id, context_id, task_id, hop, framed}],
@@ -1355,11 +1399,23 @@ messages and one of its receive channels.
   the call timeout); returning a message marks it injected. There is no
   model-driven mailbox read tool.
 
+Tool arguments are published under their canonical names only (every JSON
+schema states each parameter with its exact name, type, required flag, meaning
+and example); the obvious case variants of the same parameter
+(`text`/`message`/`Message`, `task_id`/`taskId`) are accepted as aliases, and
+a missing or unknown argument is answered with an error that names the
+parameter and lists the valid arguments.
+
 Every other tool result carries the queued messages as full framed text
 (`a2a_incoming`, capped at 16 KiB) when any are queued (the `tool_result`
 channel). Errors are MCP tool errors (`isError:true`), never panics; tools
 accept agent ids and registry names only, never URLs. `MAX_RESPONSE_BYTES`
-20 KiB (oversize → `{"error":"response exceeds..."}`); call timeout 30 s.
+20 KiB: the size limit stays (it protects the agent's context) and a result
+that still would not fit after bounding is cut by the same rule (older
+`history` entries dropped first, the cut reflected in `history_truncated`/
+`history_total`, then long strings truncated with the marker), never replaced
+by the oversize error — a delivered message is never reported as an error.
+Call timeout 30 s.
 Registration: the worker registers `mcp-a2a` for agy in
 `~/.gemini/config/mcp_config.json` and for claude jobs in the job's MCP
 configuration; the session supervisor registers it for each session; all point
@@ -1778,7 +1834,7 @@ section is outstanding.
 | absent recipient queued, `delivery` in the send answer | partial | queue and TTL implemented; the send answer carries no `delivery` value |
 | audit and text deletion (§7.15) | planned | |
 | end by creator, tombstone, peer propagation (§7.16) | partial | operator end route and epoch bump implemented, per pod only |
-| `mcp-a2a` tools | partial | all five tools exist; credential fail-closed, jobset-scoped `list_agents`, `jobset`/`interrupt` parameters and registration for claude jobs and sessions planned; `a2a_mcp_enabled` defaults to false |
+| `mcp-a2a` tools | partial | all five tools exist; fixed-shape `send_message`/`reply` result (`delivered`, `delivery`), bounded `get_task` (`history_length`, truncation markers), cut-not-error response cap, canonical argument names with case-variant aliases, oversize-text refusal naming the limit, credential fail-closed; jobset-scoped `list_agents`, `jobset`/`interrupt` parameters and registration for claude jobs and sessions planned; `a2a_mcp_enabled` defaults to false |
 
 ### 13.4 Sandbox, configuration, API (§5, §6, §9)
 | Item | Status | Note |
