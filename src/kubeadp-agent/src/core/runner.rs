@@ -2876,33 +2876,58 @@ mod tests {
         meta.job_id = job_id.clone();
         meta.worktree_path = wt;
 
-        // Post-spawn hook: agy is spawned and running (writes pidfile), but
-        // monitor parks before attempting CAS(PENDING, RUNNING).
-        // The launcher times out after 100ms and transitions to CANCELLED.
-        register_test_post_spawn_hook(&job_id, || {
-            thread::sleep(Duration::from_millis(300));
+        // Post-spawn hook: agy is spawned and running (writes pidfile), but the
+        // monitor PARKS on a barrier before attempting CAS(PENDING, RUNNING).
+        // The test releases it only after the agy has confirmed itself, so the
+        // whole thing is deterministic instead of racing a fixed sleep: the
+        // monitor is parked across the launcher's whole confirmation window,
+        // the launcher therefore always times out (PENDING -> CANCELLED) while
+        // the monitor writes no PID, and only then is the monitor released to
+        // observe CANCELLED, kill the agy process group and record nothing.
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let gate_hook = Arc::clone(&gate);
+        register_test_post_spawn_hook(&job_id, move || {
+            let _ = gate_hook.wait();
         });
 
-        let err = launch_background_job_with_timeout(
-            &config,
-            &mut meta,
-            Duration::from_millis(100),
-            Duration::from_millis(20),
-        )
-        .expect_err("launch must fail when PID is not confirmed within timeout");
+        let job_config = config.clone();
+        let launcher = std::thread::spawn(move || {
+            let res = launch_background_job_with_timeout(
+                &job_config,
+                &mut meta,
+                Duration::from_millis(100),
+                Duration::from_millis(20),
+            );
+            (res, meta)
+        });
 
+        // The monitor is parked at the barrier while the agy runs: wait until
+        // the agy has started and recorded its PID (the "spawned and confirmed"
+        // precondition), with a generous deadline for a loaded runner.
         assert!(
-            err.to_string().contains("did not confirm a PID"),
-            "unexpected error: {err}"
-        );
-
-        // Fake agy was spawned and recorded its PID
-        assert!(
-            wait_until(std::time::Instant::now() + Duration::from_secs(5), || {
+            wait_until(std::time::Instant::now() + Duration::from_secs(20), || {
                 pidfile.exists()
             }),
             "fake agy should have started and recorded its PID"
         );
+
+        // The launcher's confirmation window has now elapsed while the monitor
+        // was parked, so the launch must have failed (PID never confirmed).
+        let (res, meta) = launcher.join().unwrap();
+        let err = res.expect_err("launch must fail when PID is not confirmed within timeout");
+        assert!(
+            err.to_string().contains("did not confirm a PID"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            meta.pid.is_none(),
+            "a cancelled launch must not record a PID on meta"
+        );
+
+        // Release the parked monitor: its CAS now fails (state is CANCELLED),
+        // so it kills the agy process group and reaps the child.
+        let _ = gate.wait();
+
         let agy_pid: u32 = fs::read_to_string(&pidfile)
             .unwrap_or_default()
             .trim()

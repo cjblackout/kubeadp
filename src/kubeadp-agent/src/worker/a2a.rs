@@ -254,6 +254,16 @@ pub struct JobMessageSink {
     seen: Mutex<VecDeque<String>>,
     /// The ladder watchers (one per job).
     ladders: crate::core::a2a::delivery::LadderWatchers,
+    /// Test-only seam: when set, `deliver_with_meta` does NOT start the
+    /// background ladder watcher, so a test drives every escalation through
+    /// the explicit [`JobMessageSink::ladder_pass`] entry point it calls
+    /// itself. This removes the wall-clock race where the background watcher
+    /// (one pass per second) would resume or expire the queued message before
+    /// a test whose thread is slow on a loaded runner. It is always present
+    /// but defaults to `false`, and the only writer
+    /// ([`set_test_ladder_disabled`]) is `#[cfg(test)]`-gated, so production
+    /// can never flip it and the delivered behaviour is unchanged.
+    test_ladder_disabled: std::sync::atomic::AtomicBool,
 }
 
 impl JobMessageSink {
@@ -263,7 +273,18 @@ impl JobMessageSink {
             slots: Mutex::new(HashMap::new()),
             seen: Mutex::new(VecDeque::new()),
             ladders: crate::core::a2a::delivery::LadderWatchers::new(),
+            test_ladder_disabled: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Test-only: stop `deliver_with_meta` from starting the background
+    /// ladder watcher for this sink (see [`test_ladder_disabled`]). Tests call
+    /// it before delivering so the queued message is escalated only by the
+    /// explicit [`JobMessageSink::ladder_pass`] the test drives.
+    #[cfg(test)]
+    pub(crate) fn set_test_ladder_disabled(&self, disabled: bool) {
+        self.test_ladder_disabled
+            .store(disabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Restart recovery: the ladder watchers are in-memory threads, so the
@@ -373,6 +394,21 @@ impl JobMessageSink {
             move || Self::ladder_pass(&config, &slot, &job_id, false),
             move || Inbox::new(&idle_dir).uninjected_count() == 0,
         );
+    }
+
+    /// Like [`ensure_ladder`] but honouring the test-only seam: when
+    /// `test_ladder_disabled` is set (only ever by tests, via
+    /// [`set_test_ladder_disabled`]), the background watcher is NOT started
+    /// and the test drives the ladder pass itself. Production never sets the
+    /// flag, so it always starts the watcher here.
+    fn ensure_ladder_for_delivery(&self, task_id: &str) {
+        if self
+            .test_ladder_disabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        self.ensure_ladder(task_id);
     }
 
     /// The ladder configuration for this worker.
@@ -735,7 +771,7 @@ impl MessageSink for JobMessageSink {
                 // The interrupt did not apply (concurrent storm limit, failed resume)
                 // but the message IS queued: it must not sit unwatched, so
                 // the ladder delivers it at the next boundary / idle turn.
-                self.ensure_ladder(task_id);
+                self.ensure_ladder_for_delivery(task_id);
             }
             return result;
         }
@@ -744,7 +780,7 @@ impl MessageSink for JobMessageSink {
         // inject at the next boundary and the ladder escalates.
         self.enqueue(task_id, sender, text, message_id, meta)?;
         self.mark_seen(task_id, message_id);
-        self.ensure_ladder(task_id);
+        self.ensure_ladder_for_delivery(task_id);
         Ok(())
     }
 }
@@ -1367,16 +1403,21 @@ mod tests {
         let _proc_lock = crate::core::reaper::lock_proc_child_tests();
         let temp = TempDir::new().unwrap();
         let (config, worktree) = save_resumable_done_job(&temp, "e2e", 0);
-        // A 1 s ack window so the ladder escalates immediately; force_secs
-        // stays 0 (never kill).
+        // A wide ack window (far larger than any test delay) so the message
+        // only escalates once this test ages it past the window explicitly;
+        // force_secs stays 0 (never kill).
         let config = Config {
-            a2a_ack_secs: 1,
+            a2a_ack_secs: 300,
             ..config
         };
         let agy = config.agy_path.clone();
         write_fake_agy(&agy, &worktree);
         let state_root = config.state_root.clone();
         let sink = JobMessageSink::new(Arc::new(config));
+        // Drive the ladder only through the explicit pass below: without this
+        // the background watcher could resume the job on its own 1 s wall-clock
+        // poll before this (possibly slow) test thread reaches the age/pass.
+        sink.set_test_ladder_disabled(true);
 
         // Deliver: the message is queued (sender task submitted), nothing is
         // resumed yet.
@@ -1394,7 +1435,7 @@ mod tests {
         // Age past the ack window: the ladder escalates to the idle turn (the
         // job is done, so the next turn is a fresh resume) and the injection
         // is the ack. force_secs=0: never an interrupt.
-        age_pending_message(&sink.inbox("e2e"), 2);
+        age_pending_message(&sink.inbox("e2e"), 301);
         let slot = JobSlot::new();
         assert_eq!(
             JobMessageSink::ladder_pass(&sink.config, &slot, "e2e", false),
@@ -1467,15 +1508,22 @@ mod tests {
             let temp = TempDir::new().unwrap();
             let job_id = format!("concur-{i}");
             let (config, worktree) = save_resumable_done_job(&temp, &job_id, 0);
-            // A 1 s ack window so the ladder escalates immediately; force_secs
-            // stays 0 (never kill).
+            // A wide ack window (far larger than any test delay) so the message
+            // only escalates once this test ages it past the window explicitly;
+            // force_secs stays 0 (never kill).
             let config = Config {
-                a2a_ack_secs: 1,
+                a2a_ack_secs: 300,
                 ..config
             };
             write_fake_agy(&config.agy_path, &worktree);
             let state_root = config.state_root.clone();
-            let sink = Arc::new(JobMessageSink::new(Arc::new(config)));
+            let sink = JobMessageSink::new(Arc::new(config));
+            // Drive the ladder only through the two explicit passes below:
+            // without this the background watcher could resume the job on its
+            // own 1 s wall-clock poll and leave the two racing passes with
+            // nothing to claim (0 pending) before they start.
+            sink.set_test_ladder_disabled(true);
+            let sink = Arc::new(sink);
 
             // Deliver the message and age it past the ack window: the idle
             // turn is the escalation that resumes the (now DONE) job.
@@ -1488,7 +1536,7 @@ mod tests {
                     DeliveryMeta::default(),
                 )
                 .is_ok());
-            age_pending_message(&sink.inbox(&job_id), 2);
+            age_pending_message(&sink.inbox(&job_id), 301);
             assert_eq!(sink.inbox(&job_id).pending().len(), 1);
 
             // Two threads race the same ladder pass on the same message.
@@ -1537,14 +1585,19 @@ mod tests {
     fn ladder_expires_the_sender_task_after_the_ttl() {
         let temp = TempDir::new().unwrap();
         let (config, worktree) = save_resumable_done_job(&temp, "expire", 0);
-        // A 1 s ack window and a short TTL (floor 10 s) for the test.
+        // Wide ack window and a 1 h TTL (far larger than any test delay); the
+        // test ages the message explicitly, so nothing depends on wall-clock
+        // timing.
         let config = Config {
-            a2a_ack_secs: 1,
-            a2a_inbox_ttl_secs: 10,
+            a2a_ack_secs: 300,
+            a2a_inbox_ttl_secs: 3600,
             ..config
         };
         write_fake_agy(&config.agy_path, &worktree);
         let sink = JobMessageSink::new(Arc::new(config.clone()));
+        // Drive the ladder only through the explicit passes below (no
+        // background watcher racing this test thread).
+        sink.set_test_ladder_disabled(true);
 
         // A BUSY (running) job: the idle turn is unavailable, force_secs is
         // 0 (never kill) -- queued until the TTL expires it.
@@ -1557,14 +1610,16 @@ mod tests {
             DeliveryMeta::default(),
         )
         .unwrap();
-        age_pending_message(&sink.inbox("expire"), 9);
+        // Inside the TTL (900 s < 3600 s): still queued.
+        age_pending_message(&sink.inbox("expire"), 900);
         let slot = JobSlot::new();
         assert_eq!(
             JobMessageSink::ladder_pass(&sink.config, &slot, "expire", false),
             LadderStep::Queued,
             "busy run inside the ttl: queued"
         );
-        age_pending_message(&sink.inbox("expire"), 20);
+        // Past the TTL (3601 s >= 3600 s): the message expires.
+        age_pending_message(&sink.inbox("expire"), 3601);
         assert!(matches!(
             JobMessageSink::ladder_pass(&sink.config, &slot, "expire", false),
             LadderStep::Expired { .. }
@@ -1624,19 +1679,26 @@ mod tests {
     fn an_expired_message_is_removed_and_does_not_block_the_next_one() {
         let temp = TempDir::new().unwrap();
         let (config, worktree) = save_resumable_done_job(&temp, "unblock", 0);
+        // Wide ack window and a 1 h TTL (far larger than any test delay); the
+        // test ages the message explicitly, so nothing depends on wall-clock
+        // timing.
         let config = Config {
-            a2a_ack_secs: 1,
-            a2a_inbox_ttl_secs: 10,
+            a2a_ack_secs: 300,
+            a2a_inbox_ttl_secs: 3600,
             ..config
         };
         write_fake_agy(&config.agy_path, &worktree);
         let sink = JobMessageSink::new(Arc::new(config.clone()));
+        // Drive the ladder only through the explicit passes below (no
+        // background watcher racing this test thread).
+        sink.set_test_ladder_disabled(true);
         // A BUSY job: nothing is delivered, the message runs into the TTL.
         save_running_job(&config, "unblock", &worktree);
         let plain = DeliveryMeta::default();
         sink.deliver_with_meta("unblock", "sender", "first", "m1", plain)
             .unwrap();
-        age_pending_message(&sink.inbox("unblock"), 20);
+        // Past the TTL (3601 s >= 3600 s): the first message expires.
+        age_pending_message(&sink.inbox("unblock"), 3601);
         let slot = JobSlot::new();
         assert!(matches!(
             JobMessageSink::ladder_pass(&sink.config, &slot, "unblock", false),
@@ -1811,7 +1873,9 @@ mod tests {
                 claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
                 a2a_interrupt_min_secs: 0,
                 a2a_live_stdin: true,
-                a2a_ack_secs: 1,
+                // A wide ack window (far larger than any test delay) so the
+                // message only escalates once this test ages it explicitly.
+                a2a_ack_secs: 300,
                 ..Default::default()
             };
             let meta = save_running_job(&config, "livedel", &worktree);
@@ -1819,6 +1883,11 @@ mod tests {
             let mut reader = register_live_channel_for_test(&config, "livedel", &meta, &worktree);
 
             let sink = JobMessageSink::new(Arc::new(config));
+            // Drive the ladder only through the explicit pass below: without
+            // this the background watcher could write the stdin line on its
+            // own 1 s wall-clock poll and leave the manual pass with
+            // `Injected` instead of `IdleTurn`.
+            sink.set_test_ladder_disabled(true);
             assert!(sink
                 .deliver_with_meta(
                     "livedel",
@@ -1830,7 +1899,7 @@ mod tests {
                 .is_ok());
             // Age past the ack window: the idle_turn step writes the stdin
             // line into the RUNNING process.
-            age_pending_message(&sink.inbox("livedel"), 2);
+            age_pending_message(&sink.inbox("livedel"), 301);
             let slot = JobSlot::new();
             assert_eq!(
                 JobMessageSink::ladder_pass(&sink.config, &slot, "livedel", false),
