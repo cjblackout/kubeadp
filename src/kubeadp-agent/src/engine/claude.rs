@@ -23,8 +23,8 @@ use crate::engine::run::{
     ContextId, EngineEvent, EngineId, ExitInfo, Run, RunId, RunKind, RunStatus,
 };
 use crate::engine::{
-    Engine, EngineCtx, EngineError, JobSpec, LaunchPlan, SessionSpec, StdinMode, Transport,
-    TurnInput,
+    Engine, EngineCtx, EngineError, JobSpec, LaunchPlan, ResumeMode, SessionDef, SessionSpec,
+    StdinMode, Transport, TurnInput,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -506,6 +506,55 @@ impl Engine for ClaudeEngine {
         })
     }
 
+    fn session_command(
+        &self,
+        session: &SessionDef,
+        resume: ResumeMode,
+    ) -> Result<LaunchPlan, EngineError> {
+        let is_resume = matches!(resume, ResumeMode::Resume);
+        let mut args: Vec<String> = Vec::new();
+        let mut session_arg_inserted = false;
+
+        for arg in &session.claude_args {
+            args.push(arg.clone());
+            if arg == "--dangerously-skip-permissions" && !session_arg_inserted {
+                if is_resume {
+                    args.push("--resume".to_string());
+                    args.push(session.session_id.clone());
+                } else {
+                    args.push("--session-id".to_string());
+                    args.push(session.session_id.clone());
+                }
+                session_arg_inserted = true;
+            }
+        }
+
+        if !session_arg_inserted {
+            if is_resume {
+                args.push("--resume".to_string());
+                args.push(session.session_id.clone());
+            } else {
+                args.push("--session-id".to_string());
+                args.push(session.session_id.clone());
+            }
+        }
+
+        let mut env: Vec<(String, String)> = session
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        env.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Ok(LaunchPlan {
+            program: session.claude_binary.clone(),
+            args,
+            env,
+            stdin: StdinMode::Null,
+            pty: true,
+        })
+    }
+
     fn classify_exit(&self, exit: ExitInfo, log_tail: &[u8]) -> JobStatus {
         let log = String::from_utf8_lossy(log_tail);
         crate::core::job::determine_status_from_claude(exit.code, &log)
@@ -645,6 +694,7 @@ fn session_name_from_workdir(workdir: &std::path::Path) -> String {
 mod tests {
     use super::*;
     use crate::engine::capability::Capability;
+    use std::path::PathBuf;
 
     /// Writes a fake `claude` shell script into `dir` that behaves like the
     /// stream-json harness for the (hermetic) job tests: it reads one line
@@ -1250,5 +1300,99 @@ exit 0
 
         meta.conversation_id = Some("sess-999".to_string());
         assert_eq!(engine.conversation_id(&meta).as_deref(), Some("sess-999"));
+    }
+
+    #[test]
+    fn test_claude_session_command_start_and_resume() {
+        let engine = ClaudeEngine::new(PathBuf::from("/usr/local/bin/claude"), None);
+
+        let mut env_map = HashMap::new();
+        env_map.insert("ZZZ".to_string(), "last".to_string());
+        env_map.insert("AAA".to_string(), "first".to_string());
+
+        let session = SessionDef {
+            name: "test-sess".to_string(),
+            workdir: PathBuf::from("/workspace/claude-repo"),
+            session_id: "session-uuid-123".to_string(),
+            engine: Some("claude".to_string()),
+            claude_binary: PathBuf::from("/opt/tools/claude"),
+            claude_args: vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--verbose".to_string(),
+            ],
+            agy_binary: PathBuf::from("agy"),
+            env: env_map,
+            session_file: None,
+            transcript_path: None,
+            memory_file: None,
+            readiness_poll_secs: 5.0,
+            hang_timeout_secs: 0.0,
+            kill_grace_secs: 5.0,
+            pty_eof_grace_secs: 10.0,
+            kill_wait_secs: 15.0,
+            sandbox: true,
+            grants: None,
+            base_backoff_secs: 2.0,
+            max_backoff_secs: 60.0,
+            healthy_run_secs: 30.0,
+            max_crashes: 5,
+            crash_window_secs: 60.0,
+            prefix_output: false,
+            failed_cooldown_secs: 300.0,
+            backoff_window_secs: 600.0,
+            resume_fail_quarantine_after: 5,
+            resume_fail_uptime_secs: 5.0,
+        };
+
+        // Start mode: injects --session-id after --dangerously-skip-permissions
+        let plan_start = engine
+            .session_command(&session, ResumeMode::Start)
+            .expect("session_command Start");
+        assert_eq!(plan_start.program, PathBuf::from("/opt/tools/claude"));
+        assert_eq!(
+            plan_start.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--session-id",
+                "session-uuid-123",
+                "--verbose",
+            ]
+        );
+        assert!(plan_start.pty);
+        assert_eq!(plan_start.stdin, StdinMode::Null);
+        assert_eq!(
+            plan_start.env,
+            vec![
+                ("AAA".to_string(), "first".to_string()),
+                ("ZZZ".to_string(), "last".to_string())
+            ]
+        );
+
+        // Resume mode: injects --resume after --dangerously-skip-permissions
+        let plan_resume = engine
+            .session_command(&session, ResumeMode::Resume)
+            .expect("session_command Resume");
+        assert_eq!(plan_resume.program, PathBuf::from("/opt/tools/claude"));
+        assert_eq!(
+            plan_resume.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--resume",
+                "session-uuid-123",
+                "--verbose",
+            ]
+        );
+
+        // Test fallback where --dangerously-skip-permissions is not in claude_args
+        let mut session_no_dsp = session.clone();
+        session_no_dsp.claude_args = vec!["--headless".to_string()];
+
+        let plan_no_dsp = engine
+            .session_command(&session_no_dsp, ResumeMode::Start)
+            .expect("session_command Start no dsp");
+        assert_eq!(
+            plan_no_dsp.args,
+            vec!["--headless", "--session-id", "session-uuid-123"]
+        );
     }
 }

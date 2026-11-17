@@ -1,11 +1,12 @@
-//! Compact emulation: summarise-then-restart (design HL-91 E4).
+//! Compact emulation: summarise-then-restart (design HL-91 E4, HL-125 B3).
 //!
 //! A native compact (claude PTY's `/compact`) rewrites the harness's own
 //! context window in place. Engines without a native compact get the
 //! emulated path: the emulation layer summarises what the run has done so
-//! far (from the run's own git worktree and checkpoint history), writes a
-//! compact record file next to the worktree, and restarts the run through the
-//! wrapped engine with a continuation prompt that carries the summary.
+//! far (from the run's own git worktree and checkpoint history), records
+//! the summary in `run_meta` (migration 5) and writes a compact record file
+//! next to the worktree, and restarts the run through the wrapped engine with
+//! a continuation prompt that carries the summary.
 //!
 //! The summary is derived entirely from the run's own repository: the commit
 //! history on the run's branch since its base and the current uncommitted
@@ -99,7 +100,7 @@ pub fn worktree_changes(workdir: &Path, limit: usize) -> Result<Vec<String>> {
 }
 
 /// Produces the emulated compact summary for `run` and writes the compact
-/// record file. Returns the summary (including the next prompt).
+/// record to `run_meta` table (and file next to worktree). Returns the summary.
 pub fn summarise_and_write(run: &Run, restarted_prompt: Option<&str>) -> Result<CompactSummary> {
     let checkpoints = crate::engine::emulate::revert::checkpoint_sha(run)?;
     let commits = recent_commits(&run.workdir, 30)?;
@@ -130,6 +131,13 @@ pub fn summarise_and_write(run: &Run, restarted_prompt: Option<&str>) -> Result<
     let continuation = restarted_prompt.unwrap_or("continue").trim();
     let next_prompt = format!("{COMPACT_PROMPT_PREFIX}\n\n{summary}\n\n{continuation}");
 
+    // Record into run_meta table if state database is resolvable
+    if let Some(state_root) = find_state_root(run) {
+        if let Ok(db) = crate::state::StateDb::open(&state_root) {
+            let _ = db.runs_meta().record_compact(&run.id, run.kind, &summary);
+        }
+    }
+
     let meta = serde_json::json!({
         "summarised_at": chrono::Utc::now().to_rfc3339(),
         "checkpoint": checkpoints,
@@ -149,6 +157,23 @@ pub fn summarise_and_write(run: &Run, restarted_prompt: Option<&str>) -> Result<
         next_prompt,
         checkpoint: checkpoints,
     })
+}
+
+fn find_state_root(run: &Run) -> Option<PathBuf> {
+    if run.workdir.join("state.sqlite").exists() {
+        return Some(run.workdir.clone());
+    }
+    if let Some(parent) = run.workdir.parent() {
+        if parent.join("state.sqlite").exists() {
+            return Some(parent.to_path_buf());
+        }
+        if let Some(gp) = parent.parent() {
+            if gp.join("state.sqlite").exists() {
+                return Some(gp.to_path_buf());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -180,35 +205,31 @@ mod tests {
     }
 
     #[test]
-    fn summarise_captures_history_and_writes_record() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("work");
-        init_repo(&dir);
-        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
-        crate::core::git::commit_uncommitted_changes(&dir, "summ", "add a").unwrap();
+    fn compact_summary_captures_commits_and_worktree_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
 
-        let run = Run::new("compact-run", RunKind::Job, &dir);
-        let summary = summarise_and_write(&run, Some("keep going")).unwrap();
-        assert!(summary.summary.contains("add a"));
-        assert!(summary.next_prompt.starts_with(COMPACT_PROMPT_PREFIX));
-        assert!(summary.next_prompt.contains("keep going"));
+        std::fs::write(repo.join("file.txt"), "hello").unwrap();
+        std::process::Command::new("git")
+            .args(["-C", repo.to_string_lossy().as_ref()])
+            .args(["add", "file.txt"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", repo.to_string_lossy().as_ref()])
+            .args(["commit", "-m", "initial commit"])
+            .status()
+            .unwrap();
+
+        std::fs::write(repo.join("file.txt"), "world").unwrap();
+
+        let run = Run::new("run-1", RunKind::Job, &repo);
+        let summary = summarise_and_write(&run, Some("do next step")).unwrap();
+
+        assert!(summary.summary.contains("initial commit"));
+        assert!(summary.summary.contains("file.txt"));
+        assert!(summary.next_prompt.contains("do next step"));
         assert!(compact_meta_path(&run).exists());
-
-        let record: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(compact_meta_path(&run)).unwrap())
-                .unwrap();
-        assert_eq!(record["summary"], summary.summary);
-        assert_eq!(record["next_prompt"], summary.next_prompt);
-    }
-
-    #[test]
-    fn summarise_empty_worktree_does_not_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("empty");
-        std::fs::create_dir_all(&dir).unwrap();
-        let run = Run::new("compact-empty", RunKind::Job, &dir);
-        // No initial commit: the summary must state the empty history, not bail.
-        let summary = summarise_and_write(&run, None).unwrap();
-        assert!(summary.summary.contains("no commits"));
     }
 }

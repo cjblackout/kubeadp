@@ -127,6 +127,20 @@ impl Engine for FakeEngine {
         })
     }
 
+    fn session_command(
+        &self,
+        session: &kubeadp_agent::engine::SessionDef,
+        _resume: kubeadp_agent::engine::ResumeMode,
+    ) -> Result<kubeadp_agent::engine::LaunchPlan, EngineError> {
+        Ok(kubeadp_agent::engine::LaunchPlan {
+            program: std::path::PathBuf::from("/bin/true"),
+            args: vec![session.name.clone()],
+            env: Vec::new(),
+            stdin: kubeadp_agent::engine::StdinMode::Null,
+            pty: true,
+        })
+    }
+
     fn classify_exit(
         &self,
         exit: kubeadp_agent::engine::ExitInfo,

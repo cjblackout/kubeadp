@@ -54,10 +54,10 @@ use kubeadp_agent::core::config::Config;
 use kubeadp_agent::core::job::{ensure_state_store, JobMetadata};
 use kubeadp_agent::core::server::{obs, RemoteControlState};
 use kubeadp_agent::engine::capability::{Capability, CapabilityTable};
-use kubeadp_agent::engine::emulate::EngineRunRegistry;
 use kubeadp_agent::engine::run::{Run, RunKind};
 use kubeadp_agent::engine::{Engine, EngineId, EngineRegistry};
 use kubeadp_agent::sandbox::testhook;
+use kubeadp_agent::state::StateDb;
 use serde_json::Value;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -99,13 +99,26 @@ fn api_app() -> Router {
 /// The engine-aware router with a caller-supplied registry (used by the
 /// synthetic-engine negative tests to drive a bare engine).
 fn api_app_with_registry(registry: EngineRegistry) -> Router {
-    let config = Arc::new(Config::default());
+    api_app_with_registry_and_config(registry, Arc::new(Config::default()))
+}
+
+fn api_app_with_registry_and_config(registry: EngineRegistry, config: Arc<Config>) -> Router {
+    let runs = Arc::new(kubeadp_agent::state::RunRegistry::lazy(&config.state_root));
+    api_app_with_registry_config_and_runs(registry, config, runs)
+}
+
+fn api_app_with_registry_config_and_runs(
+    registry: EngineRegistry,
+    config: Arc<Config>,
+    runs: Arc<kubeadp_agent::state::RunRegistry>,
+) -> Router {
     obs::add_observability(
-        kubeadp_agent::core::server::router_with_engines(
+        kubeadp_agent::core::server::router_with_engines_and_runs(
             Arc::clone(&config),
             Arc::new(AuthManager::new()),
             RemoteControlState::default(),
             Arc::new(registry),
+            runs,
         ),
         kubeadp_agent::core::server::auth::AuthState::none(),
         Arc::new(|| Ok(())),
@@ -206,6 +219,19 @@ impl Engine for SyntheticEngine {
             pty: false,
         })
     }
+    fn session_command(
+        &self,
+        session: &kubeadp_agent::engine::SessionDef,
+        _resume: kubeadp_agent::engine::ResumeMode,
+    ) -> Result<kubeadp_agent::engine::LaunchPlan, kubeadp_agent::engine::EngineError> {
+        Ok(kubeadp_agent::engine::LaunchPlan {
+            program: std::path::PathBuf::from("/bin/true"),
+            args: vec![session.name.clone()],
+            env: Vec::new(),
+            stdin: kubeadp_agent::engine::StdinMode::Null,
+            pty: true,
+        })
+    }
     fn classify_exit(
         &self,
         exit: kubeadp_agent::engine::ExitInfo,
@@ -269,11 +295,18 @@ fn post_json(uri: &str, body: &str) -> Request<Body> {
 /// A `Run` registered into the process-wide run registry, with a given engine
 /// and kind, whose workdir is a real temp git fixture (the emulated
 /// fork/compact/revert read it). Returns the run id.
-fn register_run(id: &str, kind: RunKind, engine: &str, workdir: &Path) -> String {
+fn register_run(
+    id: &str,
+    kind: RunKind,
+    engine: &str,
+    workdir: &Path,
+    app_runs: &kubeadp_agent::state::RunRegistry,
+) -> String {
     let mut run = Run::new(id.to_string(), kind, workdir);
     run.engine = engine.to_string();
-    let registry = EngineRunRegistry::global();
-    registry.register(run);
+    let state_root = workdir.parent().unwrap_or(workdir);
+    let _ = StateDb::open(state_root);
+    app_runs.register(run).unwrap();
     id.to_string()
 }
 
@@ -449,12 +482,16 @@ async fn run_control_capabilities_dispatch() {
         state_root: state_root_dir.path().to_path_buf(),
         ..Default::default()
     });
-    let app = api_app_with_registry(production_registry_with_config(Arc::clone(&config)));
-    let root = TempDir::new().unwrap();
-    let workdir = root.path().join("workdir");
+    let app_runs = Arc::new(kubeadp_agent::state::RunRegistry::lazy(&config.state_root));
+    let app = api_app_with_registry_config_and_runs(
+        production_registry_with_config(Arc::clone(&config)),
+        Arc::clone(&config),
+        Arc::clone(&app_runs),
+    );
+    let workdir = state_root_dir.path().join("workdir");
     std::fs::create_dir_all(&workdir).unwrap();
 
-    let registry = production_registry_with_config(config);
+    let registry = production_registry_with_config(Arc::clone(&config));
     for engine in registry.enabled_ids() {
         let table = registry
             .capability_table(&engine)
@@ -466,6 +503,7 @@ async fn run_control_capabilities_dispatch() {
                 RunKind::Job,
                 &engine,
                 &workdir,
+                &app_runs,
             );
             let (method, uri, body) = control_request(key, &run_id);
             let req = match method {
@@ -515,12 +553,14 @@ async fn run_control_capabilities_dispatch() {
             if matches!(cap, Capability::Native | Capability::Emulated) && key == "fork" {
                 for seq in 0..4 {
                     let forked = format!("{run_id}-fork-{seq}");
-                    if EngineRunRegistry::global().unregister(&forked) {
+                    let db = StateDb::open(&config.state_root).unwrap();
+                    if db.runs().unregister(&forked) {
                         break;
                     }
                 }
             }
-            EngineRunRegistry::global().unregister(&run_id);
+            let db = StateDb::open(&config.state_root).unwrap();
+            db.runs().unregister(&run_id);
         }
     }
 
@@ -639,13 +679,22 @@ async fn engine_selection_and_capabilities_listing() {
 /// bare engine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_control_key_answers_typed_501() {
-    let root = TempDir::new().unwrap();
-    let workdir = root.path().join("workdir");
+    let state_root_dir = TempDir::new().unwrap();
+    let config = Arc::new(Config {
+        state_root: state_root_dir.path().to_path_buf(),
+        ..Default::default()
+    });
+    let workdir = state_root_dir.path().join("workdir");
     std::fs::create_dir_all(&workdir).unwrap();
 
-    let app = api_app_with_registry(synthetic_registry("bare", &[]));
+    let app_runs = Arc::new(kubeadp_agent::state::RunRegistry::lazy(&config.state_root));
+    let app = api_app_with_registry_config_and_runs(
+        synthetic_registry("bare", &[]),
+        Arc::clone(&config),
+        Arc::clone(&app_runs),
+    );
     let registry = synthetic_registry("bare", &[]);
-    let run_id = register_run("bare-run-1", RunKind::Job, "bare", &workdir);
+    let run_id = register_run("bare-run-1", RunKind::Job, "bare", &workdir, &app_runs);
 
     for (method, uri, body) in [
         ("POST", format!("/api/v1/runs/{run_id}/interrupt"), ""),
@@ -691,7 +740,7 @@ async fn unsupported_control_key_answers_typed_501() {
         "bare todo must be 2xx, got {status}: {value}"
     );
 
-    EngineRunRegistry::global().unregister(&run_id);
+    let _ = StateDb::open(&config.state_root).map(|db| db.runs().unregister(&run_id));
     assert_eq!(
         registry.len(),
         1,
@@ -1071,7 +1120,7 @@ async fn job_control_surface_answers_usable_bodies() {
         assert_eq!(v["data"]["reverted"], false, "{engine_name}: {v}");
 
         // The fork registered a new run; drop it and tear the job down.
-        EngineRunRegistry::global().unregister(&forked);
+        let _ = StateDb::open(&hcfg.state_root).map(|db| db.runs().unregister(&forked));
         teardown_job(&hcfg, &job_id);
     }
 }

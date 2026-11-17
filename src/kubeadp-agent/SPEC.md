@@ -160,7 +160,7 @@ run_meta(run_id TEXT PRIMARY KEY, kind TEXT NOT NULL, paused INTEGER NOT NULL DE
        compact_summary TEXT, compacted_at INTEGER, forked_from TEXT,
        updated_at INTEGER NOT NULL)
 ```
-`jobset`/`jobset_member` and `run_meta` are planned (§13.1). The per-run A2A
+`jobset`/`jobset_member` are planned (§13.1); `run_meta` is implemented. The per-run A2A
 inbox is implemented: every accepted message is one `a2a_message` row keyed by
 `(run_id, message_id)`, the durable dedupe store. A row is `queued`
 (`injected_at` NULL) or `injected` (`injected_at` and `channel` set; injected
@@ -258,8 +258,10 @@ and secrets.
   error mapping only as a defect signal; the conformance suite (§12.6) fails an
   engine that produces it.
 - **Engine trait launch methods**: The engine trait exposes `job_command(job, turn) -> Result<LaunchPlan, EngineError>`
-  and `classify_exit(exit, log_tail) -> JobStatus` and `conversation_id(job) -> Option<ContextId>`.
+  for jobs and `session_command(session, resume) -> Result<LaunchPlan, EngineError>` for sessions, alongside
+  `classify_exit(exit, log_tail) -> JobStatus` and `conversation_id(job) -> Option<ContextId>`.
   Engines build their exact argv, env, stdin mode and PTY requirements into `LaunchPlan`.
+  `ResumeMode` distinguishes fresh starts (`Start`) from resumes (`Resume`).
   No launcher or command outside the engine may branch on an engine name.
 
 ### 3.2 agy engine (`"agy"`)
@@ -409,7 +411,11 @@ at start is imported into the state database once and renamed to
 `*.migrated`); `heartbeat_interval_secs` 2.0; `stale_heartbeat_secs` 15.0;
 `shutdown_grace_secs` 5.0; `claude_config_dir` `$HOME/.claude`;
 `default_session_engine` unset (claude); `agy_path` unset
-(`AGENT_ORCHESTRATE_AGY_PATH`, the per-session `agy_binary`, then `PATH`).
+(`AGENT_ORCHESTRATE_AGY_PATH`, the per-session `agy_binary`, then `PATH`);
+`default_sandbox` unset (true) — the `sandbox` setting for GENERATED sessions
+(the legacy default session and the `CLAUDE_WORKSPACES` workspace sessions,
+§4.8), overridden by the `CLAUDE_SANDBOX` environment variable. File-defined
+sessions always use their own `sandbox` key.
 
 Per-session options (defaults):
 | Key | Default | Meaning |
@@ -463,11 +469,18 @@ one `session_state` row per session. Writes are transactional, one writer
 keeps the heartbeat cadence from hammering the disk. The state survives a
 pod restart (restored at start); the legacy JSON state file is imported once
 (`*.migrated`). Schema migrations are numbered and additive
-(`src/state/migrations.rs`, `PRAGMA user_version`). Heartbeat written every
-`heartbeat_interval_secs`, stale after `stale_heartbeat_secs`.
-`kubeadp-agent orchestrator status` exit codes: `0` healthy, `1`
-stale heartbeat, `2` a session `failed`/thread died, `3` supervisor state
-unreadable / no state in the database,
+(`src/state/migrations.rs`, `PRAGMA user_version`). The heartbeat is written
+every `heartbeat_interval_secs` with millisecond epoch precision
+(`heartbeat_epoch_ms`, migration 4; the whole-second `heartbeat_epoch` is
+kept in sync for readers of older binaries) and is stale after
+`stale_heartbeat_secs`: the age is computed at millisecond precision with a
+strict `age > threshold` comparison (an age exactly at the threshold is
+still fresh). `kubeadp-agent orchestrator status` exit codes: `0` healthy,
+`1` stale heartbeat or a dead supervisor process (a missing `/proc/<pid>`
+entry or a zombie — killed but not yet reaped by its parent — is a dead
+supervisor; the check reads the process state, never `kill(pid, 0)`, so it
+does not depend on the child being reaped), `2` a session `failed`/thread
+died, `3` supervisor state unreadable / no state in the database,
 `4` supervisor stopped or a session stopped. `/healthz` → `200 {"status":"ok"}`;
 `/readyz` → `200 {"status":"ready"}` or `503 {"error":"not ready",
 "code":"not_ready"}` via a caller-supplied readiness closure. Both never auth.
@@ -529,7 +542,12 @@ when all keys satisfied).
 Generated session id = UUIDv5(`ai-server-<name>`); valid workspace name regex
 `^[a-z0-9][a-z0-9._-]*$`; `CLAUDE_WORKSPACES` list or `auto`,
 `CLAUDE_WORKSPACE_ROOT` default `/workspace`; a file-defined session wins over a
-generated one on name/id conflict.
+generated one on name/id conflict. Generated sessions (the legacy default
+session and every workspace session) take their `sandbox` setting from
+`default_sandbox` (default true), which the `CLAUDE_SANDBOX` environment
+variable overrides; every other per-session option is the built-in generated
+default (§4.2), so a generated session runs the engine binary found on the
+supervisor's `PATH` in the workspace directory.
 
 ### 4.9 Session message sink
 - A2A Task = session; `task id = context id = session name`; `status_message` =
@@ -1527,6 +1545,7 @@ never logged.
 | `KUBEADP_A2A_INBOX_URL` | `a2a-hook`, `mcp-a2a` | pod-local inbox API base URL, default `http://127.0.0.1:8002` (§7.14); set by the launcher only |
 | `KUBEADP_JOBSET` | `agent-run start` | jobset to join; may only name the caller's own default jobset (§7.2) |
 | `AGENT_ORCHESTRATE_AGY_PATH` | orchestrator | agy binary for agy sessions |
+| `CLAUDE_SANDBOX` | orchestrator | sandbox override for GENERATED sessions (§4.2, §4.8): wins over the supervisor config's `default_sandbox` (default true) |
 | `A2A_KUBE_API` | discovery | API base override; test-only (`test-hooks`) |
 | `A2A_URL_OVERRIDES` | `mcp-a2a`/client | name → URL redirect; test-only |
 | `KUBEADP_REPO_SYNC_*` | repo-sync | §9.4 overrides |
@@ -1799,10 +1818,11 @@ section is outstanding.
 | Item | Status | Note |
 |---|---|---|
 | migrations 1–2 (`jobs`, `supervisor_state`, `session_state`), WAL, busy timeout | implemented | |
-| refusal of a newer `user_version` | planned | |
+| migration 4 (`heartbeat_epoch_ms`, supervisor heartbeat in milliseconds) | implemented | sub-second stale detection with a strict threshold comparison; the whole-second epoch is kept in sync for older readers |
+| refusal of a newer `user_version` | implemented | |
 | migration 3 (`jobset`, `jobset_member`, `jobsets.json` import) | planned | membership is `jobsets.json` plus in-memory maps today |
 | `a2a_message`/`a2a_expiry` inbox tables, per-run inbox in the shared database | implemented | the code's migration 3; the `<state_root>/a2a-inbox/<run>/` directory survives only as the run key, the sandboxed receive side reads through the pod-local HTTP API |
-| migration 5 (`run_meta`), run registry as a view | planned | run registry is in memory and not populated outside tests; compact record and message queue are worktree files |
+| migration 5 (`run_meta`), run registry as a view | implemented | run registry is a view over `jobs`/`session_state` and `run_meta`; compact record and message queue integrate with `run_meta` and `a2a_message` |
 
 ### 13.2 Engines (§3, §5.4, §5.5)
 | Item | Status | Note |
@@ -1815,10 +1835,10 @@ section is outstanding.
 | built-in default by run kind only | implemented | |
 | capability table of §3.4 | partial | `a2a.send_message` is `emulated` for both engines and `permissions` is `unsupported` for both; the raw claude table reports `interrupt`/`pause`/`fork`/`compact`/`revert`/`todo` `unsupported` until the worker arms the emulation layer, while the agy table declares the same set `emulated` from the start |
 | no `501` because of the engine | implemented | the worker arms the emulation layer for every control endpoint each engine lacks, so no `/api/v1` control route answers `501` because of the engine; an `unsupported` endpoint still answers the typed `501` by contract |
-| run-control routes resolving real jobs and sessions | partial | the job surface (`/api/v1/jobs/{id}/...`) resolves the job row on demand; the `/api/v1/runs/{id}` routes still resolve only runs registered by tests (`404` in production); session run-control is the sessions API |
+| run-control routes resolving real jobs and sessions | implemented | run-control routes resolve real jobs and sessions through `RunRegistry` backed by SQLite and `run_meta` |
 | `fork` creating a run | implemented | the job surface clones the source worktree and returns the new run id |
 | `permissions` route | planned | the capability key exists; no HTTP handler |
-| queue of §3.6 in the `inbox` table | planned | worktree file `.engine-message-queue` today |
+| queue of §3.6 in the `inbox` table | implemented | queued messages in `a2a_message` table with sender `api` |
 | conformance suite (§12.6) | implemented | |
 
 ### 13.3 Jobset messaging (§7, §8)

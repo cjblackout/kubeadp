@@ -51,30 +51,65 @@ impl SessionStore {
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| format!("Failed to set busy timeout on {}: {}", db_path.display(), e))?;
 
-        let (pid, heartbeat, heartbeat_epoch, status, version): (i64, String, i64, String, i64) =
-            match conn.query_row(
-                "SELECT supervisor_pid, heartbeat, heartbeat_epoch, status, version                  FROM supervisor_state WHERE id = 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            ) {
-                Ok(row) => row,
-                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-                Err(e) => {
-                    return Err(format!(
-                        "Failed to read the supervisor state from {} (is the file corrupted?): {}",
+        // The heartbeat millisecond epoch (migration 4) is read when the
+        // column exists; the read-only reader never migrates, so a database
+        // written by an older binary selects a literal 0 and the stale check
+        // falls back to the whole-second `heartbeat_epoch`.
+        let has_ms_column: bool = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(supervisor_state)")
+                .map_err(|e| {
+                    format!(
+                        "Failed to inspect the supervisor_state table in {}: {}",
                         db_path.display(),
                         e
-                    ));
-                }
-            };
+                    )
+                })?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| {
+                    format!(
+                        "Failed to read the supervisor_state columns in {}: {}",
+                        db_path.display(),
+                        e
+                    )
+                })?;
+            let columns: Vec<String> = rows.filter_map(|c| c.ok()).collect();
+            columns.iter().any(|c| c == "heartbeat_epoch_ms")
+        };
+        let supervisor_sql = if has_ms_column {
+            "SELECT supervisor_pid, heartbeat, heartbeat_epoch, heartbeat_epoch_ms, status, version                  FROM supervisor_state WHERE id = 1"
+        } else {
+            "SELECT supervisor_pid, heartbeat, heartbeat_epoch, 0, status, version                  FROM supervisor_state WHERE id = 1"
+        };
+
+        let (pid, heartbeat, heartbeat_epoch, heartbeat_epoch_ms, status, version): (
+            i64,
+            String,
+            i64,
+            i64,
+            String,
+            i64,
+        ) = match conn.query_row(supervisor_sql, [], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        }) {
+            Ok(row) => row,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => {
+                return Err(format!(
+                    "Failed to read the supervisor state from {} (is the file corrupted?): {}",
+                    db_path.display(),
+                    e
+                ));
+            }
+        };
         if version > SUPERVISOR_STATE_ROW_VERSION {
             return Err(format!(
                 "Supervisor state in {} was written by a newer version (schema {} > {})",
@@ -164,6 +199,7 @@ impl SessionStore {
             supervisor_pid: pid as u32,
             heartbeat,
             heartbeat_epoch: heartbeat_epoch as u64,
+            heartbeat_epoch_ms: heartbeat_epoch_ms.max(0) as u64,
             status,
             sessions,
         }))
@@ -192,13 +228,14 @@ impl SessionStore {
 
         tx.execute(
             "INSERT INTO supervisor_state (
-                id, supervisor_pid, started, heartbeat, heartbeat_epoch, status, version, updated_at
-            ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                id, supervisor_pid, started, heartbeat, heartbeat_epoch, heartbeat_epoch_ms, status, version, updated_at
+            ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             ON CONFLICT(id) DO UPDATE SET
                 supervisor_pid = excluded.supervisor_pid,
                 started = excluded.started,
                 heartbeat = excluded.heartbeat,
                 heartbeat_epoch = excluded.heartbeat_epoch,
+                heartbeat_epoch_ms = excluded.heartbeat_epoch_ms,
                 status = excluded.status,
                 version = excluded.version,
                 updated_at = excluded.updated_at",
@@ -207,6 +244,7 @@ impl SessionStore {
                 state.heartbeat,
                 state.heartbeat,
                 state.heartbeat_epoch as i64,
+                state.heartbeat_epoch_ms as i64,
                 state.status,
                 SUPERVISOR_STATE_ROW_VERSION,
                 now,

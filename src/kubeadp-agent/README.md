@@ -149,6 +149,7 @@ Variables that are read at runtime and have no configuration-file key. Environme
 
 | Variable | Used by | Default / Notes |
 |---|---|---|
+| `CLAUDE_SANDBOX` | Orchestrator (generated sessions) | Sandbox override for GENERATED sessions (the legacy default session and `CLAUDE_WORKSPACES` workspace sessions): wins over the supervisor session config's `default_sandbox` (default `true`). Has no configuration-file key; file-defined sessions always use their own `sandbox` key. |
 | `KUBEADP_API_ALLOW_OPEN` | A2A routes (both long-lived roles) | Boolean; with no operator token configured the A2A routes stay open only when `true` — without it the server refuses to mount them and exits with an error naming this variable (fail closed). Has no configuration-file key. |
 | `KUBEADP_AGY_HOME` | Conversation recovery / `agy` home | Path override for `Config::agy_home` holding `agy`'s own state (`~/.gemini/antigravity-cli`). Passes into the sandbox via `KUBEADP_*`. |
 | `KUBEADP_SANDBOX_HOME` | Sandbox policy | Path override for `Config::sandbox_home` (default `/home/agent`) granted `shared_rw` in sandboxed worker jobs. |

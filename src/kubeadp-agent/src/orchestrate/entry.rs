@@ -177,6 +177,28 @@ fn check_supervisor_status(
         println!("{}", json_str);
     }
 
+    // A dead supervisor process is never healthy: a SIGKILLed supervisor
+    // leaves no final heartbeat write, so liveness is checked alongside the
+    // heartbeat age. The check reads the /proc process STATE, which treats a
+    // zombie (killed but not yet reaped by its parent) as dead — a
+    // kill(pid, 0) liveness probe would keep answering "alive" for a zombie
+    // and make the verdict depend on the child being reaped. The stopped
+    // statuses (a graceful stop writes `stopped`) keep their own exit code 4.
+    let any_session_stopped = state
+        .sessions
+        .values()
+        .any(|s| s.status == SessionStatus::Stopped);
+    if state.status != "stopped"
+        && !any_session_stopped
+        && !supervisor_process_alive(state.supervisor_pid)
+    {
+        eprintln!(
+            "Probe check failed: supervisor process {} is not running (dead or zombie)",
+            state.supervisor_pid
+        );
+        std::process::exit(1);
+    }
+
     match check_status(&state, stale_threshold) {
         Ok(()) => {
             std::process::exit(0);
@@ -202,6 +224,19 @@ fn check_supervisor_status(
             eprintln!("Probe check failed: {}", reason);
             std::process::exit(4);
         }
+    }
+}
+
+/// Whether the process `pid` is running: a missing /proc entry or a zombie
+/// (process state `Z`, killed but not yet reaped by its parent) is a dead
+/// process. A zombie still answers `kill(pid, 0)` like a live process, so
+/// the /proc state read is what keeps the status probe independent of the
+/// child being reaped.
+fn supervisor_process_alive(pid: u32) -> bool {
+    match crate::core::reaper::proc_pid_state(pid) {
+        Some('Z') => false,
+        Some(_) => true,
+        None => false,
     }
 }
 
@@ -677,4 +712,84 @@ fn run_supervisor(config_path: Option<PathBuf>) {
 
     log_event("supervisor", "Shutdown complete. Clean exit.");
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::reaper::lock_proc_child_tests;
+    use crate::orchestrate::state::{evaluate_status_at, now_epoch_millis};
+
+    /// The dead-supervisor check must not depend on the child being reaped:
+    /// a live child is alive, a SIGKILLed-but-unreaped child (zombie, which
+    /// still answers kill(pid, 0)) is dead, and a reaped pid is dead.
+    /// Serialized against the other /proc-touching tests and the reaper's
+    /// waitpid(-1) drain with the crate env lock and the proc-child lock.
+    #[test]
+    fn test_supervisor_process_alive_live_zombie_and_reaped() {
+        let _env_lock = crate::test_env_lock();
+        let _proc_lock = lock_proc_child_tests();
+
+        // This test's own process is alive.
+        assert!(supervisor_process_alive(std::process::id()));
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning a live child must succeed");
+        assert!(supervisor_process_alive(child.id()));
+
+        // SIGKILL without reaping: the kernel keeps a zombie entry that
+        // answers kill(pid, 0), but the process state is 'Z'. Poll with a
+        // generous deadline: the kernel still has to schedule the child's
+        // death on a loaded CI box.
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut zombie = false;
+        while std::time::Instant::now() < deadline {
+            if crate::core::reaper::proc_pid_state(child.id()) == Some('Z') {
+                zombie = true;
+                break;
+            }
+            assert!(
+                std::path::Path::new(&format!("/proc/{}", child.id())).exists(),
+                "the killed child must stay a zombie while unreaped and unreaped-locked"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(zombie, "the killed child must be a zombie before the reap");
+        assert!(
+            !supervisor_process_alive(child.id()),
+            "a zombie (not yet reaped) must be reported dead"
+        );
+
+        // After the reap the /proc entry is gone: still dead.
+        child.wait().expect("reaping the child must succeed");
+        assert!(
+            !supervisor_process_alive(child.id()),
+            "a reaped pid must be reported dead"
+        );
+    }
+
+    /// The status evaluation at a live but stale heartbeat and at a dead
+    /// supervisor: `evaluate_status_at` is the pure age check; the
+    /// dead-supervisor verdict is layered on top of it in the status path.
+    #[test]
+    fn test_evaluate_status_at_sub_second_freshness() {
+        let now_ms = now_epoch_millis();
+        let mut state = SupervisorState::new(1234);
+        state.heartbeat_epoch_ms = now_ms - 400; // written 0.4 s ago
+        state.heartbeat_epoch = state.heartbeat_epoch_ms / 1000;
+        assert_eq!(evaluate_status_at(&state, 1.0, now_ms), Ok(()));
+        assert_eq!(check_status(&state, 1.0), Ok(()));
+
+        state.heartbeat_epoch_ms = now_ms - 1500; // written 1.5 s ago
+        state.heartbeat_epoch = state.heartbeat_epoch_ms / 1000;
+        assert!(matches!(
+            evaluate_status_at(&state, 1.0, now_ms),
+            Err(StatusCheckError::StaleHeartbeat { .. })
+        ));
+    }
 }

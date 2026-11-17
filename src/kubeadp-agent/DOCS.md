@@ -46,6 +46,8 @@ pub struct Run {
 
 Run statuses: `pending`, `starting`, `running`, `backoff`, `paused`, `stopped`, `failed`, `killed`, `done`, `interrupted`.
 
+Runs are resolved through the unified `RunRegistry` view over the authoritative `jobs` and `session_state` SQLite tables, merged with metadata (`paused`, `compact_summary`, `forked_from`) stored in the `run_meta` table (schema migration 5). Compact records and message queue entries integrate with `run_meta` and `a2a_message` tables rather than legacy worktree files.
+
 ### 2.2 Supported Engines
 
 - **`agy`**: Execution driver for headless coding tasks. Runs as a background child process inside a private Git worktree.
@@ -57,6 +59,7 @@ Run statuses: `pending`, `starting`, `running`, `backoff`, `paused`, `stopped`, 
 
 Engines build their process launch parameters through the `Engine` trait:
 - `job_command(job, turn) -> Result<LaunchPlan, EngineError>`: Emits a `LaunchPlan` specifying executable program, arguments, environment variables, `StdinMode` (`Null` or `Pipe { first_line }`), and pseudo-terminal allocation (`pty`).
+- `session_command(session, resume) -> Result<LaunchPlan, EngineError>`: Emits a `LaunchPlan` for orchestrator sessions according to `ResumeMode` (`Start` vs `Resume`).
 - `classify_exit(exit, log_tail) -> JobStatus`: Interprets process exit code/signals and output log tail according to the engine's status taxonomy.
 - `conversation_id(job) -> Option<ContextId>`: Extracts the engine's conversation/session identifier from job metadata or execution logs.
 
@@ -458,6 +461,7 @@ Global options:
 | `stale_heartbeat_secs` | `15.0` | Age after which the heartbeat is considered stale by the `status` probe. |
 | `shutdown_grace_secs` | `5.0` | Grace period before SIGKILL on supervisor shutdown. |
 | `claude_config_dir` | `$HOME/.claude` | Base Claude configuration directory. |
+| `default_sandbox` | unset (`true`) | The `sandbox` setting for GENERATED sessions (the legacy default session and the `CLAUDE_WORKSPACES` workspace sessions). The `CLAUDE_SANDBOX` environment variable wins over this key; file-defined sessions always use their own `sandbox` key. |
 
 Per-session backoff, retry, and supervision options:
 
@@ -484,7 +488,15 @@ Restart delay is `min(base_backoff_secs * 2^n, max_backoff_secs)` where `n` is t
 
 The supervisor and per-session state (pid, heartbeat, status, restart counts, last exit reason, engine) is stored in the shared per-pod SQLite state database `<state_root>/state.sqlite` (the same database that holds the `jobs` table, one db per pod): a single `supervisor_state` row (pid, started, heartbeat, status, schema version) plus one `session_state` row per session. Writes are transactional and only the supervisor process writes; readers (`kubeadp-agent orchestrator status`) use read-only connections with `synchronous=NORMAL` keeping the heartbeat cadence from hammering the disk. The state survives a pod restart: at start the supervisor restores the previous session state (crash accounting, last exit reason) from the database. The legacy JSON state file (`state_file`, `/tmp/claude-supervisor-state.json` — `/tmp` is wiped at every pod restart) is imported once at start and renamed to `*.migrated`. The schema evolves through the numbered, additive migrations in `src/state/migrations.rs` (tracked by `PRAGMA user_version`).
 
-The `kubeadp-agent orchestrator status` probe exits `0` (healthy), `1` (heartbeat stale), `2` (a session is `failed` or a session thread died), `3` (supervisor state unreadable / no state in the database), or `4` (supervisor stopped or a session is `stopped`). It prints the same state JSON document as before.
+The heartbeat is written with millisecond epoch precision (`heartbeat_epoch_ms`, migration 4; the whole-second `heartbeat_epoch` column is kept in sync for readers of older binaries). The stale check computes the age at millisecond precision with a strict `age > threshold` comparison — an age exactly at the threshold is still fresh, one millisecond above it is stale.
+
+The `kubeadp-agent orchestrator status` probe exits `0` (healthy), `1` (heartbeat stale, or the supervisor process is dead: a missing `/proc/<pid>` entry or a zombie — killed but not yet reaped by its parent — reads the process state, never `kill(pid, 0)`, so the verdict does not depend on the child being reaped), `2` (a session is `failed` or a session thread died), `3` (supervisor state unreadable / no state in the database), or `4` (supervisor stopped or a session is `stopped`). It prints the same state JSON document as before.
+
+### 5.5.1 Generated workspace sessions
+
+Beyond the file-defined sessions, the supervisor generates sessions from the environment: the legacy default session (`CLAUDE_DEFAULT_SESSION`, on by default) and one session per `CLAUDE_WORKSPACES` entry (`auto` discovers every direct child of `CLAUDE_WORKSPACE_ROOT` containing a `.git` entry; explicit names map to `<workspace_root>/<name>`). A file-defined session with the same name or session id wins, and a conflicting generated session is skipped with a warning.
+
+A generated session runs the engine binary found on the supervisor's `PATH` in the workspace directory with the generated UUIDv5 session id (`ai-server-<name>` namespace) and the built-in generated defaults (`readiness_poll_secs` 30.0, `max_crashes` 0 = unlimited, base backoff 2.0). Its `sandbox` setting comes from the supervisor config's `default_sandbox` (default `true`), which the `CLAUDE_SANDBOX` environment variable overrides; file-defined sessions always use their own `sandbox` key. A generated sandboxed session only gets its workspace directory granted read-write, so a binary outside the granted paths (a repo checkout or `/tmp`) cannot be executed by it — set `default_sandbox: false` in the supervisor config or `CLAUDE_SANDBOX=0` in the environment for test harnesses and trusted hosts.
 
 ---
 

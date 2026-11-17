@@ -33,8 +33,6 @@ use crate::core::config::Config;
 use crate::core::job::JobMetadata;
 use crate::core::output::CommandOutput;
 #[cfg(feature = "engine")]
-use crate::engine::emulate::EngineRunRegistry;
-#[cfg(feature = "engine")]
 use crate::engine::EngineRegistry;
 use anyhow::{Context, Result};
 use axum::extract::{RawQuery, State};
@@ -151,7 +149,9 @@ pub fn router_with_rc(
         .route("/runs/{run_id}/fork", post(runs::fork_run))
         .route("/runs/{run_id}/revert", post(runs::revert_run))
         .route("/runs/{run_id}/todo", get(runs::todo_run))
-        .layer(Extension(EngineRunRegistry::global()))
+        .layer(Extension(Arc::new(crate::state::RunRegistry::lazy(
+            &state.state_root,
+        ))))
         .layer(Extension(Arc::new(EngineRegistry::with_builtin(&state))));
 
     Router::new().nest("/api/v1", api_v1)
@@ -169,6 +169,18 @@ pub fn router_with_engines(
     auth: Arc<AuthManager>,
     rc_state: RemoteControlState,
     engines: Arc<EngineRegistry>,
+) -> Router {
+    let runs = Arc::new(crate::state::RunRegistry::lazy(&state.state_root));
+    router_with_engines_and_runs(state, auth, rc_state, engines, runs)
+}
+
+#[cfg(feature = "engine")]
+pub fn router_with_engines_and_runs(
+    state: AppState,
+    auth: Arc<AuthManager>,
+    rc_state: RemoteControlState,
+    engines: Arc<EngineRegistry>,
+    runs: Arc<crate::state::RunRegistry>,
 ) -> Router {
     let api_v1 = Router::new()
         .route("/jobs", post(start_job).get(list_jobs))
@@ -230,7 +242,7 @@ pub fn router_with_engines(
         .route("/jobs/{job_id}/fork", post(runs::fork_job))
         .route("/jobs/{job_id}/revert", post(runs::revert_job))
         .route("/jobs/{job_id}/todo", get(runs::todo_job))
-        .layer(Extension(EngineRunRegistry::global()))
+        .layer(Extension(runs))
         .fallback(api_v1_not_found)
         .with_state(state.clone())
         .layer(Extension(auth))
@@ -3372,6 +3384,19 @@ mod tests {
                     env: Vec::new(),
                     stdin: crate::engine::StdinMode::Null,
                     pty: false,
+                })
+            }
+            fn session_command(
+                &self,
+                session: &crate::engine::SessionDef,
+                _resume: crate::engine::ResumeMode,
+            ) -> Result<crate::engine::LaunchPlan, EngineError> {
+                Ok(crate::engine::LaunchPlan {
+                    program: PathBuf::from("/bin/true"),
+                    args: vec![session.name.clone()],
+                    env: Vec::new(),
+                    stdin: crate::engine::StdinMode::Null,
+                    pty: true,
                 })
             }
             fn classify_exit(

@@ -8,12 +8,14 @@
 //! Current table owners:
 //! - the `jobs` table (the agent-run job store, version 1),
 //! - the orchestrator's `supervisor_state` / `session_state` tables
-//!   (version 2),
+//!   (versions 2 and 4),
 //! - the per-run A2A inbox (`a2a_message` / `a2a_expiry`,
 //!   version 3). The inbox is the shared per-pod SQLite-backed store (HL-113
 //!   phase 3): the pod's own process (the A2A sink and the escalation ladder)
 //!   writes and reads it directly; a SANDBOXED run reaches it only through
-//!   the pod's local HTTP API, never the database file.
+//!   the pod's local HTTP API, never the database file,
+//! - the run metadata table (`run_meta`, version 5: paused flag, compact record,
+//!   fork lineage, updated_at).
 //!
 //! Rules for a new migration:
 //! - additive only (new tables, new columns; never drop or rename),
@@ -219,6 +221,58 @@ CREATE INDEX IF NOT EXISTS a2a_expiry_run_idx ON a2a_expiry (run_id)
     WHERE fake = 0;
 ";
 
+/// The supervisor heartbeat with sub-second precision (migration 4): the
+/// heartbeat epoch in MILLISECONDS (`heartbeat_epoch_ms`). The whole-second
+/// `heartbeat_epoch` column is kept in sync so readers of older binaries
+/// keep working; rows written before this column existed read 0 and fall
+/// back to the whole-second epoch at read time. Whole-second truncation on
+/// both ends of the age computation loses up to two seconds and made a
+/// strict `age > threshold` stale check miss its threshold (T13 flake).
+fn supervisor_heartbeat_ms_v4(conn: &Connection) -> Result<()> {
+    let columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(supervisor_state)")
+            .context("Failed to inspect the supervisor_state table")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("Failed to read the supervisor_state table columns")?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    if !columns.iter().any(|c| c == "heartbeat_epoch_ms") {
+        if let Err(e) = conn.execute_batch(
+            "ALTER TABLE supervisor_state ADD COLUMN heartbeat_epoch_ms INTEGER NOT NULL DEFAULT 0;",
+        ) {
+            if !e.to_string().contains("duplicate column") {
+                return Err(e).context(
+                    "Failed to migrate the supervisor_state table (missing column 'heartbeat_epoch_ms')",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `run_meta` table (migration 5, HL-91 §2.3 / HL-125 B3): stores per-run
+/// metadata (paused flag, compact summary, compaction timestamp, fork lineage)
+/// that supplements the authoritative `jobs` and `session_state` rows.
+fn run_meta_v5(conn: &Connection) -> Result<()> {
+    conn.execute_batch(RUN_META_V5_SQL)
+        .context("Failed to initialize run_meta table")
+}
+
+const RUN_META_V5_SQL: &str = "
+CREATE TABLE IF NOT EXISTS run_meta (
+    run_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    paused INTEGER NOT NULL DEFAULT 0,
+    compact_summary TEXT,
+    compacted_at INTEGER,
+    forked_from TEXT,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS run_meta_kind_idx ON run_meta (kind);
+";
+
 /// Every declared migration, in application order. Append new migrations at
 /// the end (additive, ascending version); see the module docs.
 pub const MIGRATIONS: &[Migration] = &[
@@ -236,6 +290,16 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "A2A inbox tables",
         apply: a2a_inbox_v3,
+    },
+    Migration {
+        version: 4,
+        name: "supervisor heartbeat milliseconds",
+        apply: supervisor_heartbeat_ms_v4,
+    },
+    Migration {
+        version: 5,
+        name: "run_meta table",
+        apply: run_meta_v5,
     },
 ];
 
@@ -304,6 +368,7 @@ mod tests {
             "session_state",
             "a2a_message",
             "a2a_expiry",
+            "run_meta",
         ] {
             let exists: bool = conn
                 .query_row(
@@ -368,6 +433,53 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, current_version());
+    }
+
+    #[test]
+    fn migrate_1_to_4_with_sample_rows_then_5() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Apply migrations 1 through 4 explicitly
+        for m in &MIGRATIONS[..4] {
+            (m.apply)(&conn).unwrap();
+            conn.pragma_update(None, "user_version", m.version).unwrap();
+        }
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+
+        // Insert sample job and session row
+        conn.execute(
+            "INSERT INTO jobs (job_id, project, prompt, resolved_prompt, sandbox, mode, add_dirs, created_at, worktree_path, branch, base_ref, retry_count)
+             VALUES ('sample-job-1', 'test', 'do work', 'do work', 0, 'plan', '[]', 0, '/tmp/wt', 'main', 'main', 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO session_state (name, status, updated_at) VALUES ('sample-session-1', 'running', 123456)",
+            [],
+        ).unwrap();
+
+        // Now run migrate(&conn), which applies migration 5
+        let version = migrate(&conn).unwrap();
+        assert_eq!(version, 5);
+        assert_eq!(current_version(), 5);
+
+        // Verify run_meta exists and accepts rows
+        conn.execute(
+            "INSERT INTO run_meta (run_id, kind, paused, compact_summary, compacted_at, forked_from, updated_at)
+             VALUES ('sample-job-1', 'job', 1, 'compacted', 123, NULL, 456)",
+            [],
+        ).unwrap();
+
+        let paused: i64 = conn
+            .query_row(
+                "SELECT paused FROM run_meta WHERE run_id = 'sample-job-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(paused, 1);
     }
 
     #[test]

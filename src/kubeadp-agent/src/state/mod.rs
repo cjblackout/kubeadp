@@ -1,7 +1,7 @@
 //! Unified state store for kubeadp-agent (`<state_root>/state.sqlite`).
 //!
-//! Provides [`StateDb`], [`JobStore`], [`SessionStore`], and numbered
-//! schema migrations ([`migrations`]).
+//! Provides [`StateDb`], [`JobStore`], [`SessionStore`], [`RunMetaStore`],
+//! [`RunRegistry`], and numbered schema migrations ([`migrations`]).
 //!
 //! # Concurrency and Durability
 //! The state store opens with WAL journal mode, a 5-second busy timeout
@@ -11,6 +11,7 @@
 
 pub mod jobs;
 pub mod migrations;
+pub mod runs;
 pub mod sessions;
 
 use anyhow::{Context, Result};
@@ -20,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use jobs::JobStore;
+pub use runs::{RunMeta, RunMetaStore, RunRegistry};
 pub use sessions::SessionStore;
 
 /// The central state database handle for a pod.
@@ -114,6 +116,16 @@ impl StateDb {
     /// Returns a [`SessionStore`] handle for supervisor and session state.
     pub fn sessions(&self) -> SessionStore {
         SessionStore::new(self.clone())
+    }
+
+    /// Returns a [`RunMetaStore`] handle for querying and modifying `run_meta`.
+    pub fn runs_meta(&self) -> RunMetaStore {
+        RunMetaStore::new(self.clone())
+    }
+
+    /// Returns a [`RunRegistry`] view over jobs, sessions, and `run_meta`.
+    pub fn runs(&self) -> RunRegistry {
+        RunRegistry::new(self.clone())
     }
 }
 

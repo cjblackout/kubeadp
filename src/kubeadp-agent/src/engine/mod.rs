@@ -40,6 +40,7 @@ pub use run::{
 
 use crate::core::job::{JobMetadata, JobStatus};
 use crate::engine::capability::CapabilityTable;
+pub use crate::orchestrate::config::SessionConfig as SessionDef;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -133,6 +134,15 @@ pub enum TurnInput<'a> {
     },
 }
 
+/// Resume mode for [`Engine::session_command`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeMode {
+    /// Fresh start turn (e.g. `--session-id`).
+    Start,
+    /// Resumed turn (e.g. `--resume`).
+    Resume,
+}
+
 /// The engine trait (design HL-91 2.2). Object-safe, async where needed,
 /// `Send + Sync`. Methods without an explicit default return an
 /// `Unsupported` error via [`agnostic`] so a partial engine implementation
@@ -176,6 +186,13 @@ pub trait Engine: Send + Sync {
         &self,
         job: &JobMetadata,
         turn: TurnInput<'_>,
+    ) -> Result<LaunchPlan, EngineError>;
+
+    /// Builds the execution launch plan for a session.
+    fn session_command(
+        &self,
+        session: &SessionDef,
+        resume: ResumeMode,
     ) -> Result<LaunchPlan, EngineError>;
 
     /// Classifies terminal status of an exited process from exit information and log tail.
@@ -505,6 +522,20 @@ mod tests {
                 env: Vec::new(),
                 stdin: StdinMode::Null,
                 pty: false,
+            })
+        }
+
+        fn session_command(
+            &self,
+            session: &SessionDef,
+            _resume: ResumeMode,
+        ) -> Result<LaunchPlan, EngineError> {
+            Ok(LaunchPlan {
+                program: PathBuf::from("/bin/true"),
+                args: vec![session.name.clone()],
+                env: Vec::new(),
+                stdin: StdinMode::Null,
+                pty: true,
             })
         }
 

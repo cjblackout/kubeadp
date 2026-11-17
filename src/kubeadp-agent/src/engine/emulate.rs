@@ -50,11 +50,8 @@
 //! and never blocks: per-run state lives on disk (queue files, checkpoints,
 //! compact records) and in process-shared lock-protected maps.
 //!
-//! [`EngineRunRegistry`] is the minimal per-run lookup the E4 routes use to
-//! resolve a job/session id to a [`Run`]. It is intentionally *not* a refactor
-//! of `core::job` / `orchestrate::state`: it is the tiny in-memory mapping the
-//! `Run` model needs so the new control endpoints can address a run before
-//! the full run registry lands in E6.
+//! [`EngineRunRegistry`] provides in-memory run tracking for tests and emulation
+//! wrappers. Real runs are resolved through [`crate::state::RunRegistry`].
 
 pub mod compact;
 pub mod queue;
@@ -63,7 +60,7 @@ pub mod revert;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 
@@ -114,12 +111,9 @@ pub struct EngineRunRegistry {
 }
 
 impl EngineRunRegistry {
-    /// The process-wide registry the emulation wrappers and the E4 routes
-    /// share by default (the role entry points may construct their own in
-    /// E3/E5 and pass it in via [`EmulatingEngine::new_over_with`]).
-    pub fn global() -> Arc<EngineRunRegistry> {
-        static GLOBAL: OnceLock<Arc<EngineRunRegistry>> = OnceLock::new();
-        Arc::clone(GLOBAL.get_or_init(|| Arc::new(EngineRunRegistry::default())))
+    /// Creates a new in-memory run registry.
+    pub fn new() -> Arc<EngineRunRegistry> {
+        Arc::new(EngineRunRegistry::default())
     }
 
     /// Registers (or replaces) the mapping of `run.id` to `run`.
@@ -176,10 +170,10 @@ pub struct EmulatingEngine {
 
 impl EmulatingEngine {
     /// Wraps `inner` with the emulation layer, using the process-wide
-    /// [`EngineRunRegistry::global`] for fork registrations. The initial
+    /// the run registry for fork registrations. The initial
     /// capability table is the inner engine's own report.
     pub fn new_over(inner: Arc<dyn Engine>) -> Self {
-        Self::new_over_with(inner, EngineRunRegistry::global())
+        Self::new_over_with(inner, EngineRunRegistry::new())
     }
 
     /// Wraps `inner` with the emulation layer, registering forked runs into
@@ -456,7 +450,12 @@ impl EmulatingEngine {
             "forked_from": from.id,
             "forked_from_context": from.context_id,
         });
-        self.runs.register(new_run);
+        self.runs.register(new_run.clone());
+        if let Some(state_root) = find_state_root(&new_run) {
+            if let Ok(db) = crate::state::StateDb::open(&state_root) {
+                let _ = db.runs().register(new_run);
+            }
+        }
         Ok(new_id)
     }
 
@@ -691,6 +690,14 @@ impl Engine for EmulatingEngine {
         self.inner.job_command(job, turn)
     }
 
+    fn session_command(
+        &self,
+        session: &crate::engine::SessionDef,
+        resume: crate::engine::ResumeMode,
+    ) -> Result<crate::engine::LaunchPlan, EngineError> {
+        self.inner.session_command(session, resume)
+    }
+
     fn classify_exit(
         &self,
         exit: crate::engine::run::ExitInfo,
@@ -795,6 +802,23 @@ impl Engine for EmulatingEngine {
     }
 }
 
+fn find_state_root(run: &Run) -> Option<PathBuf> {
+    if run.workdir.join("state.sqlite").exists() {
+        return Some(run.workdir.clone());
+    }
+    if let Some(parent) = run.workdir.parent() {
+        if parent.join("state.sqlite").exists() {
+            return Some(parent.to_path_buf());
+        }
+        if let Some(gp) = parent.parent() {
+            if gp.join("state.sqlite").exists() {
+                return Some(gp.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,6 +914,23 @@ mod tests {
                 env: Vec::new(),
                 stdin: crate::engine::StdinMode::Null,
                 pty: false,
+            })
+        }
+        fn session_command(
+            &self,
+            session: &crate::engine::SessionDef,
+            _resume: crate::engine::ResumeMode,
+        ) -> Result<crate::engine::LaunchPlan, EngineError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("session_command|{}", session.name));
+            Ok(crate::engine::LaunchPlan {
+                program: std::path::PathBuf::from("/bin/true"),
+                args: vec![session.name.clone()],
+                env: Vec::new(),
+                stdin: crate::engine::StdinMode::Null,
+                pty: true,
             })
         }
         fn classify_exit(

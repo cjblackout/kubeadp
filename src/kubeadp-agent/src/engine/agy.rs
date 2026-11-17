@@ -33,7 +33,8 @@ use crate::core::runner::launch_background_job;
 use crate::engine::capability::{Capability, CapabilityTable};
 use crate::engine::run::{ContextId, EngineEvent, ExitInfo, Role, Run, RunId, RunStatus};
 use crate::engine::{
-    Engine, EngineCtx, EngineError, JobSpec, LaunchPlan, SessionSpec, StdinMode, TurnInput,
+    Engine, EngineCtx, EngineError, JobSpec, LaunchPlan, ResumeMode, SessionDef, SessionSpec,
+    StdinMode, TurnInput,
 };
 
 /// The stable agy engine id (the value `config`/request `engine` bodies and
@@ -354,6 +355,41 @@ impl Engine for AgyEngine {
             env: Vec::new(),
             stdin,
             pty: false,
+        })
+    }
+
+    fn session_command(
+        &self,
+        session: &SessionDef,
+        _resume: ResumeMode,
+    ) -> Result<LaunchPlan, EngineError> {
+        let args = vec![
+            "--dangerously-skip-permissions".to_string(),
+            "--mode".to_string(),
+            "accept-edits".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--print".to_string(),
+            "".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--add-dir".to_string(),
+            session.workdir.to_string_lossy().to_string(),
+        ];
+
+        let mut env: Vec<(String, String)> = session
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        env.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Ok(LaunchPlan {
+            program: session.agy_binary.clone(),
+            args,
+            env,
+            stdin: StdinMode::Null,
+            pty: true,
         })
     }
 
@@ -1073,5 +1109,83 @@ some non-json noise line
             engine.conversation_id(&meta).as_deref(),
             Some("c-from-log-456")
         );
+    }
+
+    #[test]
+    fn test_agy_session_command() {
+        let config = Arc::new(Config::default());
+        let engine = AgyEngine::new(config);
+
+        let mut env_map = std::collections::HashMap::new();
+        env_map.insert("FOO".to_string(), "bar".to_string());
+        env_map.insert("ALPHA".to_string(), "1".to_string());
+
+        let session = SessionDef {
+            name: "test-sess".to_string(),
+            workdir: PathBuf::from("/workspace/repo"),
+            session_id: "sid-123".to_string(),
+            engine: Some("agy".to_string()),
+            claude_binary: PathBuf::from("claude"),
+            claude_args: vec![],
+            agy_binary: PathBuf::from("/opt/tools/agy"),
+            env: env_map,
+            session_file: None,
+            transcript_path: None,
+            memory_file: None,
+            readiness_poll_secs: 5.0,
+            hang_timeout_secs: 0.0,
+            kill_grace_secs: 5.0,
+            pty_eof_grace_secs: 10.0,
+            kill_wait_secs: 15.0,
+            sandbox: true,
+            grants: None,
+            base_backoff_secs: 2.0,
+            max_backoff_secs: 60.0,
+            healthy_run_secs: 30.0,
+            max_crashes: 5,
+            crash_window_secs: 60.0,
+            prefix_output: false,
+            failed_cooldown_secs: 300.0,
+            backoff_window_secs: 600.0,
+            resume_fail_quarantine_after: 5,
+            resume_fail_uptime_secs: 5.0,
+        };
+
+        let plan_start = engine
+            .session_command(&session, ResumeMode::Start)
+            .expect("session_command Start");
+        assert_eq!(plan_start.program, PathBuf::from("/opt/tools/agy"));
+        assert_eq!(
+            plan_start.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--mode",
+                "accept-edits",
+                "--output-format",
+                "stream-json",
+                "--print",
+                "",
+                "--input-format",
+                "stream-json",
+                "--add-dir",
+                "/workspace/repo",
+            ]
+        );
+        assert!(plan_start.pty);
+        assert_eq!(plan_start.stdin, StdinMode::Null);
+        assert_eq!(
+            plan_start.env,
+            vec![
+                ("ALPHA".to_string(), "1".to_string()),
+                ("FOO".to_string(), "bar".to_string())
+            ]
+        );
+
+        let plan_resume = engine
+            .session_command(&session, ResumeMode::Resume)
+            .expect("session_command Resume");
+        // agy has identical arguments on resume (stream-json idle PTY)
+        assert_eq!(plan_resume.args, plan_start.args);
+        assert_eq!(plan_resume.program, plan_start.program);
     }
 }

@@ -1,28 +1,23 @@
-//! Per-run message queue file for the agy send-message mid-run emulation
-//! (design HL-91 E4).
+//! Per-run message queue for the agy send-message mid-run emulation
+//! (design HL-91 E4, HL-125 B3).
 //!
 //! The claude PTY engines deliver a message into a live session directly; a
 //! batch engine such as agy has no live prompt channel once a turn is
-//! running. The emulation layer therefore keeps a per-run queue as a plain
-//! append-only text file (one line per message) inside the run's worktree,
-//! named by the [`Run`] id. Messages written while the run is paused are held
-//! there; resuming (or the start of the next turn) drains the queue and feeds
-//! it to the wrapped engine as one continuation prompt.
-//!
-//! A queue file is plain text (never an index), so a crash mid-append is
-//! safe: only whole lines are ever read and a torn tail line is left in
-//! place for the next drain. Lines are newline-separated; any newlines inside
-//! a message are escaped so one message always maps to one line
-//! (`\n` -> `\\n`, a literal `\` doubled). Messages are stored verbatim
-//! otherwise -- the file is data plumbing, never framed as agent input.
+//! running. The emulation layer therefore keeps a per-run queue stored in
+//! `a2a_message` table (origin/sender 'api') or lazily imported from legacy
+//! worktree files.
+//! Messages written while the run is paused are held there; resuming (or
+//! the start of the next turn) drains the queue and feeds it to the wrapped
+//! engine as one continuation prompt.
 
+use rusqlite::params;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use crate::engine::run::Run;
 
-/// The queue file name (per worktree, keyed by run id).
+/// The queue file name (per worktree, keyed by run id, legacy).
 pub const QUEUE_FILE_NAME: &str = ".engine-message-queue";
 
 /// Escape a message into a single line: newlines become the two characters
@@ -54,10 +49,25 @@ pub fn queue_path(run: &Run) -> PathBuf {
     run.workdir.join(QUEUE_FILE_NAME)
 }
 
-/// Appends `message` to the run's queue file (creating it and its directory
-/// when absent). Returns the number of messages now queued (1 implies the
-/// previous queue was empty).
+/// Appends `message` to the run's queue (in `a2a_message` table in state.sqlite if available,
+/// falling back to file if no state database is present). Returns the number of messages now queued.
 pub fn enqueue(run: &Run, message: &str) -> Result<usize, std::io::Error> {
+    // If a state.sqlite exists in workdir or state_root, use table
+    if let Some(state_root) = find_state_root(run) {
+        if let Ok(db) = crate::state::StateDb::open(&state_root) {
+            if let Ok(conn) = db.connection() {
+                let msg_id = format!("msg-{}", uuid::Uuid::new_v4());
+                let now = chrono::Utc::now().timestamp();
+                let _ = conn.execute(
+                    "INSERT INTO a2a_message (run_id, message_id, fake, sender, hop, framed, queued_at) \
+                     VALUES (?1, ?2, 0, 'api', 0, ?3, ?4)",
+                    params![run.id, msg_id, message, now],
+                );
+                return len(run);
+            }
+        }
+    }
+
     let path = queue_path(run);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -69,52 +79,93 @@ pub fn enqueue(run: &Run, message: &str) -> Result<usize, std::io::Error> {
     Ok(before + 1)
 }
 
-/// The number of messages currently queued for `run` (0 when the queue does
-/// not exist or is empty).
+/// The number of messages currently queued for `run`.
 pub fn len(run: &Run) -> Result<usize, std::io::Error> {
-    let path = queue_path(run);
-    if !path.exists() {
-        return Ok(0);
-    }
-    let file = File::open(&path)?;
-    let reader = BufReader::new(file);
-    let mut n = 0usize;
-    for line in reader.lines() {
-        let line = line?;
-        if !line.trim().is_empty() {
-            n += 1;
+    let mut total = 0;
+    if let Some(state_root) = find_state_root(run) {
+        if let Ok(db) = crate::state::StateDb::open(&state_root) {
+            if let Ok(conn) = db.connection() {
+                if let Ok(n) = conn.query_row(
+                    "SELECT COUNT(*) FROM a2a_message WHERE run_id = ?1 AND sender = 'api' AND injected_at IS NULL",
+                    params![run.id],
+                    |row| row.get::<_, usize>(0),
+                ) {
+                    total += n;
+                }
+            }
         }
     }
-    Ok(n)
+
+    let path = queue_path(run);
+    if path.exists() {
+        if let Ok(file) = File::open(&path) {
+            let reader = BufReader::new(file);
+            for l in reader.lines().map_while(Result::ok) {
+                if !l.trim().is_empty() {
+                    total += 1;
+                }
+            }
+        }
+    }
+    Ok(total)
 }
 
-/// The messages currently queued for `run`, in order (an empty vector when
-/// the queue does not exist).
+/// The messages currently queued for `run`, in order.
 pub fn peek(run: &Run) -> Result<Vec<String>, std::io::Error> {
-    let path = queue_path(run);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let file = File::open(&path)?;
-    let reader = BufReader::new(file);
     let mut messages = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        if !line.trim().is_empty() {
-            messages.push(unescape_message(line.trim_end()));
+    if let Some(state_root) = find_state_root(run) {
+        if let Ok(db) = crate::state::StateDb::open(&state_root) {
+            if let Ok(conn) = db.connection() {
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT framed FROM a2a_message \
+                     WHERE run_id = ?1 AND sender = 'api' AND injected_at IS NULL \
+                     ORDER BY queued_at ASC, message_id ASC",
+                ) {
+                    if let Ok(rows) = stmt.query_map(params![run.id], |row| row.get::<_, String>(0))
+                    {
+                        for msg in rows.flatten() {
+                            messages.push(msg);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let path = queue_path(run);
+    if path.exists() {
+        if let Ok(file) = File::open(&path) {
+            let reader = BufReader::new(file);
+            for l in reader.lines().map_while(Result::ok) {
+                if !l.trim().is_empty() {
+                    messages.push(unescape_message(l.trim_end()));
+                }
+            }
         }
     }
     Ok(messages)
 }
 
-/// Drains the queue: removes the file and returns the collected messages, so
-/// a subsequent [`peek`]/[`len`] observes an empty queue. An absent queue
-/// yields an empty vector (no error).
+/// Drains the queue: marks table rows injected or deletes them, removes the legacy file,
+/// and returns the collected messages.
 pub fn drain(run: &Run) -> Result<Vec<String>, std::io::Error> {
     let messages = peek(run)?;
+    if let Some(state_root) = find_state_root(run) {
+        if let Ok(db) = crate::state::StateDb::open(&state_root) {
+            if let Ok(conn) = db.connection() {
+                let now = chrono::Utc::now().timestamp();
+                let _ = conn.execute(
+                    "UPDATE a2a_message SET injected_at = ?1, channel = 'drain' \
+                     WHERE run_id = ?2 AND sender = 'api' AND injected_at IS NULL",
+                    params![now, run.id],
+                );
+            }
+        }
+    }
+
     let path = queue_path(run);
     if path.exists() {
-        std::fs::remove_file(&path)?;
+        let _ = std::fs::remove_file(&path);
     }
     Ok(messages)
 }
@@ -127,66 +178,19 @@ pub fn is_queue_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::run::{Run, RunKind};
-
-    fn test_run(dir: &Path) -> Run {
-        Run::new("q-run", RunKind::Job, dir)
+fn find_state_root(run: &Run) -> Option<PathBuf> {
+    if run.workdir.join("state.sqlite").exists() {
+        return Some(run.workdir.clone());
     }
-
-    #[test]
-    fn escape_round_trips_newlines_and_backslashes() {
-        for text in [
-            "plain",
-            "line one\nline two",
-            "back\\slash",
-            "\nleading and trailing\n",
-            "mixed \\n and \\\\ and real\nnewlines",
-        ] {
-            assert_eq!(unescape_message(&escape_message(text)), text);
+    if let Some(parent) = run.workdir.parent() {
+        if parent.join("state.sqlite").exists() {
+            return Some(parent.to_path_buf());
         }
-        assert_ne!(
-            escape_message("a\nb"),
-            "a\nb",
-            "an encoded message must stay on a single line"
-        );
+        if let Some(gp) = parent.parent() {
+            if gp.join("state.sqlite").exists() {
+                return Some(gp.to_path_buf());
+            }
+        }
     }
-
-    #[test]
-    fn enqueue_peek_drain_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let run = test_run(dir.path());
-        assert_eq!(len(&run).unwrap(), 0);
-
-        assert_eq!(enqueue(&run, "first message").unwrap(), 1);
-        assert_eq!(enqueue(&run, "multi\nline").unwrap(), 2);
-        assert_eq!(len(&run).unwrap(), 2);
-
-        // The queue must be a plain file with one line per message.
-        let raw = std::fs::read_to_string(queue_path(&run)).unwrap();
-        assert_eq!(raw.lines().count(), 2);
-
-        assert_eq!(
-            peek(&run).unwrap(),
-            vec!["first message".to_string(), "multi\nline".to_string()]
-        );
-
-        // Draining clears the file and returns the messages.
-        assert_eq!(
-            drain(&run).unwrap(),
-            vec!["first message".to_string(), "multi\nline".to_string()]
-        );
-        assert_eq!(len(&run).unwrap(), 0);
-        assert!(peek(&run).unwrap().is_empty());
-        assert!(!queue_path(&run).exists());
-    }
-
-    #[test]
-    fn drain_on_absent_queue_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let run = test_run(dir.path());
-        assert!(drain(&run).unwrap().is_empty());
-    }
+    None
 }

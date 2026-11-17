@@ -83,33 +83,45 @@ impl SessionState {
 pub struct SupervisorState {
     pub supervisor_pid: u32,
     pub heartbeat: String,
+    /// Whole-second epoch of the last heartbeat, kept in sync for readers of
+    /// older binaries (the row schema predates the millisecond precision).
     pub heartbeat_epoch: u64,
+    /// Millisecond epoch of the last heartbeat (migration 4
+    /// `heartbeat_epoch_ms`). The stale-heartbeat check computes the age
+    /// from this field: whole-second truncation loses up to two seconds
+    /// (one on each end), which made a strict `age > threshold` comparison
+    /// read a ~1.4 s age as 1 s and miss the threshold.
+    #[serde(default)]
+    pub heartbeat_epoch_ms: u64,
     pub status: String,
     pub sessions: HashMap<String, SessionState>,
 }
 
+pub fn now_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 impl SupervisorState {
     pub fn new(pid: u32) -> Self {
-        let now_epoch = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now_ms = now_epoch_millis();
         Self {
             supervisor_pid: pid,
             heartbeat: rfc3339_now(),
-            heartbeat_epoch: now_epoch,
+            heartbeat_epoch: now_ms / 1000,
+            heartbeat_epoch_ms: now_ms,
             status: "running".to_string(),
             sessions: HashMap::new(),
         }
     }
 
     pub fn update_heartbeat(&mut self) {
-        let now_epoch = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now_ms = now_epoch_millis();
         self.heartbeat = rfc3339_now();
-        self.heartbeat_epoch = now_epoch;
+        self.heartbeat_epoch = now_ms / 1000;
+        self.heartbeat_epoch_ms = now_ms;
     }
 }
 
@@ -208,10 +220,39 @@ pub enum StatusCheckError {
     Stopped { reason: String },
 }
 
+/// The heartbeat age in milliseconds at `now_epoch_ms`. The sub-second
+/// heartbeat (migration 4 `heartbeat_epoch_ms`) is used when present; a state
+/// written by an older binary carries 0 there and falls back to the
+/// whole-second `heartbeat_epoch` (conservative: never underestimates the
+/// age, adds only the current second's fraction).
+fn heartbeat_age_ms(state: &SupervisorState, now_epoch_ms: u64) -> f64 {
+    let hb_ms = if state.heartbeat_epoch_ms > 0 {
+        state.heartbeat_epoch_ms
+    } else {
+        state.heartbeat_epoch.saturating_mul(1000)
+    };
+    if now_epoch_ms >= hb_ms {
+        (now_epoch_ms - hb_ms) as f64
+    } else {
+        0.0
+    }
+}
+
 /// Validates heartbeat freshness and checks if supervisor or any session is in stopped/failed status.
 pub fn check_status(
     state: &SupervisorState,
     stale_threshold_secs: f64,
+) -> Result<(), StatusCheckError> {
+    evaluate_status_at(state, stale_threshold_secs, now_epoch_millis())
+}
+
+/// [`check_status`] at an explicit `now_epoch_ms`, so the threshold boundary
+/// (age exactly at and just above the threshold) is testable without racing
+/// the wall clock.
+pub fn evaluate_status_at(
+    state: &SupervisorState,
+    stale_threshold_secs: f64,
+    now_epoch_ms: u64,
 ) -> Result<(), StatusCheckError> {
     if state.status == "stopped" {
         return Err(StatusCheckError::Stopped {
@@ -232,20 +273,12 @@ pub fn check_status(
         });
     }
 
-    let now_epoch = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let age_secs = if now_epoch >= state.heartbeat_epoch {
-        (now_epoch - state.heartbeat_epoch) as f64
-    } else {
-        0.0
-    };
-
-    if age_secs > stale_threshold_secs {
+    // Strict, monotonic comparison at millisecond precision: an age exactly
+    // at the threshold is still fresh, one millisecond above it is stale.
+    let age_ms = heartbeat_age_ms(state, now_epoch_ms);
+    if age_ms > stale_threshold_secs * 1000.0 {
         return Err(StatusCheckError::StaleHeartbeat {
-            age_secs,
+            age_secs: age_ms / 1000.0,
             threshold_secs: stale_threshold_secs,
         });
     }
@@ -474,8 +507,67 @@ mod tests {
     fn test_check_status_stale_heartbeat() {
         let mut state = SupervisorState::new(100);
         state.heartbeat_epoch = 1000; // Old epoch
+        state.heartbeat_epoch_ms = 1_000_000;
         let res = check_status(&state, 5.0);
         assert!(matches!(res, Err(StatusCheckError::StaleHeartbeat { .. })));
+    }
+
+    /// The stale threshold boundary at millisecond precision: a heartbeat
+    /// written 1.2 s ago with a 1 s threshold is stale, an age exactly at the
+    /// threshold is still fresh, one millisecond above it is stale.
+    #[test]
+    fn test_check_status_threshold_boundary() {
+        let now_ms = now_epoch_millis();
+
+        // Heartbeat written 1.2 s ago, threshold 1: stale.
+        let mut state = SupervisorState::new(100);
+        state.heartbeat_epoch_ms = now_ms - 1200;
+        state.heartbeat_epoch = state.heartbeat_epoch_ms / 1000;
+        let res = evaluate_status_at(&state, 1.0, now_ms);
+        assert!(
+            matches!(res, Err(StatusCheckError::StaleHeartbeat { age_secs, .. }) if age_secs > 1.0),
+            "an age of 1.2 s must exceed a 1 s threshold"
+        );
+
+        // Age exactly at the threshold: still fresh (strict comparison).
+        let mut state = SupervisorState::new(100);
+        state.heartbeat_epoch_ms = now_ms - 1000;
+        state.heartbeat_epoch = state.heartbeat_epoch_ms / 1000;
+        assert_eq!(evaluate_status_at(&state, 1.0, now_ms), Ok(()));
+
+        // One millisecond above the threshold: stale.
+        let mut state = SupervisorState::new(100);
+        state.heartbeat_epoch_ms = now_ms - 1001;
+        state.heartbeat_epoch = state.heartbeat_epoch_ms / 1000;
+        assert!(matches!(
+            evaluate_status_at(&state, 1.0, now_ms),
+            Err(StatusCheckError::StaleHeartbeat { .. })
+        ));
+    }
+
+    /// A state written by an older binary (no millisecond epoch) falls back
+    /// to the whole-second epoch: a multi-second-old heartbeat is still
+    /// detected as stale.
+    #[test]
+    fn test_check_status_falls_back_to_whole_second_epoch() {
+        let now_ms = now_epoch_millis();
+        let mut state = SupervisorState::new(100);
+        state.heartbeat_epoch_ms = 0; // older writer
+        state.heartbeat_epoch = (now_ms - 5000) / 1000;
+        let res = evaluate_status_at(&state, 1.0, now_ms);
+        assert!(matches!(res, Err(StatusCheckError::StaleHeartbeat { .. })));
+    }
+
+    /// A sub-second heartbeat age never reads as stale: whole-second
+    /// truncation on both ends could previously add up to two phantom
+    /// seconds to the computed age.
+    #[test]
+    fn test_check_status_sub_second_age_stays_fresh() {
+        let now_ms = now_epoch_millis();
+        let mut state = SupervisorState::new(100);
+        state.heartbeat_epoch_ms = now_ms - 800;
+        state.heartbeat_epoch = state.heartbeat_epoch_ms / 1000;
+        assert_eq!(evaluate_status_at(&state, 1.0, now_ms), Ok(()));
     }
 
     #[test]

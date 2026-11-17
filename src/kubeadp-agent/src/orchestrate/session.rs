@@ -676,67 +676,60 @@ fn run_session_iteration(
     let fingerprint_before = get_transcript_fingerprint(&session_file);
     let is_resume = *force_resume || session_file.exists();
 
-    // 4. Build command arguments (engine-aware, HL-91 E5 cross-use).
-    let is_agy = engine == "agy";
-    let binary = if is_agy {
-        &session.agy_binary
-    } else {
-        &session.claude_binary
+    // 4. Build command arguments using the resolved engine's session_command (design B2).
+    let core_config = crate::core::config::Config::load().unwrap_or_default();
+    let registry = crate::engine::EngineRegistry::with_builtin(&core_config);
+    let eng = match registry.resolve(
+        crate::engine::PodRole::Orchestrator,
+        crate::engine::RunKind::Session,
+        session.engine.as_deref(),
+        default_session_engine.as_deref(),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            log_event(
+                &session.name,
+                &format!("failed to resolve session engine: {}", e),
+            );
+            handle_spawn_error(
+                &ctx,
+                swb,
+                crash_tracker,
+                restart_count,
+                format!("engine-resolve-error: {}", e),
+            );
+            return true;
+        }
     };
-    let mut cmd = Command::new(binary);
-    cmd.current_dir(&session.workdir);
-    cmd.envs(&session.env);
 
-    let mut args: Vec<String> = Vec::new();
-    if is_agy {
-        // The agy session contract (mirrors `core::runner` live mode): agy
-        // runs headless stream-json with an empty `--print`, so it idles
-        // reading consecutive turns as NDJSON lines from the PTY (each
-        // `/message` injects one `{"event":"user",...}` line). There is no
-        // claude-style persistent `--session-id`/`--resume` and no
-        // `--remote-control ai-server` summary transport; the supervisor's
-        // crash/restart/backoff loop still supervises the child exactly like
-        // a claude session.
-        args.push("--dangerously-skip-permissions".to_string());
-        args.push("--mode".to_string());
-        args.push("accept-edits".to_string());
-        args.push("--output-format".to_string());
-        args.push("stream-json".to_string());
-        args.push("--print".to_string());
-        args.push("".to_string());
-        args.push("--input-format".to_string());
-        args.push("stream-json".to_string());
-        args.push("--add-dir".to_string());
-        args.push(session.workdir.to_string_lossy().to_string());
+    let resume_mode = if is_resume {
+        crate::engine::ResumeMode::Resume
     } else {
-        let mut session_arg_inserted = false;
+        crate::engine::ResumeMode::Start
+    };
 
-        for arg in &session.claude_args {
-            args.push(arg.clone());
-            if arg == "--dangerously-skip-permissions" && !session_arg_inserted {
-                if is_resume {
-                    args.push("--resume".to_string());
-                    args.push(session.session_id.clone());
-                } else {
-                    args.push("--session-id".to_string());
-                    args.push(session.session_id.clone());
-                }
-                session_arg_inserted = true;
-            }
+    let launch_plan = match eng.session_command(session, resume_mode) {
+        Ok(p) => p,
+        Err(e) => {
+            log_event(
+                &session.name,
+                &format!("failed to build session launch plan: {}", e),
+            );
+            handle_spawn_error(
+                &ctx,
+                swb,
+                crash_tracker,
+                restart_count,
+                format!("launch-plan-error: {}", e),
+            );
+            return true;
         }
+    };
 
-        if !session_arg_inserted {
-            if is_resume {
-                args.push("--resume".to_string());
-                args.push(session.session_id.clone());
-            } else {
-                args.push("--session-id".to_string());
-                args.push(session.session_id.clone());
-            }
-        }
-    }
-
-    cmd.args(&args);
+    let mut cmd = Command::new(&launch_plan.program);
+    cmd.current_dir(&session.workdir);
+    cmd.envs(launch_plan.env.iter().cloned());
+    cmd.args(&launch_plan.args);
 
     // A trusted session (`sandbox: false`) runs `claude` directly, unwrapped.
     // A jobset member session is only ever handed its derived secret through
@@ -867,10 +860,14 @@ fn run_session_iteration(
         sandboxed_cmd.arg("--policy");
         sandboxed_cmd.arg(policy_path.to_string_lossy().to_string());
         sandboxed_cmd.arg("--");
-        sandboxed_cmd.arg(binary);
-        sandboxed_cmd.args(&args);
+        sandboxed_cmd.arg(&launch_plan.program);
+        sandboxed_cmd.args(&launch_plan.args);
         cmd = sandboxed_cmd;
     }
+
+    // HL-113: Apply A2A sender identity so messages from this session carry
+    // `<A2A_SELF_PREFIX>/<session_name>`.
+    crate::core::runner::apply_a2a_self_name(&mut cmd, &session.name);
 
     // HL-113 phase 1 (a2a builds): name the session's durable A2A inbox for
     // the injecting processes (the `mcp-a2a` receive side and the `a2a-hook`
@@ -1243,7 +1240,7 @@ fn run_session_iteration(
     // resumes a claude transcript (its conversation lives in agy's own store,
     // keyed by `--conversation`), so the `already in use` switch and the
     // fast-resume quarantine do not apply.
-    if !is_agy {
+    if engine != "agy" {
         if !is_resume && uptime <= 15.0 && !*force_resume && tail_str.contains("already in use") {
             log_event(
                 &session.name,
@@ -1734,5 +1731,39 @@ mod tests {
         assert_eq!(sess.status, SessionStatus::Starting);
         assert_eq!(sess.pid, None);
         let _ = std::fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn test_session_a2a_self_name_identity() {
+        let _g = crate::test_env_lock();
+        let saved_prefix = std::env::var("A2A_SELF_PREFIX").ok();
+        let saved_name = std::env::var("A2A_SELF_NAME").ok();
+
+        std::env::set_var("A2A_SELF_PREFIX", "kubeadp-agent-orchestrator-service");
+        std::env::remove_var("A2A_SELF_NAME");
+
+        let mut cmd = Command::new("claude");
+        crate::core::runner::apply_a2a_self_name(&mut cmd, "homelab");
+
+        let self_name = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("A2A_SELF_NAME"))
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()));
+        assert_eq!(
+            self_name.as_deref(),
+            Some("kubeadp-agent-orchestrator-service/homelab")
+        );
+
+        // Restore env
+        if let Some(p) = saved_prefix {
+            std::env::set_var("A2A_SELF_PREFIX", p);
+        } else {
+            std::env::remove_var("A2A_SELF_PREFIX");
+        }
+        if let Some(n) = saved_name {
+            std::env::set_var("A2A_SELF_NAME", n);
+        } else {
+            std::env::remove_var("A2A_SELF_NAME");
+        }
     }
 }

@@ -1,7 +1,7 @@
 //! E4 run-control endpoints (design HL-91 section 2.5): `interrupt`, `pause`,
 //! `compact`, `fork`, `revert` and `todo`, all addressed by run id.
 //!
-//! A request resolves the [`Run`] through [`EngineRunRegistry`] and the run's
+//! A request resolves the [`Run`] through [`crate::state::RunRegistry`] and the run's
 //! engine through the [`EngineRegistry`]; the engine's reported capability for
 //! the endpoint then decides the answer (design 2.4 rule, 501 only where
 //! genuinely impossible):
@@ -11,11 +11,6 @@
 //! - `Native`/`Emulated` -- dispatched through the [`EmulatingEngine`]
 //!   wrapper, which delegates a native endpoint to the inner engine and fronts
 //!   an emulated one itself.
-//!
-//! Nothing registers runs into [`EngineRunRegistry::global`] during E4 (the
-//! drivers land in E3/E5), so in production these routes answer 404 for any
-//! run id; the contract is exercised by tests that register runs directly
-//! through the same registry.
 
 use axum::extract::{Extension, State};
 use axum::response::{IntoResponse, Response};
@@ -28,23 +23,27 @@ use crate::core::config::Config;
 use crate::core::job::JobMetadata;
 use crate::core::output::CommandOutput;
 use crate::engine::capability::{CapEndpointKey, Capability};
-use crate::engine::emulate::{EmulatingEngine, EngineRunRegistry};
+use crate::engine::emulate::EmulatingEngine;
 use crate::engine::errors::EngineError;
 use crate::engine::run::Run;
 use crate::engine::{Engine, EngineRegistry, RunKind};
 use crate::server::{ApiJson, ApiPath, AppState};
+use crate::state::RunRegistry;
 
 /// Resolves `run` and its emulation wrapper, gating `key` on the engine's
 /// reported capability (an `Unsupported` endpoint answers 501).
 fn resolve_run_control(
     registry: &EngineRegistry,
-    runs: &EngineRunRegistry,
+    runs: &RunRegistry,
     run_id: &str,
     key: CapEndpointKey,
 ) -> Result<(Run, Arc<EmulatingEngine>), EngineError> {
-    let run = runs.lookup(run_id).ok_or_else(|| EngineError::NotFound {
-        run: run_id.to_string(),
-    })?;
+    let run = runs
+        .get(run_id)
+        .map_err(|e| EngineError::Internal(e.to_string()))?
+        .ok_or_else(|| EngineError::NotFound {
+            run: run_id.to_string(),
+        })?;
     let engine = registry
         .emulating(&run.engine)
         .ok_or_else(|| EngineError::UnknownEngine {
@@ -106,7 +105,7 @@ fn resolve_job_run_control(
 /// `POST /api/v1/runs/{id}/interrupt` -- interrupt a run (native or emulated).
 pub async fn interrupt_run(
     Extension(registry): Extension<Arc<EngineRegistry>>,
-    Extension(runs): Extension<Arc<EngineRunRegistry>>,
+    Extension(runs): Extension<Arc<RunRegistry>>,
     ApiPath(run_id): ApiPath<String>,
 ) -> Response {
     let result = match resolve_run_control(&registry, &runs, &run_id, "interrupt") {
@@ -130,7 +129,7 @@ pub struct PauseBody {
 /// pauses, `{"paused": false}` resumes.
 pub async fn pause_run(
     Extension(registry): Extension<Arc<EngineRegistry>>,
-    Extension(runs): Extension<Arc<EngineRunRegistry>>,
+    Extension(runs): Extension<Arc<RunRegistry>>,
     ApiPath(run_id): ApiPath<String>,
     ApiJson(body): ApiJson<PauseBody>,
 ) -> Response {
@@ -148,7 +147,7 @@ pub async fn pause_run(
 /// emulated summarise-then-restart).
 pub async fn compact_run(
     Extension(registry): Extension<Arc<EngineRegistry>>,
-    Extension(runs): Extension<Arc<EngineRunRegistry>>,
+    Extension(runs): Extension<Arc<RunRegistry>>,
     ApiPath(run_id): ApiPath<String>,
 ) -> Response {
     let result = match resolve_run_control(&registry, &runs, &run_id, "compact") {
@@ -165,7 +164,7 @@ pub async fn compact_run(
 /// emulated worktree copy), returning the new run id.
 pub async fn fork_run(
     Extension(registry): Extension<Arc<EngineRegistry>>,
-    Extension(runs): Extension<Arc<EngineRunRegistry>>,
+    Extension(runs): Extension<Arc<RunRegistry>>,
     ApiPath(run_id): ApiPath<String>,
 ) -> Response {
     let result = match resolve_run_control(&registry, &runs, &run_id, "fork") {
@@ -200,7 +199,7 @@ pub struct RevertBody {
 /// checkpoint (`{"commit": ""}` unreverts).
 pub async fn revert_run(
     Extension(registry): Extension<Arc<EngineRegistry>>,
-    Extension(runs): Extension<Arc<EngineRunRegistry>>,
+    Extension(runs): Extension<Arc<RunRegistry>>,
     ApiPath(run_id): ApiPath<String>,
     ApiJson(body): ApiJson<RevertBody>,
 ) -> Response {
@@ -223,7 +222,7 @@ pub async fn revert_run(
 /// from its event stream by the emulation layer).
 pub async fn todo_run(
     Extension(registry): Extension<Arc<EngineRegistry>>,
-    Extension(runs): Extension<Arc<EngineRunRegistry>>,
+    Extension(runs): Extension<Arc<RunRegistry>>,
     ApiPath(run_id): ApiPath<String>,
 ) -> Response {
     let result = match resolve_run_control(&registry, &runs, &run_id, "todo") {
@@ -517,6 +516,19 @@ mod tests {
                 pty: false,
             })
         }
+        fn session_command(
+            &self,
+            session: &crate::engine::SessionDef,
+            _resume: crate::engine::ResumeMode,
+        ) -> Result<crate::engine::LaunchPlan, EngineError> {
+            Ok(crate::engine::LaunchPlan {
+                program: std::path::PathBuf::from("/bin/true"),
+                args: vec![session.name.clone()],
+                env: Vec::new(),
+                stdin: crate::engine::StdinMode::Null,
+                pty: true,
+            })
+        }
         fn classify_exit(
             &self,
             exit: crate::engine::run::ExitInfo,
@@ -543,23 +555,27 @@ mod tests {
 
     /// The observable test app with one registered engine and the extensions
     /// the run-control routes need.
-    fn run_control_app() -> Router {
+    fn run_control_app(runs: std::sync::Arc<RunRegistry>) -> Router {
         let mut registry = crate::engine::EngineRegistry::new();
         let inner: std::sync::Arc<dyn Engine> = std::sync::Arc::new(TestRunEngine {
             id: "rterm",
             table: CapabilityTable::builder("rterm").native(&["pause"]).build(),
         });
         registry.register(inner);
-        run_control_app_with(std::sync::Arc::new(registry))
+        run_control_app_with(std::sync::Arc::new(registry), runs)
     }
 
-    fn run_control_app_with(registry: std::sync::Arc<crate::engine::EngineRegistry>) -> Router {
+    fn run_control_app_with(
+        registry: std::sync::Arc<crate::engine::EngineRegistry>,
+        runs: std::sync::Arc<RunRegistry>,
+    ) -> Router {
         obs::add_observability(
-            crate::server::router_with_engines(
+            crate::server::router_with_engines_and_runs(
                 std::sync::Arc::new(Config::default()),
                 std::sync::Arc::new(AuthManager::new()),
                 RemoteControlState::default(),
                 registry,
+                runs,
             ),
             crate::server::auth::AuthState::none(),
             std::sync::Arc::new(|| Ok(())),
@@ -567,8 +583,10 @@ mod tests {
         )
     }
 
-    fn register_run(run: Run) {
-        EngineRunRegistry::global().register(run);
+    fn test_runs() -> std::sync::Arc<RunRegistry> {
+        std::sync::Arc::new(RunRegistry::lazy(
+            &crate::core::config::Config::default().state_root,
+        ))
     }
 
     async fn body_json(res: axum::response::Response) -> (StatusCode, Value) {
@@ -601,8 +619,10 @@ mod tests {
     async fn pause_on_native_engine_returns_200() {
         // The engine reports pause native; dispatching through the wrapper must
         // reach the inner engine (which records nothing but answers Ok).
-        let app = run_control_app();
-        register_run(run("p-run", RunKind::Job, "/workspace/proj", "rterm"));
+        let runs = test_runs();
+        let app = run_control_app(Arc::clone(&runs));
+        runs.register(run("p-run", RunKind::Job, "/workspace/proj", "rterm"))
+            .unwrap();
         let res = app
             .oneshot(post("/api/v1/runs/p-run/pause", r#"{"paused":true}"#))
             .await
@@ -617,8 +637,10 @@ mod tests {
     async fn compact_unsupported_answers_501() {
         // rterm declares no native compact and nothing is emulated -> 501 with
         // the E1 contract body.
-        let app = run_control_app();
-        register_run(run("c-run", RunKind::Job, "/workspace/proj", "rterm"));
+        let runs = test_runs();
+        let app = run_control_app(Arc::clone(&runs));
+        runs.register(run("c-run", RunKind::Job, "/workspace/proj", "rterm"))
+            .unwrap();
         let res = app
             .oneshot(post("/api/v1/runs/c-run/compact", "{}"))
             .await
@@ -641,10 +663,11 @@ mod tests {
         });
         registry.register(inner);
         let registry = std::sync::Arc::new(registry);
-        let app = run_control_app_with(Arc::clone(&registry));
+        let runs = test_runs();
+        let app = run_control_app_with(Arc::clone(&registry), Arc::clone(&runs));
 
         let run = run("t-run", RunKind::Job, "/workspace/proj", "tterm");
-        register_run(run.clone());
+        runs.register(run.clone()).unwrap();
         let wrap = registry.emulating("tterm").expect("registered wrapper");
         wrap.record_todo(
             &run,
@@ -666,8 +689,10 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_run_answers_404() {
-        let app = run_control_app();
-        register_run(run("exists", RunKind::Job, "/workspace/proj", "rterm"));
+        let runs = test_runs();
+        let app = run_control_app(Arc::clone(&runs));
+        runs.register(run("exists", RunKind::Job, "/workspace/proj", "rterm"))
+            .unwrap();
         let res = app
             .oneshot(post("/api/v1/runs/nope/interrupt", "{}"))
             .await
@@ -679,7 +704,8 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_job_on_run_control_route_answers_404_not_500() {
-        let app = run_control_app();
+        let runs = test_runs();
+        let app = run_control_app(runs);
         let res = app
             .oneshot(post("/api/v1/jobs/nope-job/interrupt", "{}"))
             .await

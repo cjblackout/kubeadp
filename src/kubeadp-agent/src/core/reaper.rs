@@ -197,7 +197,10 @@ pub fn wait_stashed_exit(pid: u32, timeout: Duration) -> Option<ReapedExit> {
 
 /// State char from `/proc/<pid>/stat` (`None` when the proc is gone or
 /// `/proc` is unavailable).
-fn proc_pid_state(pid: u32) -> Option<char> {
+/// The process state character of `pid` from `/proc/<pid>/stat` (the char
+/// after the last ')'), or None when the process is gone: 'Z' marks a zombie
+/// (killed but not yet reaped by its parent).
+pub fn proc_pid_state(pid: u32) -> Option<char> {
     let content = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let close = content.rfind(')')?;
     let rest = content.get(close + 1..)?.trim_start();

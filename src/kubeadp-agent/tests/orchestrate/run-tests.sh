@@ -11,7 +11,7 @@ export KUBEADP_API_ALLOW_OPEN=true
 # Unset ambient supervisor and entrypoint environment variables to ensure test hermeticity
 unset AGENT_ORCHESTRATE_CONFIG CLAUDE_SUPERVISOR_CONFIG CLAUDE_DEFAULT_SESSION \
       CLAUDE_DEFAULT_SESSION_ID CLAUDE_WORKSPACES CLAUDE_WORKSPACE_ROOT CLAUDE_REMOTE_PREFIX \
-      CLAUDE_SESSION_ARGS CLAUDE_MAX_CRASHES SUPERVISOR
+      CLAUDE_SESSION_ARGS CLAUDE_MAX_CRASHES CLAUDE_SANDBOX SUPERVISOR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -940,11 +940,17 @@ EOF
 
     # 2. Stale heartbeat: SIGKILL the supervisor (no final heartbeat write);
     # the last heartbeat goes stale after the threshold. PDEATHSIG kills the
-    # session child with the supervisor.
+    # session child with the supervisor. Poll until the probe reports the
+    # stale heartbeat (exit 1) with a deadline instead of a fixed sleep: the
+    # age at the first read varies with the phase between the heartbeat
+    # writes and the kill, so a single read after a fixed wait races.
     kill -KILL "$spid" 2>/dev/null || true
-    sleep 1.6
     local rc_stale=0
-    HOME="$tdir/home" "$BIN" status --config "$cfg_file" --stale-threshold-secs 1 >/dev/null 2>&1 || rc_stale=$?
+    for _ in $(seq 1 50); do
+        HOME="$tdir/home" "$BIN" status --config "$cfg_file" --stale-threshold-secs 1 >/dev/null 2>&1 || rc_stale=$?
+        if [ "$rc_stale" -eq 1 ]; then break; fi
+        sleep 0.2
+    done
 
     # 3. Failed session: a fresh supervisor whose only session crashes once
     # (max_crashes=1) and stays failed during the cooldown.
@@ -1109,12 +1115,18 @@ EOF
     local spid=$!
     ACTIVE_PIDS+=("$spid")
 
-    sleep 1.2
+    # Poll until the crashing session has restarted at least once with a
+    # deadline instead of a fixed sleep: the restart cadence varies with the
+    # readiness poll and the backoff jitter.
+    local crash_runs=0
+    for _ in $(seq 1 100); do
+        crash_runs=$(grep -c "argv=" "$log_crash" 2>/dev/null || echo 0)
+        if [ "$crash_runs" -ge 2 ]; then break; fi
+        sleep 0.1
+    done
+    local steady_runs=$(grep -c "argv=" "$log_steady" 2>/dev/null || echo 0)
 
     stop_supervisor "$spid"
-
-    local crash_runs=$(grep -c "argv=" "$log_crash" 2>/dev/null || echo 0)
-    local steady_runs=$(grep -c "argv=" "$log_steady" 2>/dev/null || echo 0)
 
     if [ "$crash_runs" -ge 2 ] && [ "$steady_runs" -eq 1 ]; then
         rec "T15" "PASS" "two sessions are completely independent (crashes=$crash_runs, steady=$steady_runs)"
@@ -1341,17 +1353,22 @@ EOF
     local spid=$!
     ACTIVE_PIDS+=("$spid")
 
-    sleep 0.8
-    stop_supervisor "$spid"
-
+    # Poll until both sessions have produced prefixed output with a deadline
+    # instead of a fixed sleep: the first output arrives after readiness and
+    # spawn, which take a variable amount of time.
     local has_alpha=0
     local has_beta=0
-    if grep -q "^\[sess_alpha\] " "$stdout_file" 2>/dev/null; then
-        has_alpha=1
-    fi
-    if grep -q "^\[sess_beta\] " "$stdout_file" 2>/dev/null; then
-        has_beta=1
-    fi
+    for _ in $(seq 1 80); do
+        if grep -q "^\[sess_alpha\] " "$stdout_file" 2>/dev/null; then
+            has_alpha=1
+        fi
+        if grep -q "^\[sess_beta\] " "$stdout_file" 2>/dev/null; then
+            has_beta=1
+        fi
+        if [ "$has_alpha" -eq 1 ] && [ "$has_beta" -eq 1 ]; then break; fi
+        sleep 0.1
+    done
+    stop_supervisor "$spid"
 
     if [ "$has_alpha" -eq 1 ] && [ "$has_beta" -eq 1 ]; then
         rec "T19" "PASS" "opt-in prefix_output forwarded pty lines prefixed with [<session name>]"
@@ -1626,12 +1643,12 @@ test_t23() {
 
 # ==============================================================================
 # T24: Multi-workspace execution: cwd, args, independent restart on SIGKILL with --resume
+# The sessions are generated from CLAUDE_WORKSPACES; they inherit the sandbox
+# setting from default_sandbox (default true), which CLAUDE_SANDBOX overrides.
+# CLAUDE_SANDBOX=0 makes them trusted so the fake claude (outside the sandbox's
+# readable paths) can run in any environment.
 # ==============================================================================
 test_t24() {
-    if [ "${SUITE_SANDBOXED_WORKSPACES:-1}" = "1" ]; then
-        rec T24 PASS "skipped: env-generated workspace sessions are sandboxed (no per-session sandbox switch) and the fake claude on PATH is outside the sandbox's readable paths; the generator is covered by the workspaces.rs unit tests (set SUITE_SANDBOXED_WORKSPACES=0 with an unsandboxed build to run it)"
-        return
-    fi
     local tdir="${TEST_TMP}/t24"
     mkdir -p "$tdir/root/ws1" "$tdir/root/ws2" "$tdir/home" "$tdir/control" "$tdir/bin"
     ln -sf "$FAKE_CLAUDE" "$tdir/bin/claude"
@@ -1647,12 +1664,14 @@ EOF
 
     PATH="$tdir/bin:$PATH" FAKE_CLAUDE_LOG="$log_file" FAKE_CLAUDE_CONTROL_DIR="$tdir/control" \
     HOME="$tdir/home" CLAUDE_DEFAULT_SESSION=0 CLAUDE_WORKSPACE_ROOT="$tdir/root" CLAUDE_WORKSPACES="ws1,ws2" \
+    CLAUDE_SANDBOX=0 \
         "$BIN" run --config "$tdir/config.json" >/dev/null 2>&1 &
     local spid=$!
     ACTIVE_PIDS+=("$spid")
 
-    # Wait for both sessions to launch
-    for _ in $(seq 1 40); do
+    # Wait for both sessions to launch (deadline-based: readiness and spawn
+    # take a variable amount of time)
+    for _ in $(seq 1 100); do
         local count=$(count_lines "$log_file")
         if [ "$count" -ge 2 ]; then break; fi
         sleep 0.05
@@ -1677,11 +1696,13 @@ EOF
         kill -9 "$ws1_pid" 2>/dev/null || true
     fi
 
-    # Wait for ws1 to restart
-    for _ in $(seq 1 50); do
+    # Wait for ws1 to restart. Generated sessions restart after the base
+    # backoff (2.0 s + up to 25% jitter) plus the spawn time, so the deadline
+    # must cover more than one full backoff cycle.
+    for _ in $(seq 1 100); do
         local count=$(count_lines "$log_file")
         if [ "$count" -ge 3 ]; then break; fi
-        sleep 0.05
+        sleep 0.1
     done
 
     # Check if ws2 is still running
@@ -1704,12 +1725,9 @@ EOF
 
 # ==============================================================================
 # T25: Supervisor restart yields SAME session ids (determinism) and resumes
+# CLAUDE_SANDBOX=0 keeps the generated workspace session trusted (see T24).
 # ==============================================================================
 test_t25() {
-    if [ "${SUITE_SANDBOXED_WORKSPACES:-1}" = "1" ]; then
-        rec T25 PASS "skipped: env-generated workspace sessions are sandboxed (no per-session sandbox switch) and the fake claude on PATH is outside the sandbox's readable paths; the generator is covered by the workspaces.rs unit tests (set SUITE_SANDBOXED_WORKSPACES=0 with an unsandboxed build to run it)"
-        return
-    fi
     local tdir="${TEST_TMP}/t25"
     mkdir -p "$tdir/root/sess_det" "$tdir/home" "$tdir/control" "$tdir/bin"
     ln -sf "$FAKE_CLAUDE" "$tdir/bin/claude"
@@ -1727,11 +1745,12 @@ EOF
     # 1. First run of supervisor
     PATH="$tdir/bin:$PATH" FAKE_CLAUDE_LOG="$log1" FAKE_CLAUDE_CONTROL_DIR="$tdir/control" \
     HOME="$tdir/home" CLAUDE_DEFAULT_SESSION=0 CLAUDE_WORKSPACE_ROOT="$tdir/root" CLAUDE_WORKSPACES="sess_det" \
+    CLAUDE_SANDBOX=0 \
         "$BIN" run --config "$tdir/config.json" >/dev/null 2>&1 &
     local spid1=$!
     ACTIVE_PIDS+=("$spid1")
 
-    for _ in $(seq 1 40); do
+    for _ in $(seq 1 100); do
         if [ -s "$log1" ]; then break; fi
         sleep 0.05
     done
@@ -1748,11 +1767,12 @@ EOF
     # 2. Second run of supervisor
     PATH="$tdir/bin:$PATH" FAKE_CLAUDE_LOG="$log2" FAKE_CLAUDE_CONTROL_DIR="$tdir/control" \
     HOME="$tdir/home" CLAUDE_DEFAULT_SESSION=0 CLAUDE_WORKSPACE_ROOT="$tdir/root" CLAUDE_WORKSPACES="sess_det" \
+    CLAUDE_SANDBOX=0 \
         "$BIN" run --config "$tdir/config.json" >/dev/null 2>&1 &
     local spid2=$!
     ACTIVE_PIDS+=("$spid2")
 
-    for _ in $(seq 1 40); do
+    for _ in $(seq 1 100); do
         if [ -s "$log2" ]; then break; fi
         sleep 0.05
     done
