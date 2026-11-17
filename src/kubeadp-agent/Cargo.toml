@@ -13,6 +13,7 @@ default = ["cli", "server", "engine"]
 # The axum-based HTTP stack shared by the core server module (`core::server`),
 # the orchestrator (supervisor HTTP API) and the worker (agent-run API daemon).
 server = [
+    "engine",
     "dep:axum",
     "dep:tokio",
     "dep:tokio-stream",
@@ -22,7 +23,7 @@ server = [
     "dep:uuid",
 ]
 # The agent-run remote CLI client (`cli` module, ureq).
-cli = ["dep:ureq"]
+cli = ["engine", "dep:ureq"]
 # A2A v1 agent protocol surface (agent card + JSON-RPC/REST bindings).
 # Merges the three old `a2a` features (agent-core/a2a, agent-orchestrate/a2a,
 # agent-run-api/a2a). Depends on `server` for the shared axum stack.

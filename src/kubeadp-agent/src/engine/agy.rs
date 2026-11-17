@@ -31,8 +31,10 @@ use crate::core::job::{compute_status, JobMetadata, JobStatus};
 use crate::core::runner::launch_background_job;
 
 use crate::engine::capability::{Capability, CapabilityTable};
-use crate::engine::run::{EngineEvent, Role, Run, RunId, RunStatus};
-use crate::engine::{Engine, EngineCtx, EngineError, JobSpec, SessionSpec};
+use crate::engine::run::{ContextId, EngineEvent, ExitInfo, Role, Run, RunId, RunStatus};
+use crate::engine::{
+    Engine, EngineCtx, EngineError, JobSpec, LaunchPlan, SessionSpec, StdinMode, TurnInput,
+};
 
 /// The stable agy engine id (the value `config`/request `engine` bodies and
 /// the capability tables carry).
@@ -246,6 +248,128 @@ impl Engine for AgyEngine {
     async fn stop_session(&self, run: &Run, restart: bool) -> Result<(), EngineError> {
         let _ = (run, restart);
         Err(EngineError::unsupported(self.id(), "session.stop"))
+    }
+
+    fn job_command(
+        &self,
+        job: &JobMetadata,
+        turn: TurnInput<'_>,
+    ) -> Result<LaunchPlan, EngineError> {
+        let live = self.config.a2a_live_stdin
+            && (crate::core::jobset::host_jobset().is_some()
+                || crate::core::a2a_live::live_member(&self.config.state_root, &job.job_id));
+
+        let mut args: Vec<String> = vec![
+            "--dangerously-skip-permissions".to_string(),
+            "--mode".to_string(),
+            job.mode.clone(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+        ];
+
+        let stdin = match turn {
+            TurnInput::Start { prompt } => {
+                if live {
+                    args.push("--print".to_string());
+                    args.push("".to_string());
+                    args.push("--input-format".to_string());
+                    args.push("stream-json".to_string());
+                    StdinMode::Pipe {
+                        first_line: if prompt.is_empty() {
+                            None
+                        } else {
+                            Some(prompt.to_string())
+                        },
+                    }
+                } else {
+                    if !prompt.is_empty() {
+                        args.push("-p".to_string());
+                        args.push(prompt.to_string());
+                    }
+                    StdinMode::Null
+                }
+            }
+            TurnInput::Resume {
+                prompt,
+                conversation,
+            } => {
+                if let Some(conv_id) = conversation {
+                    args.push("--conversation".to_string());
+                    args.push(conv_id.to_string());
+                } else {
+                    args.push("--continue".to_string());
+                }
+                if live {
+                    args.push("--print".to_string());
+                    args.push("".to_string());
+                    args.push("--input-format".to_string());
+                    args.push("stream-json".to_string());
+                    StdinMode::Pipe {
+                        first_line: if prompt.is_empty() {
+                            None
+                        } else {
+                            Some(prompt.to_string())
+                        },
+                    }
+                } else {
+                    if !prompt.is_empty() {
+                        args.push("-p".to_string());
+                        args.push(prompt.to_string());
+                    }
+                    StdinMode::Null
+                }
+            }
+        };
+
+        if let Some(m) = &job.model {
+            args.push("--model".to_string());
+            args.push(m.clone());
+        }
+
+        if let Some(e) = &job.effort {
+            args.push("--effort".to_string());
+            args.push(e.clone());
+        }
+
+        if job.sandbox {
+            args.push("--sandbox".to_string());
+        }
+
+        args.push("--add-dir".to_string());
+        args.push(job.worktree_path.to_string_lossy().to_string());
+
+        for dir in &job.add_dirs {
+            args.push("--add-dir".to_string());
+            args.push(dir.to_string_lossy().to_string());
+        }
+
+        if let Some(timeout) = &job.print_timeout {
+            args.push("--print-timeout".to_string());
+            args.push(timeout.clone());
+        }
+
+        Ok(LaunchPlan {
+            program: self.config.agy_path.clone(),
+            args,
+            env: Vec::new(),
+            stdin,
+            pty: false,
+        })
+    }
+
+    fn classify_exit(&self, exit: ExitInfo, log_tail: &[u8]) -> JobStatus {
+        let log = String::from_utf8_lossy(log_tail);
+        crate::core::job::determine_status_from_signals(exit.code, &log)
+    }
+
+    fn conversation_id(&self, job: &JobMetadata) -> Option<ContextId> {
+        if let Some(ref conv_id) = job.conversation_id {
+            if !conv_id.trim().is_empty() {
+                return Some(conv_id.clone());
+            }
+        }
+        let log_path = JobMetadata::log_path(&self.config.state_root, &job.job_id);
+        crate::core::job::extract_conversation_id_from_log(&log_path)
     }
 
     async fn events(&self, run: &Run, after: u64) -> Result<Vec<EngineEvent>, EngineError> {
@@ -715,5 +839,239 @@ some non-json noise line
                 "owner rule: job-control endpoint '{key}' must never be unsupported for claude"
             );
         }
+    }
+
+    #[test]
+    fn test_agy_job_command_start_normal_pinned() {
+        use std::path::Path;
+        let config = Arc::new(Config {
+            agy_path: PathBuf::from("/usr/local/bin/agy"),
+            ..Config::default()
+        });
+        let engine = AgyEngine::new(config);
+        let mut meta = test_meta("job-agy-start", Path::new("/tmp/wt"));
+        meta.mode = "normal".to_string();
+        meta.model = Some("gemini-2.5-flash".to_string());
+        meta.effort = Some("medium".to_string());
+        meta.sandbox = true;
+        meta.add_dirs = vec![PathBuf::from("/extra/dir")];
+        meta.print_timeout = Some("60s".to_string());
+
+        let plan = engine
+            .job_command(
+                &meta,
+                TurnInput::Start {
+                    prompt: "initial task prompt",
+                },
+            )
+            .expect("plan");
+
+        assert_eq!(plan.program, PathBuf::from("/usr/local/bin/agy"));
+        assert_eq!(
+            plan.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--mode",
+                "normal",
+                "--output-format",
+                "stream-json",
+                "-p",
+                "initial task prompt",
+                "--model",
+                "gemini-2.5-flash",
+                "--effort",
+                "medium",
+                "--sandbox",
+                "--add-dir",
+                "/tmp/wt",
+                "--add-dir",
+                "/extra/dir",
+                "--print-timeout",
+                "60s",
+            ]
+        );
+        assert_eq!(plan.env, Vec::<(String, String)>::new());
+        assert_eq!(plan.stdin, StdinMode::Null);
+        assert!(!plan.pty);
+    }
+
+    #[test]
+    fn test_agy_job_command_resume_with_conversation_pinned() {
+        use std::path::Path;
+        let config = Arc::new(Config {
+            agy_path: PathBuf::from("/usr/local/bin/agy"),
+            ..Config::default()
+        });
+        let engine = AgyEngine::new(config);
+        let mut meta = test_meta("job-agy-resume", Path::new("/tmp/wt"));
+        meta.mode = "normal".to_string();
+
+        let plan = engine
+            .job_command(
+                &meta,
+                TurnInput::Resume {
+                    prompt: "continue with next step",
+                    conversation: Some("conv-12345"),
+                },
+            )
+            .expect("plan");
+
+        assert_eq!(plan.program, PathBuf::from("/usr/local/bin/agy"));
+        assert_eq!(
+            plan.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--mode",
+                "normal",
+                "--output-format",
+                "stream-json",
+                "--conversation",
+                "conv-12345",
+                "-p",
+                "continue with next step",
+                "--add-dir",
+                "/tmp/wt",
+            ]
+        );
+        assert_eq!(plan.stdin, StdinMode::Null);
+        assert!(!plan.pty);
+    }
+
+    #[test]
+    fn test_agy_job_command_resume_without_conversation_pinned() {
+        use std::path::Path;
+        let config = Arc::new(Config {
+            agy_path: PathBuf::from("/usr/local/bin/agy"),
+            ..Config::default()
+        });
+        let engine = AgyEngine::new(config);
+        let mut meta = test_meta("job-agy-resume-bare", Path::new("/tmp/wt"));
+        meta.mode = "plan".to_string();
+
+        let plan = engine
+            .job_command(
+                &meta,
+                TurnInput::Resume {
+                    prompt: "continue prompt",
+                    conversation: None,
+                },
+            )
+            .expect("plan");
+
+        assert_eq!(
+            plan.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--mode",
+                "plan",
+                "--output-format",
+                "stream-json",
+                "--continue",
+                "-p",
+                "continue prompt",
+                "--add-dir",
+                "/tmp/wt",
+            ]
+        );
+        assert_eq!(plan.stdin, StdinMode::Null);
+    }
+
+    #[test]
+    fn test_agy_job_command_live_mode_pinned() {
+        use std::path::Path;
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().to_path_buf();
+        let config = Arc::new(Config {
+            agy_path: PathBuf::from("/usr/local/bin/agy"),
+            state_root: state_root.clone(),
+            a2a_live_stdin: true,
+            ..Config::default()
+        });
+        let engine = AgyEngine::new(config);
+        let mut meta = test_meta("job-live-1", Path::new("/tmp/wt"));
+        meta.mode = "normal".to_string();
+
+        // Mark as live member
+        crate::core::a2a_live::set_live_member(&state_root, "job-live-1", true);
+
+        let plan = engine
+            .job_command(
+                &meta,
+                TurnInput::Start {
+                    prompt: "live mesh prompt",
+                },
+            )
+            .expect("plan");
+
+        assert_eq!(
+            plan.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--mode",
+                "normal",
+                "--output-format",
+                "stream-json",
+                "--print",
+                "",
+                "--input-format",
+                "stream-json",
+                "--add-dir",
+                "/tmp/wt",
+            ]
+        );
+        assert_eq!(
+            plan.stdin,
+            StdinMode::Pipe {
+                first_line: Some("live mesh prompt".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_agy_classify_exit_and_conversation_id() {
+        use std::path::Path;
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().to_path_buf();
+        let config = Arc::new(Config {
+            agy_path: PathBuf::from("/usr/local/bin/agy"),
+            state_root: state_root.clone(),
+            ..Config::default()
+        });
+        let engine = AgyEngine::new(config);
+
+        let exit_0 = ExitInfo {
+            code: Some(0),
+            signal: None,
+        };
+        let exit_137 = ExitInfo {
+            code: Some(137),
+            signal: None,
+        };
+
+        assert_eq!(
+            engine.classify_exit(exit_137, b"killed by sigkill"),
+            JobStatus::SelfTerminated
+        );
+
+        let success_log =
+            b"{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"done\"}}\n";
+        assert_eq!(engine.classify_exit(exit_0, success_log), JobStatus::Done);
+
+        let mut meta = test_meta("job-conv", Path::new("/tmp/wt"));
+        meta.conversation_id = Some("c-stored-123".to_string());
+        assert_eq!(
+            engine.conversation_id(&meta).as_deref(),
+            Some("c-stored-123")
+        );
+
+        meta.conversation_id = None;
+        let log_dir = JobMetadata::log_dir(&state_root);
+        fs::create_dir_all(&log_dir).unwrap();
+        let log_file = JobMetadata::log_path(&state_root, "job-conv");
+        fs::write(&log_file, "Conversation ID: c-from-log-456\n").unwrap();
+        assert_eq!(
+            engine.conversation_id(&meta).as_deref(),
+            Some("c-from-log-456")
+        );
     }
 }

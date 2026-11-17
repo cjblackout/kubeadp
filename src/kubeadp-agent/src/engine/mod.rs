@@ -35,9 +35,10 @@ pub use agnostic::EmptyEngineCtx;
 pub use agy::AgyEngine;
 pub use errors::EngineError;
 pub use run::{
-    ContextId, EngineEvent, EngineId, PodRole, Run, RunId, RunKind, RunStatus, Transport,
+    ContextId, EngineEvent, EngineId, ExitInfo, PodRole, Run, RunId, RunKind, RunStatus, Transport,
 };
 
+use crate::core::job::{JobMetadata, JobStatus};
 use crate::engine::capability::CapabilityTable;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -96,6 +97,42 @@ pub struct SessionSpec {
     pub transport: Option<Transport>,
 }
 
+/// Standard input delivery mode for [`LaunchPlan`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum StdinMode {
+    /// No stdin delivered (or /dev/null).
+    Null,
+    /// Piped stdin with an optional first line to write upon launch.
+    Pipe { first_line: Option<String> },
+}
+
+/// Execution launch plan describing program, argv, env, stdin mode and PTY requirement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchPlan {
+    /// Program executable path.
+    pub program: PathBuf,
+    /// Command line arguments.
+    pub args: Vec<String>,
+    /// Environment variables to set.
+    pub env: Vec<(String, String)>,
+    /// Standard input delivery mode.
+    pub stdin: StdinMode,
+    /// Whether execution requires allocation of a pseudo-terminal (PTY).
+    pub pty: bool,
+}
+
+/// Turn input for [`Engine::job_command`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnInput<'a> {
+    /// Initial start turn with prompt.
+    Start { prompt: &'a str },
+    /// Resumed/retry turn with prompt and optional conversation identifier.
+    Resume {
+        prompt: &'a str,
+        conversation: Option<&'a str>,
+    },
+}
+
 /// The engine trait (design HL-91 2.2). Object-safe, async where needed,
 /// `Send + Sync`. Methods without an explicit default return an
 /// `Unsupported` error via [`agnostic`] so a partial engine implementation
@@ -131,6 +168,21 @@ pub trait Engine: Send + Sync {
 
     /// Stops (or stops-and-arms-for-restart) a session.
     async fn stop_session(&self, run: &Run, restart: bool) -> Result<(), EngineError>;
+
+    // ---- launch description ----------------------------------------------
+
+    /// Builds the execution launch plan for a job turn.
+    fn job_command(
+        &self,
+        job: &JobMetadata,
+        turn: TurnInput<'_>,
+    ) -> Result<LaunchPlan, EngineError>;
+
+    /// Classifies terminal status of an exited process from exit information and log tail.
+    fn classify_exit(&self, exit: ExitInfo, log_tail: &[u8]) -> JobStatus;
+
+    /// Extracts or returns the engine-specific conversation context identifier.
+    fn conversation_id(&self, job: &JobMetadata) -> Option<ContextId>;
 
     // ---- shared control (E4 emulation layer fronts these) -----------------
 
@@ -215,6 +267,22 @@ pub struct EngineRegistry {
 }
 
 impl EngineRegistry {
+    /// Resolves the engine for an existing job metadata record.
+    pub fn for_job(&self, job: &JobMetadata) -> Result<Arc<dyn Engine>, EngineError> {
+        self.resolve(PodRole::Worker, RunKind::Job, job.engine.as_deref(), None)
+    }
+
+    /// Creates an engine registry pre-populated with the builtin engines (agy, claude).
+    pub fn with_builtin(config: &crate::core::config::Config) -> Self {
+        let mut reg = Self::new();
+        reg.register(Arc::new(AgyEngine::new(Arc::new(config.clone()))));
+        reg.register(Arc::new(claude::ClaudeEngine::new(
+            config.claude_path.clone(),
+            None,
+        )));
+        reg
+    }
+
     /// A registry with the default per-role engines, initially empty.
     pub fn new() -> Self {
         Self {
@@ -424,6 +492,31 @@ mod tests {
 
         async fn stop_session(&self, _run: &Run, _restart: bool) -> Result<(), EngineError> {
             Ok(())
+        }
+
+        fn job_command(
+            &self,
+            job: &JobMetadata,
+            _turn: TurnInput<'_>,
+        ) -> Result<LaunchPlan, EngineError> {
+            Ok(LaunchPlan {
+                program: PathBuf::from("/bin/true"),
+                args: vec![job.job_id.clone()],
+                env: Vec::new(),
+                stdin: StdinMode::Null,
+                pty: false,
+            })
+        }
+
+        fn classify_exit(&self, exit: ExitInfo, _log_tail: &[u8]) -> JobStatus {
+            match exit.code {
+                Some(0) => JobStatus::Done,
+                _ => JobStatus::Failed,
+            }
+        }
+
+        fn conversation_id(&self, job: &JobMetadata) -> Option<ContextId> {
+            job.conversation_id.clone()
         }
 
         fn capabilities(&self) -> CapabilityTable {

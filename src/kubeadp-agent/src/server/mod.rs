@@ -138,7 +138,7 @@ pub fn router_with_rc(
         .route("/auth/code", post(submit_auth_code))
         .route("/auth/cancel", post(cancel_auth))
         .fallback(api_v1_not_found)
-        .with_state(state)
+        .with_state(state.clone())
         .layer(Extension(auth))
         .layer(Extension(rc_state));
 
@@ -152,7 +152,7 @@ pub fn router_with_rc(
         .route("/runs/{run_id}/revert", post(runs::revert_run))
         .route("/runs/{run_id}/todo", get(runs::todo_run))
         .layer(Extension(EngineRunRegistry::global()))
-        .layer(Extension(Arc::new(EngineRegistry::new())));
+        .layer(Extension(Arc::new(EngineRegistry::with_builtin(&state))));
 
     Router::new().nest("/api/v1", api_v1)
 }
@@ -232,7 +232,7 @@ pub fn router_with_engines(
         .route("/jobs/{job_id}/todo", get(runs::todo_job))
         .layer(Extension(EngineRunRegistry::global()))
         .fallback(api_v1_not_found)
-        .with_state(state)
+        .with_state(state.clone())
         .layer(Extension(auth))
         .layer(Extension(rc_state))
         .layer(Extension(engines));
@@ -706,66 +706,23 @@ struct AuthCodeRequest {
 /// `POST /api/v1/jobs` -- start.
 async fn start_job(
     State(config): State<AppState>,
+    Extension(engines): Extension<Arc<EngineRegistry>>,
     ApiJson(req): ApiJson<StartRequest>,
 ) -> Response {
     // HL-91 E3/E5: engine selection for this job with the documented
     // precedence -- request (`engine` in the body) > configured default
-    // (`default_engine` / `AGENT_RUN_DEFAULT_ENGINE`) > per-role default
-    // ("agy"). The effective engine is resolved BEFORE validation so the
-    // config default can route a job to `claude` without an explicit body
-    // field, and a bogus configured default fails with 400 `unknown_engine`
-    // just like a bogus request value (never a 501 -- a selection error,
-    // design 2.4).
-    let engine = req
-        .engine
-        .clone()
-        .or_else(|| config.default_engine.clone())
-        .or_else(|| Some("agy".to_string()));
-    if let Some(engine) = engine.as_deref() {
-        match engine {
-            "agy" => {}
-            #[cfg(feature = "engine")]
-            "claude" => {
-                // claude is a registered job engine: accept it and let the
-                // engine-aware runner drive it (the row is built with
-                // `engine: claude`, `launch_background_job` branches on it).
-            }
-            #[cfg(not(feature = "engine"))]
-            "claude" => {
-                return (
-                    StatusCode::NOT_IMPLEMENTED,
-                    Json(json!({
-                        "error": "engine 'claude' does not support endpoint 'job.start'",
-                        "code": "unsupported",
-                        "engine": "claude",
-                    })),
-                )
-                    .into_response()
-            }
-            other => {
-                #[cfg(feature = "engine")]
-                {
-                    return crate::engine::errors::to_response(
-                        &crate::engine::EngineError::UnknownEngine {
-                            engine: other.to_string(),
-                        },
-                    );
-                }
-                #[cfg(not(feature = "engine"))]
-                {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "error": "unknown engine",
-                            "code": "unknown_engine",
-                            "engine": other,
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-        }
-    }
+    // (`default_engine` / `AGENT_RUN_DEFAULT_ENGINE`) > per-role default.
+    let resolved_engine = engines.resolve(
+        crate::engine::PodRole::Worker,
+        crate::engine::RunKind::Job,
+        req.engine.as_deref(),
+        config.default_engine.as_deref(),
+    );
+    let resolved_engine = match resolved_engine {
+        Ok(eng) => eng,
+        Err(err) => return crate::engine::errors::to_response(&err),
+    };
+    let _ = resolved_engine;
     // Materialize --from-patch content before running (the core applies the
     // patch file path, not content); delete it when run returns, success or
     // error.
@@ -794,7 +751,7 @@ async fn start_job(
         plan: req.plan,
         max_runtime: req.max_runtime,
         jobset_id: req.jobset_id,
-        engine: engine.clone(),
+        engine: Some(resolved_engine.id()),
     };
     let config = Arc::clone(&config);
     let output = run_blocking(move || commands::start::run(&config, &args)).await;
@@ -3403,6 +3360,32 @@ mod tests {
             }
             async fn stop_session(&self, _run: &Run, _restart: bool) -> Result<(), EngineError> {
                 Ok(())
+            }
+            fn job_command(
+                &self,
+                job: &JobMetadata,
+                _turn: crate::engine::TurnInput<'_>,
+            ) -> Result<crate::engine::LaunchPlan, EngineError> {
+                Ok(crate::engine::LaunchPlan {
+                    program: PathBuf::from("/bin/true"),
+                    args: vec![job.job_id.clone()],
+                    env: Vec::new(),
+                    stdin: crate::engine::StdinMode::Null,
+                    pty: false,
+                })
+            }
+            fn classify_exit(
+                &self,
+                exit: crate::engine::run::ExitInfo,
+                _log_tail: &[u8],
+            ) -> crate::core::job::JobStatus {
+                match exit.code {
+                    Some(0) => crate::core::job::JobStatus::Done,
+                    _ => crate::core::job::JobStatus::Failed,
+                }
+            }
+            fn conversation_id(&self, job: &JobMetadata) -> Option<crate::engine::ContextId> {
+                job.conversation_id.clone()
             }
             fn capabilities(&self) -> CapabilityTable {
                 self.capabilities.clone()

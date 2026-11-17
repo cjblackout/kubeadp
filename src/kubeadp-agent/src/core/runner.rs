@@ -19,6 +19,7 @@ use crate::core::job::{
     compute_status, extract_conversation_id_from_log, get_process_start_time,
     restore_conversation_id, save_final_status_unless_killed, JobMetadata,
 };
+pub use crate::engine::{LaunchPlan, StdinMode, TurnInput};
 
 /// Resolves a prompt argument.
 ///
@@ -95,12 +96,36 @@ pub fn build_command_and_args(
     mode: &InvocationMode,
     live: bool,
 ) -> (std::path::PathBuf, Vec<String>) {
-    // A claude job (HL-91 E5 `engine:"claude"`) runs the headless stream-json
-    // harness instead of agy: same worktree/sandbox/log lifecycle, different
-    // argv + prompt transport (the prompt is a stdin NDJSON line, delivered by
-    // the monitor). The argv mirrors `engine::claude::stream_json::StreamJsonArgs`.
-    if meta.engine.as_deref() == Some("claude") {
-        return build_claude_command_and_args(config, meta, mode, live);
+    let registry = crate::engine::EngineRegistry::with_builtin(config);
+    if let Ok(eng) = registry.for_job(meta) {
+        let turn = match mode {
+            InvocationMode::Start { resolved_prompt } => TurnInput::Start {
+                prompt: resolved_prompt,
+            },
+            InvocationMode::Retry {
+                conversation_id,
+                prompt,
+            } => TurnInput::Resume {
+                prompt: prompt.as_deref().unwrap_or_default(),
+                conversation: conversation_id.as_deref(),
+            },
+        };
+        if let Ok(mut plan) = eng.job_command(meta, turn) {
+            if live && eng.id() == "agy" {
+                for i in 0..plan.args.len() {
+                    if plan.args[i] == "-p" {
+                        plan.args[i] = "--print".to_string();
+                        if i + 1 < plan.args.len() {
+                            plan.args[i + 1] = "".to_string();
+                        }
+                        break;
+                    }
+                }
+                plan.args.push("--input-format".to_string());
+                plan.args.push("stream-json".to_string());
+            }
+            return (plan.program, plan.args);
+        }
     }
 
     // Build agy arguments:
@@ -195,75 +220,6 @@ pub fn build_command_and_args(
     (config.agy_path.clone(), agy_args)
 }
 
-/// Builds the claude stream-json argv for a claude job (HL-91 E5).
-///
-/// Mirrors `engine::claude::stream_json::StreamJsonArgs` (kept self-contained
-/// here so `core` does not depend on the `engine` layer): the run is always
-/// headless auto-approve (`--dangerously-skip-permissions`), and a retry
-/// resumes the harness conversation via `--resume <conversation_id>`.
-///
-/// The mode maps onto the real `claude` CLI's `--permission-mode`: a `plan`
-/// job passes `--permission-mode plan` (plan-only turn), any other mode
-/// passes NO `--permission-mode` flag at all (the auto-approve
-/// `--dangerously-skip-permissions` above is the normal-mode behaviour).
-/// The agy `--mode <m>` flag is agy-specific -- the claude CLI rejects it
-/// with `error: unknown option '--mode'` -- and must never appear in this
-/// argv.
-/// `--verbose` is required by the real CLI whenever `--output-format
-/// stream-json` is combined with `-p`.
-/// The job model (the `--model` flag or the `default_model` config) is passed
-/// through as `--model <name>`, exactly like the agy builder.
-///
-/// The prompt is NOT part of the argv: the stream-json input format reads it
-/// as an NDJSON line on stdin (the monitor writes it, exactly like
-/// `render_text_request` in the engine driver).
-fn build_claude_command_and_args(
-    config: &Config,
-    meta: &JobMetadata,
-    mode: &InvocationMode,
-    live: bool,
-) -> (std::path::PathBuf, Vec<String>) {
-    let mut args: Vec<String> = vec![
-        "--dangerously-skip-permissions".to_string(),
-        "-p".to_string(),
-        "--input-format".to_string(),
-        "stream-json".to_string(),
-        "--output-format".to_string(),
-        "stream-json".to_string(),
-        "--verbose".to_string(),
-    ];
-    // Plan-only turn: the claude CLI's permission mode is `plan`. Any other
-    // mode (normal) keeps `--dangerously-skip-permissions` and no
-    // `--permission-mode` flag.
-    if meta.mode.eq_ignore_ascii_case("plan") {
-        args.push("--permission-mode".to_string());
-        args.push("plan".to_string());
-    }
-    // Model: the claude CLI takes `--model <name>` exactly like agy; the job
-    // model (CLI flag or the `default_model` config) is engine-agnostic.
-    if let Some(m) = &meta.model {
-        args.push("--model".to_string());
-        args.push(m.clone());
-    }
-    // A retry resumes the harness session: like agy's `--conversation`, the
-    // claude resume key is the captured conversation/session id of the last
-    // attempt. `live` A2A jobs deliver the prompt over stdin like any claude
-    // job (stream-json is already the stdin transport), so no `--print` knob.
-    if let InvocationMode::Retry {
-        conversation_id: Some(conv_id),
-        ..
-    } = mode
-    {
-        args.push("--resume".to_string());
-        args.push(conv_id.clone());
-    }
-    // `live` (an A2A mesh job) has no separate argv consequence for claude:
-    // the stdin pipe the monitor opens is the same stream-json channel used
-    // for the initial prompt and for A2A messages.
-    let _ = live;
-    (config.claude_path.clone(), args)
-}
-
 /// Builds the `std::process::Command` according to configuration and job metadata.
 ///
 /// Every job (and every retry attempt, which goes through the same function)
@@ -277,66 +233,30 @@ fn build_claude_command_and_args(
 /// On success the returned `Command` wraps `sandbox-exec ... -- <agy> ...`;
 /// the policy file path is also reported back in `policy_path` so callers can
 /// surface it in job status/info output.
-pub fn build_command(
+/// Wraps a [`crate::engine::LaunchPlan`] with `sandbox-exec` in exactly one function,
+/// for every engine and role.
+pub fn sandboxed(
+    plan: crate::engine::LaunchPlan,
     config: &Config,
     meta: &JobMetadata,
-    mode: &InvocationMode,
-    live: bool,
-) -> Result<(Command, std::path::PathBuf, Option<String>), anyhow::Error> {
-    let (prog, args) = build_command_and_args(config, meta, mode, live);
-
-    // The sandbox policy names the harness binary whose argv the launch wraps:
-    // agy path for agy jobs, claude path for claude jobs (HL-91 E5).
-    let engine_bin = if meta.engine.as_deref() == Some("claude") {
-        &config.claude_path
-    } else {
-        &config.agy_path
-    };
-
-    // Base policy for the job: main's `shared_rw` override (the writable
-    // shared home path, default `/home/agent`) is preserved.
+) -> Result<(Command, std::path::PathBuf, Option<String>)> {
     let base_policy = crate::sandbox::SandboxPolicy::for_job(
         &meta.job_id,
         &meta.worktree_path,
         None,
-        Some(engine_bin),
+        Some(&plan.program),
         Some(vec![config.sandbox_home.clone()]),
     );
-    // HL-113 phase 3 (sqlite inbox): the run's A2A inbox lives in the shared
-    // per-pod `state.sqlite`, which the sandbox NEVER gets (the grant was
-    // removed: the database is host-owned). The sandboxed receive side (the
-    // `mcp-a2a` server the agent spawns and the `a2a-hook` subcommand) reaches
-    // its inbox through the pod-local HTTP API, named by the
-    // `KUBEADP_A2A_INBOX_DIR` env var and authenticated by the per-run token
-    // set below.
-    // Jobset wiring: if this job is a jobset member (registered in the
-    // process-wide registry before launch), its jobset secret rides the
-    // sandbox `secret` channel (an inherited fd the sandbox turns into a 0400
-    // file in the agent's private tmp) and only the jobset id + the secret
-    // file's PATH reach the environment. The secret value never touches argv
-    // or env (see the pre_exec that hands it on fd 3 in `run_internal_runner`).
-    // A job that is not a member is launched unchanged.
+
     let jobset = crate::core::jobset::agent_jobset(&meta.job_id);
     let policy = match &jobset {
         Some(_) => crate::core::jobset::build_jobset_policy(&base_policy),
         None => base_policy,
     };
-    // The operator token file (config `api_token_file`) is hidden so a
-    // sandboxed agent can never read the credential that guards the host's
-    // /api/v1 and A2A surface. No-op when the host has no token file.
-    let policy = policy.hide_operator_token_file();
-    // The jobset root key file (config `jobset_root_key_file`) is hidden so a
-    // sandboxed agent can never read the root of trust that derives every
-    // jobset secret (agents see only their derived per-jobset secret through
-    // the `secret` channel). No-op when no root key file is configured.
-    let policy = policy.hide_jobset_root_key_file();
-    // HL-71: claude-engine jobs authenticate with the worker pod's durable
-    // claude OAuth token (`claude setup-token`, Secret claude-oauth-token env
-    // CLAUDE_CODE_OAUTH_TOKEN): the env NAME joins the job's `env_allow` so the
-    // value passes the sandbox-exec env filter into the agent process. Agy jobs
-    // keep the default allowlist; the VALUE never enters argv, the policy file
-    // or any log line.
-    let policy = if meta.engine.as_deref() == Some("claude") {
+    let policy = policy
+        .hide_operator_token_file()
+        .hide_jobset_root_key_file();
+    let policy = if plan.program.file_name().is_some_and(|f| f == "claude") {
         policy.allow_claude_oauth_env()
     } else {
         policy
@@ -352,11 +272,6 @@ pub fn build_command(
     crate::sandbox::SandboxPolicy::write_policy_file(&policy, &policy_path)
         .map_err(|e| anyhow::anyhow!("job '{}' cannot be launched sandboxed: {e}", meta.job_id))?;
 
-    // Test-only seam (absent from production builds): when the `test-hooks`
-    // feature is enabled, the process-global passthrough switch (default on)
-    // lets the launcher return the plain agy command so the fake-agy unit
-    // tests run on a platform that cannot isolate. Production builds always
-    // wrap. The policy file is written and reported either way (same form).
     let passthrough = {
         #[cfg(feature = "test-hooks")]
         {
@@ -367,16 +282,14 @@ pub fn build_command(
             false
         }
     };
-    let argv = launch_argv(&prog, &args, &policy_path, passthrough);
+    let argv = launch_argv(&plan.program, &plan.args, &policy_path, passthrough);
     let mut cmd = Command::new(argv[0].clone());
     cmd.args(&argv[1..]);
 
-    // Hand the jobset to the agent's environment: the jobset id and the PATH
-    // of the 0400 secret file (never the secret value). These vars match the
-    // default `KUBEADP_*` allow pattern, so the sandbox passes them through.
-    // The secret VALUE itself is not set here (it must never touch env): it is
-    // handed on fd 3 by `run_internal_runner` via `attach_session_and_secret`
-    // and written into the private tmp by the sandbox.
+    for (k, v) in plan.env {
+        cmd.env(k, v);
+    }
+
     if let Some(cred) = &jobset {
         let private_tmp = policy
             .private_tmp_path()
@@ -385,34 +298,19 @@ pub fn build_command(
             cmd.env(k, v);
         }
     }
-    // Every job gets its OWN A2A sender identity: `<prefix>/<job_id>` (see
-    // [`apply_a2a_self_name`]).
     apply_a2a_self_name(&mut cmd, &meta.job_id);
 
-    // HL-113 (sqlite inbox): name the run's durable A2A inbox for the
-    // injecting processes (the `mcp-a2a` receive side and the `a2a-hook`
-    // subcommand). The var matches the default `KUBEADP_*` sandbox allow
-    // pattern, so it passes through into the sandboxed job.
     #[cfg(feature = "a2a")]
     {
         let a2a_inbox_dir =
             crate::core::a2a::inbox::inbox_dir_for(&config.state_root, &meta.job_id);
         cmd.env(crate::core::a2a::inbox::INBOX_ENV, &a2a_inbox_dir);
-        // HL-113 phase 3: the sandbox has NO database grant, so the receive
-        // side reaches its inbox through the pod-local HTTP API. Hand it the
-        // per-run token (derived host-side from the jobset root key; the
-        // sandbox never sees the key). The token is bound to the run's start
-        // time (N3) and is accepted only while the run is live: a run that
-        // has not started (no started_at) gets no token and no inbox access.
         if let Some(started_at) = meta.started_at {
             let secs = u64::try_from(started_at.timestamp()).unwrap_or(0);
             if let Some(token) = crate::core::a2a::http::token_for_run(&a2a_inbox_dir, secs) {
                 cmd.env(crate::core::a2a::receive::INBOX_TOKEN_ENV, token);
             }
         }
-        // N4: hand the sandboxed receive side the REAL inbox API address —
-        // the loopback form of the same listener the host serves — so a
-        // changed listen port cannot break delivery silently.
         let listen =
             std::env::var("AGENT_RUN_API_LISTEN").unwrap_or_else(|_| "0.0.0.0:8002".to_string());
         if let Some(url) = crate::core::a2a::receive::inbox_url_for_listen(&listen) {
@@ -422,6 +320,23 @@ pub fn build_command(
 
     crate::core::proxy::apply_proxy(&mut cmd, Some(config), meta.proxy.as_deref());
     Ok((cmd, policy_path, jobset.map(|c| c.secret)))
+}
+
+pub fn build_command(
+    config: &Config,
+    meta: &JobMetadata,
+    mode: &InvocationMode,
+    live: bool,
+) -> Result<(Command, std::path::PathBuf, Option<String>), anyhow::Error> {
+    let (prog, args) = build_command_and_args(config, meta, mode, live);
+    let plan = crate::engine::LaunchPlan {
+        program: prog,
+        args,
+        env: Vec::new(),
+        stdin: crate::engine::StdinMode::Null,
+        pty: false,
+    };
+    sandboxed(plan, config, meta)
 }
 
 /// Sets a launched job's `A2A_SELF_NAME` to `<prefix>/<job_id>` so every job
@@ -1091,67 +1006,78 @@ pub fn run_internal_runner(
 
     let mut meta = JobMetadata::load(&config.state_root, job_id)?;
 
-    // A claude job (HL-91 E5) streams its prompt as an NDJSON line over stdin
-    // (the stream-json input contract); the agy reference-line normalization is
-    // agy-specific and must not run for it (the claude harness has no
-    // conversation database to stamp).
-    let is_claude = meta.engine.as_deref() == Some("claude");
+    // Resolve engine
+    let registry = crate::engine::EngineRegistry::with_builtin(config);
+    let engine = registry
+        .for_job(&meta)
+        .map_err(|e| anyhow::anyhow!("failed to resolve engine for job '{}': {e}", meta.job_id))?;
 
-    // Every prompt handed to agy is normalized to carry exactly one
-    // per-job/per-turn reference line ([`agy_conversations::normalize_ref_prompt`]):
-    // turn 0 for the start prompt, the attempt number for retries. The line
-    // also lands in agy's conversation db (agy stores the prompt it receives)
-    // and is what the recovery below scans for -- unique by construction,
-    // unlike the old 80-byte prompt prefix two sibling jobs could share.
-    let mode = if meta.retry_count > 0 {
-        let prompt = if is_claude {
-            meta.retry_prompt.clone().unwrap_or_default()
-        } else {
+    // Live mode (an A2A mesh job): the process reads newline-delimited
+    // JSON from its stdin (`--print "" --input-format stream-json`) instead of
+    // taking the prompt on `-p`, and A2A messages are delivered to the running
+    // process over that pipe rather than by killing and resuming it.
+    let live = config.a2a_live_stdin
+        && (crate::core::jobset::host_jobset().is_some()
+            || crate::core::a2a_live::live_member(&config.state_root, job_id));
+
+    // Construct TurnInput for the engine
+    let prompt_text = if meta.retry_count > 0 {
+        if engine.id() == "agy" {
             agy_conversations::normalize_ref_prompt(
                 meta.retry_prompt.as_deref().unwrap_or_default(),
                 &meta.job_id,
                 meta.retry_count,
             )
-        };
-        InvocationMode::Retry {
-            conversation_id: meta.conversation_id.clone(),
-            prompt: Some(prompt),
+        } else {
+            meta.retry_prompt.clone().unwrap_or_default()
         }
     } else {
-        let resolved_prompt = if is_claude {
-            meta.resolved_prompt.clone()
-        } else {
+        if engine.id() == "agy" {
             agy_conversations::normalize_ref_prompt(&meta.resolved_prompt, &meta.job_id, 0)
-        };
-        InvocationMode::Start { resolved_prompt }
+        } else {
+            meta.resolved_prompt.clone()
+        }
     };
 
-    // Live mode (an A2A mesh job): the agy process reads newline-delimited
-    // JSON from its stdin (`--print "" --input-format stream-json`) instead of
-    // taking the prompt on `-p`, and A2A messages are delivered to the running
-    // process over that pipe rather than by killing and resuming it. A job is
-    // live-eligible only when `[worker] a2a_live_stdin` is on AND the job is a
-    // member of a real mesh: either this worker's host is itself a jobset
-    // member (so the job joined the host's mesh) or the job was explicitly
-    // started into a jobset (`--jobset`, see `commands::start`). The marker is
-    // the module's own `job-live/<job_id>` file, never `agent_jobset()` --
-    // every job carries a jobset registration, but only meshed ones are live.
-    let live = config.a2a_live_stdin
-        && (crate::core::jobset::host_jobset().is_some()
-            || crate::core::a2a_live::live_member(&config.state_root, job_id));
+    let turn_input = if meta.retry_count > 0 {
+        TurnInput::Resume {
+            prompt: &prompt_text,
+            conversation: meta.conversation_id.as_deref(),
+        }
+    } else {
+        TurnInput::Start {
+            prompt: &prompt_text,
+        }
+    };
 
-    let (cmd, policy_path, jobset_secret) = build_command(config, &meta, &mode, live)
-        .with_context(|| {
-            format!(
-                "Failed to build sandboxed command for job '{}'",
-                meta.job_id
-            )
-        })?;
+    let mut plan = engine
+        .job_command(&meta, turn_input)
+        .map_err(|e| anyhow::anyhow!("engine failed to build job command: {e}"))?;
 
-    // Every launch (and every retry, which runs through this same path) fills
-    // the row's `sandbox` object with the backend the pod will auto-select,
-    // the runtime label and the policy file actually given to `sandbox-exec`.
-    // Status/info then print it without re-reading the policy file.
+    // If live mode is active on an agy job, adjust argv for live stdin
+    if live && engine.id() == "agy" {
+        for i in 0..plan.args.len() {
+            if plan.args[i] == "-p" {
+                plan.args[i] = "--print".to_string();
+                if i + 1 < plan.args.len() {
+                    plan.args[i + 1] = "".to_string();
+                }
+                break;
+            }
+        }
+        plan.args.push("--input-format".to_string());
+        plan.args.push("stream-json".to_string());
+    }
+
+    let stdin_mode = plan.stdin.clone();
+    let (cmd, policy_path, jobset_secret) = sandboxed(plan, config, &meta).with_context(|| {
+        format!(
+            "Failed to build sandboxed command for job '{}'",
+            meta.job_id
+        )
+    })?;
+
+    // Record sandbox info
     let sandbox = crate::sandbox::SandboxInfo::detected(&policy_path);
     if let Err(e) = crate::core::job::set_job_sandbox(&config.state_root, &meta.job_id, &sandbox) {
         eprintln!(
@@ -1174,28 +1100,14 @@ pub fn run_internal_runner(
 
     let mut spawn_cmd = cmd;
     spawn_cmd.current_dir(&meta.worktree_path);
-    // Own new session + process group (so `agent-run kill` reaches the whole
-    // process group), and -- for a jobset member -- hand the jobset secret on
-    // fd 3 in the same `pre_exec` (the sandbox writes it into the private tmp
-    // as a 0400 file). `None` secret = a plain job, identical to the old
-    // `detached_session` behavior.
     attach_session_and_secret(&mut spawn_cmd, jobset_secret)?;
-    // Live mode: the job's stdin is a pipe the worker owns; A2A messages (and
-    // the initial prompt) are written into it as NDJSON lines. The pipe
-    // survives the sandbox wrapper (fds 0-2 are kept open by the backends), so
-    // agy reads exactly what the worker writes.
-    //
-    // A claude job (HL-91 E5) also needs the stdin pipe: the stream-json input
-    // contract reads the initial prompt as an NDJSON line, which the monitor
-    // writes below right after the spawn.
-    if live || is_claude {
+
+    let needs_piped_stdin = live || matches!(stdin_mode, StdinMode::Pipe { .. });
+    if needs_piped_stdin {
         spawn_cmd.stdin(std::process::Stdio::piped());
     }
 
-    // Cancellation check, immediately before the spawn: if the launcher
-    // already declared this launch failed (PID not confirmed in time), do
-    // not spawn agy at all -- no process, and nothing recorded that could
-    // keep a discarded row alive.
+    // Cancellation check
     if let Some(ref state) = handshake {
         if state.load(Ordering::SeqCst) == LAUNCH_STATE_CANCELLED {
             append_to_log_file(
@@ -1208,19 +1120,20 @@ pub fn run_internal_runner(
 
     spawn_cmd.stdout(log_file);
     spawn_cmd.stderr(err_file);
-    let mut child = match crate::core::spawn::spawn_command_tracked(&mut spawn_cmd, "agy") {
+    let mut child = match crate::core::spawn::spawn_command_tracked(&mut spawn_cmd, &engine.id()) {
         Ok(c) => c,
         Err(e) => {
-            // Make the failure visible to status classification: the log gets
-            // an explicit error line so compute_status lands on Failed (via
-            // the "failed" log signal) instead of a silent SelfTerminated.
             append_to_log_file(
                 &log_path,
                 &format!(
                     "Failed to spawn {}: {} (configured path: {})",
-                    if is_claude { "claude" } else { "agy" },
+                    if engine.id() == "claude" {
+                        "claude"
+                    } else {
+                        "agy"
+                    },
                     e,
-                    if is_claude {
+                    if engine.id() == "claude" {
                         config.claude_path.display()
                     } else {
                         config.agy_path.display()
@@ -1290,10 +1203,7 @@ pub fn run_internal_runner(
             // prompt. Writing it over stdin is best-effort -- a failure means
             // the pipe broke, which the fallback deliverer turns into an
             // interrupt-and-resume path.
-            let initial = match &mode {
-                InvocationMode::Start { resolved_prompt } => resolved_prompt.clone(),
-                InvocationMode::Retry { prompt, .. } => prompt.clone().unwrap_or_default(),
-            };
+            let initial = prompt_text.clone();
             if !initial.is_empty() {
                 // The initial prompt is a normal first user message on the
                 // live channel (it is the same NDJSON `user` envelope the
@@ -1311,30 +1221,15 @@ pub fn run_internal_runner(
         }
     }
 
-    // A claude job (HL-91 E5) delivers its prompt as the first NDJSON user
-    // line over stdin (the stream-json input contract; same envelope the
-    // `render_text_request` driver renders). Written once right after the
-    // spawn; stdin stays open for A2A/live deliveries on the live path.
-    if is_claude {
+    // Deliver initial line if specified by StdinMode::Pipe { first_line }
+    if let StdinMode::Pipe {
+        first_line: Some(line),
+    } = &stdin_mode
+    {
         if let Some(mut stdin) = child.stdin.take() {
-            let initial = match &mode {
-                InvocationMode::Start { resolved_prompt } => resolved_prompt.clone(),
-                InvocationMode::Retry { prompt, .. } => prompt.clone().unwrap_or_default(),
-            };
-            // Mirrors `engine::claude::stream_json::render_text_request`.
-            let request = serde_json::json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [{ "type": "text", "text": initial }]
-                }
-            });
             use std::io::Write;
-            let _ = stdin.write_all(format!("{}\n", request).as_bytes());
+            let _ = stdin.write_all(line.as_bytes());
             let _ = stdin.flush();
-            // Keep no handle: the child's stdin reaches EOF on the job's own
-            // turn boundary; the child is spawned with piped stdin so this
-            // drop of the `stdin` handle at the end of the block sends EOF.
             let _ = stdin;
         }
     }
@@ -1685,6 +1580,7 @@ fn poll_conversation_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::{EngineRegistry, StdinMode, TurnInput};
     use chrono::Utc;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -3499,5 +3395,152 @@ mod tests {
             !agy_json.contains(crate::sandbox::CLAUDE_OAUTH_TOKEN_ENV),
             "the agy job policy must NOT allow CLAUDE_CODE_OAUTH_TOKEN: {agy_json}"
         );
+    }
+
+    #[test]
+    fn test_exact_launch_plan_agy_start_and_resume() {
+        let config = Config {
+            agy_path: PathBuf::from("/usr/local/bin/agy"),
+            claude_path: PathBuf::from("/usr/local/bin/claude"),
+            ..Default::default()
+        };
+        let registry = EngineRegistry::with_builtin(&config);
+        let mut meta = test_meta_overrides();
+        meta.job_id = "test-job-agy".to_string();
+        meta.mode = "accept-edits".to_string();
+        meta.engine = Some("agy".to_string());
+
+        let engine = registry.for_job(&meta).expect("engine for agy");
+
+        // Start turn
+        let start_turn = TurnInput::Start {
+            prompt: "Test prompt [agent-run ref test-job-agy#0]",
+        };
+        let plan = engine.job_command(&meta, start_turn).expect("start plan");
+        assert_eq!(plan.program, PathBuf::from("/usr/local/bin/agy"));
+        assert_eq!(plan.stdin, StdinMode::Null);
+        assert!(!plan.pty);
+        assert!(plan
+            .args
+            .contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(plan.args.contains(&"--mode".to_string()));
+        assert!(plan.args.contains(&"accept-edits".to_string()));
+        assert!(plan.args.contains(&"--output-format".to_string()));
+        assert!(plan.args.contains(&"stream-json".to_string()));
+        assert!(plan.args.contains(&"-p".to_string()));
+        assert!(plan
+            .args
+            .contains(&"Test prompt [agent-run ref test-job-agy#0]".to_string()));
+
+        // Resume turn
+        let resume_turn = TurnInput::Resume {
+            prompt: "Next turn [agent-run ref test-job-agy#1]",
+            conversation: Some("conv-1234"),
+        };
+        let plan_resume = engine.job_command(&meta, resume_turn).expect("resume plan");
+        assert_eq!(plan_resume.program, PathBuf::from("/usr/local/bin/agy"));
+        assert_eq!(plan_resume.stdin, StdinMode::Null);
+        assert!(plan_resume.args.contains(&"--conversation".to_string()));
+        assert!(plan_resume.args.contains(&"conv-1234".to_string()));
+        assert!(plan_resume.args.contains(&"-p".to_string()));
+        assert!(plan_resume
+            .args
+            .contains(&"Next turn [agent-run ref test-job-agy#1]".to_string()));
+    }
+
+    #[test]
+    fn test_exact_launch_plan_claude_start_and_resume() {
+        let config = Config {
+            agy_path: PathBuf::from("/usr/local/bin/agy"),
+            claude_path: PathBuf::from("/usr/local/bin/claude"),
+            ..Default::default()
+        };
+        let registry = EngineRegistry::with_builtin(&config);
+        let mut meta = test_meta_overrides();
+        meta.job_id = "test-job-claude".to_string();
+        meta.mode = "normal".to_string();
+        meta.engine = Some("claude".to_string());
+
+        let engine = registry.for_job(&meta).expect("engine for claude");
+
+        // Start turn
+        let start_turn = TurnInput::Start {
+            prompt: "Hello claude",
+        };
+        let plan = engine.job_command(&meta, start_turn).expect("start plan");
+        assert_eq!(plan.program, PathBuf::from("/usr/local/bin/claude"));
+        assert!(plan.args.contains(&"--input-format".to_string()));
+        assert!(plan.args.contains(&"stream-json".to_string()));
+        assert!(plan.args.contains(&"--output-format".to_string()));
+        assert!(plan.args.contains(&"stream-json".to_string()));
+        assert!(plan.args.contains(&"--verbose".to_string()));
+
+        match &plan.stdin {
+            StdinMode::Pipe { first_line } => {
+                let line = first_line.as_deref().expect("first line present");
+                assert!(line.contains("Hello claude"));
+                assert!(
+                    line.ends_with('\n'),
+                    "claude prompt line must end with newline"
+                );
+            }
+            _ => panic!("claude must use StdinMode::Pipe"),
+        }
+
+        // Resume turn
+        let resume_turn = TurnInput::Resume {
+            prompt: "Continue work",
+            conversation: Some("sess-9876"),
+        };
+        let plan_resume = engine.job_command(&meta, resume_turn).expect("resume plan");
+        assert_eq!(plan_resume.program, PathBuf::from("/usr/local/bin/claude"));
+        assert!(plan_resume.args.contains(&"--resume".to_string()));
+        assert!(plan_resume.args.contains(&"sess-9876".to_string()));
+        match &plan_resume.stdin {
+            StdinMode::Pipe { first_line } => {
+                let line = first_line.as_deref().expect("first line present");
+                assert!(line.contains("Continue work"));
+                assert!(
+                    line.ends_with('\n'),
+                    "claude resume prompt line must end with newline"
+                );
+            }
+            _ => panic!("claude resume must use StdinMode::Pipe"),
+        }
+    }
+
+    #[test]
+    fn test_claude_job_command_preserves_prompt_with_fake_markers_and_cwd() {
+        let config = Config {
+            claude_path: PathBuf::from("/usr/local/bin/claude"),
+            ..Default::default()
+        };
+        let registry = EngineRegistry::with_builtin(&config);
+        let mut meta = test_meta_overrides();
+        meta.job_id = "test-job-markers".to_string();
+        meta.engine = Some("claude".to_string());
+        meta.worktree_path = PathBuf::from("/workspace/test-wt");
+
+        let engine = registry.for_job(&meta).expect("engine for claude");
+
+        let turn = TurnInput::Start {
+            prompt: "FAKE_FAIL FAKE_WRITE=result.txt claude prompt",
+        };
+        let plan = engine.job_command(&meta, turn).expect("plan");
+
+        match &plan.stdin {
+            StdinMode::Pipe { first_line } => {
+                let line = first_line.as_deref().expect("first line");
+                assert!(line.contains("FAKE_FAIL"));
+                assert!(line.contains("FAKE_WRITE=result.txt"));
+                assert!(line.ends_with('\n'));
+            }
+            _ => panic!("expected StdinMode::Pipe"),
+        }
+
+        // Verify sandboxed execution plan wraps with worktree path preserved
+        let (cmd, policy_path, _) = sandboxed(plan, &config, &meta).expect("sandboxed command");
+        assert_eq!(cmd.get_current_dir(), None); // Command current_dir is applied on spawn_cmd in run_internal_runner
+        assert!(policy_path.to_string_lossy().contains("test-job-markers"));
     }
 }

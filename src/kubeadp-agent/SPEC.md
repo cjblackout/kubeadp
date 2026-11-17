@@ -257,6 +257,10 @@ and secrets.
   engine. `EngineError::Unsupported` (`501`, `code:"unsupported"`) stays in the
   error mapping only as a defect signal; the conformance suite (§12.6) fails an
   engine that produces it.
+- **Engine trait launch methods**: The engine trait exposes `job_command(job, turn) -> Result<LaunchPlan, EngineError>`
+  and `classify_exit(exit, log_tail) -> JobStatus` and `conversation_id(job) -> Option<ContextId>`.
+  Engines build their exact argv, env, stdin mode and PTY requirements into `LaunchPlan`.
+  No launcher or command outside the engine may branch on an engine name.
 
 ### 3.2 agy engine (`"agy"`)
 - **Job mode** delegates to the core commands and runner: byte-identical job

@@ -113,6 +113,38 @@ impl Engine for FakeEngine {
         Ok(())
     }
 
+    fn job_command(
+        &self,
+        job: &kubeadp_agent::core::job::JobMetadata,
+        _turn: kubeadp_agent::engine::TurnInput<'_>,
+    ) -> Result<kubeadp_agent::engine::LaunchPlan, EngineError> {
+        Ok(kubeadp_agent::engine::LaunchPlan {
+            program: std::path::PathBuf::from("/bin/true"),
+            args: vec![job.job_id.clone()],
+            env: Vec::new(),
+            stdin: kubeadp_agent::engine::StdinMode::Null,
+            pty: false,
+        })
+    }
+
+    fn classify_exit(
+        &self,
+        exit: kubeadp_agent::engine::ExitInfo,
+        _log_tail: &[u8],
+    ) -> kubeadp_agent::core::job::JobStatus {
+        match exit.code {
+            Some(0) => kubeadp_agent::core::job::JobStatus::Done,
+            _ => kubeadp_agent::core::job::JobStatus::Failed,
+        }
+    }
+
+    fn conversation_id(
+        &self,
+        job: &kubeadp_agent::core::job::JobMetadata,
+    ) -> Option<kubeadp_agent::engine::ContextId> {
+        job.conversation_id.clone()
+    }
+
     async fn interrupt(&self, run: &Run) -> Result<(), EngineError> {
         self.kills.lock().unwrap().push(run.id.clone());
         Ok(())

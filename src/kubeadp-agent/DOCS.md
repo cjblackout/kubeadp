@@ -53,6 +53,13 @@ Run statuses: `pending`, `starting`, `running`, `backoff`, `paused`, `stopped`, 
   - `pty_remote_control`: Interactive PTY process group.
   - `stream_json`: Headless JSON streaming via standard input/output.
 
+### 2.2.1 Launch Plan and Trait Methods
+
+Engines build their process launch parameters through the `Engine` trait:
+- `job_command(job, turn) -> Result<LaunchPlan, EngineError>`: Emits a `LaunchPlan` specifying executable program, arguments, environment variables, `StdinMode` (`Null` or `Pipe { first_line }`), and pseudo-terminal allocation (`pty`).
+- `classify_exit(exit, log_tail) -> JobStatus`: Interprets process exit code/signals and output log tail according to the engine's status taxonomy.
+- `conversation_id(job) -> Option<ContextId>`: Extracts the engine's conversation/session identifier from job metadata or execution logs.
+
 ### 2.3 Engine Selection Precedence
 
 Engine resolution follows a strict three-tier precedence:

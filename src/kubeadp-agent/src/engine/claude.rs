@@ -12,14 +12,20 @@
 //! Nothing routes through the trait yet (E1 state): this is the engine-side
 //! implementation that E3/E5 wire the endpoint layer onto.
 
+use crate::core::job::{JobMetadata, JobStatus};
 use crate::engine::capability::CapabilityTable;
 use crate::engine::claude::session_pty::ClaudePtyAdapter;
 use crate::engine::claude::stream_json::{
     parse_result_session_id, parse_stream_json_line, render_text_request, stream_events,
     StreamJsonArgs, StreamJsonMode,
 };
-use crate::engine::run::{ContextId, EngineEvent, EngineId, Run, RunId, RunKind, RunStatus};
-use crate::engine::{Engine, EngineCtx, EngineError, JobSpec, SessionSpec, Transport};
+use crate::engine::run::{
+    ContextId, EngineEvent, EngineId, ExitInfo, Run, RunId, RunKind, RunStatus,
+};
+use crate::engine::{
+    Engine, EngineCtx, EngineError, JobSpec, LaunchPlan, SessionSpec, StdinMode, Transport,
+    TurnInput,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -443,6 +449,75 @@ impl Engine for ClaudeEngine {
     async fn stop_session(&self, run: &Run, restart: bool) -> Result<(), EngineError> {
         let adapter = self.adapter("session.stop")?;
         adapter.stop(&run.id, restart)
+    }
+
+    fn job_command(
+        &self,
+        job: &JobMetadata,
+        turn: TurnInput<'_>,
+    ) -> Result<LaunchPlan, EngineError> {
+        let mut args: Vec<String> = vec![
+            "--dangerously-skip-permissions".to_string(),
+            "-p".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+        ];
+
+        if job.mode.eq_ignore_ascii_case("plan") {
+            args.push("--permission-mode".to_string());
+            args.push("plan".to_string());
+        }
+
+        if let Some(m) = &job.model {
+            args.push("--model".to_string());
+            args.push(m.clone());
+        }
+
+        let prompt = match turn {
+            TurnInput::Start { prompt } => prompt,
+            TurnInput::Resume {
+                prompt,
+                conversation,
+            } => {
+                if let Some(conv_id) = conversation {
+                    args.push("--resume".to_string());
+                    args.push(conv_id.to_string());
+                }
+                prompt
+            }
+        };
+
+        let mut first_line = render_text_request(prompt);
+        if !first_line.ends_with('\n') {
+            first_line.push('\n');
+        }
+
+        Ok(LaunchPlan {
+            program: self.binary.clone(),
+            args,
+            env: Vec::new(),
+            stdin: StdinMode::Pipe {
+                first_line: Some(first_line),
+            },
+            pty: false,
+        })
+    }
+
+    fn classify_exit(&self, exit: ExitInfo, log_tail: &[u8]) -> JobStatus {
+        let log = String::from_utf8_lossy(log_tail);
+        crate::core::job::determine_status_from_claude(exit.code, &log)
+    }
+
+    fn conversation_id(&self, job: &JobMetadata) -> Option<ContextId> {
+        if let Some(ref conv_id) = job.conversation_id {
+            if !conv_id.trim().is_empty() {
+                return Some(conv_id.clone());
+            }
+        }
+        None
     }
 
     async fn events(&self, run: &Run, after: u64) -> Result<Vec<EngineEvent>, EngineError> {
@@ -964,5 +1039,216 @@ exit 0
             matches!(err, Err(EngineError::Conflict(_))),
             "second start for the same workdir must conflict, got {err:?}"
         );
+    }
+
+    fn test_job_meta(job_id: &str, wt: &Path) -> JobMetadata {
+        JobMetadata {
+            job_id: job_id.to_string(),
+            project: "homelab".to_string(),
+            prompt: "task prompt".to_string(),
+            resolved_prompt: "task prompt".to_string(),
+            model: None,
+            effort: None,
+            sandbox: false,
+            mode: "normal".to_string(),
+            add_dirs: Vec::new(),
+            print_timeout: None,
+            created_at: chrono::Utc::now(),
+            worktree_path: wt.to_path_buf(),
+            branch: "b".to_string(),
+            base_ref: "HEAD".to_string(),
+            conversation_id: None,
+            retry_count: 0,
+            pid: None,
+            exit_code: None,
+            status: None,
+            hindsight: None,
+            auto_recall: None,
+            auto_retain: None,
+            retry_prompt: None,
+            read_only: false,
+            external_worktree: false,
+            pid_start_time: None,
+            hindsight_bank: None,
+            proxy: None,
+            max_runtime: None,
+            started_at: None,
+            hindsight_query: None,
+            sandbox_info: None,
+            engine: Some("claude".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_claude_job_command_start_normal_pinned() {
+        use std::path::{Path, PathBuf};
+        let engine = ClaudeEngine::new(PathBuf::from("/usr/local/bin/claude"), None);
+        let mut meta = test_job_meta("claude-start-1", Path::new("/tmp/claude-wt"));
+        meta.mode = "normal".to_string();
+        meta.model = Some("claude-3-5-sonnet-20241022".to_string());
+
+        let plan = engine
+            .job_command(
+                &meta,
+                TurnInput::Start {
+                    prompt: "implement feature X",
+                },
+            )
+            .expect("plan");
+
+        assert_eq!(plan.program, PathBuf::from("/usr/local/bin/claude"));
+        assert_eq!(
+            plan.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--model",
+                "claude-3-5-sonnet-20241022",
+            ]
+        );
+        assert_eq!(plan.env, Vec::<(String, String)>::new());
+        let mut expected_json = render_text_request("implement feature X");
+        expected_json.push('\n');
+        assert_eq!(
+            plan.stdin,
+            StdinMode::Pipe {
+                first_line: Some(expected_json),
+            }
+        );
+        assert!(!plan.pty);
+    }
+
+    #[test]
+    fn test_claude_job_command_plan_mode_pinned() {
+        use std::path::{Path, PathBuf};
+        let engine = ClaudeEngine::new(PathBuf::from("/usr/local/bin/claude"), None);
+        let mut meta = test_job_meta("claude-plan-1", Path::new("/tmp/claude-wt"));
+        meta.mode = "plan".to_string();
+
+        let plan = engine
+            .job_command(
+                &meta,
+                TurnInput::Start {
+                    prompt: "investigate issue",
+                },
+            )
+            .expect("plan");
+
+        assert_eq!(
+            plan.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--permission-mode",
+                "plan",
+            ]
+        );
+        let mut expected_json = render_text_request("investigate issue");
+        expected_json.push('\n');
+        assert_eq!(
+            plan.stdin,
+            StdinMode::Pipe {
+                first_line: Some(expected_json),
+            }
+        );
+    }
+
+    #[test]
+    fn test_claude_job_command_resume_pinned() {
+        use std::path::{Path, PathBuf};
+        let engine = ClaudeEngine::new(PathBuf::from("/usr/local/bin/claude"), None);
+        let meta = test_job_meta("claude-resume-1", Path::new("/tmp/claude-wt"));
+
+        let plan = engine
+            .job_command(
+                &meta,
+                TurnInput::Resume {
+                    prompt: "continue with next step",
+                    conversation: Some("sess-uuid-789"),
+                },
+            )
+            .expect("plan");
+
+        assert_eq!(
+            plan.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--resume",
+                "sess-uuid-789",
+            ]
+        );
+        let mut expected_json = render_text_request("continue with next step");
+        expected_json.push('\n');
+        assert_eq!(
+            plan.stdin,
+            StdinMode::Pipe {
+                first_line: Some(expected_json),
+            }
+        );
+    }
+
+    #[test]
+    fn test_claude_classify_exit_and_conversation_id() {
+        use std::path::{Path, PathBuf};
+        let engine = ClaudeEngine::new(PathBuf::from("/usr/local/bin/claude"), None);
+
+        let exit_0 = ExitInfo {
+            code: Some(0),
+            signal: None,
+        };
+        let exit_1 = ExitInfo {
+            code: Some(1),
+            signal: None,
+        };
+        let exit_137 = ExitInfo {
+            code: Some(137),
+            signal: None,
+        };
+
+        assert_eq!(
+            engine.classify_exit(exit_137, b""),
+            JobStatus::SelfTerminated
+        );
+
+        let result_ok = b"{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}\n";
+        assert_eq!(engine.classify_exit(exit_0, result_ok), JobStatus::Done);
+
+        let result_err = b"{\"type\":\"result\",\"subtype\":\"error\",\"error\":\"bad\"}\n";
+        assert_eq!(engine.classify_exit(exit_1, result_err), JobStatus::Failed);
+
+        // Also test error result line with result field (auth fail shape), quota line, etc.
+        let result_authfail = b"{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"result\":\"Failed to authenticate: OAuth session expired\"}\n";
+        assert_eq!(
+            engine.classify_exit(exit_1, result_authfail),
+            JobStatus::Failed
+        );
+
+        let result_quota = b"{\"type\":\"result\",\"subtype\":\"error\",\"error\":\"upstream 429 resource_exhausted: rate limit exceeded\"}\n";
+        assert_eq!(
+            engine.classify_exit(exit_1, result_quota),
+            JobStatus::QuotaExhausted
+        );
+
+        let mut meta = test_job_meta("meta-conv", Path::new("/tmp/wt"));
+        assert_eq!(engine.conversation_id(&meta), None);
+
+        meta.conversation_id = Some("sess-999".to_string());
+        assert_eq!(engine.conversation_id(&meta).as_deref(), Some("sess-999"));
     }
 }

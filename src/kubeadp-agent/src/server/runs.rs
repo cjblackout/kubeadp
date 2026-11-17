@@ -504,6 +504,35 @@ mod tests {
         async fn stop_session(&self, _run: &Run, _restart: bool) -> Result<(), EngineError> {
             Ok(())
         }
+        fn job_command(
+            &self,
+            job: &crate::core::job::JobMetadata,
+            _turn: crate::engine::TurnInput<'_>,
+        ) -> Result<crate::engine::LaunchPlan, EngineError> {
+            Ok(crate::engine::LaunchPlan {
+                program: std::path::PathBuf::from("/bin/true"),
+                args: vec![job.job_id.clone()],
+                env: Vec::new(),
+                stdin: crate::engine::StdinMode::Null,
+                pty: false,
+            })
+        }
+        fn classify_exit(
+            &self,
+            exit: crate::engine::run::ExitInfo,
+            _log_tail: &[u8],
+        ) -> crate::core::job::JobStatus {
+            match exit.code {
+                Some(0) => crate::core::job::JobStatus::Done,
+                _ => crate::core::job::JobStatus::Failed,
+            }
+        }
+        fn conversation_id(
+            &self,
+            job: &crate::core::job::JobMetadata,
+        ) -> Option<crate::engine::ContextId> {
+            job.conversation_id.clone()
+        }
         async fn pause(&self, _run: &Run, _paused: bool) -> Result<(), EngineError> {
             Ok(())
         }
