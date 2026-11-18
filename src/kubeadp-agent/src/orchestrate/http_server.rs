@@ -30,7 +30,7 @@ use crate::orchestrate::server::RemoteControlState;
 use crate::orchestrate::session_control::SessionControlRegistry;
 use crate::orchestrate::session_log::SessionLogs;
 use crate::orchestrate::state::SupervisorState;
-use crate::server::sessions::{bearer_token_from_env, router as sessions_router, SessionsApiState};
+use crate::server::sessions::{bearer_token_from_env, SessionsApiState};
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:8002";
 
@@ -115,7 +115,7 @@ pub fn build_router(
     };
 
     let api_state = SessionsApiState::new(state.clone(), controls.clone(), session_logs);
-    let sessions = sessions_router(api_state.clone());
+    let base = crate::server::router_with_sessions(base, Some(api_state.clone()));
     // The operator bearer token guards the WHOLE /api/v1 group (agent-run AND
     // sessions routes) plus, under `a2a`, the A2A routes. It is resolved once
     // at startup: the raw value lives only long enough to be hashed into the
@@ -202,7 +202,7 @@ pub fn build_router(
         })
     };
 
-    let app = base.merge(sessions);
+    let app = base;
     // The operator bearer layer guards `/api/v1` (and `/metrics`) only. The A2A
     // routes carry their own authentication layer (operator bearer OR a
     // jobset credential, plus the public agent card), so they are merged

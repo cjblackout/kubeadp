@@ -247,12 +247,15 @@ and secrets.
   an engine name; engine-specific behaviour lives behind the trait.
 - Every role registers every engine built into the image (`agy`, `claude`). The
   registry maps ids to engines, each wrapped in the emulation layer (§3.5);
-  `resolve` returns `UnknownEngine` for an unknown id.
+  `resolve(kind, request, configured)` returns `UnknownEngine` for an unknown id.
 - Selection precedence, per run: explicit request (`--engine` / `engine` in the
   job body; `engine` in the session definition) > configured default
   (`default_engine` for jobs, `default_session_engine` for sessions) > built-in
   default (`agy` for jobs, `claude` for sessions). The built-in default depends
-  on the run kind only, never on the role.
+  on the run kind only, never on the role (`PodRole` parameter removed from `resolve`).
+- Sessions API endpoints (`/api/v1/sessions/*`) are mounted dynamically via
+  `router_with_sessions` in any process that runs a session supervisor (`SessionsApiState`
+  present), rather than by static role checks.
 - The resolved engine is persisted with the run (`jobs.engine`,
   `session_state.engine`) and never changes for the life of the run: retry,
   resume and restart use the stored engine.
@@ -332,7 +335,7 @@ and secrets.
 | `session.log` | — | Y | emulated | native |
 | `session.message` | — | Y | emulated | native |
 | `interrupt` | Y | Y | emulated | emulated |
-| `pause` | Y | Y | native | emulated |
+| `pause` | Y | Y | emulated | emulated |
 | `fork` | Y | Y | emulated | emulated |
 | `compact` | Y | Y | emulated | emulated |
 | `revert` | Y | Y | emulated | emulated |
@@ -1886,11 +1889,11 @@ section is outstanding.
 | claude sessions (`pty_remote_control`), agy sessions (live stream-json) | partial | work on the orchestrator; the session supervisor branches on the engine name; claude `stream_json` sessions planned |
 | engine persisted per run and used by retry/restart | implemented | |
 | built-in default by run kind only | implemented | |
-| capability table of §3.4 | partial | `a2a.send_message` is `emulated` for both engines and `permissions` is `unsupported` for both; the raw claude table reports `interrupt`/`pause`/`fork`/`compact`/`revert`/`todo` `unsupported` until the worker arms the emulation layer, while the agy table declares the same set `emulated` from the start |
-| no `501` because of the engine | implemented | the worker arms the emulation layer for every control endpoint each engine lacks, so no `/api/v1` control route answers `501` because of the engine; an `unsupported` endpoint still answers the typed `501` by contract |
+| capability table of §3.4 | implemented | implemented capability tables match §3.4: `claude` gets native `job.list`/`job.kill`/`job.result`/`workspace.*`, `interrupt`/`pause`/`fork` emulated for both engines; only `permissions` remains `unsupported` |
+| no `501` because of the engine | implemented | the worker arms the emulation layer for every control endpoint each engine lacks, so no `/api/v1` control route answers `501` because of the engine; run-control route handlers have no hard-coded 501 arm (answers through capability check) |
 | run-control routes resolving real jobs and sessions | implemented | run-control routes resolve real jobs and sessions through `RunRegistry` backed by SQLite and `run_meta` |
 | `fork` creating a run | implemented | the job surface clones the source worktree and returns the new run id |
-| `permissions` route | planned | the capability key exists; no HTTP handler |
+| `permissions` route | implemented | `GET /api/v1/runs/{run_id}/permissions` and `GET /api/v1/jobs/{job_id}/permissions` return `{"permissions": []}` for engines whose capability is `unsupported` |
 | queue of §3.6 in the `inbox` table | implemented | queued messages in `a2a_message` table with sender `api` |
 | conformance suite (§12.6) | implemented | |
 

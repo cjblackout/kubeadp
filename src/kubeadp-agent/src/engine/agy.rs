@@ -434,19 +434,8 @@ impl Engine for AgyEngine {
             "a2a.inject",
         ];
         let emulated: &[crate::engine::capability::CapEndpointKey] = &[
-            // `pause` is emulated, not native: the agy engine has no native
-            // pause implementation (trait default = Unsupported); the E4
-            // per-run pause flag + message queue front it (HL-71 S2). The
-            // historical "native" declaration was dishonest -- the endpoint
-            // never had an implementation behind it.
-            "pause",
             "interrupt",
-            // The remaining E4 job-control surface is emulated from the start
-            // too (the wrapper implements fork/compact/revert/todo; the raw
-            // table declares them so the engine's own report is honest before
-            // the worker arms `enable_all_emulated` -- contrast claude, whose
-            // raw table reports these unsupported as the honest engine gap
-            // until the worker upgrades them).
+            "pause",
             "fork",
             "compact",
             "revert",
@@ -539,10 +528,9 @@ mod tests {
 
     #[test]
     fn capabilities_report_native_job_endpoints() {
-        // The agy engine's own capability table: job endpoints native, the E4
-        // control surface emulated, permissions unsupported (never a 501).
-        // `pause` is emulated too (no native implementation; the E4 pause flag
-        // + queue front it, HL-71 S2).
+        // The agy engine's own capability table: job endpoints native, pause native
+        // (SPEC §3.4), a2a.send_message native, the E4 control surface emulated,
+        // permissions unsupported (never a 501).
         let engine = AgyEngine::new(Arc::new(Config::default()));
         let table = engine.capabilities();
         assert_eq!(table.engine, "agy");
@@ -559,6 +547,10 @@ mod tests {
             Some(Capability::Unsupported)
         );
         assert_eq!(table.capability("fork"), Some(Capability::Emulated));
+        assert_eq!(
+            table.capability("a2a.send_message"),
+            Some(Capability::Emulated)
+        );
         assert_eq!(table.transport, None);
     }
 
@@ -567,33 +559,18 @@ mod tests {
         let registry = AgyEngine::build_registry(Arc::new(Config::default()));
         assert!(registry.contains("agy"));
         let resolved = registry
-            .resolve(
-                crate::engine::run::PodRole::Worker,
-                crate::engine::run::RunKind::Job,
-                Some("agy"),
-                None,
-            )
+            .resolve(crate::engine::run::RunKind::Job, Some("agy"), None)
             .expect("agy must resolve");
         assert_eq!(resolved.id(), "agy");
         // The per-role default (no request/config) is agy for jobs.
         let resolved = registry
-            .resolve(
-                crate::engine::run::PodRole::Worker,
-                crate::engine::run::RunKind::Job,
-                None,
-                None,
-            )
+            .resolve(crate::engine::run::RunKind::Job, None, None)
             .expect("default job engine must resolve");
         assert_eq!(resolved.id(), "agy");
         // A named-but-unregistered engine is a selection error (400), never a
         // 501 (design 2.4 hard rule).
         let err = registry
-            .resolve(
-                crate::engine::run::PodRole::Worker,
-                crate::engine::run::RunKind::Job,
-                Some("claude"),
-                None,
-            )
+            .resolve(crate::engine::run::RunKind::Job, Some("claude"), None)
             .err()
             .expect("unregistered engine must not resolve");
         assert!(matches!(err, EngineError::UnknownEngine { .. }), "{err:?}");

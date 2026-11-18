@@ -827,9 +827,9 @@ mod tests {
             Arc::new(crate::core::config::Config::default()),
             Arc::new(crate::core::auth::AuthManager::new()),
         );
-        let sess = router(api_state());
+        let app = crate::server::router_with_sessions(base, Some(api_state()));
         crate::server::obs::add_observability(
-            base.merge(sess),
+            app,
             crate::server::auth::AuthState::token(token.to_string()),
             Arc::new(|| Ok(())),
             Arc::new(Vec::new),
@@ -841,9 +841,9 @@ mod tests {
             Arc::new(crate::core::config::Config::default()),
             Arc::new(crate::core::auth::AuthManager::new()),
         );
-        let sess = router(api_state());
+        let app = crate::server::router_with_sessions(base, Some(api_state()));
         crate::server::obs::add_observability(
-            base.merge(sess),
+            app,
             crate::server::auth::AuthState::none(),
             Arc::new(|| Ok(())),
             Arc::new(Vec::new),
@@ -905,6 +905,31 @@ mod tests {
             let res = app.clone().oneshot(get_request(uri)).await.unwrap();
             assert_eq!(res.status(), StatusCode::OK, "GET {uri} must stay open");
         }
+    }
+
+    #[tokio::test]
+    async fn test_sessions_routes_omitted_without_supervisor_state() {
+        // When no SessionsApiState is attached (None), sessions routes are not mounted and answer 404.
+        let base = crate::server::router(
+            Arc::new(crate::core::config::Config::default()),
+            Arc::new(crate::core::auth::AuthManager::new()),
+        );
+        let app = crate::server::router_with_sessions(base, None);
+        let app = crate::server::obs::add_observability(
+            app,
+            crate::server::auth::AuthState::none(),
+            Arc::new(|| Ok(())),
+            Arc::new(Vec::new),
+        );
+        let res = app
+            .clone()
+            .oneshot(get_request("/api/v1/sessions"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        // Standard API endpoints like /api/v1/jobs remain accessible.
+        let res_jobs = app.oneshot(get_request("/api/v1/jobs")).await.unwrap();
+        assert_eq!(res_jobs.status(), StatusCode::OK);
     }
 
     #[tokio::test]

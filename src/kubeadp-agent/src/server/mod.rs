@@ -149,6 +149,7 @@ pub fn router_with_rc(
         .route("/runs/{run_id}/fork", post(runs::fork_run))
         .route("/runs/{run_id}/revert", post(runs::revert_run))
         .route("/runs/{run_id}/todo", get(runs::todo_run))
+        .route("/runs/{run_id}/permissions", get(runs::permissions_run))
         .layer(Extension(Arc::new(crate::state::RunRegistry::lazy(
             &state.state_root,
         ))))
@@ -172,6 +173,20 @@ pub fn router_with_engines(
 ) -> Router {
     let runs = Arc::new(crate::state::RunRegistry::lazy(&state.state_root));
     router_with_engines_and_runs(state, auth, rc_state, engines, runs)
+}
+
+/// Extends a router with the `/api/v1/sessions` supervisor endpoints when a
+/// supervisor handle (`SessionsApiState`) is provided. If `None`, the sessions
+/// routes are not mounted.
+pub fn router_with_sessions(
+    router: Router,
+    sessions_state: Option<Arc<sessions::SessionsApiState>>,
+) -> Router {
+    if let Some(state) = sessions_state {
+        router.merge(sessions::router(state))
+    } else {
+        router
+    }
 }
 
 #[cfg(feature = "engine")]
@@ -229,6 +244,7 @@ pub fn router_with_engines_and_runs(
         .route("/runs/{run_id}/fork", post(runs::fork_run))
         .route("/runs/{run_id}/revert", post(runs::revert_run))
         .route("/runs/{run_id}/todo", get(runs::todo_run))
+        .route("/runs/{run_id}/permissions", get(runs::permissions_run))
         // HL-71 S2: the job-scoped run-control surface (the production
         // counterpart of the run routes -- the run registry resolves no runs
         // in production, but a job row always resolves). Each endpoint gates
@@ -242,6 +258,7 @@ pub fn router_with_engines_and_runs(
         .route("/jobs/{job_id}/fork", post(runs::fork_job))
         .route("/jobs/{job_id}/revert", post(runs::revert_job))
         .route("/jobs/{job_id}/todo", get(runs::todo_job))
+        .route("/jobs/{job_id}/permissions", get(runs::permissions_job))
         .layer(Extension(runs))
         .fallback(api_v1_not_found)
         .with_state(state.clone())
@@ -725,7 +742,6 @@ async fn start_job(
     // precedence -- request (`engine` in the body) > configured default
     // (`default_engine` / `AGENT_RUN_DEFAULT_ENGINE`) > per-role default.
     let resolved_engine = engines.resolve(
-        crate::engine::PodRole::Worker,
         crate::engine::RunKind::Job,
         req.engine.as_deref(),
         config.default_engine.as_deref(),

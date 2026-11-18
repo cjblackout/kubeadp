@@ -65,12 +65,14 @@ Engines build their process launch parameters through the `Engine` trait:
 
 ### 2.3 Engine Selection Precedence
 
-Engine resolution follows a strict three-tier precedence:
-1. **Explicit Request**: Specified via `--engine <name>` on `agent-run start` or the `engine` string in `POST /api/v1/jobs`.
-2. **Configuration**: Configured via `default_engine` (worker) or `default_session_engine` (orchestrator).
-3. **Role Default**: Falls back to `agy` for jobs and `claude` for sessions.
+Engine resolution (`EngineRegistry::resolve(kind, request, configured)`) follows a strict three-tier precedence independent of pod role:
+1. **Explicit Request**: Specified via `--engine <name>` on `agent-run start`, the `engine` string in `POST /api/v1/jobs`, or the `engine` field in a session definition.
+2. **Configuration**: Configured via `default_engine` (for jobs) or `default_session_engine` (for sessions).
+3. **Kind Default**: Built-in fallback defaulting to `agy` for `RunKind::Job` and `claude` for `RunKind::Session`.
 
 If an unknown or unregistered engine identifier is requested, the API returns HTTP 400 (`{"code": "unknown_engine"}`). If a known engine lacks support for the requested operation, the API returns HTTP 501 (`{"code": "unsupported", "engine": "<name>"}`).
+
+Sessions API endpoints (`/api/v1/sessions/*`) are dynamically attached via `router_with_sessions` in any process running a session supervisor (`SessionsApiState` provided), remaining unmounted (returning 404) in worker-only runtimes lacking a session supervisor.
 
 ### 2.4 Capabilities and Endpoint Emulation
 
@@ -99,7 +101,7 @@ Endpoints are classified as `native`, `emulated`, or `unsupported`:
 | `workspace.*` | Yes | Yes | Native | Native | File inspection, diff, cat |
 | `a2a.send_message` | Yes | Yes | Emulated | Emulated | Sends outbound A2A message (queued to `.engine-message-queue` on the job surface) |
 | `a2a.inject` | Yes | Yes | Native | Native | Harness injects inbound A2A messages into the model context |
-| `permissions` | Yes | Yes | Unsupported | Unsupported | No `Engine` trait method; reported Unsupported, never a 501 |
+| `permissions` | Yes | Yes | Unsupported | Unsupported | Returns `{"permissions": []}` (headless auto-approve); never a 501 |
 
 > The `interrupt`/`pause`/`fork`/`a2a.send_message` rows above show the
 > *effective* (post-S2 emulation) values. SPEC.md §5.5, a locked normative
@@ -107,7 +109,11 @@ Endpoints are classified as `native`, `emulated`, or `unsupported`:
 > `agy.fork` (unsupported), `claude.interrupt` (native), `claude.pause`
 > (unsupported), `claude.fork` (unsupported) and `claude.a2a.send_message`
 > (native); those SPEC.md rows are the KNOWN_GAPS the conformance suite pins
-> (see §8) and are not edited here.
+> (see §8) and are not edited here. In SPEC.md §3.4, the normative table matches:
+> claude has native `job.list`, `job.kill`, `job.result`, and `workspace.*`;
+> `interrupt`, `pause`, and `fork` are emulated for both engines; `permissions`
+> route answers 200 with an empty list; run-control route handlers have no
+> hard-coded 501 arm.
 
 #### Emulation Mechanisms
 

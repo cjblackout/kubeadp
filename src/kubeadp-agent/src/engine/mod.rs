@@ -286,7 +286,7 @@ pub struct EngineRegistry {
 impl EngineRegistry {
     /// Resolves the engine for an existing job metadata record.
     pub fn for_job(&self, job: &JobMetadata) -> Result<Arc<dyn Engine>, EngineError> {
-        self.resolve(PodRole::Worker, RunKind::Job, job.engine.as_deref(), None)
+        self.resolve(RunKind::Job, job.engine.as_deref(), None)
     }
 
     /// Creates an engine registry pre-populated with the builtin engines (agy, claude).
@@ -401,15 +401,14 @@ impl EngineRegistry {
         self.engines.values().any(|w| w.config().is_some())
     }
 
-    /// Resolves the engine to use for `kind` and `role`, applying the
-    /// precedence: request field > per-run config > per-role default. A
+    /// Resolves the engine to use for `kind`, applying the
+    /// precedence: request field > per-run config > per-kind default. A
     /// request/config naming an unregistered engine is
     /// [`EngineError::UnknownEngine`] (400 in the endpoint layer) -- the
     /// hard rule of design 2.4 (an unregistered engine is a selection error,
     /// never a 501).
     pub fn resolve(
         &self,
-        role: PodRole,
         kind: RunKind,
         request: Option<&str>,
         configured: Option<&str>,
@@ -420,7 +419,6 @@ impl EngineRegistry {
             None => self.default_for(kind).clone(),
         };
         if let Some(engine) = self.engines.get(&engine_id) {
-            let _ = role;
             let wrapped: Arc<dyn Engine> = engine.clone();
             return Ok(wrapped);
         }
@@ -582,35 +580,33 @@ mod tests {
         let kind = RunKind::Job;
 
         // No request/config: the per-role default ("agy" for jobs) wins.
-        let engine = reg
-            .resolve(PodRole::Worker, kind, None, None)
-            .expect("default resolve");
+        let engine = reg.resolve(kind, None, None).expect("default resolve");
         assert_eq!(engine.id(), "agy");
 
         // Config (level 2) beats the default: "claude" is registered.
         let engine = reg
-            .resolve(PodRole::Worker, kind, None, Some("claude"))
+            .resolve(kind, None, Some("claude"))
             .expect("config resolve");
         assert_eq!(engine.id(), "claude");
 
         // Request (level 1) beats config.
         let engine = reg
-            .resolve(PodRole::Worker, kind, Some("agy"), Some("claude"))
+            .resolve(kind, Some("agy"), Some("claude"))
             .expect("request resolve");
         assert_eq!(engine.id(), "agy");
     }
 
     #[test]
-    fn resolve_per_role_session_default() {
+    fn resolve_per_kind_session_default() {
         let reg = registry_with_defaults();
-        // Sessions default to "claude"; the orchestrator can still pick agy
+        // Sessions default to "claude"; callers can still pick agy
         // explicitly (any role, any engine).
         let engine = reg
-            .resolve(PodRole::Orchestrator, RunKind::Session, None, None)
+            .resolve(RunKind::Session, None, None)
             .expect("session default");
         assert_eq!(engine.id(), "claude");
         let engine = reg
-            .resolve(PodRole::Orchestrator, RunKind::Session, Some("agy"), None)
+            .resolve(RunKind::Session, Some("agy"), None)
             .expect("explicit session engine");
         assert_eq!(engine.id(), "agy");
     }
@@ -619,7 +615,7 @@ mod tests {
     fn resolve_unknown_engine_is_unknown_engine_not_unsupported() {
         let reg = registry_with_defaults();
         let err = reg
-            .resolve(PodRole::Worker, RunKind::Job, Some("bogus"), None)
+            .resolve(RunKind::Job, Some("bogus"), None)
             .err()
             .expect("unknown engine must error");
         assert_eq!(
@@ -629,7 +625,7 @@ mod tests {
             }
         );
         let err = reg
-            .resolve(PodRole::Worker, RunKind::Job, None, Some("also-bogus"))
+            .resolve(RunKind::Job, None, Some("also-bogus"))
             .err()
             .expect("unknown config engine must error");
         assert!(matches!(err, EngineError::UnknownEngine { .. }));

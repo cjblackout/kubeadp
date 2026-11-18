@@ -546,4 +546,102 @@ mod tests {
             .native(&["job.start", "no.such.key"])
             .build();
     }
+
+    #[test]
+    fn capability_tables_match_spec_3_4_literal() {
+        // Assert each engine's CapabilityTable equals a literal copy of SPEC §3.4
+        // and that no cell other than permissions is Unsupported.
+        use crate::core::config::Config;
+        use crate::engine::agy::AgyEngine;
+        use crate::engine::claude::ClaudeEngine;
+        use crate::engine::Engine;
+        use std::sync::Arc;
+
+        let agy = AgyEngine::new(Arc::new(Config::default()));
+        let claude = ClaudeEngine::new(std::path::PathBuf::from("claude"), None);
+
+        let agy_table = agy.capabilities();
+        let claude_table = claude.capabilities();
+
+        // SPEC §3.4 literal expected values:
+        let spec_3_4_agy: &[(&str, Capability)] = &[
+            ("job.start", Capability::Native),
+            ("job.status", Capability::Native),
+            ("job.list", Capability::Native),
+            ("job.kill", Capability::Native),
+            ("job.retry", Capability::Native),
+            ("job.events", Capability::Native),
+            ("job.result", Capability::Native),
+            ("session.start", Capability::Emulated),
+            ("session.stop", Capability::Emulated),
+            ("session.restart", Capability::Emulated),
+            ("session.log", Capability::Emulated),
+            ("session.message", Capability::Emulated),
+            ("interrupt", Capability::Emulated),
+            ("pause", Capability::Emulated),
+            ("fork", Capability::Emulated),
+            ("compact", Capability::Emulated),
+            ("revert", Capability::Emulated),
+            ("todo", Capability::Emulated),
+            ("permissions", Capability::Unsupported),
+            ("workspace.*", Capability::Native),
+            ("a2a.send_message", Capability::Emulated),
+            ("a2a.inject", Capability::Native),
+        ];
+
+        let spec_3_4_claude: &[(&str, Capability)] = &[
+            ("job.start", Capability::Native),
+            ("job.status", Capability::Native),
+            ("job.list", Capability::Native),
+            ("job.kill", Capability::Native),
+            ("job.retry", Capability::Native),
+            ("job.events", Capability::Native),
+            ("job.result", Capability::Native),
+            ("session.start", Capability::Native),
+            ("session.stop", Capability::Native),
+            ("session.restart", Capability::Native),
+            ("session.log", Capability::Native),
+            ("session.message", Capability::Native),
+            ("interrupt", Capability::Emulated),
+            ("pause", Capability::Emulated),
+            ("fork", Capability::Emulated),
+            ("compact", Capability::Emulated),
+            ("revert", Capability::Emulated),
+            ("todo", Capability::Emulated),
+            ("permissions", Capability::Unsupported),
+            ("workspace.*", Capability::Native),
+            ("a2a.send_message", Capability::Emulated),
+            ("a2a.inject", Capability::Native),
+        ];
+
+        for (key, expected) in spec_3_4_agy {
+            assert_eq!(
+                agy_table.capability(key),
+                Some(*expected),
+                "agy capability for '{key}' must match SPEC §3.4"
+            );
+            if *key != "permissions" {
+                assert_ne!(
+                    agy_table.capability(key),
+                    Some(Capability::Unsupported),
+                    "no agy cell other than permissions may be Unsupported ('{key}')"
+                );
+            }
+        }
+
+        for (key, expected) in spec_3_4_claude {
+            assert_eq!(
+                claude_table.capability(key),
+                Some(*expected),
+                "claude capability for '{key}' must match SPEC §3.4"
+            );
+            if *key != "permissions" {
+                assert_ne!(
+                    claude_table.capability(key),
+                    Some(Capability::Unsupported),
+                    "no claude cell other than permissions may be Unsupported ('{key}')"
+                );
+            }
+        }
+    }
 }

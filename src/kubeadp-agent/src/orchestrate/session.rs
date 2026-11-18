@@ -785,7 +785,6 @@ fn run_session_iteration(
     let core_config = crate::core::config::Config::load().unwrap_or_default();
     let registry = crate::engine::EngineRegistry::with_builtin(&core_config);
     let eng = match registry.resolve(
-        crate::engine::PodRole::Orchestrator,
         crate::engine::RunKind::Session,
         session.engine.as_deref(),
         default_session_engine.as_deref(),

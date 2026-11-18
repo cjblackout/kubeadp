@@ -235,6 +235,32 @@ pub async fn todo_run(
     }
 }
 
+/// `GET /api/v1/runs/{id}/permissions` -- returns permissions for a run.
+/// For an engine whose capability is `Unsupported`, answers 200 with an empty list
+/// (`{"permissions": []}`). If the run does not exist, answers 404.
+pub async fn permissions_run(
+    Extension(registry): Extension<Arc<EngineRegistry>>,
+    Extension(runs): Extension<Arc<RunRegistry>>,
+    ApiPath(run_id): ApiPath<String>,
+) -> Response {
+    let run = match runs
+        .get(&run_id)
+        .map_err(|e| EngineError::Internal(e.to_string()))
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return crate::engine::errors::to_response(&EngineError::NotFound { run: run_id })
+        }
+        Err(err) => return crate::engine::errors::to_response(&err),
+    };
+    if registry.emulating(&run.engine).is_none() {
+        return crate::engine::errors::to_response(&EngineError::UnknownEngine {
+            engine: run.engine.clone(),
+        });
+    }
+    Json(json!({ "run_id": run_id, "permissions": [] })).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Job-scoped run control (`/api/v1/jobs/{job_id}/...`, HL-71 S2).
 //
@@ -446,6 +472,51 @@ pub async fn todo_job(
         }
         Err(err) => crate::engine::errors::to_response(&err),
     }
+}
+
+/// `GET /api/v1/jobs/{id}/permissions` -- returns permissions for a job.
+/// For an engine whose capability is `Unsupported`, answers 200 with an empty list
+/// (`{"permissions": []}`). If the job does not exist, answers 404.
+pub async fn permissions_job(
+    State(config): State<AppState>,
+    Extension(registry): Extension<Arc<EngineRegistry>>,
+    ApiPath(job_id): ApiPath<String>,
+) -> Response {
+    let meta = match JobMetadata::resolve(&config.state_root, &job_id) {
+        Ok(m) => m,
+        Err(e) => {
+            if let Some(err) = e.downcast_ref::<crate::core::error::AgentRunError>() {
+                if matches!(err.kind, crate::core::error::ErrorKind::NotFound) {
+                    return crate::engine::errors::to_response(&EngineError::NotFound {
+                        run: job_id,
+                    });
+                }
+            }
+            let msg = e.to_string();
+            let clean = match msg.find(" (no job record in ") {
+                Some(idx) => &msg[..idx],
+                None => msg.as_str(),
+            };
+            return crate::engine::errors::to_response(&EngineError::Internal(format!(
+                "failed to resolve job '{job_id}': {clean}"
+            )));
+        }
+    };
+    let engine_id = match meta.engine.as_deref() {
+        Some(e) => e.to_string(),
+        None => registry.default_for(RunKind::Job).clone(),
+    };
+    if registry.emulating(&engine_id).is_none() {
+        return crate::engine::errors::to_response(&EngineError::UnknownEngine {
+            engine: engine_id,
+        });
+    }
+    let mut output = CommandOutput::new(json!({
+        "job_id": job_id,
+        "permissions": []
+    }));
+    output.push_out(format!("Job '{job_id}' has 0 permission(s)."));
+    Json(output).into_response()
 }
 
 #[cfg(test)]
@@ -708,6 +779,35 @@ mod tests {
         let app = run_control_app(runs);
         let res = app
             .oneshot(post("/api/v1/jobs/nope-job/interrupt", "{}"))
+            .await
+            .unwrap();
+        let (status, body) = body_json(res).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn permissions_on_run_answers_200_empty_list() {
+        let runs = test_runs();
+        let app = run_control_app(Arc::clone(&runs));
+        runs.register(run("perm-run", RunKind::Job, "/workspace/proj", "rterm"))
+            .unwrap();
+        let res = app
+            .oneshot(get("/api/v1/runs/perm-run/permissions"))
+            .await
+            .unwrap();
+        let (status, body) = body_json(res).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["run_id"], "perm-run");
+        assert_eq!(body["permissions"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn permissions_on_unknown_run_answers_404() {
+        let runs = test_runs();
+        let app = run_control_app(Arc::clone(&runs));
+        let res = app
+            .oneshot(get("/api/v1/runs/nope/permissions"))
             .await
             .unwrap();
         let (status, body) = body_json(res).await;

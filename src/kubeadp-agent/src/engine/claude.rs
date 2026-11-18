@@ -623,13 +623,12 @@ impl Engine for ClaudeEngine {
                 "a2a.inject",
             ])
             .emulated(&[
-                // HL-71 S2: the job-scoped message surface is fronted by the
-                // E4 emulation layer for every engine without a live mid-run
-                // channel. Claude's PTY adapter handles `session.message`
-                // natively when a session exists, but a job-mode run (worker,
-                // no PTY) has no live channel -- `send_message` falls back to
-                // the per-run queue, so `a2a.send_message` is emulated for the
-                // job surface (the wrapper never reports a job message 501).
+                "interrupt",
+                "pause",
+                "fork",
+                "compact",
+                "revert",
+                "todo",
                 "a2a.send_message",
             ])
             .build()
@@ -842,9 +841,21 @@ exit 0
             table.capability("session.message"),
             Some(Capability::Native)
         );
-        // Control endpoints the engine does not implement are honest gaps.
-        assert_eq!(table.capability("interrupt"), Some(Capability::Unsupported));
-        assert_eq!(table.capability("fork"), Some(Capability::Unsupported));
+        // Control endpoints the engine implements via emulation.
+        assert_eq!(table.capability("interrupt"), Some(Capability::Emulated));
+        assert_eq!(table.capability("pause"), Some(Capability::Emulated));
+        assert_eq!(table.capability("fork"), Some(Capability::Emulated));
+        assert_eq!(table.capability("compact"), Some(Capability::Emulated));
+        assert_eq!(table.capability("revert"), Some(Capability::Emulated));
+        assert_eq!(table.capability("todo"), Some(Capability::Emulated));
+        assert_eq!(
+            table.capability("a2a.send_message"),
+            Some(Capability::Emulated)
+        );
+        assert_eq!(
+            table.capability("permissions"),
+            Some(Capability::Unsupported)
+        );
     }
 
     #[test]
