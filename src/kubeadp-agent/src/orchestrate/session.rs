@@ -599,40 +599,145 @@ fn run_session_iteration(
         return !shutdown.load(Ordering::SeqCst) && !paused.load(Ordering::SeqCst);
     }
 
-    // 2b. Inject the per-project CLAUDE.md into the workdir before spawning.
-    // FAIL-OPEN: on error, log prominently and still start the session.
-    // Claude-only: agy sessions have no CLAUDE.md (their context is the
-    // stream-json prompts).
-    if engine != "agy" {
-        if let Some(ref memory_file) = session.memory_file {
-            match crate::orchestrate::memory::inject_memory_file(&session.workdir, memory_file) {
-                Ok(crate::orchestrate::memory::InjectOutcome::Written) => {
-                    log_event(
-                        &session.name,
-                        &format!(
-                            "memory file injected: {} -> {}",
-                            memory_file.display(),
-                            session.workdir.join("CLAUDE.md").display()
-                        ),
-                    );
-                }
-                Ok(crate::orchestrate::memory::InjectOutcome::Unchanged) => {
-                    log_event(
-                        &session.name,
-                        &format!("memory file unchanged: {}", memory_file.display()),
-                    );
-                }
-                Err(e) => {
-                    log_event(
-                        &session.name,
-                        &format!(
-                            "ERROR: failed to inject memory file '{}': {} (continuing without it)",
-                            memory_file.display(),
-                            e
-                        ),
-                    );
-                }
+    // 2b. Materialise the instruction-file hierarchy (stream 6, design 6.1/6.2/6.3)
+    // into the engine's witness files before spawning. FAIL-OPEN: on error, log
+    // prominently and still start the session.
+    //
+    // Hierarchy (highest wins last): global -> per-session. The per-session
+    // level is the session's private `instructions_file` when set (it takes
+    // PRECEDENCE over the legacy `memory_file`), else
+    // `<sessions-dir>/<name>.md`; the legacy `memory_file` keeps working
+    // unchanged when the new per-session file is absent.
+    {
+        use crate::core::instructions::{self, ReadOutcome};
+        // HOME as the run sees it: the value the (sandboxed or trusted)
+        // session child inherits, so the witness files land where the engine
+        // actually reads them. Sandboxed sessions run under the pod's
+        // `sandbox_home` (default `/home/agent`); a trusted session inherits
+        // the supervisor's HOME.
+        let run_home = if !session.sandbox {
+            std::env::var("HOME")
+                .ok()
+                .filter(|h| !h.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/home/agent"))
+        } else {
+            crate::core::config::Config::load()
+                .map(|c| c.sandbox_home.clone())
+                .unwrap_or_else(|_| PathBuf::from("/home/agent"))
+        };
+
+        let global = match instructions::read(&instructions::global_instructions_path()) {
+            ReadOutcome::None => None,
+            ReadOutcome::Content { path, text } => Some((path, text)),
+            ReadOutcome::Missing(path) => {
+                log_event(
+                    &session.name,
+                    &format!(
+                        "instructions: global file {} not present; continuing without it",
+                        path.display()
+                    ),
+                );
+                None
             }
+            ReadOutcome::Unreadable { path, reason } => {
+                log_event(
+                    &session.name,
+                    &format!(
+                        "ERROR: instructions: global file {} cannot be read: {} (continuing without it)",
+                        path.display(),
+                        reason
+                    ),
+                );
+                None
+            }
+        };
+
+        // Per-session level: an explicit `instructions_file` wins over the
+        // default path; the new per-session file takes precedence over the
+        // legacy `memory_file` when present.
+        let explicit = session.instructions_file.as_deref();
+        let per_session_default = instructions::session_instructions_path(&session.name);
+        let per_used = explicit
+            .map(PathBuf::from)
+            .unwrap_or(per_session_default.clone());
+        let per_session = match instructions::read(&per_used) {
+            ReadOutcome::None => None,
+            ReadOutcome::Content { path, text } => Some((path, text)),
+            ReadOutcome::Missing(path) => {
+                // An explicit per-session instructions_file that is missing is
+                // logged once and skipped; the legacy memory_file fallback is
+                // handled below.
+                log_event(
+                    &session.name,
+                    &format!(
+                        "instructions: per-session file {} not present{}",
+                        path.display(),
+                        if engine == "claude" && session.memory_file.is_some() {
+                            "; falling back to the legacy memory_file"
+                        } else {
+                            "; continuing without it"
+                        }
+                    ),
+                );
+                None
+            }
+            ReadOutcome::Unreadable { path, reason } => {
+                log_event(
+                    &session.name,
+                    &format!(
+                        "ERROR: instructions: per-session file {} cannot be read: {} (continuing without it)",
+                        path.display(),
+                        reason
+                    ),
+                );
+                None
+            }
+        };
+
+        let (_materialized, lines) = instructions::materialize(
+            &engine,
+            &run_home,
+            &session.workdir,
+            global,
+            // claude per-session CLAUDE.md: new instructions_file takes
+            // precedence over legacy memory_file when present.
+            if per_session.is_some() {
+                per_session
+            } else if engine == "claude" {
+                session.memory_file.as_ref().and_then(|mf| {
+                    match instructions::read(mf) {
+                        ReadOutcome::Content { path, text } => Some((path, text)),
+                        ReadOutcome::Missing(path) => {
+                            log_event(
+                                &session.name,
+                                &format!(
+                                    "instructions: legacy memory_file {} not present; continuing without it",
+                                    path.display()
+                                ),
+                            );
+                            None
+                        }
+                        ReadOutcome::Unreadable { path, reason } => {
+                            log_event(
+                                &session.name,
+                                &format!(
+                                    "ERROR: instructions: legacy memory_file {} cannot be read: {} (continuing without it)",
+                                    path.display(),
+                                    reason
+                                ),
+                            );
+                            None
+                        }
+                        ReadOutcome::None => None,
+                    }
+                })
+            } else {
+                None
+            },
+        );
+        for line in &lines {
+            log_event(&session.name, line);
         }
     }
 
@@ -1657,6 +1762,7 @@ mod tests {
             session_file: None,
             transcript_path: None,
             memory_file: None,
+            instructions_file: None,
             readiness_poll_secs: 5.0,
             hang_timeout_secs: 0.0,
             kill_grace_secs: 5.0,

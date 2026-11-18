@@ -1094,6 +1094,12 @@ pub fn run_internal_runner(
         .open(&log_path)
         .with_context(|| format!("Failed to open log file {}", log_path.display()))?;
 
+    // Materialise the instruction-file hierarchy (stream 6, design 6.1/6.2/6.3)
+    // before spawn. Jobs have no per-job configuration; the per-project analog
+    // is `<sessions-dir>/<project>.md` derived from `meta.project`. FAIL-OPEN:
+    // errors are log lines, never a start failure.
+    crate::core::instructions::job_materialize(config, &meta, &log_path);
+
     let err_file = log_file
         .try_clone()
         .context("Failed to clone log file descriptor")?;

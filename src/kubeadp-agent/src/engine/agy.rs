@@ -1132,6 +1132,7 @@ some non-json noise line
             session_file: None,
             transcript_path: None,
             memory_file: None,
+            instructions_file: None,
             readiness_poll_secs: 5.0,
             hang_timeout_secs: 0.0,
             kill_grace_secs: 5.0,

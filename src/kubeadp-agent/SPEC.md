@@ -192,6 +192,12 @@ and secrets.
   "did not confirm a PID". On timeout any already-spawned engine must be killed
   (SIGKILL to its process group) and reaped with **no** job record, PID, exit code
   or final status recorded.
+- Before the engine spawns, the job materialises its instruction files into the
+  engine's witness files (§4.10, FAIL-OPEN): global file + `<sessions-dir>/<project>.md`
+  where `<project>` is the job's `meta.project`. Failures and missing files are
+  logged once each; the job always proceeds. HOME for the witnesses is the job
+  child's HOME (the sandbox passes it through via `env_allow`, backed by
+  `sandbox_home`, default `/home/agent`, §6.4).
 
 ### 2.5 Conversation identity
 - A job may carry a `conversation_id`, recovered from the engine's structured
@@ -438,6 +444,7 @@ Per-session options (defaults):
 | `engine` | unset | engine for this session (§3.1, request level) |
 | `claude_binary` / `claude_args` | `claude` / `--dangerously-skip-permissions --remote-control ai-server` | claude PTY transport binary and args |
 | `agy_binary` | `agy` | binary for the agy live stream-json session transport |
+| `instructions_file` | unset | absolute path of this session's per-session instruction file (design 6.2); absolute-path validated at load like `memory_file`; when present it takes precedence over the legacy `memory_file`, when absent the default `<sessions-dir>/<name>.md` applies (§4.10) |
 
 Restart delay is `min(base * 2^n, max)` where `n` is restarts already in the
 window (first uses `base`), plus `+0..+25%` jitter. Durations are validated at
@@ -563,6 +570,50 @@ supervisor's `PATH` in the workspace directory.
   `idle_turn` channel
   and the sessions API `message` route) goes through the one `deliver_message`
   core of §4.5.
+
+### 4.10 Instruction-file hierarchy
+The agent materialises a global → per-agency instruction hierarchy into the
+engine-specific witness files at every session and job start (design 6.1,
+6.2, 6.3; worker job form in §2.4):
+
+- **Global level**: the global instruction file. Resolved by
+  `[common] instructions_file` → env `KUBEADP_INSTRUCTIONS_FILE`, default
+  `/etc/kubeadp-agent/instructions/global.md` (`core/instructions.rs`).
+- **Per-session level**: an explicit `instructions_file` (session defined,
+  §4.2) when set, else the per-session default
+  `<sessions-dir>/<name>.md`. The legacy `memory_file` keeps working unchanged
+  when the new per-session file is absent; when present the new per-session
+  file takes precedence over `memory_file`.
+- **Per-project level (worker jobs, §2.4)**: `<sessions-dir>/<project>.md`,
+  `sessions` dir default `/etc/kubeadp-agent/instructions/sessions`
+  (env-only override `KUBEADP_INSTRUCTIONS_SESSIONS_DIR`).
+
+Materialisation targets (same text for both engines, hierarchy order
+global → per-session → per-project appended last):
+
+- **claude**: global → `~/.claude/CLAUDE.md`; per-session → `CLAUDE.md` in the
+  run's workdir. The workdir `CLAUDE.md` is excluded from git via
+  `.git/info/exclude`; a tracked `CLAUDE.md` in the workdir is never
+  overwritten (logged).
+- **agy**: `~/.gemini/config/AGENTS.md` with each level appended in hierarchy
+  order under a `## kubeadp-agent instructions (source: ...)` heading; the
+  per-session (job) text is appended after the global text.
+
+Content rules (enforced by the SPEC, both engines, all levels): the files
+carry **rules only** — no dates, no Vikunja/issue/task identifiers, no
+incident stories, no run-specific state. A file whose configured path cannot
+be read (directory, mode 000, …) is logged as `ERROR` once at start and the
+run proceeds without it (FAIL-OPEN); a path that simply does not exist is
+logged once as `not present` and skipped. Materialisation writes are atomic
+(tmp + rename); a write failure is logged as `ERROR` and does not stop the run
+(a legacy read-only witness mount keeps working until the deployment
+migration of 6.4).
+
+The global file path is resolved per process from the environment and
+`KUBEADP_CONFIG_FILE` at start; the per-session and per-project default paths
+derive from the run's name / project id. `instructions.rs` is part of the
+unconditionally-compiled `core` (mirroring `memory.rs`) so the worker job path
+does not depend on the `orchestrate` feature.
 
 ## 5. HTTP API
 
@@ -1464,6 +1515,7 @@ sections; they are the separate trusted config of §4.2.
 | `api_token_file` | `KUBEADP_API_TOKEN_FILE` | API bearer guarding `/api/v1` and `/metrics` only (§5.6) |
 | `api_allow_unauthenticated` | `KUBEADP_API_ALLOW_UNAUTHENTICATED` | boolean; allows tokenless start |
 | `jobset_root_key_file` | `KUBEADP_JOBSET_ROOT_KEY_FILE` | root HMAC key for jobset credentials; mandatory with `a2a` (§7.3) |
+| `instructions_file` | `KUBEADP_INSTRUCTIONS_FILE` | global instruction file, default `/etc/kubeadp-agent/instructions/global.md`; hierarchy in §4.10 |
 
 `[orchestrator]`:
 | Key | Env | Default / Notes |
@@ -1545,6 +1597,7 @@ never logged.
 | `KUBEADP_A2A_INBOX_URL` | `a2a-hook`, `mcp-a2a` | pod-local inbox API base URL, default `http://127.0.0.1:8002` (§7.14); set by the launcher only |
 | `KUBEADP_JOBSET` | `agent-run start` | jobset to join; may only name the caller's own default jobset (§7.2) |
 | `AGENT_ORCHESTRATE_AGY_PATH` | orchestrator | agy binary for agy sessions |
+| `KUBEADP_INSTRUCTIONS_SESSIONS_DIR` | both roles | sessions base for the per-session / per-project instruction files (`<name>.md` / `<project>.md`), default `/etc/kubeadp-agent/instructions/sessions`; env-only, no config-file key (§4.10) |
 | `CLAUDE_SANDBOX` | orchestrator | sandbox override for GENERATED sessions (§4.2, §4.8): wins over the supervisor config's `default_sandbox` (default true) |
 | `A2A_KUBE_API` | discovery | API base override; test-only (`test-hooks`) |
 | `A2A_URL_OVERRIDES` | `mcp-a2a`/client | name → URL redirect; test-only |

@@ -390,6 +390,13 @@ pub struct SessionConfig {
     #[serde(default)]
     pub memory_file: Option<PathBuf>,
 
+    /// Absolute path of this session's per-session instruction file (design
+    /// 6.2). When present it TAKES PRECEDENCE over the legacy `memory_file`;
+    /// when absent, the default `<sessions-dir>/<name>.md` applies and the
+    /// legacy `memory_file` keeps working unchanged.
+    #[serde(default)]
+    pub instructions_file: Option<PathBuf>,
+
     #[serde(default = "default_readiness_poll")]
     pub readiness_poll_secs: f64,
 
@@ -490,6 +497,15 @@ impl SessionConfig {
                     "Configuration error: field 'memory_file' in session '{}' must be an absolute path (got {})",
                     n,
                     mf.display()
+                ));
+            }
+        }
+        if let Some(ref inf) = self.instructions_file {
+            if !inf.is_absolute() {
+                return Err(format!(
+                    "Configuration error: field 'instructions_file' in session '{}' must be an absolute path (got {})",
+                    n,
+                    inf.display()
                 ));
             }
         }
@@ -907,6 +923,7 @@ session_id = "id-b"
             session_file: None,
             transcript_path: None,
             memory_file: None,
+            instructions_file: None,
             readiness_poll_secs: 5.0,
             hang_timeout_secs: 0.0,
             kill_grace_secs: 5.0,
@@ -1088,6 +1105,7 @@ session_id = "id-b"
             session_file: Some(PathBuf::from("/old/session.jsonl")),
             transcript_path: Some(PathBuf::from("/custom/explicit/transcript.jsonl")),
             memory_file: None,
+            instructions_file: None,
             readiness_poll_secs: 5.0,
             hang_timeout_secs: 0.0,
             kill_grace_secs: 5.0,
@@ -1134,6 +1152,7 @@ session_id = "id-b"
             session_file: None,
             transcript_path: None,
             memory_file: None,
+            instructions_file: None,
             readiness_poll_secs: 5.0,
             hang_timeout_secs: 0.0,
             kill_grace_secs: 5.0,

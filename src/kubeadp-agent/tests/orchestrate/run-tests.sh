@@ -4684,6 +4684,280 @@ EOF
     fi
 }
 
+# ==============================================================================
+# T70: instruction-file hierarchy - global + per-session default materialised
+# before spawn (stream 6, design 6.1/6.2/6.3)
+# ==============================================================================
+test_t70() {
+    local tdir="${TEST_TMP}/t70"
+    mkdir -p "$tdir/home" "$tdir/work" "$tdir/instr" "$tdir/sessions"
+    local log_file="$tdir/fake-claude.log"
+    local state_file="$tdir/state.json"
+    local cfg_file="$tdir/config.json"
+
+    cat <<EOF > "$tdir/instr/global.md"
+GLOBAL-RULE-70
+EOF
+    cat <<EOF > "$tdir/sessions/sess70.md"
+SESSION-RULE-70
+EOF
+
+    cat <<EOF > "$cfg_file"
+{
+    "state_file": "$state_file",
+    "sessions": [
+        {
+            "name": "sess70",
+            "workdir": "$tdir/work",
+            "sandbox": false,
+            "session_id": "test-session-070",
+            "claude_binary": "$FAKE_CLAUDE",
+            "readiness_poll_secs": 0.2,
+            "base_backoff_secs": 0.2,
+            "env": {
+                "FAKE_CLAUDE_LOG": "$log_file",
+                "FAKE_CLAUDE_CONTROL_DIR": "$tdir/control"
+            }
+        }
+    ]
+}
+EOF
+
+    HOME="$tdir/home" \
+    KUBEADP_INSTRUCTIONS_FILE="$tdir/instr/global.md" \
+    KUBEADP_INSTRUCTIONS_SESSIONS_DIR="$tdir/sessions" \
+        "$BIN" run --config "$cfg_file" >/dev/null 2>&1 &
+    local spid=$!
+    ACTIVE_PIDS+=("$spid")
+
+    local ok=0
+    for _ in $(seq 1 60); do
+        if [ -f "$tdir/home/.claude/CLAUDE.md" ] && [ -f "$tdir/work/CLAUDE.md" ]; then
+            ok=1
+            break
+        fi
+        sleep 0.05
+    done
+
+    stop_supervisor "$spid"
+
+    if [ "$ok" -ne 1 ]; then
+        rec "T70" "FAIL" "witness files not materialised (home CLAUDE.md: $(test -f $tdir/home/.claude/CLAUDE.md && cat $tdir/home/.claude/CLAUDE.md || echo MISSING); work CLAUDE.md: $(test -f $tdir/work/CLAUDE.md && cat $tdir/work/CLAUDE.md || echo MISSING))"
+        return
+    fi
+    local gtext stext
+    gtext=$(cat "$tdir/home/.claude/CLAUDE.md")
+    stext=$(cat "$tdir/work/CLAUDE.md")
+    if [[ "$gtext" != *"GLOBAL-RULE-70"* ]] || [[ "$stext" != *"SESSION-RULE-70"* ]]; then
+        rec "T70" "FAIL" "materialised content wrong (global=$gtext, per-session=$stext)"
+        return
+    fi
+    rec "T70" "PASS" "global + per-session instruction files materialised into claude witnesses before spawn"
+}
+
+# ==============================================================================
+# T71: legacy memory_file keeps working when the new per-session file is absent
+# ==============================================================================
+test_t71() {
+    local tdir="${TEST_TMP}/t71"
+    mkdir -p "$tdir/home" "$tdir/work" "$tdir/control"
+    local log_file="$tdir/fake-claude.log"
+    local state_file="$tdir/state.json"
+    local cfg_file="$tdir/config.json"
+
+    cat <<EOF > "$tdir/project-CLAUDE.md"
+MEMORY-RULE-71
+EOF
+
+    cat <<EOF > "$cfg_file"
+{
+    "state_file": "$state_file",
+    "sessions": [
+        {
+            "name": "sess71",
+            "workdir": "$tdir/work",
+            "sandbox": false,
+            "session_id": "test-session-071",
+            "claude_binary": "$FAKE_CLAUDE",
+            "memory_file": "$tdir/project-CLAUDE.md",
+            "readiness_poll_secs": 0.2,
+            "base_backoff_secs": 0.2,
+            "env": {
+                "FAKE_CLAUDE_LOG": "$log_file",
+                "FAKE_CLAUDE_CONTROL_DIR": "$tdir/control"
+            }
+        }
+    ]
+}
+EOF
+
+    HOME="$tdir/home" \
+    KUBEADP_INSTRUCTIONS_SESSIONS_DIR="$tdir/sessions" \
+        "$BIN" run --config "$cfg_file" >/dev/null 2>&1 &
+    local spid=$!
+    ACTIVE_PIDS+=("$spid")
+
+    local ok=0
+    for _ in $(seq 1 60); do
+        if [ -f "$tdir/work/CLAUDE.md" ]; then
+            ok=1
+            break
+        fi
+        sleep 0.05
+    done
+    stop_supervisor "$spid"
+
+    if [ "$ok" -ne 1 ]; then
+        rec "T71" "FAIL" "legacy memory_file did not inject CLAUDE.md into the workdir"
+        return
+    fi
+    local stext
+    stext=$(cat "$tdir/work/CLAUDE.md")
+    if [[ "$stext" != *"MEMORY-RULE-71"* ]]; then
+        rec "T71" "FAIL" "workdir CLAUDE.md came from something else: $stext"
+        return
+    fi
+    rec "T71" "PASS" "legacy memory_file injected without a new per-session file present"
+}
+
+# ==============================================================================
+# T72: explicit per-session instructions_file takes precedence over memory_file
+# ==============================================================================
+test_t72() {
+    local tdir="${TEST_TMP}/t72"
+    mkdir -p "$tdir/home" "$tdir/work" "$tdir/control"
+    local log_file="$tdir/fake-claude.log"
+    local state_file="$tdir/state.json"
+    local cfg_file="$tdir/config.json"
+
+    cat <<EOF > "$tdir/memory-rule.md"
+MEMORY-RULE-72
+EOF
+    cat <<EOF > "$tdir/instructions-rule.md"
+INSTRUCTIONS-RULE-72
+EOF
+
+    cat <<EOF > "$cfg_file"
+{
+    "state_file": "$state_file",
+    "sessions": [
+        {
+            "name": "sess72",
+            "workdir": "$tdir/work",
+            "sandbox": false,
+            "session_id": "test-session-072",
+            "claude_binary": "$FAKE_CLAUDE",
+            "memory_file": "$tdir/memory-rule.md",
+            "instructions_file": "$tdir/instructions-rule.md",
+            "readiness_poll_secs": 0.2,
+            "base_backoff_secs": 0.2,
+            "env": {
+                "FAKE_CLAUDE_LOG": "$log_file",
+                "FAKE_CLAUDE_CONTROL_DIR": "$tdir/control"
+            }
+        }
+    ]
+}
+EOF
+
+    HOME="$tdir/home" \
+    KUBEADP_INSTRUCTIONS_SESSIONS_DIR="$tdir/sessions" \
+        "$BIN" run --config "$cfg_file" >/dev/null 2>&1 &
+    local spid=$!
+    ACTIVE_PIDS+=("$spid")
+
+    local ok=0
+    for _ in $(seq 1 60); do
+        if [ -f "$tdir/work/CLAUDE.md" ]; then
+            ok=1
+            break
+        fi
+        sleep 0.05
+    done
+    stop_supervisor "$spid"
+
+    if [ "$ok" -ne 1 ]; then
+        rec "T72" "FAIL" "no CLAUDE.md materialised"
+        return
+    fi
+    local stext
+    stext=$(cat "$tdir/work/CLAUDE.md")
+    if [[ "$stext" != *"INSTRUCTIONS-RULE-72"* ]] || [[ "$stext" == *"MEMORY-RULE-72"* ]]; then
+        rec "T72" "FAIL" "instructions_file did not take precedence over memory_file: $stext"
+        return
+    fi
+    rec "T72" "PASS" "explicit instructions_file wins over the legacy memory_file"
+}
+
+# ==============================================================================
+# T73: missing / unreadable instruction files are logged, session still starts
+# ==============================================================================
+test_t73() {
+    local tdir="${TEST_TMP}/t73"
+    mkdir -p "$tdir/home" "$tdir/work" "$tdir/control" "$tdir/sessions"
+    local log_file="$tdir/fake-claude.log"
+    local state_file="$tdir/state.json"
+    local cfg_file="$tdir/config.json"
+    local sup_log="$tdir/supervisor.log"
+    # A directory at the global file path: exists but not readable as a file.
+    mkdir -p "$tdir/instr"
+    cat <<EOF > "$tdir/instr/global.md"
+GLOBAL-RULE-73
+EOF
+
+    cat <<EOF > "$cfg_file"
+{
+    "state_file": "$state_file",
+    "sessions": [
+        {
+            "name": "sess73",
+            "workdir": "$tdir/work",
+            "sandbox": false,
+            "session_id": "test-session-073",
+            "claude_binary": "$FAKE_CLAUDE",
+            "readiness_poll_secs": 0.2,
+            "base_backoff_secs": 0.2,
+            "env": {
+                "FAKE_CLAUDE_LOG": "$log_file",
+                "FAKE_CLAUDE_CONTROL_DIR": "$tdir/control"
+            }
+        }
+    ]
+}
+EOF
+
+    # sessions dir has no sess73.md -> per-session level missing. Global file
+    # exists and is readable, so the global witness must be written.
+    HOME="$tdir/home" \
+    KUBEADP_INSTRUCTIONS_FILE="$tdir/instr/global.md" \
+    KUBEADP_INSTRUCTIONS_SESSIONS_DIR="$tdir/sessions" \
+        "$BIN" run --config "$cfg_file" > "$sup_log" 2>&1 &
+    local spid=$!
+    ACTIVE_PIDS+=("$spid")
+
+    local ok=0
+    for _ in $(seq 1 60); do
+        if [ -f "$tdir/home/.claude/CLAUDE.md" ] && [ -s "$log_file" ]; then
+            ok=1
+            break
+        fi
+        sleep 0.05
+    done
+    stop_supervisor "$spid"
+
+    if [ "$ok" -ne 1 ]; then
+        rec "T73" "FAIL" "session did not start with a missing per-session instruction file (sup log: $(tail -n 5 "$sup_log" 2>/dev/null))"
+        return
+    fi
+    local gtext
+    gtext=$(cat "$tdir/home/.claude/CLAUDE.md")
+    if [[ "$gtext" != *"GLOBAL-RULE-73"* ]]; then
+        rec "T73" "FAIL" "global witness not written: $gtext"
+        return
+    fi
+    rec "T73" "PASS" "missing per-session instruction file tolerated; global witness materialised and session started"
+}
+
 TESTS_TO_RUN=()
 if [ -n "${ONLY:-}" ]; then
     for t in $ONLY; do
@@ -4771,6 +5045,10 @@ else
     test_t67
     test_t68
     test_t69
+    test_t70
+    test_t71
+    test_t72
+    test_t73
 fi
 
 echo "============================================================"

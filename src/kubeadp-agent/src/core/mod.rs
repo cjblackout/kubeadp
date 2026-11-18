@@ -28,6 +28,7 @@ pub mod crypto;
 pub mod error;
 pub mod git;
 pub mod hindsight;
+pub mod instructions;
 pub mod job;
 pub mod jobset;
 pub mod max_runtime;

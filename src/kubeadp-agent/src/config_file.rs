@@ -32,6 +32,7 @@
 //!   api_token_file          -> KUBEADP_API_TOKEN_FILE
 //!   api_allow_unauthenticated -> KUBEADP_API_ALLOW_UNAUTHENTICATED
 //!   jobset_root_key_file    -> KUBEADP_JOBSET_ROOT_KEY_FILE
+//!   instructions_file       -> KUBEADP_INSTRUCTIONS_FILE
 //!
 //! [orchestrator]
 //!   listen                  -> AGENT_ORCHESTRATE_LISTEN
@@ -264,6 +265,9 @@ fn var_for_section_key(section: &str, key: &str) -> Option<String> {
         // HMAC key deriving per-jobset secrets. Shared by both roles, a secret
         // supplied through a file only (see secret_inline_for_section_key).
         ("common", "jobset_root_key_file") => Some("KUBEADP_JOBSET_ROOT_KEY_FILE".to_string()),
+        // The global instructions file (design 6.2): read by both the
+        // orchestrator (sessions) and the worker (jobs) at run start.
+        ("common", "instructions_file") => Some("KUBEADP_INSTRUCTIONS_FILE".to_string()),
 
         // --- [orchestrator]: the agent-orchestrate session supervisor ---
         ("orchestrator", "listen") => Some("AGENT_ORCHESTRATE_LISTEN".to_string()),
@@ -399,6 +403,7 @@ fn section_keys(section: &str) -> Vec<&'static str> {
             "api_token_file",
             "api_allow_unauthenticated",
             "jobset_root_key_file",
+            "instructions_file",
         ],
         "orchestrator" => vec![
             "listen",
@@ -884,5 +889,19 @@ a2a_live_idle_secs = 300
             vars.get("AGENT_RUN_CLAUDE_PATH").map(|s| s.as_str()),
             Some("/opt/claude/bin/claude")
         );
+    }
+
+    #[test]
+    fn test_instructions_file_key_maps_to_env() {
+        // Stream 6: `[common] instructions_file` -> KUBEADP_INSTRUCTIONS_FILE.
+        let vars =
+            parse("[common]\ninstructions_file = \"/etc/kubeadp-agent/instructions/global.md\"\n");
+        assert_eq!(
+            vars.get("KUBEADP_INSTRUCTIONS_FILE").map(|s| s.as_str()),
+            Some("/etc/kubeadp-agent/instructions/global.md")
+        );
+        let (section, key) = section_and_key_for_var("KUBEADP_INSTRUCTIONS_FILE").unwrap();
+        assert_eq!(section, "common");
+        assert_eq!(key, "instructions_file");
     }
 }

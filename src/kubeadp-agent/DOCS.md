@@ -483,6 +483,7 @@ Per-session backoff, retry, and supervision options:
 | `resume_fail_quarantine_after` | `5` | Consecutive fast `--resume` failures before the transcript is quarantined for a fresh start. |
 | `resume_fail_uptime_secs` | `5.0` | Uptime that still counts a `--resume` launch as a fast resume failure. |
 | `sandbox` | `true` | Run the session under `sandbox-exec`; `false` is a trusted session (full environment, no grants). |
+| `instructions_file` | unset | Absolute path of this session's per-session instruction file (overrides the legacy `memory_file` when present and is validated absolute at load; without it the default `<sessions-dir>/<name>.md` applies — see §5.5.2). |
 
 Restart delay is `min(base_backoff_secs * 2^n, max_backoff_secs)` where `n` is the restarts already in the window (the first restart in the window uses `base_backoff_secs`), with +0..+25% jitter applied on top.
 
@@ -497,6 +498,41 @@ The `kubeadp-agent orchestrator status` probe exits `0` (healthy), `1` (heartbea
 Beyond the file-defined sessions, the supervisor generates sessions from the environment: the legacy default session (`CLAUDE_DEFAULT_SESSION`, on by default) and one session per `CLAUDE_WORKSPACES` entry (`auto` discovers every direct child of `CLAUDE_WORKSPACE_ROOT` containing a `.git` entry; explicit names map to `<workspace_root>/<name>`). A file-defined session with the same name or session id wins, and a conflicting generated session is skipped with a warning.
 
 A generated session runs the engine binary found on the supervisor's `PATH` in the workspace directory with the generated UUIDv5 session id (`ai-server-<name>` namespace) and the built-in generated defaults (`readiness_poll_secs` 30.0, `max_crashes` 0 = unlimited, base backoff 2.0). Its `sandbox` setting comes from the supervisor config's `default_sandbox` (default `true`), which the `CLAUDE_SANDBOX` environment variable overrides; file-defined sessions always use their own `sandbox` key. A generated sandboxed session only gets its workspace directory granted read-write, so a binary outside the granted paths (a repo checkout or `/tmp`) cannot be executed by it — set `default_sandbox: false` in the supervisor config or `CLAUDE_SANDBOX=0` in the environment for test harnesses and trusted hosts.
+
+### 5.5.2 Instruction-file hierarchy
+
+The agent materialises a global → per-agency instruction hierarchy into the
+engine-specific witness files at every session and job start (design 6.1,
+6.2, 6.3):
+
+- **Global level**: `[common] instructions_file`
+  (`KUBEADP_INSTRUCTIONS_FILE`), default
+  `/etc/kubeadp-agent/instructions/global.md`.
+- **Per-session level**: the session's `instructions_file` when set, else
+  `<sessions-dir>/<name>.md` (`sessions-dir` env-only override
+  `KUBEADP_INSTRUCTIONS_SESSIONS_DIR`, default
+  `/etc/kubeadp-agent/instructions/sessions`). When the new per-session file
+  is absent the legacy `memory_file` keeps working unchanged; when present it
+  takes precedence.
+- **Per-project level (worker jobs)**: `<sessions-dir>/<project>.md` where
+  `<project>` is the job's `meta.project`.
+
+Witness targets (same text for both engines, hierarchy order
+global → per-session/project appended last):
+
+- **claude**: global → `~/.claude/CLAUDE.md`; per-session → `CLAUDE.md` in the
+  run's workdir, git-excluded via `.git/info/exclude` (a tracked `CLAUDE.md`
+  is never overwritten).
+- **agy**: `~/.gemini/config/AGENTS.md` with each level appended in order under
+  a `## kubeadp-agent instructions (source: ...)` heading.
+
+Content rules: **rules only** — no dates, no issue/task identifiers, no
+incident stories, no run-specific state. Read failures (directory, mode 000, …)
+are logged as `ERROR` once at start and the run proceeds without the file
+(FAIL-OPEN); a merely-missing path is logged once as `not present` and skipped.
+Materialisation writes are atomic; a write failure is logged as `ERROR` and does
+not stop the run (a legacy read-only witness mount keeps working until the
+deployment migration of 6.4).
 
 ---
 

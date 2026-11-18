@@ -5899,6 +5899,283 @@ t_t191() {
   rec T191 PASS "explicit --engine agy runs the agy driver; db engine=agy and FAKE-DONE result (job $id)"
 }
 
+# ==============================================================================
+# T192-T194: worker job instruction-file materialisation (stream 6, design 6.5)
+# Jobs carry no per-job config; the per-project file is
+# <sessions-dir>/<project>.md. These run against a private server with the
+# instruction-file env set; the suite's standard server stays untouched.
+# ==============================================================================
+t_t192() {
+  local id st
+  local ini_dir="$TMPROOT/instr"
+  mkdir -p "$ini_dir" "$TMPROOT/instr-sessions"
+  cat <<EOF > "$ini_dir/global.md"
+GLOBAL-RULE-192
+EOF
+  cat <<EOF > "$TMPROOT/instr-sessions/proj.md"
+PROJECT-RULE-192
+EOF
+
+  stop_server
+  (
+    cd "$TMPROOT" || exit 1
+    cd "$WORKSPACE" || exit 1
+    local cfg_idx=${GIT_CONFIG_COUNT:-0}
+    eval "export GIT_CONFIG_KEY_$cfg_idx=core.excludesFile"
+    eval "export GIT_CONFIG_VALUE_$cfg_idx=\"\$GIT_EXCLUDE_FILE\""
+    export GIT_CONFIG_COUNT=$((cfg_idx + 1))
+    exec env -u AGENT_RUN_REMOTE -u GH_TOKEN -u GITHUB_TOKEN \
+      HOME="$FAKE_HOME" \
+      KUBEADP_API_ALLOW_UNAUTHENTICATED=true \
+      KUBEADP_API_ALLOW_OPEN=true \
+      KUBEADP_AGY_HOME="$FAKE_HOME" \
+      KUBEADP_SANDBOX_HOME="$FAKE_HOME" \
+      GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" \
+      GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL" \
+      GIT_COMMITTER_NAME="$GIT_COMMITTER_NAME" \
+      GIT_COMMITTER_EMAIL="$GIT_COMMITTER_EMAIL" \
+      AGENT_RUN_API_LISTEN="127.0.0.1:$PORT" \
+      AGENT_RUN_WORKSPACE_ROOT="$WORKSPACE" \
+      AGENT_RUN_STATE_ROOT="$STATE_ROOT" \
+      AGENT_RUN_AGY_PATH="$FAKE_AGY" \
+      AGENT_RUN_CLAUDE_PATH="$FAKE_CLAUDE" \
+      AGENT_RUN_JOBS_DIR_NAME=".agent-jobs" \
+      AGENT_RUN_MAX_PARALLEL=3 \
+      AGENT_RUN_HINDSIGHT_ENABLED=false \
+      KUBEADP_INSTRUCTIONS_FILE="$ini_dir/global.md" \
+      KUBEADP_INSTRUCTIONS_SESSIONS_DIR="$TMPROOT/instr-sessions" \
+      FAKE_ARGV_LOG="$FAKE_HOME/argv.log" \
+      FAKE_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
+      KUBEADP_ARGV_LOG="$FAKE_HOME/argv.log" \
+      KUBEADP_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
+      KUBEADP_ROLE=worker \
+       "$KUBEADP_AGENT" >"$TMPROOT/server-instr.log" 2>&1
+  ) &
+  SERVER_PID=$!
+  CUR_SERVER_LOG="$TMPROOT/server-instr.log"
+  wait_for_server "$TMPROOT/server-instr.log"
+
+  # Default engine is agy -> witnesses land in the agy AGENTS.md.
+  start_job "FAKE_SLEEP=1 t192 agy instructions"
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    stop_server; start_server; wait_for_server
+    rec T192 FAIL "start failed (rc $START_RC): $START_OUT"
+    return
+  fi
+  id="$START_JOB_ID"
+  st=$(wait_state "$id" done 60) || {
+    cleanup_job "$id"
+    stop_server; start_server; wait_for_server
+    rec T192 FAIL "job did not reach done (last status: $st)"
+    return
+  }
+  local agents
+  agents="$FAKE_HOME/.gemini/config/AGENTS.md"
+  if [ ! -f "$agents" ]; then
+    cleanup_job "$id"
+    stop_server; start_server; wait_for_server
+    rec T192 FAIL "agy AGENTS.md not materialised at $agents"
+    return
+  fi
+  local text gi pi
+  text=$(cat "$agents")
+  if [[ "$text" != *"GLOBAL-RULE-192"* ]] || [[ "$text" != *"PROJECT-RULE-192"* ]]; then
+    cleanup_job "$id"
+    stop_server; start_server; wait_for_server
+    rec T192 FAIL "agy AGENTS.md lacks global/project rules: $text"
+    return
+  fi
+  gi=$(grep -n "GLOBAL-RULE-192" "$agents" | head -n1 | cut -d: -f1)
+  pi=$(grep -n "PROJECT-RULE-192" "$agents" | head -n1 | cut -d: -f1)
+  if [ -n "$gi" ] && [ -n "$pi" ] && [ "$gi" -ge "$pi" ]; then
+    cleanup_job "$id"
+    stop_server; start_server; wait_for_server
+    rec T192 FAIL "per-project rule not appended after global (global line $gi, project line $pi): $text"
+    return
+  fi
+  cleanup_job "$id"
+  # restore the standard server
+  stop_server; start_server; wait_for_server
+  rec T192 PASS "agy job materialised global + per-project rules into AGENTS.md, project appended last (job $id)"
+}
+
+t_t193() {
+  local id st
+  local ini_dir="$TMPROOT/instr"
+  mkdir -p "$ini_dir" "$TMPROOT/instr-sessions"
+  cat <<EOF > "$ini_dir/global.md"
+GLOBAL-RULE-193
+EOF
+  cat <<EOF > "$TMPROOT/instr-sessions/proj.md"
+PROJECT-RULE-193
+EOF
+
+  stop_server
+  (
+    cd "$TMPROOT" || exit 1
+    cd "$WORKSPACE" || exit 1
+    local cfg_idx=${GIT_CONFIG_COUNT:-0}
+    eval "export GIT_CONFIG_KEY_$cfg_idx=core.excludesFile"
+    eval "export GIT_CONFIG_VALUE_$cfg_idx=\"\$GIT_EXCLUDE_FILE\""
+    export GIT_CONFIG_COUNT=$((cfg_idx + 1))
+    exec env -u AGENT_RUN_REMOTE -u GH_TOKEN -u GITHUB_TOKEN \
+      HOME="$FAKE_HOME" \
+      KUBEADP_API_ALLOW_UNAUTHENTICATED=true \
+      KUBEADP_API_ALLOW_OPEN=true \
+      KUBEADP_AGY_HOME="$FAKE_HOME" \
+      KUBEADP_SANDBOX_HOME="$FAKE_HOME" \
+      GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" \
+      GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL" \
+      GIT_COMMITTER_NAME="$GIT_COMMITTER_NAME" \
+      GIT_COMMITTER_EMAIL="$GIT_COMMITTER_EMAIL" \
+      AGENT_RUN_API_LISTEN="127.0.0.1:$PORT" \
+      AGENT_RUN_WORKSPACE_ROOT="$WORKSPACE" \
+      AGENT_RUN_STATE_ROOT="$STATE_ROOT" \
+      AGENT_RUN_AGY_PATH="$FAKE_AGY" \
+      AGENT_RUN_CLAUDE_PATH="$FAKE_CLAUDE" \
+      AGENT_RUN_JOBS_DIR_NAME=".agent-jobs" \
+      AGENT_RUN_MAX_PARALLEL=3 \
+      AGENT_RUN_HINDSIGHT_ENABLED=false \
+      KUBEADP_INSTRUCTIONS_FILE="$ini_dir/global.md" \
+      KUBEADP_INSTRUCTIONS_SESSIONS_DIR="$TMPROOT/instr-sessions" \
+      FAKE_ARGV_LOG="$FAKE_HOME/argv.log" \
+      FAKE_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
+      KUBEADP_ARGV_LOG="$FAKE_HOME/argv.log" \
+      KUBEADP_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
+      KUBEADP_ROLE=worker \
+       "$KUBEADP_AGENT" >"$TMPROOT/server-instr-claude.log" 2>&1
+  ) &
+  SERVER_PID=$!
+  CUR_SERVER_LOG="$TMPROOT/server-instr-claude.log"
+  wait_for_server "$TMPROOT/server-instr-claude.log"
+
+  # A claude-engine job writes the claude witnesses: global -> ~/.claude/CLAUDE.md,
+  # per-project -> <worktree>/CLAUDE.md, git-excluded.
+  start_job "FAKE_SLEEP=1 t193 claude instructions" --engine claude
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    stop_server; start_server; wait_for_server
+    rec T193 FAIL "claude start failed (rc $START_RC): $START_OUT"
+    return
+  fi
+  id="$START_JOB_ID"
+  st=$(wait_state "$id" done 60) || {
+    cleanup_job "$id"
+    stop_server; start_server; wait_for_server
+    rec T193 FAIL "claude job did not reach done (last status: $st)"
+    return
+  }
+  local wt="$WORKSPACE/.agent-jobs/proj/$id"
+  local gl stx
+  if [ ! -f "$FAKE_HOME/.claude/CLAUDE.md" ] || [ ! -f "$wt/CLAUDE.md" ]; then
+    cleanup_job "$id"
+    stop_server; start_server; wait_for_server
+    rec T193 FAIL "claude witnesses missing (home: $(test -f $FAKE_HOME/.claude/CLAUDE.md && echo y || echo n), worktree: $(test -f $wt/CLAUDE.md && echo y || echo n))"
+    return
+  fi
+  gl=$(cat "$FAKE_HOME/.claude/CLAUDE.md")
+  stx=$(cat "$wt/CLAUDE.md")
+  if [[ "$gl" != *"GLOBAL-RULE-193"* ]] || [[ "$stx" != *"PROJECT-RULE-193"* ]]; then
+    cleanup_job "$id"
+    stop_server; start_server; wait_for_server
+    rec T193 FAIL "claude witness content wrong (home=$gl, worktree=$stx)"
+    return
+  fi
+  # The per-project CLAUDE.md must be git-excluded: a bare `git status` sees no change.
+  if git -C "$wt" status --porcelain | grep -q "CLAUDE.md"; then
+    cleanup_job "$id"
+    stop_server; start_server; wait_for_server
+    rec T193 FAIL "per-project CLAUDE.md is not git-excluded (git status shows it)"
+    return
+  fi
+  cleanup_job "$id"
+  stop_server; start_server; wait_for_server
+  rec T193 PASS "claude job materialised global + per-project witnesses; worktree CLAUDE.md git-excluded (job $id)"
+}
+
+t_t194() {
+  local id st
+  local ini_dir="$TMPROOT/instr"
+  mkdir -p "$ini_dir" "$TMPROOT/instr-sessions"
+  cat <<EOF > "$ini_dir/global.md"
+GLOBAL-RULE-194
+EOF
+  # Unreadable per-project "file": a directory at the path. The job must log
+  # an ERROR line and still start and finish normally.
+  rm -rf "$TMPROOT/instr-sessions/proj.md"
+  mkdir -p "$TMPROOT/instr-sessions/proj.md"
+
+  stop_server
+  (
+    cd "$TMPROOT" || exit 1
+    cd "$WORKSPACE" || exit 1
+    local cfg_idx=${GIT_CONFIG_COUNT:-0}
+    eval "export GIT_CONFIG_KEY_$cfg_idx=core.excludesFile"
+    eval "export GIT_CONFIG_VALUE_$cfg_idx=\"\$GIT_EXCLUDE_FILE\""
+    export GIT_CONFIG_COUNT=$((cfg_idx + 1))
+    exec env -u AGENT_RUN_REMOTE -u GH_TOKEN -u GITHUB_TOKEN \
+      HOME="$FAKE_HOME" \
+      KUBEADP_API_ALLOW_UNAUTHENTICATED=true \
+      KUBEADP_API_ALLOW_OPEN=true \
+      KUBEADP_AGY_HOME="$FAKE_HOME" \
+      KUBEADP_SANDBOX_HOME="$FAKE_HOME" \
+      GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" \
+      GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL" \
+      GIT_COMMITTER_NAME="$GIT_COMMITTER_NAME" \
+      GIT_COMMITTER_EMAIL="$GIT_COMMITTER_EMAIL" \
+      AGENT_RUN_API_LISTEN="127.0.0.1:$PORT" \
+      AGENT_RUN_WORKSPACE_ROOT="$WORKSPACE" \
+      AGENT_RUN_STATE_ROOT="$STATE_ROOT" \
+      AGENT_RUN_AGY_PATH="$FAKE_AGY" \
+      AGENT_RUN_CLAUDE_PATH="$FAKE_CLAUDE" \
+      AGENT_RUN_JOBS_DIR_NAME=".agent-jobs" \
+      AGENT_RUN_MAX_PARALLEL=3 \
+      AGENT_RUN_HINDSIGHT_ENABLED=false \
+      KUBEADP_INSTRUCTIONS_FILE="$ini_dir/global.md" \
+      KUBEADP_INSTRUCTIONS_SESSIONS_DIR="$TMPROOT/instr-sessions" \
+      FAKE_ARGV_LOG="$FAKE_HOME/argv.log" \
+      FAKE_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
+      KUBEADP_ARGV_LOG="$FAKE_HOME/argv.log" \
+      KUBEADP_CONVMAP_LOG="$FAKE_HOME/convmap.log" \
+      KUBEADP_ROLE=worker \
+       "$KUBEADP_AGENT" >"$TMPROOT/server-instr-unreadable.log" 2>&1
+  ) &
+  SERVER_PID=$!
+  CUR_SERVER_LOG="$TMPROOT/server-instr-unreadable.log"
+  wait_for_server "$TMPROOT/server-instr-unreadable.log"
+
+  start_job "FAKE_SLEEP=1 t194 unreadable per-project file"
+  if [ "$START_RC" -ne 0 ] || [ -z "$START_JOB_ID" ]; then
+    stop_server; start_server; wait_for_server
+    rec T194 FAIL "start failed (rc $START_RC): $START_OUT"
+    return
+  fi
+  id="$START_JOB_ID"
+  st=$(wait_state "$id" done 60) || {
+    cleanup_job "$id"
+    stop_server; start_server; wait_for_server
+    rec T194 FAIL "job did not reach done with an unreadable per-project file (last status: $st)"
+    return
+  }
+  local jlog
+  jlog=$(ar log "$id" 2>&1)
+  if [[ "$jlog" != *"ERROR: instructions: per-project file"* ]]; then
+    cleanup_job "$id"
+    stop_server; start_server; wait_for_server
+    rec T194 FAIL "job log lacks the ERROR line for the unreadable per-project file: $jlog"
+    return
+  fi
+  # Global still materialised (FAIL-OPEN is per level).
+  if [ ! -f "$FAKE_HOME/.gemini/config/AGENTS.md" ] || ! grep -q "GLOBAL-RULE-194" "$FAKE_HOME/.gemini/config/AGENTS.md" 2>/dev/null; then
+    cleanup_job "$id"
+    stop_server; start_server; wait_for_server
+    rec T194 FAIL "global rule not materialised despite the per-project ERROR"
+    return
+  fi
+  cleanup_job "$id"
+  stop_server; start_server; wait_for_server
+  rec T194 PASS "unreadable per-project file logged as ERROR, per-level FAIL-OPEN, job finished normally (job $id)"
+}
+
 # --- main ------------------------------------------------------------------------------
 TEARDOWN_DONE=0
 teardown() {
@@ -6036,6 +6313,9 @@ run_test T188 t_t188
 run_test T189 t_t189
 run_test T190 t_t190
 run_test T191 t_t191
+run_test T192 t_t192
+run_test T193 t_t193
+run_test T194 t_t194
 
 echo
 echo "=== per-test results ==="

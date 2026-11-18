@@ -123,6 +123,7 @@ mod tests {
             env: Default::default(),
             session_file: None,
             memory_file: None,
+            instructions_file: None,
             readiness_poll_secs: 1.0,
             hang_timeout_secs: 0.0,
             kill_grace_secs: 1.0,
