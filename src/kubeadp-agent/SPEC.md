@@ -462,6 +462,11 @@ load: negative, non-finite or values above `MAX_DURATION_SECS` (30 days) rejecte
   SIGTERM-ignoring child must be escalated. A session thread dying unexpectedly
   marks the session `failed` reason `thread-exited`. SIGTERM/SIGINT/SIGHUP start
   a graceful drain of all sessions.
+- Every session process-group kill is identity-verified: the recorded
+  `/proc/<pid>/stat` start ticks (recorded at spawn) must still match the PID's
+  current start ticks, so a recycled PID now held by an unrelated process is
+  never signalled (the same guarantee the job kill path of §2.1 gives). See
+  `pty::is_same_process` / `pty::signal_process_group_if_target`.
 - An unusable/corrupt transcript is quarantined (`quarantine_corrupt_session_file`)
   and the session starts fresh; a missing transcript resumes.
 - Only the `resume-not-found` error class is quarantined after
@@ -596,11 +601,22 @@ global → per-session → per-project appended last):
 
 - **claude**: global → `~/.claude/CLAUDE.md`; per-session → `CLAUDE.md` in the
   run's workdir. The workdir `CLAUDE.md` is excluded from git via
-  `.git/info/exclude`; a tracked `CLAUDE.md` in the workdir is never
-  overwritten (logged).
-- **agy**: `~/.gemini/config/AGENTS.md` with each level appended in hierarchy
-  order under a `## kubeadp-agent instructions (source: ...)` heading; the
-  per-session (job) text is appended after the global text.
+  `.git/info/exclude`; a tracked `CLAUDE.md` in the workdir is never touched
+  (logged).
+- **agy**: `~/.gemini/config/AGENTS.md` (the config file that also holds the
+  MCP configuration).
+
+The agent writes only a **managed block** delimited by the marker lines
+`<!-- kubeadp-agent instructions: begin -->` … `<!-- kubeadp-agent
+instructions: end -->`; inside it, each level appears in hierarchy order under
+a `## kubeadp-agent instructions (source: <path>)` heading (the per-session /
+per-project section after the global one). Every run **replaces** that block —
+or **removes** it when no level exists — and leaves all other content of the
+file untouched. Because the witness files are persistent and shared (the agy
+home outlives individual jobs and sessions), this makes the materialisation
+idempotent (the same inputs leave the file byte-identical) and project-safe
+(two different projects in sequence never see each other's text), and a file
+that holds user content outside the block keeps it.
 
 Content rules (enforced by the SPEC, both engines, all levels): the files
 carry **rules only** — no dates, no Vikunja/issue/task identifiers, no
@@ -1281,7 +1297,12 @@ having to read a mailbox.
   the harness processes inside the sandbox (`a2a-hook`, `mcp-a2a`) reach their
   run's inbox only through the host's pod-local HTTP API on the same listener
   the host serves (`KUBEADP_A2A_INBOX_URL`, default `http://127.0.0.1:8002`),
-  never the database file. Authentication is a per-run bearer token
+  never the database file. The receive side reuses ONE blocking HTTP client per
+  process (a `OnceLock`) with a bounded connect phase (`INBOX_CONNECT_TIMEOUT`,
+  5 s) and a bounded per-request deadline (`INBOX_REQUEST_TIMEOUT`, 10 s), so a
+  hung or unreachable local inbox FAILS CLOSED with a clear error inside the
+  deadline instead of silently reading as empty. Authentication is a per-run
+  bearer token
   (`KUBEADP_A2A_INBOX_TOKEN`), derived host-side from the jobset root key and
   bound to the run's start time: it is accepted only while the run is live, so
   it expires the moment the run finishes and a retried job mints a fresh one.
@@ -1316,8 +1337,21 @@ having to read a mailbox.
   With nothing queued it prints `{}` for the agy events and nothing for the
   Claude Code events and exits `0` (a hook never breaks the engine). Inside a
   relay-sandboxed run the pod-local inbox API is unreachable: the hook fails
-  closed with the reason on stderr, exit `2`. Unknown or surplus arguments →
-  exit `2`.
+  closed with the reason on stderr, exit `1`. Whenever the inbox API is
+  unreachable or stuck (not just in relay mode), an UNREACHABLE inbox is never
+  read as empty: the claim (or a later ack) fails closed with the endpoint and
+  the deadline on stderr and the hook exits `1`, so a broken delivery is never
+  silently invisible; a failed ack after the text already reached stdout keeps
+  exit `0` (the message is re-delivered after the claim lease). Every hook
+  failure (including usage errors and a failed output write) is NON-blocking:
+  the reason goes to stderr and the hook exits `1`, never `2`, for every event
+  and both engines — on Claude Code hooks exit `2` is a blocking error (it
+  would block and erase the prompt on `UserPromptSubmit`, loop the turn on
+  `Stop`, and feed stderr to the model on `PostToolUse`), so a hub/inbox
+  outage or a misconfigured hook can never block an agent; the deliberate
+  turn re-entry (`decision: block` on Stop, `decision: continue` on the agy
+  stop event, `terminationBehavior: force_continue`) is answered on stdout
+  JSON, not on the exit code. Unknown or surplus arguments → exit `1`.
 - **Hook installation**: the session supervisor writes the Claude Code hook
   settings for each session; the worker writes the native agy plugin
   (`.antigravity-plugin/plugin.json` plus `hooks.json` at the plugin root,
@@ -1424,6 +1458,15 @@ Two receive methods work on the same inbox. Both acknowledge a row exactly once
 registered for every agent of every engine. It is the agent's only way to send
 messages and one of its receive channels.
 
+- **HTTP client reuse and bounded timeouts**: every outbound A2A call
+  (`send_message`, `reply`, `get_task`) runs on ONE process-wide shared
+  `reqwest` client with a bounded connect phase (`A2A_CONNECT_TIMEOUT`, 5 s)
+  and a bounded per-request deadline (`A2A_REQUEST_TIMEOUT`, 10 s, far below
+  the 30 s tool call timeout); the `A2A_URL_OVERRIDES`/URL-redirection seam
+  uses the same shared client. A hung or unreachable hub/peer therefore FAILS
+  CLOSED with a clear `a2a_send_failed`/`a2a_gettask_failed` / timeout error
+  inside the deadline — a dead peer can never hang an MCP call indefinitely or
+  leak a connection pool per call.
 - **Authentication**: it reads `KUBEADP_JOBSET_CREDENTIALS_FILE` at start and
   sends the headers of §7.4 on every request. A missing, unreadable or
   malformed file makes every tool answer the tool error
@@ -1472,8 +1515,13 @@ messages and one of its receive channels.
   delivery API (§7.14); the RESULT is the queued message(s) (`{messages:[{
   from_agent_id, jobset_id, message_id, context_id, task_id, hop, framed}],
   count}`), an empty result at the timeout. The wait is capped at 25 s (below
-  the call timeout); returning a message marks it injected. There is no
-  model-driven mailbox read tool.
+  the call timeout); returning a message marks it injected. An unreachable or
+  stuck pod-local inbox API fails closed with
+  `{code:"a2a_inbox_unreachable", message}` (the endpoint and the deadline)
+  instead of a silent empty result, and the same fail-closed error surfaces as
+  an `a2a_inbox_unreachable` field on every `tool_result` drain that cannot
+  reach the inbox (the tool's own result is still returned; nothing is
+  acknowledged). There is no model-driven mailbox read tool.
 
 Tool arguments are published under their canonical names only (every JSON
 schema states each parameter with its exact name, type, required flag, meaning

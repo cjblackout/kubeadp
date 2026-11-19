@@ -27,7 +27,7 @@ use crate::engine::{
     StdinMode, Transport, TurnInput,
 };
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout};
@@ -47,6 +47,18 @@ pub const ENGINE_ID: &str = "claude";
 /// Bounded event buffer size per job (drop-oldest), so an idle engine does not
 /// accumulate an unbounded transcript for a long-lived job.
 const JOB_EVENT_BUFFER_CAP: usize = 10_000;
+
+/// Upper bound on the number of in-memory `JobHandle`s the engine tracks.
+///
+/// A job handle is inserted on `start_job` and never removed by a terminal
+/// `job_status` (the `events` cursor and `resume_job` read the same handle),
+/// so without a bound the map would grow one entry per job ever started. When
+/// a NEW job would exceed the cap, only *terminal* (already-exited) handles
+/// are evicted -- the oldest first -- so a live child is never evicted while
+/// it runs (evicting a live handle would leak its process). Terminal entries
+/// are safe to drop: the durable job row on disk remains the authoritative
+/// state and is re-materialized on demand.
+const MAX_JOBS: usize = 1024;
 
 /// A bounded, ordered in-memory event buffer appended by a job's output reader
 /// thread. Cursor semantics mirror the session path: a cursor is a 0-based
@@ -125,6 +137,9 @@ pub struct ClaudeEngine {
     pty: Option<ClaudePtyAdapter>,
     /// Live job children keyed by run id.
     jobs: Mutex<HashMap<RunId, JobHandle>>,
+    /// First-appearance order of the tracked job handles (FIFO eviction of
+    /// terminal handles); see [`MAX_JOBS`].
+    job_order: Mutex<VecDeque<RunId>>,
     /// The `--mode` value for jobs.
     mode: StreamJsonMode,
 }
@@ -137,7 +152,38 @@ impl ClaudeEngine {
             binary,
             pty,
             jobs: Mutex::new(HashMap::new()),
+            job_order: Mutex::new(VecDeque::new()),
             mode: StreamJsonMode::Normal,
+        }
+    }
+
+    /// Evicts terminal handles (oldest first) until the map is under `max`,
+    /// leaving live handles untouched. Called under the `jobs`/`job_order`
+    /// locks before a new handle is inserted.
+    fn evict_terminal_jobs(
+        jobs: &mut HashMap<RunId, JobHandle>,
+        order: &mut VecDeque<RunId>,
+        max: usize,
+    ) {
+        while jobs.len() >= max {
+            // Find the oldest candidate with a terminal (exited) handle.
+            let evicted = order
+                .iter()
+                .position(|run_id| jobs.get(run_id).is_some_and(|h| h.terminal.is_some()));
+            match evicted {
+                Some(idx) => {
+                    let run_id = order.remove(idx).expect("index from position");
+                    jobs.remove(&run_id);
+                }
+                None => {
+                    // Every tracked handle is still live: an engine saturated
+                    // with running jobs evicts nothing (a live child must not
+                    // be dropped and leaked); the newest insert still counts
+                    // toward the cap, so the map is at most
+                    // `max + (live jobs over the cap)` when all are live.
+                    break;
+                }
+            }
         }
     }
 
@@ -294,6 +340,10 @@ impl Engine for ClaudeEngine {
             .jobs
             .lock()
             .map_err(|e| EngineError::Internal(format!("claude job map poisoned: {e}")))?;
+        let mut order = self
+            .job_order
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("claude job order poisoned: {e}")))?;
         if jobs.contains_key(&run_id) {
             // The freshly spawned child must not be leaked by replacing the
             // handle; it is a new process for a workdir that already has a
@@ -308,6 +358,10 @@ impl Engine for ClaudeEngine {
                 spec.workdir.display()
             )));
         }
+        // Keep the map bounded: evict terminal handles (oldest first) before
+        // inserting a new one; live handles are never evicted.
+        Self::evict_terminal_jobs(&mut jobs, &mut order, MAX_JOBS);
+        order.push_back(run_id.clone());
         jobs.insert(
             run_id.clone(),
             JobHandle {
@@ -1406,5 +1460,83 @@ exit 0
             plan_no_dsp.args,
             vec!["--headless", "--session-id", "session-uuid-123"]
         );
+    }
+
+    #[test]
+    fn evict_terminal_jobs_keeps_map_bounded_and_spares_live() {
+        // Directly exercises the map bound with tiny synthetic handles: the
+        // eviction must drop terminal (exited) handles oldest-first while
+        // never dropping a live handle.
+        use std::process::Command as StdCommand;
+
+        // A JobHandle whose child is a real `sleep 30` (live) or a `sleep 0`
+        // that is reaped before the handle is built (terminal, Done).
+        fn make_handle(live: bool) -> JobHandle {
+            let mut child = if live {
+                StdCommand::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .expect("spawn live child")
+            } else {
+                StdCommand::new("sleep")
+                    .arg("0")
+                    .spawn()
+                    .expect("spawn terminal child")
+            };
+            if !live {
+                let _ = child.wait();
+            }
+            JobHandle {
+                child,
+                stdin: None,
+                session_id: Arc::new(Mutex::new(None)),
+                events: Arc::new(Mutex::new(JobEvents::new(8))),
+                terminal: if live { None } else { Some(RunStatus::Done) },
+            }
+        }
+
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
+        let mut jobs = HashMap::new();
+        let mut order = VecDeque::new();
+
+        // Oldest first: t1, t2 are terminal; "live" is running.
+        jobs.insert("t1".to_string(), make_handle(false));
+        order.push_back("t1".to_string());
+        jobs.insert("t2".to_string(), make_handle(false));
+        order.push_back("t2".to_string());
+        jobs.insert("live".to_string(), make_handle(true));
+        order.push_back("live".to_string());
+
+        // Cap at 2 before a new insert: evicts the terminal handles oldest
+        // first (down to max-1 = 1 to make room for the pending insert),
+        // leaving the live handle untouched.
+        ClaudeEngine::evict_terminal_jobs(&mut jobs, &mut order, 2);
+        assert!(!jobs.contains_key("t1"), "oldest terminal handle evicted");
+        assert!(
+            !jobs.contains_key("t2"),
+            "terminal handles are evicted down to max-1 to leave room for the insert"
+        );
+        assert!(jobs.contains_key("live"), "live handle must not be evicted");
+        assert!(jobs.len() <= 1);
+
+        // All-live over a small cap: nothing terminal to evict, so live
+        // handles are all kept (the map may exceed the cap rather than leak a
+        // running child).
+        let mut jobs2 = HashMap::new();
+        let mut order2 = VecDeque::new();
+        jobs2.insert("a".to_string(), make_handle(true));
+        order2.push_back("a".to_string());
+        jobs2.insert("b".to_string(), make_handle(true));
+        order2.push_back("b".to_string());
+        ClaudeEngine::evict_terminal_jobs(&mut jobs2, &mut order2, 1);
+        assert_eq!(jobs2.len(), 2, "all-live handles must never be evicted");
+
+        // Cleanup: kill the live children so no test leaks a process group.
+        for handle in jobs.values_mut() {
+            let _ = handle.child.kill();
+        }
+        for handle in jobs2.values_mut() {
+            let _ = handle.child.kill();
+        }
     }
 }

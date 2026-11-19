@@ -91,6 +91,14 @@ pub const SA_NAMESPACE_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccou
 pub const CARD_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// Hard size cap on fetched agent cards (64 KB). Bodies exceeding this are rejected.
 pub const MAX_CARD_BYTES: usize = 64 * 1024;
+/// Connect (TCP/TLS) phase cap of the shared peer HTTP client: an unreachable
+/// or hung hub must fail the connect inside this, never hang it.
+pub const A2A_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Per-request (connect + write + response body) deadline of the shared peer
+/// HTTP client, well below the MCP tool call timeout
+/// ([`crate::mcp_a2a::CALL_TIMEOUT`]), so a hung peer always FAILS CLOSED
+/// with a clear error inside the tool call instead of hanging it.
+pub const A2A_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Default of the bounded `get_task` result's history: at most the last N
 /// history entries are kept. The tool argument `history_length` is clamped
@@ -345,8 +353,7 @@ impl A2aClientCtx {
     fn client_for(&self, entry: &AgentEntry) -> Result<A2AClient<RestTransport>, String> {
         let override_base = url_override(&entry.name, &entry.namespace);
         let base = override_base.clone().unwrap_or_else(|| entry.url.clone());
-        let http = a2a_client::default_reqwest_client(None)
-            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+        let http = shared_peer_client()?;
         let transport = RestTransport::new(http, base.trim_end_matches('/').to_string());
         let interceptors = self.interceptors_for(entry, &base, override_base.is_some());
         Ok(A2AClient::new(transport).with_interceptors(interceptors))
@@ -521,6 +528,30 @@ impl A2aClientCtx {
             serde_json::to_value(task).map_err(|e| format!("failed to encode task: {e}"))?;
         Ok(bound_task(value, history_length))
     }
+}
+
+/// The process-wide shared HTTP client for peer A2A traffic (`mcp-a2a`).
+///
+/// Built ONCE per process (a `OnceLock`) with bounded connect and per-request
+/// timeouts and reused by every `client_for` call: the old code constructed a
+/// fresh client (and with it a fresh connection pool) for every
+/// `send_message`/`get_task`/`reply` call. Sharing the client reuses the
+/// connection pool across calls and, crucially, means the bounded timeouts on
+/// a single shared client apply to EVERY A2A HTTP call, so a hung or
+/// unreachable hub/peer always fails closed with a clear error within the
+/// deadline.
+fn shared_peer_client() -> Result<reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(A2A_CONNECT_TIMEOUT)
+                .timeout(A2A_REQUEST_TIMEOUT)
+                .build()
+                .map_err(|e| format!("failed to build HTTP client: {e}"))
+        })
+        .clone()
 }
 
 /// The delivery a successful send can tell from the peer's response: a task
@@ -1417,6 +1448,55 @@ mod tests {
     fn label_constants_are_sane() {
         assert!(AGENT_LABEL.contains("a2a.homelab/agent"));
         assert_eq!(MAX_HOP, 4);
+    }
+
+    /// A never-answering peer hub (accepts the connection, then never
+    /// responds) must fail a `send_message` CLOSED with a clear error within
+    /// the shared client's request deadline -- never hang the tool call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_message_fails_closed_on_a_never_answering_peer_within_the_deadline() {
+        // A listener that accepts and holds every connection without ever
+        // answering (a STUCK hub, not just an unreachable one).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let holder = tokio::spawn(async move {
+            // Accept and hold each connection; never read or respond.
+            for _ in 0..8 {
+                let _ = listener.accept().await.ok();
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+
+        // A context whose only agent points at the stuck listener. The
+        // `A2A_URL_OVERRIDES` seam maps the peer base there.
+        let mut ctx = ctx_with(vec![("stuck", "ops", "http://stuck.ops.svc:8080")]);
+        let url = format!("http://{addr}");
+        ctx.agents = Arc::new({
+            let mut map = HashMap::new();
+            map.insert(
+                ("ops".to_string(), "stuck".to_string()),
+                AgentEntry {
+                    name: "stuck".to_string(),
+                    namespace: "ops".to_string(),
+                    url: url.clone(),
+                    card: None,
+                },
+            );
+            map
+        });
+
+        let start = tokio::time::Instant::now();
+        let err = ctx
+            .send_message("stuck", "hello", None, None, None)
+            .await
+            .expect_err("a stuck hub fails the send closed, it never hangs");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < A2A_REQUEST_TIMEOUT + std::time::Duration::from_secs(2),
+            "failed closed within the request deadline: {elapsed:?}"
+        );
+        assert!(err.contains("send_message to stuck"), "{err}");
+        holder.abort();
     }
 
     #[tokio::test]

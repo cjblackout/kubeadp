@@ -3,8 +3,7 @@ use crate::orchestrate::claude_config::ensure_claude_config;
 use crate::orchestrate::config::{warn_if_symlink_workdir, SessionConfig, SupervisorConfig};
 use crate::orchestrate::logging::log_event;
 use crate::orchestrate::pty::{
-    kill_process_group_with_grace, poll_and_read_pty, signal_process_group, spawn_in_pty,
-    KillResult, Pty,
+    kill_process_group_with_grace, poll_and_read_pty, spawn_in_pty, KillResult, Pty,
 };
 use crate::orchestrate::session_file::{
     classify_transcript, get_transcript_fingerprint, output_contains_resume_not_found,
@@ -18,7 +17,7 @@ use crate::orchestrate::stdout_writer::StdoutSender;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -105,6 +104,13 @@ pub fn run_session_loop(
 
         let child_pid_tracker = Arc::new(AtomicU32::new(0));
         let child_pid_clone = Arc::clone(&child_pid_tracker);
+        // The child's process-identity anchor (`/proc/<pid>/stat` start
+        // ticks), recorded fresh each attempt at spawn alongside the pid, so
+        // the recovery/cooldown kill paths can tell the recorded child from
+        // an unrelated process that later reused the PID (never signal a
+        // recycled PID).
+        let child_start_tracker = Arc::new(AtomicU64::new(0));
+        let child_start_clone = Arc::clone(&child_start_tracker);
         let session_name = session.name.clone();
 
         let iteration_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -132,6 +138,7 @@ pub fn run_session_loop(
                 &mut crash_tracker,
                 &mut restart_count,
                 &child_pid_clone,
+                &child_start_clone,
                 &mut stdout_sender,
                 &mut force_resume,
                 &mut resume_fail_tracker,
@@ -166,7 +173,13 @@ pub fn run_session_loop(
                 // Terminate child process group if child was running
                 let pid = child_pid_tracker.load(Ordering::SeqCst);
                 if pid > 0 {
-                    let _ = signal_process_group(pid, libc::SIGKILL);
+                    let start_ticks = child_start_tracker.load(Ordering::SeqCst);
+                    let start_time = (start_ticks > 0).then_some(start_ticks);
+                    crate::orchestrate::pty::signal_process_group_if_target(
+                        pid,
+                        start_time,
+                        libc::SIGKILL,
+                    );
                     let mut status: libc::c_int = 0;
                     let _ = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
                 }
@@ -205,6 +218,7 @@ pub fn run_session_loop(
                         &shutdown,
                         &paused,
                         Some(&child_pid_tracker),
+                        Some(&child_start_tracker),
                         &mut crash_tracker,
                         &mut restart_count,
                         None,
@@ -270,6 +284,7 @@ fn handle_failed_cooldown(
     shutdown: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
     child_pid_tracker: Option<&Arc<AtomicU32>>,
+    child_start_tracker: Option<&Arc<AtomicU64>>,
     crash_tracker: &mut CrashWindowTracker,
     restart_count: &mut u32,
     stuck_pid: Option<u32>,
@@ -281,6 +296,7 @@ fn handle_failed_cooldown(
         shutdown,
         paused,
         child_pid_tracker,
+        child_start_tracker,
         crash_tracker,
         restart_count,
         stuck_pid,
@@ -296,6 +312,7 @@ pub fn handle_failed_cooldown_custom<F>(
     shutdown: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
     child_pid_tracker: Option<&Arc<AtomicU32>>,
+    child_start_tracker: Option<&Arc<AtomicU64>>,
     crash_tracker: &mut CrashWindowTracker,
     restart_count: &mut u32,
     stuck_pid: Option<u32>,
@@ -353,6 +370,9 @@ pub fn handle_failed_cooldown_custom<F>(
         if let Some(tracker) = child_pid_tracker {
             tracker.store(0, Ordering::SeqCst);
         }
+        if let Some(start_tracker) = child_start_tracker {
+            start_tracker.store(0, Ordering::SeqCst);
+        }
         log_event(
             &session.name,
             &format!(
@@ -389,8 +409,16 @@ pub fn handle_failed_cooldown_custom<F>(
 /// 4. Polls up to `kill_wait` with WNOHANG.
 /// 5. If reaped: returns KillResult::Reaped.
 /// 6. If not reaped within deadline: returns KillResult::Unkillable.
+///
+/// `start_time` is the process identity anchor recorded at spawn (see
+/// [`crate::orchestrate::pty::is_same_process`]): before every signal the
+/// PID is re-verified, so a recycled PID held by an unrelated process is
+/// never signalled (the escalation signatures are unchanged in effect -- the
+/// identity check only ever refuses to signal a PID that no longer belongs
+/// to the child this `Child` handle describes).
 pub fn bounded_child_escalation<F>(
     child_pid: u32,
+    start_time: Option<u64>,
     child: &mut std::process::Child,
     kill_grace: Duration,
     kill_wait: Duration,
@@ -409,7 +437,11 @@ where
         return KillResult::Reaped(None);
     }
 
-    let _ = signal_process_group(child_pid, libc::SIGTERM);
+    let _ = crate::orchestrate::pty::signal_process_group_if_target(
+        child_pid,
+        start_time,
+        libc::SIGTERM,
+    );
 
     let start = Instant::now();
     let mut reaped = false;
@@ -430,7 +462,11 @@ where
     }
 
     if !reaped {
-        let _ = signal_process_group(child_pid, libc::SIGKILL);
+        let _ = crate::orchestrate::pty::signal_process_group_if_target(
+            child_pid,
+            start_time,
+            libc::SIGKILL,
+        );
         let kill_start = Instant::now();
         while kill_start.elapsed() < kill_wait {
             let mut st: libc::c_int = 0;
@@ -487,6 +523,7 @@ fn run_session_iteration(
     crash_tracker: &mut CrashWindowTracker,
     restart_count: &mut u32,
     child_pid_tracker: &Arc<AtomicU32>,
+    child_start_tracker: &Arc<AtomicU64>,
     stdout_sender: &mut StdoutSender,
     force_resume: &mut bool,
     resume_fail_tracker: &mut ResumeFailTracker,
@@ -1076,6 +1113,20 @@ fn run_session_iteration(
 
     let child_pid = child.id();
     child_pid_tracker.store(child_pid, Ordering::SeqCst);
+    // Record the process-identity anchor for this attempt alongside the pid:
+    // the recovery paths (panic, cooldown, pty-close, hang, shutdown) use it
+    // to refuse signaling a PID that an unrelated process has reused.
+    child_start_tracker.store(
+        crate::core::job::get_process_start_time(child_pid).unwrap_or(0),
+        Ordering::SeqCst,
+    );
+    // The local identity anchor read once after spawn: every kill path below
+    // re-verifies the PID against it before signaling, so a PID recycled by
+    // an unrelated process is never signaled.
+    let child_start_time = {
+        let ticks = child_start_tracker.load(Ordering::SeqCst);
+        (ticks > 0).then_some(ticks)
+    };
 
     // Clone state snapshot before writing (fix #1: release lock before I/O)
     let state_snapshot = {
@@ -1155,6 +1206,7 @@ fn run_session_iteration(
                     );
                     let reaped = kill_process_group_with_grace(
                         child_pid,
+                        child_start_time,
                         Duration::from_secs_f64(session.kill_grace_secs),
                         Duration::from_secs_f64(session.kill_wait_secs),
                     );
@@ -1245,6 +1297,7 @@ fn run_session_iteration(
             );
             let reaped = kill_process_group_with_grace(
                 child_pid,
+                child_start_time,
                 Duration::from_secs_f64(session.kill_grace_secs),
                 Duration::from_secs_f64(session.kill_wait_secs),
             );
@@ -1270,6 +1323,7 @@ fn run_session_iteration(
         let kill_wait = Duration::from_secs_f64(session.kill_wait_secs);
         let res = bounded_child_escalation(
             child_pid,
+            child_start_time,
             &mut child,
             kill_grace,
             kill_wait,
@@ -1294,6 +1348,7 @@ fn run_session_iteration(
         exit_reason = Some("unkillable".to_string());
     } else {
         child_pid_tracker.store(0, Ordering::SeqCst);
+        child_start_tracker.store(0, Ordering::SeqCst);
     }
     let uptime = start_time_instant.elapsed().as_secs_f64();
 
@@ -1481,6 +1536,7 @@ fn run_session_iteration(
             shutdown,
             paused,
             Some(child_pid_tracker),
+            Some(child_start_tracker),
             crash_tracker,
             restart_count,
             Some(child_pid),
@@ -1532,6 +1588,7 @@ fn run_session_iteration(
                 shutdown,
                 paused,
                 Some(child_pid_tracker),
+                Some(child_start_tracker),
                 crash_tracker,
                 restart_count,
                 None,
@@ -1622,6 +1679,7 @@ fn handle_spawn_error(
             shutdown,
             paused,
             None,
+            None,
             crash_tracker,
             restart_count,
             None,
@@ -1699,6 +1757,7 @@ mod tests {
         // Stub waitpid: always returns 0 (child appears unwaitable / stuck in D-state)
         let res = bounded_child_escalation(
             child_pid,
+            crate::core::job::get_process_start_time(child_pid),
             &mut child,
             grace,
             kill_wait,
@@ -1739,6 +1798,7 @@ mod tests {
 
         let res = bounded_child_escalation(
             child_pid,
+            crate::core::job::get_process_start_time(child_pid),
             &mut child,
             grace,
             kill_wait,
@@ -1807,6 +1867,7 @@ mod tests {
         }
         let shutdown = Arc::new(AtomicBool::new(false));
         let child_pid_tracker = Arc::new(AtomicU32::new(12345));
+        let child_start_tracker = Arc::new(AtomicU64::new(0));
         let mut crash_tracker = CrashWindowTracker::new(3, 60.0);
         crash_tracker.record_crash(1.0);
         let mut restart_count = 5;
@@ -1819,6 +1880,7 @@ mod tests {
             &shutdown,
             &shutdown,
             Some(&child_pid_tracker),
+            Some(&child_start_tracker),
             &mut crash_tracker,
             &mut restart_count,
             Some(12345),

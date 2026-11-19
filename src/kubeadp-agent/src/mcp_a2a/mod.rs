@@ -729,11 +729,15 @@ impl A2aMcpServer {
     }
 
     /// The queued messages drained through the `tool_result` injection
-    /// channel (the ack); empty when the run has no inbox.
-    fn drain_injection(&self) -> Vec<QueuedMessage> {
+    /// channel (the ack); empty when the run has no inbox. The pod-local
+    /// inbox call FAILS CLOSED: an unreachable or stuck inbox is an error,
+    /// never a silent empty (the caller decides how to surface it).
+    fn drain_injection(
+        &self,
+    ) -> Result<Vec<QueuedMessage>, crate::core::a2a::receive::InboxApiError> {
         match self.inbox.as_ref() {
             Some(inbox) => inbox.drain_capped(InjectChannel::ToolResult.as_str(), MAX_INJECT_BYTES),
-            None => Vec::new(),
+            None => Ok(Vec::new()),
         }
     }
 
@@ -750,7 +754,31 @@ impl A2aMcpServer {
 
     /// [`Self::tool_result`] as a value (the structured tool errors).
     fn tool_result_value(&self, value: serde_json::Value) -> serde_json::Value {
-        let messages = self.drain_injection();
+        // The pod-local inbox drain FAILS CLOSED: an unreachable or stuck
+        // inbox is never a silent empty. The tool itself still succeeds (its
+        // result is delivered); the failure is surfaced as a visible
+        // `a2a_inbox_unreachable` field in the result so a broken inbox is
+        // never invisible, and nothing is acknowledged (the messages stay
+        // queued and are delivered once the inbox answers again).
+        let messages = match self.drain_injection() {
+            Ok(messages) => messages,
+            Err(e) => {
+                eprintln!("[mcp-a2a] inbox drain failed: {e}");
+                // The own value is cloned so the Ok path below can still use
+                // it: this arm returns early and never reaches that code.
+                let mut value = fit_to_budget(value.clone(), MAX_RESPONSE_BYTES);
+                if !value.is_object() {
+                    value = serde_json::json!({ "result": value });
+                }
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(
+                        "a2a_inbox_unreachable".to_string(),
+                        serde_json::json!(e.to_string()),
+                    );
+                }
+                return value;
+            }
+        };
         if messages.is_empty() {
             return fit_to_budget(value, MAX_RESPONSE_BYTES);
         }
@@ -1058,7 +1086,19 @@ impl A2aMcpServer {
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout);
         loop {
-            if inbox.pending_count() > 0 {
+            // FAIL CLOSED: an unreachable or stuck pod-local inbox API is an
+            // error named here, never a silent "no messages" that makes the
+            // agent proceed without its queued messages.
+            let pending = match inbox.pending_count() {
+                Ok(pending) => pending,
+                Err(e) => {
+                    return CallToolResult::structured_error(serde_json::json!({
+                        "code": "a2a_inbox_unreachable",
+                        "message": e.to_string(),
+                    }));
+                }
+            };
+            if pending > 0 {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -1067,8 +1107,19 @@ impl A2aMcpServer {
             tokio::time::sleep(inbox.poll_interval(WAIT_POLL)).await;
         }
         // Draining IS the acknowledgement: the messages are marked injected
-        // (exactly once by message id) and are never returned again.
-        let messages = inbox.drain_capped(InjectChannel::ToolResult.as_str(), MAX_INJECT_BYTES);
+        // (exactly once by message id) and are never returned again. A drain
+        // that fails closed (the host went away mid-wait) is an error, never
+        // a silent empty.
+        let messages =
+            match inbox.drain_capped(InjectChannel::ToolResult.as_str(), MAX_INJECT_BYTES) {
+                Ok(messages) => messages,
+                Err(e) => {
+                    return CallToolResult::structured_error(serde_json::json!({
+                        "code": "a2a_inbox_unreachable",
+                        "message": e.to_string(),
+                    }));
+                }
+            };
         // Not passed through the response-cap fit: the messages were
         // acknowledged by the drain above and are bounded by
         // MAX_INJECT_BYTES; replacing the result with the oversize error

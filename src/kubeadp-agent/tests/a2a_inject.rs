@@ -684,9 +684,11 @@ fn h_a2a_hook_subcommand_marks_injected_and_is_silent_when_empty() {
     assert!(inbox.injected("m1"));
     assert!(inbox.pending().is_empty());
 
-    // A wrong event or missing arguments are usage errors.
-    assert_eq!(run_a2a_hook(&["Nope".to_string()]), 2);
-    assert_eq!(run_a2a_hook(&[]), 2);
+    // A wrong event or missing arguments are usage errors; they are
+    // NON-blocking (exit 1, never exit 2) so a mis-invoked hook never blocks
+    // a prompt or loops a turn on Claude Code hooks.
+    assert_eq!(run_a2a_hook(&["Nope".to_string()]), 1);
+    assert_eq!(run_a2a_hook(&[]), 1);
 }
 
 // ---------------------------------------------------------------------------

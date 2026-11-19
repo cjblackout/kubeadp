@@ -89,9 +89,42 @@ pub fn inbox_unreachable_reason() -> Option<String> {
     None
 }
 
-/// Per-call HTTP timeout, well above the queue byte accounting and far below
-/// the MCP call timeout, so a dead host never hangs a hook or a wait.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Connect (TCP) phase cap of the pod-local inbox HTTP client: an unreachable
+/// host must fail the connect inside this, never hang a hook or a wait.
+pub const INBOX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-request (connect + write + response body) deadline of the pod-local
+/// inbox HTTP client: a stuck local inbox (a listener that accepts but never
+/// answers) must FAIL CLOSED inside this with a clear error, never silently
+/// read as an empty inbox. Far below the MCP call timeout so the deliverers
+/// always get their answer in time.
+pub const INBOX_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-run receive failure carrying the endpoint and the deadline, so a hook
+/// or a wait can fail closed with a clear reason instead of silently treating
+/// an unreachable inbox as empty.
+#[derive(Debug, Clone)]
+pub struct InboxApiError {
+    /// The pod-local endpoint that failed (`<base>/<path>`).
+    pub endpoint: String,
+    /// The underlying request error (timeout, connect, transport).
+    pub source: String,
+    /// The per-request deadline the call ran under.
+    pub deadline: Duration,
+}
+
+impl std::fmt::Display for InboxApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "inbox API request to {} failed after {:.1}s: {}",
+            self.endpoint,
+            self.deadline.as_secs_f64(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for InboxApiError {}
 
 /// Poll interval of a blocking receive over the pod-local HTTP API.
 pub const REMOTE_POLL: Duration = Duration::from_millis(500);
@@ -134,20 +167,27 @@ impl ReceiveInbox {
         }
     }
 
-    /// The number of pending (queued, uninjected) messages.
-    pub fn pending_count(&self) -> usize {
+    /// The number of pending (queued, uninjected) messages. Fails closed with
+    /// a clear [`InboxApiError`] when the pod-local inbox API is unreachable
+    /// or stuck (an unreachable inbox is never silently read as empty).
+    pub fn pending_count(&self) -> Result<usize, InboxApiError> {
         match self {
-            Self::Local(inbox) => inbox.pending_count(),
+            Self::Local(inbox) => Ok(inbox.pending_count()),
             Self::Remote(remote) => remote.pending_count(),
         }
     }
 
     /// Drains (claims, i.e. marks injected through `channel`) the oldest
     /// pending messages up to the byte budget. Exactly once: a message
-    /// already injected by another channel is not returned.
-    pub fn drain_capped(&self, channel: &str, max_bytes: usize) -> Vec<QueuedMessage> {
+    /// already injected by another channel is not returned. Fails closed with
+    /// a clear error when the pod-local inbox API is unreachable or stuck.
+    pub fn drain_capped(
+        &self,
+        channel: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<QueuedMessage>, InboxApiError> {
         match self {
-            Self::Local(inbox) => inbox.drain_capped(channel, max_bytes),
+            Self::Local(inbox) => Ok(inbox.drain_capped(channel, max_bytes)),
             Self::Remote(remote) => remote.drain_capped(channel, max_bytes),
         }
     }
@@ -158,23 +198,24 @@ impl ReceiveInbox {
     /// [`ReceiveInbox::ack`]. A claimed-but-unacked message stops being
     /// claimable for the lease, then returns to the queue, so a crash between
     /// claim and ack re-delivers the message (a duplicate print is harmless).
-    pub fn claim_capped(&self, max_bytes: usize) -> Vec<QueuedMessage> {
+    /// Fails closed with a clear error when the pod-local inbox API is
+    /// unreachable or stuck.
+    pub fn claim_capped(&self, max_bytes: usize) -> Result<Vec<QueuedMessage>, InboxApiError> {
         match self {
-            Self::Local(inbox) => inbox.claim_capped(max_bytes),
+            Self::Local(inbox) => Ok(inbox.claim_capped(max_bytes)),
             Self::Remote(remote) => remote
                 .claim(max_bytes)
-                .into_iter()
-                .map(QueuedMessage::from)
-                .collect(),
+                .map(|claimed| claimed.into_iter().map(QueuedMessage::from).collect()),
         }
     }
 
     /// Acknowledges (marks injected through `channel`) one claimed message
     /// after the text reached the channel. Idempotent; the ack is deduped by
-    /// message id.
-    pub fn ack(&self, channel: &str, message_id: &str) -> bool {
+    /// message id. Fails closed with a clear error when the pod-local inbox
+    /// API is unreachable or stuck.
+    pub fn ack(&self, channel: &str, message_id: &str) -> Result<bool, InboxApiError> {
         match self {
-            Self::Local(inbox) => inbox.mark_injected(message_id, channel),
+            Self::Local(inbox) => Ok(inbox.mark_injected(message_id, channel)),
             Self::Remote(remote) => remote.mark_injected(channel, message_id),
         }
     }
@@ -207,79 +248,121 @@ impl RemoteInbox {
     }
 
     /// The number of pending (queued, uninjected, unclaimed) messages,
-    /// without consuming anything (a `peek`).
-    pub fn pending_count(&self) -> usize {
+    /// without consuming anything (a `peek`). Fails closed with a clear error
+    /// when the pod-local inbox API is unreachable or stuck.
+    pub fn pending_count(&self) -> Result<usize, InboxApiError> {
         let body = serde_json::json!({ "inbox": self.inbox }).to_string();
-        let Some(text) = self.post("/a2a-inbox/peek", &body) else {
-            return 0;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return 0;
-        };
-        value.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize
+        let text = self.post("/a2a-inbox/peek", &body)?;
+        let value = serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+            self.api_error("/a2a-inbox/peek", format!("invalid peek response: {e}"))
+        })?;
+        if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            return Err(self.api_error(
+                "/a2a-inbox/peek",
+                format!("host refused the peek: {}", value),
+            ));
+        }
+        Ok(value.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize)
     }
 
     /// Claims (leases) the oldest pending messages up to the byte budget and
     /// acknowledges (marks injected through `channel`) every one delivered.
     /// The two-phase protocol is transparent to the caller: the messages
-    /// returned are exactly the ones this call acknowledged.
-    pub fn drain_capped(&self, channel: &str, max_bytes: usize) -> Vec<QueuedMessage> {
-        let claimed = self.claim(max_bytes);
+    /// returned are exactly the ones this call acknowledged. Fails closed
+    /// with a clear error when the pod-local inbox API is unreachable or
+    /// stuck.
+    pub fn drain_capped(
+        &self,
+        channel: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<QueuedMessage>, InboxApiError> {
+        let claimed = self.claim(max_bytes)?;
         // Acknowledge each claimed message we are about to return (the
         // injection is the acknowledgement); an already-injected row is a
         // no-op (another channel won), so never returned.
-        claimed
-            .into_iter()
-            .filter(|m| self.mark_injected(channel, &m.message_id))
-            .map(QueuedMessage::from)
-            .collect()
+        let mut out = Vec::new();
+        for m in claimed {
+            if self.mark_injected(channel, &m.message_id)? {
+                out.push(QueuedMessage::from(m));
+            }
+        }
+        Ok(out)
     }
 
     /// Claims (leases) the oldest pending messages up to the byte budget.
-    fn claim(&self, max_bytes: usize) -> Vec<ClaimedMessage> {
+    /// Fails closed with a clear error when the pod-local inbox API is
+    /// unreachable or stuck.
+    fn claim(&self, max_bytes: usize) -> Result<Vec<ClaimedMessage>, InboxApiError> {
         let body = serde_json::json!({
             "inbox": self.inbox,
             "max_bytes": max_bytes,
         })
         .to_string();
-        let Some(text) = self.post("/a2a-inbox/claim", &body) else {
-            return Vec::new();
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return Vec::new();
-        };
+        let text = self.post("/a2a-inbox/claim", &body)?;
+        let value = serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+            self.api_error("/a2a-inbox/claim", format!("invalid claim response: {e}"))
+        })?;
         if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            return Vec::new();
+            return Err(self.api_error(
+                "/a2a-inbox/claim",
+                format!("host refused the claim: {}", value),
+            ));
         }
         let Some(messages) = value.get("messages").and_then(|v| v.as_array()) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        messages
-            .iter()
-            .filter_map(|m| serde_json::from_value::<ClaimedMessage>(m.clone()).ok())
-            .collect()
+        let mut out = Vec::new();
+        for m in messages {
+            out.push(
+                serde_json::from_value::<ClaimedMessage>(m.clone()).map_err(|e| {
+                    self.api_error("/a2a-inbox/claim", format!("invalid claimed message: {e}"))
+                })?,
+            );
+        }
+        Ok(out)
     }
 
     /// Acknowledges (marks injected through `channel`) one message. Idempotent.
-    fn mark_injected(&self, channel: &str, message_id: &str) -> bool {
+    /// Fails closed with a clear error when the pod-local inbox API is
+    /// unreachable or stuck; `Ok(false)` means the host answered but did not
+    /// mark (already injected by another channel -- a no-op).
+    fn mark_injected(&self, channel: &str, message_id: &str) -> Result<bool, InboxApiError> {
         let body = serde_json::json!({
             "inbox": self.inbox,
             "message_id": message_id,
             "channel": channel,
         })
         .to_string();
-        let Some(text) = self.post("/a2a-inbox/mark-injected", &body) else {
-            return false;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return false;
-        };
-        value.get("ok").and_then(|v| v.as_bool()) == Some(true)
-            && value.get("marked").and_then(|v| v.as_bool()) == Some(true)
+        let text = self.post("/a2a-inbox/mark-injected", &body)?;
+        let value = serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+            self.api_error(
+                "/a2a-inbox/mark-injected",
+                format!("invalid mark-injected response: {e}"),
+            )
+        })?;
+        if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            return Err(self.api_error(
+                "/a2a-inbox/mark-injected",
+                format!("host refused the mark-injected: {}", value),
+            ));
+        }
+        Ok(value.get("marked").and_then(|v| v.as_bool()) == Some(true))
+    }
+
+    /// A clear fail-closed error for an endpoint, with the deadline this
+    /// process runs its inbox calls under.
+    fn api_error(&self, path: &str, source: String) -> InboxApiError {
+        InboxApiError {
+            endpoint: format!("{}{}", self.base(), path),
+            source,
+            deadline: INBOX_REQUEST_TIMEOUT,
+        }
     }
 
     /// POSTs `body` to a relative endpoint with the bearer token, returning
-    /// the response body text on success (HTTP 200). Nil on any error.
+    /// the response body text on success (HTTP 200). Fails closed with a
+    /// clear error on any transport/HTTP failure (connect, timeout, non-2xx):
+    /// an unreachable or stuck local inbox is NEVER silently read as empty.
     ///
     /// Runs on a fresh OS thread: the `reqwest` blocking client uses its OWN
     /// internal tokio runtime, which is forbidden to block_on inside an
@@ -288,36 +371,62 @@ impl RemoteInbox {
     /// (and its connection pool + background runtime thread) is shared across
     /// calls via a `OnceLock` so `wait_message` polling does not construct a
     /// new runtime and TCP connection on every 500 ms tick.
-    fn post(&self, path: &str, body: &str) -> Option<String> {
+    fn post(&self, path: &str, body: &str) -> Result<String, InboxApiError> {
         static CLIENT: std::sync::OnceLock<Option<reqwest::blocking::Client>> =
             std::sync::OnceLock::new();
         let url = format!("{}{}", self.base(), path);
+        // The URL the worker thread posts to: cloned so the join below can
+        // still name `url` on a panic (the thread `move`s its own copy).
+        let thread_url = url.clone();
         let token = self.token.clone();
         let body = body.to_string();
+        // The deadline used on the shared client (named on this error).
+        let deadline = INBOX_REQUEST_TIMEOUT;
         std::thread::spawn(move || {
-            let client = CLIENT
-                .get_or_init(|| {
-                    reqwest::blocking::Client::builder()
-                        .timeout(HTTP_TIMEOUT)
-                        .build()
-                        .ok()
-                })
-                .as_ref()?;
+            let client = CLIENT.get_or_init(|| {
+                reqwest::blocking::Client::builder()
+                    .connect_timeout(INBOX_CONNECT_TIMEOUT)
+                    .timeout(INBOX_REQUEST_TIMEOUT)
+                    .build()
+                    .ok()
+            });
+            let client = client.as_ref().ok_or_else(|| InboxApiError {
+                endpoint: thread_url.clone(),
+                source: "failed to build the inbox HTTP client".to_string(),
+                deadline,
+            })?;
             let resp = client
-                .post(url)
+                .post(&thread_url)
                 .header("content-type", "application/json")
                 .bearer_auth(&token)
                 .body(body)
                 .send()
-                .ok()?;
+                .map_err(|e| InboxApiError {
+                    endpoint: thread_url.clone(),
+                    source: format!("{e}"),
+                    deadline,
+                })?;
             if !resp.status().is_success() {
-                return None;
+                let status = resp.status();
+                let text = resp.text().unwrap_or_default();
+                return Err(InboxApiError {
+                    endpoint: thread_url.clone(),
+                    source: format!("HTTP {status}: {text}"),
+                    deadline,
+                });
             }
-            resp.text().ok()
+            resp.text().map_err(|e| InboxApiError {
+                endpoint: thread_url,
+                source: format!("{e}"),
+                deadline,
+            })
         })
         .join()
-        .ok()
-        .flatten()
+        .map_err(|_| InboxApiError {
+            endpoint: url,
+            source: "the inbox request thread panicked".to_string(),
+            deadline,
+        })?
     }
 }
 
@@ -397,9 +506,12 @@ mod tests {
             || {
                 let reason = inbox_unreachable_reason().expect("announced");
                 assert!(reason.contains("relay"), "{reason}");
-                // The hook subcommand fails closed with the same reason.
+                // The hook subcommand fails closed with the same reason, and
+                // it does so NON-blockingly (exit 1): a hub/inbox outage must
+                // never block a prompt or loop a turn (exit 2 on Claude Code
+                // hooks would be a blocking error).
                 let code = crate::core::a2a::inject::run_a2a_hook(&["PostToolUse".to_string()]);
-                assert_eq!(code, 2, "the hook fails closed");
+                assert_eq!(code, 1, "the hook fails closed, non-blocking");
             },
         );
         // A non-relay proxy value is not announced.
@@ -409,5 +521,54 @@ mod tests {
                 assert!(inbox_unreachable_reason().is_none());
             },
         );
+    }
+
+    /// A listener that accepts every connection and never responds (a STUCK
+    /// local inbox, not just an unreachable one). Dropped (not joined) so the
+    /// test ends even though the holder thread sleeps on.
+    fn never_answering_listener() -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let holder = std::thread::spawn(move || {
+            // Accept and hold every connection without reading or responding;
+            // the sockets stay open (in scope) until the process exits.
+            for _ in 0..8 {
+                let _ = listener.accept().ok();
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        });
+        (addr, holder)
+    }
+
+    /// A stuck (never-answering) pod-local inbox must FAIL CLOSED with a
+    /// clear error within the request deadline -- never silently read as an
+    /// empty inbox that makes a hook/wait proceed as if nothing were queued.
+    #[test]
+    fn stuck_remote_inbox_fails_closed_within_the_request_deadline() {
+        let (addr, holder) = never_answering_listener();
+        let remote = RemoteInbox::new(
+            "/x/a2a-inbox/run-stuck".to_string(),
+            "t0k3n".to_string(),
+            format!("http://{addr}"),
+        );
+        let start = std::time::Instant::now();
+        let err = remote
+            .pending_count()
+            .expect_err("a stuck inbox is an error, not an empty count");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < INBOX_REQUEST_TIMEOUT + std::time::Duration::from_secs(2),
+            "failed closed within the deadline: {elapsed:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("inbox API request"), "{msg}");
+        assert!(msg.contains(&addr.to_string()), "{msg}");
+        // The ack path fails closed the same way.
+        let err = remote
+            .mark_injected("hook", "m1")
+            .expect_err("a stuck inbox ack is an error, not a false no-op");
+        assert!(err.to_string().contains("inbox API request"), "{err}");
+        // The holder thread is left to sleep on; do not join it.
+        let _ = holder;
     }
 }

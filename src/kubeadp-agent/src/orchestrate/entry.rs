@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 
 use crate::orchestrate::config::SupervisorConfig;
 use crate::orchestrate::logging::log_event;
-use crate::orchestrate::pty::signal_process_group;
 use crate::orchestrate::session::run_session_loop;
 use crate::orchestrate::session_control::{take_restart, SessionControl, SessionControlRegistry};
 use crate::orchestrate::state::{
@@ -648,7 +647,11 @@ fn run_supervisor(config_path: Option<PathBuf>) {
 
     // Send SIGTERM to all child process groups
     for &pid in &active_pids {
-        let _ = signal_process_group(pid, libc::SIGTERM);
+        // Identity-verified: a session PID that was recorded in state but whose
+        // process has since exited and been reused by an unrelated process is
+        // never signalled (`start_time` is not persisted in session state, so
+        // the helper's cmdline-plausibility fallback guards the PID instead).
+        crate::orchestrate::pty::signal_process_group_if_target(pid, None, libc::SIGTERM);
     }
 
     // Wait up to shutdown_grace_secs for threads to finish (bounded, never blocking indefinitely on join)
@@ -674,7 +677,7 @@ fn run_supervisor(config_path: Option<PathBuf>) {
     };
 
     for &pid in &tracked_pids {
-        let _ = signal_process_group(pid, libc::SIGKILL);
+        crate::orchestrate::pty::signal_process_group_if_target(pid, None, libc::SIGKILL);
     }
 
     // Fix #7: Reap only tracked child processes (never waitpid(-1) because session

@@ -8,8 +8,17 @@
 //! - claude reads the global `~/.claude/CLAUDE.md` and the per-session
 //!   `CLAUDE.md` in the run's working directory,
 //! - agy reads the global `<agy-home>/.gemini/config/AGENTS.md` (the config
-//!   file that already holds the MCP configuration) with the per-session text
-//!   appended after it.
+//!   file that already holds the MCP configuration).
+//!
+//! The engine files may also carry *user* content that is not managed by the
+//! agent (the agy `AGENTS.md` doubles as the MCP configuration file, and the
+//! worker's agy home is persistent and shared by every job). The agent
+//! therefore writes only a *managed block* — delimited by the
+//! [`BLOCK_BEGIN`]/[`BLOCK_END`] marker lines — and every run *replaces* that
+//! block (or removes it when no level exists), leaving all other content of
+//! the file untouched. This keeps the materialisation idempotent (the same
+//! inputs leave the file byte-identical) and project-safe (two different
+//! projects in sequence never see each other's text).
 //!
 //! ## Hierarchy (design 6.1)
 //!
@@ -35,6 +44,8 @@
 //! Materialisation rewrites the engine's witness file on every run start (the
 //! mounted sources are read again each time; the targets are written
 //! read-only to the sandbox — the sandbox allows the runtime paths below).
+//! Only the managed block (see [`BLOCK_BEGIN`]) is rewritten; user content
+//! outside it is preserved.
 //! The **legacy** per-project `memory_file` keeps working unchanged when the
 //! new per-session file is absent; the new per-session file takes precedence
 //! when present.
@@ -58,6 +69,15 @@ pub const DEFAULT_GLOBAL_INSTRUCTIONS: &str = "/etc/kubeadp-agent/instructions/g
 pub const SESSIONS_DIR_ENV: &str = "KUBEADP_INSTRUCTIONS_SESSIONS_DIR";
 /// Default directory for the per-session / per-project instruction files.
 pub const DEFAULT_SESSIONS_INSTRUCTIONS_DIR: &str = "/etc/kubeadp-agent/instructions/sessions";
+
+/// Marker delimiting the managed block written into the engine witness files
+/// (the agy `AGENTS.md` and, when present, a `CLAUDE.md` that already holds
+/// user content). Every materialisation replaces the region between the
+/// markers (inclusive) or removes it entirely; content outside the markers is
+/// never touched.
+pub const BLOCK_BEGIN: &str = "<!-- kubeadp-agent instructions: begin -->";
+/// Closing marker of the managed block; see [`BLOCK_BEGIN`].
+pub const BLOCK_END: &str = "<!-- kubeadp-agent instructions: end -->";
 
 /// Resolution of one instruction level.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,9 +182,11 @@ pub fn read(path: &Path) -> ReadOutcome {
 /// Outcome of one materialisation call (a single run start).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaterializeOutcome {
-    /// Nothing materialised (no levels configured / readable).
+    /// Nothing materialised (no change to any witness file: no levels and no
+    /// stale managed block to remove).
     Noop,
-    /// At least one level was (re)written.
+    /// At least one witness file was changed (a managed block written or
+    /// removed).
     Written,
 }
 
@@ -175,7 +197,13 @@ pub enum MaterializeOutcome {
 /// (the process `HOME` for a trusted run, the `<sandbox-home>` path the way
 /// the sandbox exposes it for a sandboxed run). `workdir` is the run's
 /// working directory. `global_text`/`per_session_text` are the already-read
-/// hierarchy levels (see [`read`]); each is materialised when non-empty.
+/// hierarchy levels (see [`read`]).
+///
+/// Each witness file is written as a **managed block** (see [`BLOCK_BEGIN`]):
+/// the levels present are rendered into the block (in hierarchy order), the
+/// block is replaced on every run and removed when no level is present, and
+/// any user content outside the block is left untouched. The materialisation
+/// is therefore idempotent and project-safe.
 ///
 /// Returns `(outcome, log_lines)` where `log_lines` are the messages the
 /// caller logs through its own channel (`log_event` for sessions,
@@ -203,9 +231,11 @@ pub fn materialize(
     (outcome, log)
 }
 
-/// Materialises the claude witness files: the global `~/.claude/CLAUDE.md`
-/// and the per-session `CLAUDE.md` in `workdir`, which is excluded via
-/// `.git/info/exclude` (tracked `CLAUDE.md` is never overwritten).
+/// Materialises the claude witness files: the global `~/.claude/CLAUDE.md` and
+/// the per-session `CLAUDE.md` in `workdir`. Each holds a managed block (see
+/// [`BLOCK_BEGIN`]) so user content outside the block is kept; the workdir
+/// file is excluded via `.git/info/exclude` (a tracked `CLAUDE.md` is never
+/// touched).
 fn materialize_claude(
     home: &Path,
     workdir: &Path,
@@ -214,76 +244,101 @@ fn materialize_claude(
     log: &mut Vec<String>,
 ) -> bool {
     let mut written = false;
-    if let Some((src, text)) = global_text {
-        let target = home.join(".claude").join("CLAUDE.md");
-        match write_atomic(&target, text.as_bytes()) {
-            Ok(()) => {
-                written = true;
-                log.push(format!(
+    // Global level -> ~/.claude/CLAUDE.md (a managed block; user content outside
+    // the block is kept, the block is replaced each run or removed when absent).
+    let global_target = home.join(".claude").join("CLAUDE.md");
+    let global_src = global_text.as_ref().map(|(s, _)| s.display().to_string());
+    let global_inner = block_content(render_inner(global_text.iter()));
+    let global_set = global_inner.is_some();
+    match write_managed(&global_target, global_inner) {
+        Ok(true) => {
+            written = true;
+            log.push(if global_set {
+                format!(
                     "instructions: claude global written: {} -> {}",
-                    src.display(),
-                    target.display()
-                ));
-            }
-            Err(e) => log.push(format!(
-                "ERROR: instructions: claude global write failed: {} (continuing without it)",
-                e
-            )),
+                    global_src.as_deref().unwrap_or_default(),
+                    global_target.display()
+                )
+            } else {
+                format!(
+                    "instructions: claude global managed block removed: {}",
+                    global_target.display()
+                )
+            });
         }
+        Ok(false) => {}
+        Err(e) => log.push(format!(
+            "ERROR: instructions: claude global write failed: {} (continuing without it)",
+            e
+        )),
     }
-    if let Some((src, text)) = per_session_text {
-        let target = workdir.join("CLAUDE.md");
-        match inject_entry(workdir, &target, text.as_bytes()) {
-            Ok(()) => {
-                written = true;
-                log.push(format!(
+    // Per-session level -> <workdir>/CLAUDE.md (managed block, git-excluded; a
+    // tracked CLAUDE.md is never touched).
+    let per_target = workdir.join("CLAUDE.md");
+    let per_src = per_session_text
+        .as_ref()
+        .map(|(s, _)| s.display().to_string());
+    let per_inner = block_content(render_inner(per_session_text.iter()));
+    let per_set = per_inner.is_some();
+    match inject_entry(workdir, &per_target, per_inner) {
+        Ok(InjectOutcome::Written) => {
+            written = true;
+            log.push(if per_set {
+                format!(
                     "instructions: claude per-session written: {} -> {}",
-                    src.display(),
-                    target.display()
-                ));
-            }
-            Err(e) => log.push(format!(
-                "ERROR: instructions: claude per-session write failed: {} (continuing without it)",
-                e
-            )),
+                    per_src.as_deref().unwrap_or_default(),
+                    per_target.display()
+                )
+            } else {
+                format!(
+                    "instructions: claude per-session managed block removed: {}",
+                    per_target.display()
+                )
+            });
         }
+        Ok(InjectOutcome::Unchanged) => {}
+        Ok(InjectOutcome::Tracked) => {
+            log.push(format!(
+                "ERROR: instructions: per-session CLAUDE.md {} is tracked in the repository; not touched",
+                per_target.display()
+            ));
+        }
+        Err(e) => log.push(format!(
+            "ERROR: instructions: claude per-session write failed: {} (continuing without it)",
+            e
+        )),
     }
     written
 }
 
-/// Materialises the agy witness file: `<home>/.gemini/config/AGENTS.md`, the
-/// global text first and the per-session text appended after it.
+/// Materialises the agy witness file: `<home>/.gemini/config/AGENTS.md`. The
+/// managed block holds the global text first and the per-session text after
+/// it; the file may carry other user content (it doubles as the MCP
+/// configuration) which is left untouched.
 fn materialize_agy(
     home: &Path,
     global_text: Option<(PathBuf, String)>,
     per_session_text: Option<(PathBuf, String)>,
     log: &mut Vec<String>,
 ) -> bool {
-    if global_text.is_none() && per_session_text.is_none() {
-        return false;
-    }
     let target = home.join(".gemini").join("config").join("AGENTS.md");
-    let existing = std::fs::read_to_string(&target).unwrap_or_default();
-    let mut combined = existing;
-    for (src, text) in global_text.iter().chain(per_session_text.iter()) {
-        if !text.is_empty() {
-            if !combined.is_empty() && !combined.ends_with('\n') {
-                combined.push('\n');
-            }
-            combined.push_str("\n## kubeadp-agent instructions (source: ");
-            combined.push_str(&src.display().to_string());
-            combined.push_str(")\n");
-            combined.push_str(text);
-            if !combined.ends_with('\n') {
-                combined.push('\n');
-            }
-        }
-    }
-    match write_atomic(&target, combined.as_bytes()) {
-        Ok(()) => {
-            log.push(format!("instructions: agy written: {}", target.display()));
+    let inner = block_content(render_inner(
+        global_text.iter().chain(per_session_text.iter()),
+    ));
+    let set = inner.is_some();
+    match write_managed(&target, inner) {
+        Ok(true) => {
+            log.push(if set {
+                format!("instructions: agy written: {}", target.display())
+            } else {
+                format!(
+                    "instructions: agy managed block removed: {}",
+                    target.display()
+                )
+            });
             true
         }
+        Ok(false) => false,
         Err(e) => {
             log.push(format!(
                 "ERROR: instructions: agy write failed: {} (continuing without it)",
@@ -292,6 +347,123 @@ fn materialize_agy(
             false
         }
     }
+}
+
+/// Renders the inner text of the managed block for the given hierarchy levels
+/// (in order): one `## kubeadp-agent instructions (source: <path>)` section per
+/// non-empty level. Empty when no level contributes content.
+fn render_inner<'a>(levels: impl Iterator<Item = &'a (PathBuf, String)>) -> String {
+    let mut out = String::new();
+    for (src, text) in levels {
+        if text.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("## kubeadp-agent instructions (source: ");
+        out.push_str(&src.display().to_string());
+        out.push_str(")\n");
+        out.push_str(text);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The inner content for the managed block, or `None` when no level
+/// contributes content — `None` means "remove the block" rather than write it.
+fn block_content(inner: String) -> Option<String> {
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner)
+    }
+}
+
+/// Renders the full managed block (markers + inner text) for `inner`; `inner`
+/// is normalised to end with a newline.
+fn render_block(inner: &str) -> String {
+    let inner = if inner.ends_with('\n') {
+        inner.to_string()
+    } else {
+        format!("{inner}\n")
+    };
+    format!("{BLOCK_BEGIN}\n{inner}{BLOCK_END}\n")
+}
+
+/// The byte range `(start, end)` of the managed block inside `existing`, or
+/// `None` when the file holds no managed block.
+fn managed_block_span(existing: &str) -> Option<(usize, usize)> {
+    let begin = existing.find(BLOCK_BEGIN)?;
+    let end_begin = begin + BLOCK_BEGIN.len();
+    let rel_end = existing[end_begin..].find(BLOCK_END)?;
+    Some((begin, end_begin + rel_end + BLOCK_END.len()))
+}
+
+/// Splices the managed block into `existing`: it is replaced with `new_block`
+/// (a full block including the marker lines) or removed when `new_block` is
+/// `None`. Content outside the block is preserved, and the surrounding
+/// whitespace is normalised to a single newline separator so that repeated
+/// runs with the same inputs are byte-identical.
+fn splice_block(existing: &str, new_block: Option<&str>) -> String {
+    // No managed block present.
+    let Some((start, end)) = managed_block_span(existing) else {
+        return match new_block {
+            // Nothing to write and nothing to remove: leave the file untouched.
+            None => existing.to_string(),
+            Some(block) => {
+                if existing.is_empty() {
+                    block.to_string()
+                } else {
+                    let base = if existing.ends_with('\n') {
+                        existing.to_string()
+                    } else {
+                        format!("{existing}\n")
+                    };
+                    format!("{base}{block}")
+                }
+            }
+        };
+    };
+    // A block is present. `before`/`after` are the content outside it; the
+    // whitespace adjoing the block is normalised to a single newline, which is
+    // what keeps repeated runs with the same inputs byte-identical.
+    let before = existing[..start].trim_end_matches('\n');
+    let after = existing[end..].trim_start_matches('\n');
+    let mut out = String::new();
+    if !before.is_empty() {
+        out.push_str(before);
+        out.push('\n');
+    }
+    if let Some(block) = new_block {
+        out.push_str(block);
+        if !after.is_empty() {
+            out.push_str(after);
+        }
+    } else {
+        out.push_str(after);
+    }
+    out
+}
+
+/// Reads the file at `path` (if present), splices the managed block in (or
+/// removes it when `inner` is `None`), and writes the result atomically,
+/// creating parent directories. Returns `Ok(true)` when the file was
+/// (re)written, `Ok(false)` when nothing changed (the idempotent no-op), and
+/// `Err` on a write failure. `inner` is the managed-block content (see
+/// [`block_content`]); `None` removes any existing block and never creates a
+/// file that does not exist.
+fn write_managed(path: &Path, inner: Option<String>) -> Result<bool, String> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let new_block = inner.as_ref().map(|i| render_block(i));
+    let out = splice_block(&existing, new_block.as_deref());
+    if out == existing {
+        return Ok(false);
+    }
+    write_atomic(path, out.as_bytes())?;
+    Ok(true)
 }
 
 /// Writes `data` to `path` atomically (temp file + rename, mode 0644),
@@ -341,31 +513,55 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
     }
 }
 
-/// Injects the per-session entry into the workdir `CLAUDE.md`, applying the
-/// git safety rules (never overwrite a tracked `CLAUDE.md`; exclude the
-/// injected file via `.git/info/exclude`). A non-git `workdir` is written
-/// directly.
-fn inject_entry(workdir: &Path, target: &Path, data: &[u8]) -> Result<(), String> {
+/// The result of applying the managed block to the workdir `CLAUDE.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectOutcome {
+    /// The managed block was (re)written.
+    Written,
+    /// The file already held the correct content (idempotent no-op).
+    Unchanged,
+    /// The file is tracked in the workdir's git repository and was left
+    /// untouched (neither injected nor removed).
+    Tracked,
+}
+
+/// Applies the managed block to the workdir `CLAUDE.md`, keeping the git
+/// safety rules (a tracked `CLAUDE.md` is never touched; the injected file is
+/// excluded via `.git/info/exclude`). A non-git `workdir` is written directly.
+///
+/// `inner` is the managed-block content (see [`block_content`]); `None`
+/// removes any existing block. `Err` is returned only for a write failure.
+fn inject_entry(
+    workdir: &Path,
+    target: &Path,
+    inner: Option<String>,
+) -> Result<InjectOutcome, String> {
     let is_work_tree = git_in_workdir(workdir, &["rev-parse", "--is-inside-work-tree"])?
         .map(|s| s == "true")
         .unwrap_or(false);
     if is_work_tree {
+        // Never touch a tracked CLAUDE.md: when one is tracked the file is
+        // owned by the repository, so neither the block is injected nor
+        // removed (the file is left byte-identical).
         if git_in_workdir(workdir, &["ls-files", "--error-unmatch", "--", "CLAUDE.md"])?.is_some() {
-            return Err(
-                "CLAUDE.md is tracked in the repository; delete it from the repo before injecting"
-                    .to_string(),
-            );
+            return Ok(InjectOutcome::Tracked);
         }
-        if let Some(exclude) = exclude_file_path(workdir)? {
-            ensure_exclude_entry(&exclude)?;
-        }
-    }
-    if let Ok(existing) = std::fs::read(target) {
-        if existing == data {
-            return Ok(());
+        // Only maintain the git-exclude entry when we actually write the
+        // block; a removal must not touch the repository's state.
+        if inner.is_some() {
+            if let Some(exclude) = exclude_file_path(workdir)? {
+                ensure_exclude_entry(&exclude)?;
+            }
         }
     }
-    write_atomic(target, data)
+    let existing = std::fs::read_to_string(target).unwrap_or_default();
+    let new_block = inner.as_ref().map(|i| render_block(i));
+    let out = splice_block(&existing, new_block.as_deref());
+    if out == existing {
+        return Ok(InjectOutcome::Unchanged);
+    }
+    write_atomic(target, out.as_bytes())?;
+    Ok(InjectOutcome::Written)
 }
 
 /// Runs `git <args>` in `workdir`, returning `Ok(Some(stdout))` on exit 0,
@@ -524,6 +720,15 @@ mod tests {
         dir
     }
 
+    /// The managed-block content of a file (between the marker lines), or
+    /// `None` when the file holds no managed block.
+    fn block_text(file: &str) -> Option<&str> {
+        let begin = file.find(BLOCK_BEGIN)?;
+        let end_begin = begin + BLOCK_BEGIN.len();
+        let rel_end = file[end_begin..].find(BLOCK_END)?;
+        Some(&file[end_begin..end_begin + rel_end])
+    }
+
     fn git_init(dir: &Path) {
         for args in [
             vec!["init", "-q"],
@@ -575,13 +780,16 @@ mod tests {
             Some((PathBuf::from("/p.md"), "per rule\n".to_string())),
         );
         assert_eq!(outcome, MaterializeOutcome::Written);
-        assert_eq!(
-            std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap(),
-            "global rule\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(work.join("CLAUDE.md")).unwrap(),
-            "per rule\n"
+        let gfile = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
+        let gblock = block_text(&gfile).expect("global managed block");
+        assert!(gblock.contains("global rule"), "global block: {gblock}");
+        assert!(gblock.contains("source: /g.md"), "global block: {gblock}");
+        let pfile = std::fs::read_to_string(work.join("CLAUDE.md")).unwrap();
+        let pblock = block_text(&pfile).expect("per-session managed block");
+        assert!(pblock.contains("per rule"), "per-session block: {pblock}");
+        assert!(
+            pblock.contains("source: /p.md"),
+            "per-session block: {pblock}"
         );
         let exclude = exclude_file_path(&work).unwrap().unwrap();
         assert!(std::fs::read_to_string(&exclude)
@@ -662,7 +870,7 @@ mod tests {
         );
         assert!(log
             .iter()
-            .any(|l| l.contains("ERROR: instructions: claude per-session write failed")));
+            .any(|l| l.contains("is tracked in the repository")));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -713,10 +921,192 @@ mod tests {
             Some((PathBuf::from("/p.md"), "no git here\n".to_string())),
         );
         assert_eq!(outcome, MaterializeOutcome::Written);
-        assert_eq!(
-            std::fs::read_to_string(work.join("CLAUDE.md")).unwrap(),
-            "no git here\n"
+        let file = std::fs::read_to_string(work.join("CLAUDE.md")).unwrap();
+        let block = block_text(&file).expect("managed block present");
+        assert!(block.contains("no git here"), "block: {block}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_agy_idempotent_same_inputs_byte_identical() {
+        let root = unique_temp_dir("agy-idem");
+        let home = root.join("home");
+        let work = root.join("work");
+        let levels = (
+            Some((PathBuf::from("/g.md"), "global rule\n".to_string())),
+            Some((PathBuf::from("/p.md"), "per rule\n".to_string())),
         );
+        for _ in 0..3 {
+            materialize("agy", &home, &work, levels.0.clone(), levels.1.clone());
+        }
+        let f = home.join(".gemini/config/AGENTS.md");
+        let first = std::fs::read(&f).unwrap();
+        // Two more runs with identical inputs must leave the file byte-identical.
+        materialize("agy", &home, &work, levels.0.clone(), levels.1.clone());
+        let second = std::fs::read(&f).unwrap();
+        assert_eq!(first, second, "same inputs must be byte-identical");
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            format!(
+                "{BLOCK_BEGIN}\n## kubeadp-agent instructions (source: /g.md)\nglobal rule\n\n## kubeadp-agent instructions (source: /p.md)\nper rule\n{BLOCK_END}\n"
+            )
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_agy_project_switch_no_cross_leak() {
+        let root = unique_temp_dir("agy-switch");
+        let home = root.join("home");
+        let work = root.join("work");
+        // Project A runs with its own per-project text.
+        materialize(
+            "agy",
+            &home,
+            &work,
+            Some((PathBuf::from("/g.md"), "shared global\n".to_string())),
+            Some((
+                PathBuf::from("/proj-a.md"),
+                "PROJECT-A-SECRET\n".to_string(),
+            )),
+        );
+        // Project B runs with a different per-project text; the shared
+        // persistent agy home must now show B's text and none of A's.
+        materialize(
+            "agy",
+            &home,
+            &work,
+            Some((PathBuf::from("/g.md"), "shared global\n".to_string())),
+            Some((
+                PathBuf::from("/proj-b.md"),
+                "PROJECT-B-SECRET\n".to_string(),
+            )),
+        );
+        let text = std::fs::read_to_string(home.join(".gemini/config/AGENTS.md")).unwrap();
+        assert!(text.contains("PROJECT-B-SECRET"), "expected B: {text}");
+        assert!(
+            !text.contains("PROJECT-A-SECRET"),
+            "A leaked into B: {text}"
+        );
+        assert!(text.contains("shared global"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_agy_preserves_foreign_content_and_replaces_block() {
+        let root = unique_temp_dir("agy-foreign");
+        let home = root.join("home");
+        let f = home.join(".gemini/config/AGENTS.md");
+        // Pre-existing user content (the file doubles as the MCP config).
+        let foreign = "mcpServers:\n  my-tool:\n    cmd: 'x'\nuser note (keep me)\n";
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, foreign).unwrap();
+        materialize(
+            "agy",
+            &home,
+            &root.join("work"),
+            Some((PathBuf::from("/g.md"), "global rule\n".to_string())),
+            Some((PathBuf::from("/p.md"), "per rule\n".to_string())),
+        );
+        let after = std::fs::read_to_string(&f).unwrap();
+        assert!(after.starts_with(foreign), "foreign prefix lost: {after}");
+        assert!(
+            after.contains("global rule") && after.contains("per rule"),
+            "{after}"
+        );
+        // Replacing the block with different content keeps the foreign part.
+        materialize(
+            "agy",
+            &home,
+            &root.join("work"),
+            None,
+            Some((PathBuf::from("/p2.md"), "per rule two\n".to_string())),
+        );
+        let after2 = std::fs::read_to_string(&f).unwrap();
+        assert!(
+            after2.starts_with(foreign),
+            "foreign prefix lost on replace: {after2}"
+        );
+        assert!(
+            after2.contains("per rule two") && !after2.contains("global rule"),
+            "{after2}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_agy_no_levels_removes_block_keeps_foreign() {
+        let root = unique_temp_dir("agy-remove");
+        let home = root.join("home");
+        let f = home.join(".gemini/config/AGENTS.md");
+        let foreign = "mcpServers: {}\n";
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, foreign).unwrap();
+        // Run 1: with a level, the block is appended after the foreign content.
+        materialize(
+            "agy",
+            &home,
+            &root.join("work"),
+            Some((PathBuf::from("/g.md"), "global rule\n".to_string())),
+            None,
+        );
+        let with = std::fs::read_to_string(&f).unwrap();
+        assert!(
+            with.starts_with(foreign) && with.contains("global rule"),
+            "{with}"
+        );
+        // Run 2: no levels -> the block is removed, foreign content survives.
+        let (outcome, _log) = materialize("agy", &home, &root.join("work"), None, None);
+        assert_eq!(outcome, MaterializeOutcome::Written);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), foreign);
+        // A third run (still no levels) is a no-op and byte-identical.
+        let (outcome2, _log2) = materialize("agy", &home, &root.join("work"), None, None);
+        assert_eq!(outcome2, MaterializeOutcome::Noop);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), foreign);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_agy_no_levels_no_file_is_noop() {
+        let root = unique_temp_dir("agy-remove-absent");
+        let home = root.join("home");
+        let f = home.join(".gemini/config/AGENTS.md");
+        let (outcome, _log) = materialize("agy", &home, &root.join("work"), None, None);
+        assert_eq!(outcome, MaterializeOutcome::Noop);
+        assert!(!f.exists(), "no levels must not create the file");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_claude_global_preserves_foreign_content() {
+        let root = unique_temp_dir("claude-foreign");
+        let home = root.join("home");
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let g = home.join(".claude/CLAUDE.md");
+        std::fs::create_dir_all(g.parent().unwrap()).unwrap();
+        let foreign = "# my user notes\nkeep this\n";
+        std::fs::write(&g, foreign).unwrap();
+        materialize(
+            "claude",
+            &home,
+            &work,
+            Some((PathBuf::from("/g.md"), "global rule\n".to_string())),
+            None,
+        );
+        let after = std::fs::read_to_string(&g).unwrap();
+        assert!(after.starts_with(foreign), "foreign prefix lost: {after}");
+        assert!(after.contains("global rule"), "{after}");
+        // Idempotent: same inputs again leave the file byte-identical.
+        let before = std::fs::read(&g).unwrap();
+        materialize(
+            "claude",
+            &home,
+            &work,
+            Some((PathBuf::from("/g.md"), "global rule\n".to_string())),
+            None,
+        );
+        assert_eq!(before, std::fs::read(&g).unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 

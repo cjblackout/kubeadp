@@ -114,20 +114,27 @@ fn is_agy_event(event: &str) -> bool {
 /// Claude Code events print nothing and exit 0 on an empty inbox (a hook
 /// that prints nothing injects nothing). The agy native plugin events print
 /// `{}` on an empty inbox (agy parses the stdout of every invocation; `{}`
-/// injects nothing). An unknown event or a write error: the reason on
-/// stderr, exit 2.
+/// injects nothing).
+///
+/// Every failure (usage error, an unreachable/stuck inbox, a failed write)
+/// is NON-blocking: the clear reason goes to stderr and the hook exits `1`,
+/// for every event, so a hub/inbox outage never blocks a prompt or loops a
+/// turn on Claude Code hooks (exit `2` would be a blocking hook error there;
+/// the deliberate `decision: block` / `decision: continue` re-entry is
+/// answered on stdout JSON, never on the exit code) and stays non-blocking
+/// on the agy hooks. A hook never exits `2`.
 pub fn run_a2a_hook(args: &[String]) -> i32 {
     let Some(event) = args.first() else {
         eprintln!(
             "usage: kubeadp-agent a2a-hook <PostToolUse|UserPromptSubmit|Stop|pre-invocation|post-invocation|stop>"
         );
-        return 2;
+        return 1;
     };
     if args.len() > 1 {
         eprintln!(
             "usage: kubeadp-agent a2a-hook <PostToolUse|UserPromptSubmit|Stop|pre-invocation|post-invocation|stop>"
         );
-        return 2;
+        return 1;
     }
     // The event is validated before the inbox is touched: a wrong event is a
     // usage error even when nothing is queued.
@@ -138,15 +145,15 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
         eprintln!(
             "kubeadp-agent (a2a-hook): unknown event '{event}' (expected PostToolUse, UserPromptSubmit, Stop, pre-invocation, post-invocation or stop)"
         );
-        return 2;
+        return 1;
     }
     // N4 (fail closed): inside a relay-sandboxed run the pod-local TCP inbox
     // API is unreachable (loopback-only netns, the relay refuses loopback).
-    // Fail loudly instead of silently seeing an empty inbox, whatever the
-    // receive side is.
+    // Fail loudly (exit 1, non-blocking) instead of silently seeing an empty
+    // inbox, whatever the receive side is.
     if let Some(reason) = crate::core::a2a::receive::inbox_unreachable_reason() {
         eprintln!("kubeadp-agent (a2a-hook): {reason}");
-        return 2;
+        return 1;
     }
     let Some(receive) = crate::core::a2a::receive::ReceiveInbox::from_env() else {
         // No inbox for this run (KUBEADP_A2A_INBOX_DIR unset): nothing to
@@ -163,7 +170,19 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
     // prints the hook JSON and only then acknowledges each one. A crash in
     // between re-delivers the message after its lease lapses; a duplicate
     // print is harmless. A write error hands the claim back.
-    let messages = receive.claim_capped(MAX_INJECT_BYTES);
+    // FAIL CLOSED, NON-BLOCKING: an unreachable or stuck pod-local inbox is
+    // never silently read as empty -- the reason goes to stderr and the hook
+    // exits 1 (any exit code other than 0 and 2 is a non-blocking error on
+    // Claude Code hooks; a hub/inbox outage must never block a prompt or
+    // loop a turn). The engine still notices the delivery is broken instead
+    // of proceeding as if the inbox were empty, without blocking.
+    let messages = match receive.claim_capped(MAX_INJECT_BYTES) {
+        Ok(messages) => messages,
+        Err(e) => {
+            eprintln!("kubeadp-agent (a2a-hook): {e}");
+            return 1;
+        }
+    };
     if messages.is_empty() {
         return if is_agy_event(event) {
             print_agy_empty()
@@ -178,9 +197,26 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
             match (writeln!(out, "{json}"), out.flush()) {
                 (Ok(()), Ok(())) => {
                     // The text reached stdout: acknowledge each claimed
-                    // message afterwards.
+                    // message afterwards. An ack that fails closed (the host
+                    // went away between claim and ack) is NOT silent: the
+                    // reason goes to stderr; the claim lease then lapses and
+                    // the message is re-delivered later (at-least-once), so
+                    // the hook still exits 0 -- the text DID reach the
+                    // channel the moment stdout was written.
+                    let mut ack_failed = false;
                     for m in &messages {
-                        receive.ack(channel, &m.message_id);
+                        if let Err(e) = receive.ack(channel, &m.message_id) {
+                            ack_failed = true;
+                            eprintln!(
+                                "kubeadp-agent (a2a-hook): ack for {} failed: {e}",
+                                m.message_id
+                            );
+                        }
+                    }
+                    if ack_failed {
+                        eprintln!(
+                            "kubeadp-agent (a2a-hook): at least one ack failed; the message(s) will be re-delivered after the claim lease"
+                        );
                     }
                     0
                 }
@@ -196,7 +232,9 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
                     if f.is_err() {
                         eprintln!("kubeadp-agent (a2a-hook): failed to flush stdout: {f:?}");
                     }
-                    2
+                    // Non-blocking: a hook that cannot deliver its own output
+                    // must never block a prompt or loop a turn (exit 1).
+                    1
                 }
             }
         }
@@ -205,7 +243,7 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
                 receive.release(&m.message_id);
             }
             eprintln!("kubeadp-agent (a2a-hook): {e}");
-            2
+            1
         }
     }
 }
@@ -223,7 +261,8 @@ fn print_agy_empty() -> i32 {
             if f.is_err() {
                 eprintln!("kubeadp-agent (a2a-hook): failed to flush stdout: {f:?}");
             }
-            2
+            // Non-blocking (exit 1), like every other hook failure.
+            1
         }
     }
 }
@@ -345,10 +384,13 @@ mod tests {
             )],
             || {
                 assert_eq!(run_a2a_hook(&["UserPromptSubmit".to_string()]), 0);
-                // A wrong event or extra arguments are usage errors.
-                assert_eq!(run_a2a_hook(&["Nope".to_string()]), 2);
-                assert_eq!(run_a2a_hook(&["Stop".to_string(), "x".to_string()]), 2);
-                assert_eq!(run_a2a_hook(&[]), 2);
+                // A wrong event or extra arguments are usage errors. These
+                // are NON-blocking (exit 1, never exit 2): a misconfigured
+                // or mis-invoked hook must not block a prompt or loop a
+                // turn on Claude Code hooks.
+                assert_eq!(run_a2a_hook(&["Nope".to_string()]), 1);
+                assert_eq!(run_a2a_hook(&["Stop".to_string(), "x".to_string()]), 1);
+                assert_eq!(run_a2a_hook(&[]), 1);
             },
         );
     }
@@ -369,6 +411,52 @@ mod tests {
         assert!(!is_agy_event("PostToolUse"));
         for event in ["pre-invocation", "post-invocation", "stop"] {
             assert!(is_agy_event(event), "{event}");
+        }
+    }
+
+    /// An UNREACHABLE pod-local inbox must make EVERY hook event fail closed
+    /// and NON-blocking: exit `1` (never `2`, which on Claude Code hooks is
+    /// a blocking error that would block a prompt or loop a turn), for the
+    /// Claude Code AND the agy events alike. (The stuck-not-unreachable case
+    /// is covered at the receive layer; the hook code path is the same
+    /// `claim_capped` error.)
+    #[test]
+    fn run_a2a_hook_fails_closed_nonblocking_on_an_unreachable_remote_inbox() {
+        use crate::core::a2a::receive::{INBOX_TOKEN_ENV, INBOX_URL_ENV};
+        use crate::core::a2a::testenv;
+
+        // An address that is NOT listening (the listener is dropped): the
+        // pod-local inbox API is unreachable, so the connect is refused fast.
+        let addr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            addr
+        };
+
+        let url = format!("http://{addr}");
+        let pairs: &[(&str, Option<&str>)] = &[
+            (
+                crate::core::a2a::inbox::INBOX_ENV,
+                Some("/x/a2a-inbox/run-unreachable"),
+            ),
+            (INBOX_TOKEN_ENV, Some("t0k3n")),
+            (INBOX_URL_ENV, Some(&url)),
+        ];
+        for event in [
+            "PostToolUse",
+            "UserPromptSubmit",
+            "Stop",
+            "pre-invocation",
+            "post-invocation",
+            "stop",
+        ] {
+            // Each event fails closed, non-blocking (exit 1).
+            let code = testenv::with_env(pairs, || run_a2a_hook(&[event.to_string()]));
+            assert_eq!(
+                code, 1,
+                "{event}: an unreachable inbox fails the hook closed, non-blocking"
+            );
         }
     }
 }

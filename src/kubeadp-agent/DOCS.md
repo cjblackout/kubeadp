@@ -291,6 +291,8 @@ The `kubeadp-agent mcp-a2a` stdio server exposes tools for outbound communicatio
 
 Every tool response is capped at 20 KiB (`MAX_RESPONSE_BYTES`); a result that would not fit is cut (older history entries dropped first, long strings truncated with the marker), never replaced by the oversize error. Tool errors are MCP tool errors (`isError: true`), never panics.
 
+All outbound A2A calls (`send_message`, `reply`, `get_task`) run on ONE process-wide shared HTTP client with a bounded connect phase (`A2A_CONNECT_TIMEOUT`, 5 s) and a bounded per-request deadline (`A2A_REQUEST_TIMEOUT`, 10 s, far below the 30 s tool call timeout). A hung or unreachable peer hub therefore fails closed with a clear `a2a_send_failed` / `a2a_gettask_failed` error inside the deadline and never hangs the tool call or leaks a connection pool per call.
+
 When `[worker] a2a_mcp_enabled = true` is configured, worker jobs automatically register `mcp-a2a` inside their local `~/.gemini/config/mcp_config.json`. Outbound sender identities default to `<A2A_SELF_PREFIX>/<job_id>`.
 
 #### 4.5.1 Working with peers: handing work over
@@ -307,7 +309,7 @@ Incoming A2A messages for a run land in a durable per-run inbox (`core/a2a/inbox
 
 `state_root` here is the agent-run state root, resolved by the ONE shared helper `core::a2a::inbox::inbox_state_root()` (the same resolution `http_server.rs` applies to the agent-run `Config`; `AGENT_RUN_STATE_ROOT` > config file > built-in `~/.agent-run`) that BOTH sides of a run's inbox use — the A2A sink (`orchestrate/a2a.rs` / `http_server.rs`, and `worker/a2a.rs`) and the launcher that names the run's inbox in `KUBEADP_A2A_INBOX_DIR` (`orchestrate/session.rs` via `SupervisorConfig::a2a_inbox_root()`, `core/runner.rs`). The session side never derives the inbox from the supervisor `state_file`'s parent (the default state file lives in `/tmp`, which the sink never writes and the pod wipes at every restart).
 
-**Sandbox reachability (phase 3)**: the shared database is host-owned — a sandboxed run gets NO database (and no directory) grant. The receive side runs as separate processes inside the sandbox and reaches its run's inbox only through the pod-local HTTP API (`core/a2a/http.rs`: `POST /a2a-inbox/peek`, `/claim`, `/mark-injected`, mounted by the host's HTTP server after the bearer layer, `127.0.0.1:8002` orchestrator / `0.0.0.0:8002` worker) under a per-run bearer token `hex(hmac_sha256(jobset_root_key, "kubeadp-a2a-inbox-v2" || 0x00 || run_id || 0x00 || started_at))` handed to the sandbox in `KUBEADP_A2A_INBOX_TOKEN` (the sandbox never sees the root key; the token is bound to the run's start time and is accepted only while the run is live, so it expires the moment the run finishes and a retried job mints a fresh one). The receive side falls back to the direct inbox when the token is unset. Two-phase receive: `claim` LEASES (60 s, `CLAIM_LEASE_SECS`) without acknowledging, `mark-injected` is the idempotent ack, `peek` reports pending without consuming; a leased-but-unacked message returns to the queue after the lease, and concurrent claimers never both win a message.
+**Sandbox reachability (phase 3)**: the shared database is host-owned — a sandboxed run gets NO database (and no directory) grant. The receive side runs as separate processes inside the sandbox and reaches its run's inbox only through the pod-local HTTP API (`core/a2a/http.rs`: `POST /a2a-inbox/peek`, `/claim`, `/mark-injected`, mounted by the host's HTTP server after the bearer layer, `127.0.0.1:8002` orchestrator / `0.0.0.0:8002` worker) under a per-run bearer token `hex(hmac_sha256(jobset_root_key, "kubeadp-a2a-inbox-v2" || 0x00 || run_id || 0x00 || started_at))` handed to the sandbox in `KUBEADP_A2A_INBOX_TOKEN` (the sandbox never sees the root key; the token is bound to the run's start time and is accepted only while the run is live, so it expires the moment the run finishes and a retried job mints a fresh one). The receive side falls back to the direct inbox when the token is unset. Two-phase receive: `claim` LEASES (60 s, `CLAIM_LEASE_SECS`) without acknowledging, `mark-injected` is the idempotent ack, `peek` reports pending without consuming; a leased-but-unacked message returns to the queue after the lease, and concurrent claimers never both win a message. The receive side reuses ONE blocking HTTP client per process (a `OnceLock`) with a bounded connect phase (`INBOX_CONNECT_TIMEOUT`, 5 s) and a bounded per-request deadline (`INBOX_REQUEST_TIMEOUT`, 10 s), so a hung or unreachable pod-local inbox FAILS CLOSED with a clear error inside the deadline instead of silently reading as empty: `a2a-hook` exits `1` (NON-blocking — exit `2` on Claude Code hooks is a blocking error and must never come from a hub/inbox outage or a misconfigured hook) with the endpoint and the deadline on stderr (a broken delivery is never silently invisible; a failed ack after the text already reached stdout keeps exit `0` because the claim lease then re-delivers it), and `mcp-a2a`'s `wait_message` answers `{code:"a2a_inbox_unreachable"}` while every `tool_result` drain reports the same `a2a_inbox_unreachable` on the result without acknowledging.
 
 - **`tool_result` (both engines)**: the `mcp-a2a` server appends the queued messages (full framed text, untrusted data, size-capped) to the result of every one of its tool calls, and `wait_message {timeout_s}` is a blocking receive whose result is the message (returns the moment one is queued; capped at 25 s). There is no model-driven `inbox` read tool.
 - **`hook` (both engines)**: `kubeadp-agent a2a-hook <event>` reads the inbox and prints the hook JSON for the engine's native hook: Claude Code `PostToolUse`/`UserPromptSubmit` (`additionalContext`) and `Stop` (`decision: block` + `reason`, so a session about to end its turn continues with the message); agy's verified native plugin hooks `pre-invocation` (stdout `injectSteps` system message put into the model's context before every model call), `post-invocation` (`injectSteps` + `terminationBehavior: force_continue`) and `stop` (`decision: continue` + `reason`). Claude Code events print nothing, exit 0, when nothing is queued; the agy events print `{}` (agy parses the stdout of every hook invocation).
@@ -528,9 +530,20 @@ global → per-session/project appended last):
 
 - **claude**: global → `~/.claude/CLAUDE.md`; per-session → `CLAUDE.md` in the
   run's workdir, git-excluded via `.git/info/exclude` (a tracked `CLAUDE.md`
-  is never overwritten).
-- **agy**: `~/.gemini/config/AGENTS.md` with each level appended in order under
-  a `## kubeadp-agent instructions (source: ...)` heading.
+  is never touched).
+- **agy**: `~/.gemini/config/AGENTS.md`.
+
+The agent writes only a **managed block** delimited by the marker lines
+`<!-- kubeadp-agent instructions: begin -->` … `<!-- kubeadp-agent
+instructions: end -->`; inside it, each level appears in hierarchy order under
+a `## kubeadp-agent instructions (source: <path>)` heading. Every run
+**replaces** the block (or **removes** it when no level exists) and leaves all
+other content of the file untouched — the agy `AGENTS.md` also holds the MCP
+configuration, and the worker's agy home is persistent and shared by every
+job. This keeps the materialisation idempotent (the same inputs leave the file
+byte-identical) and project-safe (two different projects in sequence never see
+each other's text), and a file that holds user content outside the block keeps
+it.
 
 Content rules: **rules only** — no dates, no issue/task identifiers, no
 incident stories, no run-specific state. Read failures (directory, mode 000, …)

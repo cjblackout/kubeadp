@@ -11,6 +11,17 @@ use std::sync::Mutex;
 
 const DEFAULT_RING_CAP_BYTES: usize = 500_000;
 
+/// Upper bound on how many distinct sessions the in-memory ring map tracks.
+///
+/// The map is appended to from the stdout writer for every session and is
+/// never explicitly removed, so without a bound a supervisor that churns
+/// through many short-lived session names would grow the map without limit.
+/// When the count exceeds [`MAX_TRACKED_SESSIONS`] the oldest session (by
+/// first appearance) is evicted, keeping the map bounded and the per-session
+/// ring accounting intact. 1024 sessions x 500 KB worst case is well within
+/// the supervised agent's memory envelope.
+const MAX_TRACKED_SESSIONS: usize = 1024;
+
 fn ring_cap_from_env() -> usize {
     let Some(raw) = std::env::var("AGENT_ORCHESTRATE_SESSION_LOG_RING_BYTES")
         .ok()
@@ -23,8 +34,13 @@ fn ring_cap_from_env() -> usize {
 }
 
 /// Bounded per-session byte ring buffers shared with the stdout writer thread.
+///
+/// Keeps at most [`MAX_TRACKED_SESSIONS`] distinct sessions, each with a ring
+/// of at most `cap` bytes; the map never grows unbounded.
 pub struct SessionLogs {
     inner: Mutex<HashMap<String, VecDeque<u8>>>,
+    /// Insertion order of the tracked sessions (FIFO eviction).
+    order: Mutex<VecDeque<String>>,
     cap: usize,
 }
 
@@ -32,6 +48,7 @@ impl SessionLogs {
     pub fn new(cap_bytes: usize) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            order: Mutex::new(VecDeque::new()),
             cap: cap_bytes.max(1),
         }
     }
@@ -41,12 +58,25 @@ impl SessionLogs {
     }
 
     /// Appends `data` to the session ring, trimming the front excess so the
-    /// ring never exceeds its byte cap.
+    /// ring never exceeds its byte cap. The session map is bounded by
+    /// [`MAX_TRACKED_SESSIONS`]: when a new session would exceed the bound,
+    /// the oldest tracked session's ring is dropped.
     pub fn append(&self, session_name: &str, data: &[u8]) {
         if data.is_empty() {
             return;
         }
+        let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !map.contains_key(session_name) {
+            while map.len() >= MAX_TRACKED_SESSIONS {
+                if let Some(oldest) = order.pop_front() {
+                    map.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+            order.push_back(session_name.to_string());
+        }
         let deque = map
             .entry(session_name.to_string())
             .or_insert_with(|| VecDeque::with_capacity(self.cap.min(4096)));
@@ -211,6 +241,37 @@ mod tests {
         logs.append("b", b"bbbb");
         assert_eq!(logs.tail("a", 100), Some(b"aaaa".to_vec()));
         assert_eq!(logs.tail("b", 100), Some(b"bbbb".to_vec()));
+    }
+
+    #[test]
+    fn test_ring_session_count_is_bounded() {
+        let logs = SessionLogs::new(100);
+        // Fill beyond the bound: the map must evict the oldest sessions and
+        // never exceed MAX_TRACKED_SESSIONS entries.
+        for i in 0..(MAX_TRACKED_SESSIONS + 100) {
+            logs.append(&format!("session-{i}"), b"data");
+        }
+        let map = logs.inner.lock().unwrap();
+        assert!(
+            map.len() <= MAX_TRACKED_SESSIONS,
+            "session map grew beyond the bound: {} > {}",
+            map.len(),
+            MAX_TRACKED_SESSIONS
+        );
+        // The earliest sessions were evicted first (FIFO by first appearance).
+        assert!(
+            !map.contains_key("session-0"),
+            "oldest tracked session must be evicted first"
+        );
+        assert!(
+            !map.contains_key("session-50"),
+            "sessions before the sliding window must be evicted"
+        );
+        // Latecomers are kept.
+        assert!(
+            map.contains_key(&format!("session-{}", MAX_TRACKED_SESSIONS + 99)),
+            "the most recent session must be retained"
+        );
     }
 
     #[test]

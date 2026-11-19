@@ -331,6 +331,37 @@ impl PtyInput {
     }
 }
 
+/// Returns whether the OS process `pid` is still alive and -- when a
+/// start-time anchor was recorded at spawn -- is still the exact same process
+/// (`/proc/<pid>/stat` field 22 start ticks, robust to PID reuse).
+///
+/// With `start_time: None` (no anchor ever recorded) the check falls back to
+/// requiring the live process's `/proc/<pid>/cmdline` to still look like a
+/// supervised agent process (claude / agy / the sandbox-exec wrapper), so a
+/// recycled PID held by an unrelated process is still refused rather than
+/// signalled. Zombies are never considered alive (`core::job::is_pid_alive`).
+pub fn is_same_process(pid: u32, start_time: Option<u64>) -> bool {
+    if !crate::core::job::is_pid_alive(pid) {
+        return false;
+    }
+    match start_time {
+        Some(recorded) => crate::core::job::get_process_start_time(pid) == Some(recorded),
+        None => crate::core::job::is_job_process_cmdline(pid),
+    }
+}
+
+/// Identity-verified process-group signal: calls [`signal_process_group`]
+/// only when `pid` is still the recorded target process (see
+/// [`is_same_process`]; a recycled or exited PID is never signalled).
+/// Returns `true` when a signal was actually sent.
+pub fn signal_process_group_if_target(pid: u32, start_time: Option<u64>, sig: c_int) -> bool {
+    if !is_same_process(pid, start_time) {
+        return false;
+    }
+    let _ = signal_process_group(pid, sig);
+    true
+}
+
 /// Signals the process group of `pid` with `sig`, falling back to signaling `pid` directly.
 pub fn signal_process_group(pid: u32, sig: c_int) -> io::Result<()> {
     unsafe {
@@ -365,8 +396,19 @@ impl KillResult {
 /// and escalates to SIGKILL if still alive. After SIGKILL, waits up to `kill_wait`
 /// (bounded poll with WNOHANG). Returns KillResult::Reaped if child is gone,
 /// or KillResult::Unkillable if child cannot be reaped within deadline.
-pub fn kill_process_group_with_grace(pid: u32, grace: Duration, kill_wait: Duration) -> KillResult {
-    kill_process_group_with_grace_custom(pid, grace, kill_wait, |p, st, opt| unsafe {
+///
+/// `start_time` is the process identity anchor recorded at spawn (see
+/// [`is_same_process`]): before every signal the PID is re-verified, so a
+/// recycled PID held by an unrelated process is left untouched (the signal
+/// is skipped and the wait keeps polling; the caller's bounded deadlines
+/// still terminate the loop).
+pub fn kill_process_group_with_grace(
+    pid: u32,
+    start_time: Option<u64>,
+    grace: Duration,
+    kill_wait: Duration,
+) -> KillResult {
+    kill_process_group_with_grace_custom(pid, start_time, grace, kill_wait, |p, st, opt| unsafe {
         libc::waitpid(p, st, opt)
     })
 }
@@ -374,6 +416,7 @@ pub fn kill_process_group_with_grace(pid: u32, grace: Duration, kill_wait: Durat
 /// Custom-waitpid version of `kill_process_group_with_grace` for unit-testing bounded waits.
 pub fn kill_process_group_with_grace_custom<F>(
     pid: u32,
+    start_time: Option<u64>,
     grace: Duration,
     kill_wait: Duration,
     mut waitpid_fn: F,
@@ -381,8 +424,8 @@ pub fn kill_process_group_with_grace_custom<F>(
 where
     F: FnMut(libc::pid_t, *mut libc::c_int, libc::c_int) -> libc::pid_t,
 {
-    // 1. Send SIGTERM to process group
-    let _ = signal_process_group(pid, libc::SIGTERM);
+    // 1. Send SIGTERM to process group (only if still the recorded process)
+    let _ = signal_process_group_if_target(pid, start_time, libc::SIGTERM);
 
     // 2. Wait up to grace
     let start = Instant::now();
@@ -402,9 +445,9 @@ where
         thread::sleep(Duration::from_millis(50));
     }
 
-    // 3. Escalate to SIGKILL if not yet exited
+    // 3. Escalate to SIGKILL if not yet exited (identity re-verified)
     if !reaped {
-        let _ = signal_process_group(pid, libc::SIGKILL);
+        let _ = signal_process_group_if_target(pid, start_time, libc::SIGKILL);
         let kill_start = Instant::now();
         while kill_start.elapsed() < kill_wait {
             let mut status: c_int = 0;
@@ -632,15 +675,20 @@ mod tests {
         let kill_wait = Duration::from_millis(50);
 
         // Child exits immediately on SIGTERM check
-        let res =
-            kill_process_group_with_grace_custom(fake_pid, grace, kill_wait, |p, status, _opt| {
+        let res = kill_process_group_with_grace_custom(
+            fake_pid,
+            None,
+            grace,
+            kill_wait,
+            |p, status, _opt| {
                 if p == fake_pid as libc::pid_t {
                     unsafe { *status = 0 };
                     fake_pid as libc::pid_t
                 } else {
                     0
                 }
-            });
+            },
+        );
         assert_eq!(res, KillResult::Reaped(Some(0)));
     }
 
@@ -654,6 +702,7 @@ mod tests {
         // Child resists SIGTERM (returns 0 during grace), then exits on SIGKILL
         let res = kill_process_group_with_grace_custom(
             fake_pid,
+            None,
             grace,
             kill_wait,
             move |p, status, _opt| {
@@ -680,8 +729,13 @@ mod tests {
 
         let start = Instant::now();
         // Child never exits (waitpid returns 0 always)
-        let res =
-            kill_process_group_with_grace_custom(fake_pid, grace, kill_wait, |_p, _status, _opt| 0);
+        let res = kill_process_group_with_grace_custom(
+            fake_pid,
+            None,
+            grace,
+            kill_wait,
+            |_p, _status, _opt| 0,
+        );
         let elapsed = start.elapsed();
 
         assert_eq!(res, KillResult::Unkillable);
@@ -696,5 +750,109 @@ mod tests {
             "elapsed {:?} exceeded bounded deadline",
             elapsed
         );
+    }
+
+    #[test]
+    fn test_signal_reused_pid_is_refused_wrong_start_time() {
+        // A live child is the identity anchor: a start time that does not
+        // match the current /proc/<pid>/stat means the PID was (could only
+        // have been) recycled by an unrelated process, so the signal must be
+        // refused -- the "reused PID" of a real child is simulated with the
+        // wrong start-tick value.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn child");
+        let pid = child.id();
+        let real_start = crate::core::job::get_process_start_time(pid)
+            .expect("live child must have a start time");
+
+        // Forged anchor (off-by-one): the PID is refused, signal NOT sent.
+        let forged = signal_process_group_if_target(pid, Some(real_start + 1), libc::SIGTERM);
+        assert!(
+            !forged,
+            "recycled PID with a mismatched start time must not be signalled"
+        );
+        assert!(
+            crate::core::job::is_pid_alive(pid),
+            "child must be untouched by the refused forged signal"
+        );
+
+        // Correct anchor: the signal IS sent and terminates the child.
+        let sent = signal_process_group_if_target(pid, Some(real_start), libc::SIGTERM);
+        assert!(sent, "the real child must be signalled");
+        let status = child.wait().expect("reap child");
+        assert!(
+            !status.success(),
+            "SIGTERM must terminate the child, got {status:?}"
+        );
+
+        // The PID must no longer be a viable signal target (dead).
+        assert!(
+            !signal_process_group_if_target(pid, Some(real_start), libc::SIGKILL),
+            "a dead PID must never be signalled again"
+        );
+    }
+
+    #[test]
+    fn test_signal_target_fallback_cmdline_plausibility() {
+        // With no recorded start time the helper falls back to a cmdline
+        // plausibility check: a supervised-agent-shaped process (sleep here,
+        // like the job tests) is signalled, while a mismatched/gone PID is not.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn child");
+        let pid = child.id();
+
+        // A start-time anchor that does not exist for any real process shape
+        // still refuses a plausible cmdline (identity beats plausibility).
+        assert!(
+            !signal_process_group_if_target(pid, Some(u64::MAX), libc::SIGTERM),
+            "a start-time mismatch must refuse even a plausible cmdline"
+        );
+        assert!(crate::core::job::is_pid_alive(pid));
+
+        // No anchor: plausible cmdline ("sleep") is signalled.
+        let sent = signal_process_group_if_target(pid, None, libc::SIGTERM);
+        assert!(sent, "the no-anchor fallback must signal a plausible child");
+        let status = child.wait().expect("reap child");
+        assert!(!status.success());
+    }
+
+    #[test]
+    fn test_kill_with_grace_refuses_recycled_pid() {
+        // The bounded kill path keeps polling and leaves a PID with a forged
+        // (recycled-PID) anchor untouched; by deadline it reports Unkillable
+        // only to the caller, never signalling the wrong process.
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let grace = Duration::from_millis(60);
+        let kill_wait = Duration::from_millis(60);
+
+        let mut wait_calls = 0_u32;
+        let res = kill_process_group_with_grace_custom(
+            pid,
+            Some(crate::core::job::get_process_start_time(pid).unwrap() + 1),
+            grace,
+            kill_wait,
+            |_p, _status, _opt| {
+                wait_calls += 1;
+                0
+            },
+        );
+        // The forged signal was refused, nothing died, the child is untouched.
+        assert_eq!(res, KillResult::Unkillable);
+        assert!(wait_calls >= 2, "the bounded loop must keep polling");
+        assert!(crate::core::job::is_pid_alive(pid));
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

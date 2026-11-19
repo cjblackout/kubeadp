@@ -47,6 +47,17 @@ use a2a::A2AError as SdkA2AError;
 
 /// Bound on the sink's global idempotency cache of delivered message ids.
 const SEEN_CACHE_CAP: usize = 4096;
+/// Upper bound on the number of distinct in-memory per-job escalation slots.
+///
+/// Each delivered job gets one `JobSlot`; a slot is never explicitly removed
+/// once created (a job can idle for a long time and then receive a new
+/// message), so without a bound the map would keep one entry per job the
+/// worker ever spoke to. When a NEW job would exceed the bound, the oldest
+/// slot is evicted: the evicted job's `JobSlot` is recreated from disk on its
+/// next message (the gate is only in-process serialization on top of the
+/// atomic store claim, so ephemeral eviction is safe). 16384 slots covers any
+/// realistic in-process job churn and keeps the map bounded.
+const MAX_SLOTS: usize = 16384;
 /// TaskBackend implementation that operates on agent-core's SQLite job store and worktrees.
 pub struct JobTaskBackend {
     config: Arc<Config>,
@@ -251,6 +262,8 @@ impl JobSlot {
 pub struct JobMessageSink {
     config: Arc<Config>,
     slots: Mutex<HashMap<String, Arc<JobSlot>>>,
+    /// First-appearance order of the tracked job slots (FIFO eviction).
+    slot_order: Mutex<VecDeque<String>>,
     seen: Mutex<VecDeque<String>>,
     /// The ladder watchers (one per job).
     ladders: crate::core::a2a::delivery::LadderWatchers,
@@ -271,6 +284,7 @@ impl JobMessageSink {
         Self {
             config,
             slots: Mutex::new(HashMap::new()),
+            slot_order: Mutex::new(VecDeque::new()),
             seen: Mutex::new(VecDeque::new()),
             ladders: crate::core::a2a::delivery::LadderWatchers::new(),
             test_ladder_disabled: std::sync::atomic::AtomicBool::new(false),
@@ -301,9 +315,23 @@ impl JobMessageSink {
     }
 
     /// The per-job slot, creating it on first use; the job's own `gate`
-    /// (acquired by the caller) serialises a resume for that job.
+    /// (acquired by the caller) serialises a resume for that job. The map is
+    /// bounded by [`MAX_SLOTS`]; the oldest slot is evicted when a new job
+    /// would exceed the bound and is transparently recreated on its next
+    /// message.
     fn slot(&self, task_id: &str) -> Arc<JobSlot> {
+        let mut order = self.slot_order.lock().expect("slot_order lock poisoned");
         let mut map = self.slots.lock().expect("slots lock poisoned");
+        if !map.contains_key(task_id) {
+            while map.len() >= MAX_SLOTS {
+                if let Some(oldest) = order.pop_front() {
+                    map.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+            order.push_back(task_id.to_string());
+        }
         map.entry(task_id.to_string())
             .or_insert_with(|| Arc::new(JobSlot::new()))
             .clone()
@@ -1939,5 +1967,40 @@ mod tests {
             let _ = reader.wait();
             crate::core::a2a_live::close_for("livedel");
         });
+    }
+
+    #[test]
+    fn slot_map_is_bounded_and_evicts_oldest_first() {
+        let temp = TempDir::new().unwrap();
+        let (config, worktree) = save_resumable_done_job(&temp, "slotbound", 0);
+        write_fake_agy(&config.agy_path, &worktree);
+        let sink = JobMessageSink::new(Arc::new(config));
+
+        // Create slots for MAX_SLOTS + margin distinct jobs. `slot` is a
+        // private helper; drive it through `deliver_with_meta` (it calls
+        // `slot` at least for the `interrupt` and normal paths) -- but that
+        // also enqueues durable messages. To keep it cheap, exercise the
+        // sink's internal map directly through the recorded slot entries.
+        for i in 0..(MAX_SLOTS + 50) {
+            let job = format!("j{i}");
+            sink.slot(&job);
+        }
+
+        let map = sink.slots.lock().unwrap();
+        assert!(
+            map.len() <= MAX_SLOTS,
+            "slot map grew beyond the bound: {} > {}",
+            map.len(),
+            MAX_SLOTS
+        );
+        assert!(!map.contains_key("j0"), "oldest slot must be evicted first");
+        assert!(
+            map.contains_key(&format!("j{}", MAX_SLOTS + 49)),
+            "the most recent slot must be retained"
+        );
+        // Re-creating an evicted job's slot works (gate recreated on demand).
+        drop(map);
+        let recreated = sink.slot("j0");
+        assert!(recreated.gate.try_lock().is_ok());
     }
 }
