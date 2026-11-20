@@ -900,15 +900,26 @@ fn run_session_iteration(
         }
     };
     if wrap_in_sandbox {
-        let grants_cfg = session
-            .grants
-            .as_ref()
-            .map(|g| crate::sandbox::policy::GrantsConfig {
-                serviceaccount: g.serviceaccount,
-                ro_paths: g.ro_paths.clone(),
-                rw_paths: g.rw_paths.clone(),
-                env: g.env.clone(),
-            });
+        let mut grants_cfg =
+            session
+                .grants
+                .as_ref()
+                .map(|g| crate::sandbox::policy::GrantsConfig {
+                    serviceaccount: g.serviceaccount,
+                    ro_paths: g.ro_paths.clone(),
+                    rw_paths: g.rw_paths.clone(),
+                    env: g.env.clone(),
+                });
+        // The session's own `env` entries are explicit operator choices: their
+        // names pass the sandbox env filter without a separate grant.
+        if !session.env.is_empty() {
+            let g = grants_cfg.get_or_insert_with(Default::default);
+            for k in session.env.keys() {
+                if !g.env.contains(k) {
+                    g.env.push(k.clone());
+                }
+            }
+        }
         let base_policy = crate::sandbox::SandboxPolicy::for_session(
             &session.session_id,
             &session.workdir,
@@ -996,6 +1007,9 @@ fn run_session_iteration(
                 }
             }
         }
+        // The session's own `env` wins over a same-named pod variable that a
+        // grant pattern passed through above.
+        sandboxed_cmd.envs(&session.env);
 
         sandboxed_cmd.arg("sandbox-exec");
         sandboxed_cmd.arg("--policy");
