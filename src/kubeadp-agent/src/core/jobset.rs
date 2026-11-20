@@ -226,6 +226,35 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// The zero epoch every fresh jobset starts at.
 pub const EPOCH_ZERO: Epoch = 0;
 
+/// Derives the membership proof for `agent_id` in `id` at `epoch`,
+/// hex-encoded.
+///
+/// `input = b"kubeadp-member-v1" || 0x00 || id || 0x00 || epoch.decimal
+///          || 0x00 || agent_id`
+/// then `member_proof = hex(hmac_sha256(root_key, input))` (SPEC §7.3, HL-125
+/// Stream 3). The proof binds the agent id to the jobset: a member cannot
+/// compute another member's proof. Deterministic: the same root key, id, epoch
+/// and agent id always produce the same proof, so any pod holding the root key
+/// can re-derive and verify a member's proof statelessly.
+pub fn derive_member_proof(root_key: &[u8], id: &str, epoch: Epoch, agent_id: &str) -> String {
+    let mut msg =
+        Vec::with_capacity(MEMBER_DERIVE_LABEL.len() + 1 + id.len() + 1 + 12 + 1 + agent_id.len());
+    msg.extend_from_slice(MEMBER_DERIVE_LABEL);
+    msg.push(DERIVE_SEP);
+    msg.extend_from_slice(id.as_bytes());
+    msg.push(DERIVE_SEP);
+    msg.extend_from_slice(epoch.to_string().as_bytes());
+    msg.push(DERIVE_SEP);
+    msg.extend_from_slice(agent_id.as_bytes());
+    hex_lower(&crypto::hmac_sha256(root_key, &msg))
+}
+
+/// The fixed label the member-proof derivation starts with, so no field
+/// concatenation can collide with the jobset-secret derivation domain:
+/// `root_key || b"kubeadp-member-v1" || 0x00 || jobset_id || 0x00 || epoch
+/// || 0x00 || agent_id`.
+const MEMBER_DERIVE_LABEL: &[u8] = b"kubeadp-member-v1";
+
 /// Generates a fresh jobset id (random, from the OS RNG, hex-encoded).
 ///
 /// The value is a public identifier (not a secret); it names the jobset the
@@ -859,6 +888,13 @@ fn register_agent_at(agent_id: &str, cred: &JobsetCredential) {
             agent_id, e
         );
     }
+    // HL-125 Stream 3 (C1): mirror the membership into the SQLite
+    // `jobset`/`jobset_member` tables. The in-memory [`JobsetRegistry`]
+    // remains the read/verification path for this step; the store is the
+    // persistence target the C5 flag-day switches to. The write is
+    // non-fatal here so the current behaviour (registry-first) never fails a
+    // start because of the store.
+    record_registration_in_store(agent_id, cred);
 }
 
 /// Drop an agent's entry from the process-wide registry, called on *every*
@@ -867,6 +903,48 @@ fn register_agent_at(agent_id: &str, cred: &JobsetCredential) {
 /// a no-op, so a double end is harmless.
 pub fn drop_agent(agent_id: &str) {
     JobsetRegistry::drop(global_registry().as_ref(), agent_id);
+}
+
+/// HL-125 Stream 3 (C1): mirrors one registration into the SQLite store when
+/// a store is open for the state root the registry is pointed at.
+///
+/// `ensure_default` (the agent's own default jobset) + `add_member` are
+/// called idempotently; `upsert_foreign` refuses an ended jobset / a higher
+/// epoch, which matches the in-memory rules. Non-fatal: a store failure only
+/// warns (the in-memory registry keeps serving, exactly like the file
+/// persistence above). The store is only reached when a root key is
+/// configured (like the derived-secret path it sits next to).
+fn record_registration_in_store(agent_id: &str, cred: &JobsetCredential) {
+    let Some(state_root) = global_registry().data_dir() else {
+        return;
+    };
+    if global_registry().root_key().is_none() {
+        return;
+    }
+    match crate::state::jobsets::JobsetStore::open_path(&state_root) {
+        Ok(store) => {
+            let result = (|| -> anyhow::Result<()> {
+                let created = store.ensure_default(agent_id)?;
+                if created.jobset_id != cred.jobset_id {
+                    store
+                        .upsert_foreign(&cred.jobset_id, "", cred.epoch)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    store.add_member(&cred.jobset_id, agent_id)?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                eprintln!(
+                    "kubeadp-agent: warning: failed to mirror jobset membership for '{}' into the state store: {e:#}",
+                    agent_id
+                );
+            }
+        }
+        Err(e) => eprintln!(
+            "kubeadp-agent: warning: failed to open the jobset state store for '{}': {e:#}",
+            agent_id
+        ),
+    }
 }
 
 /// RAII handle that drops the jobset entry for `agent_id` from the
@@ -899,6 +977,9 @@ impl Drop for JobsetDropGuard {
 pub fn register_self() {
     if let Some(cred) = host_jobset() {
         global_registry().register_at(local_agent_id(), &cred.jobset_id, &cred.secret, cred.epoch);
+        // The host is itself a member: mirror into the store too, so the
+        // store row/persistence view starts with the hosting agent.
+        record_registration_in_store(&local_agent_id(), &cred);
     }
 }
 
@@ -946,21 +1027,21 @@ pub const KNOWN_JOBSETS_MAX: usize = 10_000;
 /// The persisted membership document (JSON on disk).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MembershipDoc {
+pub struct MembershipDoc {
     /// agent id -> (jobset id, epoch) for every agent we know a membership for.
     #[serde(default)]
-    members: HashMap<String, Member>,
+    pub members: HashMap<String, Member>,
     /// ended jobset id -> the epoch it was ended at.
     #[serde(default)]
-    ended: HashMap<String, u64>,
+    pub ended: HashMap<String, u64>,
 }
 
 /// One persisted membership: the jobset id and the epoch (never a secret).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Member {
-    jobset_id: String,
-    epoch: u64,
+pub struct Member {
+    pub jobset_id: String,
+    pub epoch: u64,
 }
 
 /// Returns the path of the membership store for `state_root`.
@@ -1100,6 +1181,20 @@ pub fn end_jobset(jobset_id: &str) -> Result<Option<u64>, String> {
         return Ok(None);
     };
     save_memberships()?;
+    // HL-125 Stream 3 (C1): mirror the end into the SQLite store (epoch bump
+    // + ended marker) when one is open for the registry's data dir. No-op
+    // when the store is not reachable (the in-memory ended map still rejects
+    // every old credential, and the C5 flag-day reads the store).
+    if let Some(state_root) = registry.data_dir() {
+        if let Ok(store) = crate::state::jobsets::JobsetStore::open_path(&state_root) {
+            if let Err(e) = store.end(jobset_id) {
+                eprintln!(
+                    "kubeadp-agent: warning: failed to mirror jobset end for '{}' into the state store: {e:#}",
+                    jobset_id
+                );
+            }
+        }
+    }
     Ok(Some(
         registry.ended_epoch(jobset_id).expect("just ended above"),
     ))
@@ -1343,6 +1438,140 @@ pub fn build_jobset_env(
             file.to_string_lossy().to_string(),
         ),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Credential file (HL-125 Stream 3, SPEC §6.5)
+// ---------------------------------------------------------------------------
+//
+// The Stream 3 layout gives an agent ONE 0400 file holding every jobset it is
+// a member of. The deriving pod only ever holds ids and epochs (the
+// `jobset`/`jobset_member` store of C1); the secret and the member proof are
+// derived from the root key at launch ([`derive_jobset_secret`],
+// [`derive_member_proof`]) and handed to the agent through the sandbox secret
+// channel. The reader the sandboxed harnesses use (`mcp-a2a`, `a2a-hook`,
+// `agent-run start`) renders itself indistinguishable from the existing
+// single-jobset layout: the file may hold several jobsets, and the reader
+// picks the entry matching its environment. No secret or proof value is ever
+// written to the state store, argv, environment or logs.
+
+/// One credential within a [`CredentialFile`]: the jobset id, the epoch the
+/// secret and proof were derived at, the secret and the membership proof
+/// (SPEC §7.3).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialEntry {
+    pub jobset_id: String,
+    pub epoch: Epoch,
+    pub secret: String,
+    pub member_proof: String,
+}
+
+/// The on-disk layout of `jobset-credentials.json` (SPEC §6.5): the owning
+/// agent id plus every jobset it is a member of.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialFile {
+    pub agent_id: String,
+    pub jobsets: Vec<CredentialEntry>,
+}
+
+/// File name of the per-agent jobset credential file in the private tmp.
+pub const CREDENTIAL_FILE_NAME: &str = "jobset-credentials.json";
+
+/// Cumulative file mode for the credential file (0400: readable and writable
+/// by the launcher only; never the owner write of the old single-secret file,
+/// see SPEC §6.5).
+pub const CREDENTIAL_FILE_MODE: u32 = 0o400;
+
+/// Writes `credentials` as the serialized 0400 credential file at `path`
+/// (SPEC §6.5): `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW`, parents created, mode
+/// 0400. A stale regular file owned by the launcher is removed first (the
+/// spec's "stale file of another launcher" rule). Failures are surfaced as a
+/// string so the launcher can fail closed rather than hand an agent a
+/// partially written secret.
+pub fn write_credential_file(
+    path: &std::path::Path,
+    credentials: &CredentialFile,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|e| {
+        format!(
+            "failed to create credential directory '{}': {e}",
+            dir.display()
+        )
+    })?;
+
+    // Best-effort removal of a stale file from an earlier launcher: only a
+    // regular file (never a symlink, which would let an attacker redirect the
+    // exclusive create) is removed.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {
+            std::fs::remove_file(path).map_err(|e| {
+                format!(
+                    "failed to remove stale credential file '{}': {e}",
+                    path.display()
+                )
+            })?;
+        }
+        Ok(_) => {
+            return Err(format!(
+                "refusing to overwrite non-regular path '{}'",
+                path.display()
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "failed to inspect existing path '{}': {e}",
+                path.display()
+            ));
+        }
+    }
+
+    let bytes = serde_json::to_vec_pretty(credentials)
+        .map_err(|e| format!("failed to serialize jobset credentials: {e}"))?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(CREDENTIAL_FILE_MODE)
+        .open(path)
+        .map_err(|e| format!("failed to create credential file '{}': {e}", path.display()))?;
+    f.write_all(&bytes)
+        .map_err(|e| format!("failed to write credential file '{}': {e}", path.display()))?;
+    f.sync_all()
+        .map_err(|e| format!("failed to fsync credential file '{}': {e}", path.display()))?;
+    Ok(())
+}
+
+/// Reads and parses the credential file at `path`, returning a
+/// [`CredentialFile`] when it is a well-formed 0400 document. A missing file
+/// returns `None`; a corrupt file is reported so the caller can fail closed
+/// (never silently fall back to an empty credential set).
+pub fn read_credential_file(path: &std::path::Path) -> Result<Option<CredentialFile>, String> {
+    let raw = match std::fs::read(path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "failed to read credential file '{}': {e}",
+                path.display()
+            ));
+        }
+    };
+    serde_json::from_slice::<CredentialFile>(&raw)
+        .map(Some)
+        .map_err(|e| format!("corrupt credential file '{}': {e}", path.display()))
+}
+
+/// The path of the per-agent credential file inside a private tmp root, and
+/// the environment variable the launcher sets for a Stream 3 agent.
+pub fn credential_file_path(private_tmp: &std::path::Path) -> std::path::PathBuf {
+    private_tmp.join(CREDENTIAL_FILE_NAME)
 }
 
 #[cfg(test)]
@@ -1881,6 +2110,75 @@ mod tests {
         assert_ne!(s1, s4, "different epoch differs");
         let s5 = derive_jobset_secret(other_key, "jobset-aaa", 0);
         assert_ne!(s1, s5, "different root key differs");
+    }
+
+    /// The member proof (SPEC §7.3) is deterministic for one
+    /// (key, id, epoch, agent) tuple, 64 hex chars, domain-separated from the
+    /// jobset secret, and binds the agent id (an agent cannot compute another
+    /// member's proof).
+    #[test]
+    fn member_proof_is_deterministic_and_binds_agent() {
+        let key = b"0123456789abcdef0123456789abcdef";
+        let other_key = b"fedcba9876543210fedcba9876543210";
+        let p1 = derive_member_proof(key, "jobset-aaa", 0, "agent-1");
+        let p2 = derive_member_proof(key, "jobset-aaa", 0, "agent-1");
+        assert_eq!(p1, p2, "same tuple is deterministic");
+        assert_eq!(p1.len(), 64, "hex of 32-byte HMAC");
+
+        let p_secret = derive_jobset_secret(key, "jobset-aaa", 0);
+        assert_ne!(p1, p_secret, "proof is domain-separated from the secret");
+
+        let other_agent = derive_member_proof(key, "jobset-aaa", 0, "agent-2");
+        assert_ne!(p1, other_agent, "a member cannot compute another's proof");
+        let other_id = derive_member_proof(key, "jobset-bbb", 0, "agent-1");
+        assert_ne!(p1, other_id, "bound to the jobset id");
+        let other_epoch = derive_member_proof(key, "jobset-aaa", 1, "agent-1");
+        assert_ne!(p1, other_epoch, "bound to the epoch");
+        let other_key_v = derive_member_proof(other_key, "jobset-aaa", 0, "agent-1");
+        assert_ne!(p1, other_key_v, "bound to the root key");
+    }
+
+    /// A credential file round-trips (SPEC §6.5 layout: agent id + a list of
+    /// jobsets, each with id/epoch/secret/member_proof), is written mode 0400
+    /// via the exclusive+no-follow create, and a stale regular file is
+    /// replaced while a non-regular path is refused.
+    #[test]
+    fn credential_file_round_trip_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobset-credentials.json");
+        let file = CredentialFile {
+            agent_id: "agent-x".to_string(),
+            jobsets: vec![CredentialEntry {
+                jobset_id: "js-1".to_string(),
+                epoch: 0,
+                secret: "a".repeat(64),
+                member_proof: "b".repeat(64),
+            }],
+        };
+        write_credential_file(&path, &file).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o400, "credential file must be 0400");
+
+        let read_back = read_credential_file(&path)
+            .unwrap()
+            .expect("file must be readable");
+        assert_eq!(read_back, file);
+
+        // A second write replaces the stale regular file and keeps 0400.
+        write_credential_file(&path, &file).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o400);
+
+        // A missing file reads as None.
+        let missing = read_credential_file(&dir.path().join("does-not-exist.json")).unwrap();
+        assert!(missing.is_none());
+
+        // A non-regular path (a directory) is refused, not followed.
+        let dir_path = dir.path().join("adir");
+        std::fs::create_dir(&dir_path).unwrap();
+        assert!(write_credential_file(&dir_path, &file).is_err());
     }
 
     #[test]

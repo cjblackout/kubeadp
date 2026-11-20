@@ -19,7 +19,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use rusqlite::Connection;
 
-/// The in-memory tables (mirror of migration v3).
+/// The in-memory tables (mirror of migration v3 plus the migration-7 audit
+/// table and the relaxed `framed NOT NULL`).
 const MEM_SQL: &str = "
 CREATE TABLE IF NOT EXISTS a2a_message (
     run_id TEXT NOT NULL,
@@ -29,7 +30,7 @@ CREATE TABLE IF NOT EXISTS a2a_message (
     hop INTEGER NOT NULL,
     context_id TEXT,
     task_id TEXT,
-    framed TEXT NOT NULL,
+    framed TEXT,
     queued_at INTEGER NOT NULL,
     claimed_at INTEGER,
     injected_at INTEGER,
@@ -44,6 +45,20 @@ CREATE TABLE IF NOT EXISTS a2a_expiry (
     expired_at INTEGER NOT NULL,
     expired_at_ns INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (run_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS a2a_audit (
+    run_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    from_agent_id TEXT NOT NULL,
+    to_agent_id TEXT NOT NULL,
+    jobset_id TEXT,
+    message_size INTEGER NOT NULL,
+    channel TEXT,
+    delivered_at INTEGER,
+    injected_at INTEGER,
+    outcome TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    PRIMARY KEY (run_id, message_id, outcome)
 );
 ";
 

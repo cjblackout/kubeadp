@@ -10,6 +10,7 @@
 //! than known to the binary are refused.
 
 pub mod jobs;
+pub mod jobsets;
 pub mod migrations;
 pub mod runs;
 pub mod sessions;
@@ -21,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use jobs::JobStore;
+pub use jobsets::JobsetStore;
 pub use runs::{RunMeta, RunMetaStore, RunRegistry};
 pub use sessions::SessionStore;
 
@@ -121,6 +123,11 @@ impl StateDb {
     /// Returns a [`RunMetaStore`] handle for querying and modifying `run_meta`.
     pub fn runs_meta(&self) -> RunMetaStore {
         RunMetaStore::new(self.clone())
+    }
+
+    /// Returns a [`JobsetStore`] handle for the jobset/member tables.
+    pub fn jobsets(&self) -> JobsetStore {
+        JobsetStore::new(self.clone())
     }
 
     /// Returns a [`RunRegistry`] view over jobs, sessions, and `run_meta`.

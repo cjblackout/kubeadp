@@ -49,6 +49,9 @@ pub mod ingress;
 pub mod inbox;
 
 #[cfg(feature = "a2a")]
+pub mod audit;
+
+#[cfg(feature = "a2a")]
 pub mod inject;
 
 #[cfg(feature = "a2a")]

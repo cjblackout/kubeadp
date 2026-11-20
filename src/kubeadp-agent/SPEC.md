@@ -136,6 +136,11 @@ file; the exceptions are listed at the end of this section.
 | 1 | `jobs` | job commands and the job monitor | — |
 | 2 | `supervisor_state` (one row), `session_state` (one row per session) | session supervisor | legacy JSON state file (imported once, renamed `*.migrated`) |
 | 3 | `a2a_message`, `a2a_expiry` | the A2A sink and delivery ladder of the hosting pod | the per-run inbox directories of the earlier phases; the `<state_root>/a2a-inbox/<run>/` directory survives only as the run key |
+| 7 | `a2a_audit`; relax `a2a_message.framed` to nullable | the A2A audit store + the inbox purge | the `NOT NULL` on `a2a_message.framed` (SQLite cannot relax it in place, so migration 7 rebuilds the table idempotently once) |
+
+Version 6 is reserved for the stream-3 step C1 `jobset`/`jobset_member`
+tables (a parallel patch); this step appends 7 so both additive migrations can
+land in any order without renumbering.
 
 The planned `jobset`/`jobset_member` tables (§7.2) and `run_meta` (§3.7) are
 appended as later additive migrations when implemented (§13.1).
@@ -151,11 +156,16 @@ jobset_member(jobset_id TEXT NOT NULL, agent_id TEXT NOT NULL,
 a2a_message(run_id TEXT NOT NULL, message_id TEXT NOT NULL,
        fake INTEGER NOT NULL DEFAULT 0, sender TEXT NOT NULL,
        hop INTEGER NOT NULL, context_id TEXT, task_id TEXT,
-       framed TEXT NOT NULL, queued_at INTEGER NOT NULL, claimed_at INTEGER,
+       framed TEXT, queued_at INTEGER NOT NULL, claimed_at INTEGER,
        injected_at INTEGER, channel TEXT, PRIMARY KEY (run_id, message_id))
 a2a_expiry(run_id TEXT NOT NULL, fake INTEGER NOT NULL DEFAULT 0,
        message_id TEXT NOT NULL, reason TEXT NOT NULL, expired_at INTEGER NOT NULL,
        expired_at_ns INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (run_id, message_id))
+a2a_audit(run_id TEXT NOT NULL, message_id TEXT NOT NULL,
+       from_agent_id TEXT NOT NULL, to_agent_id TEXT NOT NULL,
+       jobset_id TEXT, message_size INTEGER NOT NULL, channel TEXT,
+       delivered_at INTEGER, injected_at INTEGER, outcome TEXT NOT NULL,
+       timestamp INTEGER NOT NULL, PRIMARY KEY (run_id, message_id, outcome))
 run_meta(run_id TEXT PRIMARY KEY, kind TEXT NOT NULL, paused INTEGER NOT NULL DEFAULT 0,
        compact_summary TEXT, compacted_at INTEGER, forked_from TEXT,
        updated_at INTEGER NOT NULL)
@@ -167,6 +177,10 @@ inbox is implemented: every accepted message is one `a2a_message` row keyed by
 rows are kept). An expired uninjected row is removed and recorded in
 `a2a_expiry` (the sender's task then fails, §7.14); the bounded-queue drop note
 is an ordinary `a2a_message` row (sender `inbox`) delivered like any message.
+Message text is metadata-only handled (§7.15): `a2a_message.framed` is set
+`NULL` 60 s after injection and at once on expire/drop; every lifecycle event
+writes one metadata-only `a2a_audit` row (never the text), purged 14 days
+after its timestamp.
 The `fake` flag keeps the test suites' in-memory store apart from the real
 per-pod database.
 
@@ -1924,9 +1938,10 @@ section is outstanding.
 | migrations 1–2 (`jobs`, `supervisor_state`, `session_state`), WAL, busy timeout | implemented | |
 | migration 4 (`heartbeat_epoch_ms`, supervisor heartbeat in milliseconds) | implemented | sub-second stale detection with a strict threshold comparison; the whole-second epoch is kept in sync for older readers |
 | refusal of a newer `user_version` | implemented | |
-| migration 3 (`jobset`, `jobset_member`, `jobsets.json` import) | planned | membership is `jobsets.json` plus in-memory maps today |
+| migration 3 (`jobset`, `jobset_member`, `jobsets.json` import) | implemented (migration 6) | `jobset`/`jobset_member` tables plus the one-time idempotent import of `jobsets.json` and the `job-jobsets/` remember-files; the in-memory registry still serves all callers (dual-write; the store is the C5 read target) |
 | `a2a_message`/`a2a_expiry` inbox tables, per-run inbox in the shared database | implemented | the code's migration 3; the `<state_root>/a2a-inbox/<run>/` directory survives only as the run key, the sandboxed receive side reads through the pod-local HTTP API |
 | migration 5 (`run_meta`), run registry as a view | implemented | run registry is a view over `jobs`/`session_state` and `run_meta`; compact record and message queue integrate with `run_meta` and `a2a_message` |
+| migration 7 (`a2a_audit`, `a2a_message.framed` nullable) | implemented | stream-3 step C2; version 6 is reserved for the parallel C1 `jobset` tables |
 
 ### 13.2 Engines (§3, §5.4, §5.5)
 | Item | Status | Note |
@@ -1949,18 +1964,18 @@ section is outstanding.
 | Item | Status | Note |
 |---|---|---|
 | derived jobset secret, root key handling, hidden root key | implemented | |
-| root key mandatory with `a2a` | planned | a random in-memory secret is used without a root key |
-| multi-jobset membership, default jobset per agent, join at start only | planned | one jobset per agent; caller-chosen `jobset_id` joins without proof |
+| root key mandatory with `a2a` | planned | a random in-memory secret is used without a root key (made mandatory at the C5 flag day) |
+| multi-jobset membership, default jobset per agent, join at start only | partial (C1) | the SQLite store holds multi-jobset membership and a persisted epoch; the in-memory registry (one jobset per agent) still serves all callers, so joining several jobsets is a C5 read-path concern |
 | creator proof on start (§7.2), `jobset_creator_required` | planned | |
-| member proof, verified sender, authorization order and codes (§7.4) | planned | sender is claimed (the credential binds the jobset, not the agent); every authorization failure answers `401` with the `UNAUTHENTICATED` envelope |
+| member proof, verified sender, authorization order and codes (§7.4) | planned | `derive_member_proof` (SPEC §7.3) and the `CredentialFile` read/write of `jobset-credentials.json` (0400) exist; the sender is still claimed in the frame, and C4 wires the proof into the authorization order |
 | API bearer accepted on A2A routes (operator credential) | implemented | the A2A surface sits behind the same operator token as `/api/v1`, mounted only with a token or `KUBEADP_API_ALLOW_OPEN`; a presented-but-invalid jobset credential is never downgraded to the bearer |
-| one credential file with all jobsets (§6.5) | planned | one secret file plus `KUBEADP_JOBSET_ID`/`_EPOCH`/`_SECRET_FILE` |
+| one credential file with all jobsets (§6.5) | partial | file layout, write (0400) and read helpers exist (`jobset-credentials.json`); the launcher still hands the single-jobset secret file + `KUBEADP_JOBSET_ID`/`_EPOCH`/`_SECRET_FILE` in C1 |
 | limits of §7.6 | partial | size, queue bound, TTL, hop cap, interrupt interval implemented; the guarded A2A send path charges a per-jobset budget (60/min, 500 lifetime) answered `429` + `Retry-After`, the session PTY message route keeps 30/min per (session, sender); the hop is read server-side from the signed `a2a.hop_token`, never from the claimed integer |
 | discovery, agent card, SDK REST surface, task mapping | implemented | card still declares a bearer scheme; `GET /a2a/agents` planned |
 | framing with verified sender and jobset (§7.12) | planned | frame says `claimed sender: <sender>` |
 | inbox, channels, `a2a-hook`, hook installation, ladder (§7.14) | implemented | the inbox is the shared state database (`a2a_message`/`a2a_expiry`); the sandboxed receive side reads it through the pod-local inbox API under a per-run token |
 | absent recipient queued, `delivery` in the send answer | partial | queue and TTL implemented; the send answer carries no `delivery` value |
-| audit and text deletion (§7.15) | planned | |
+| audit and text deletion (§7.15) | implemented | stream-3 step C2: metadata-only `a2a_audit` rows on accept/inject/expire/drop (never the text), `framed` set `NULL` 60 s after injection and at once on expire/drop, 14-day purge at startup + hourly |
 | end by creator, tombstone, peer propagation (§7.16) | partial | operator end route and epoch bump implemented, per pod only |
 | `mcp-a2a` tools | partial | all five tools exist; fixed-shape `send_message`/`reply` result (`delivered`, `delivery`), bounded `get_task` (`history_length`, truncation markers), cut-not-error response cap, canonical argument names with case-variant aliases, oversize-text refusal naming the limit, credential fail-closed; jobset-scoped `list_agents`, `jobset`/`interrupt` parameters and registration for claude jobs and sessions planned; `a2a_mcp_enabled` defaults to false |
 

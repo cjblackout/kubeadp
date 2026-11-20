@@ -25,7 +25,7 @@
 //!   with the old ad-hoc layout already in place).
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
 /// One additive schema migration. `apply` runs at most once per database --
 /// when the database's `user_version` is still below `version` -- and brings
@@ -273,6 +273,288 @@ CREATE TABLE IF NOT EXISTS run_meta (
 CREATE INDEX IF NOT EXISTS run_meta_kind_idx ON run_meta (kind);
 ";
 
+/// The `jobset` / `jobset_member` tables (migration 6, HL-125 Stream 3 C1,
+/// SPEC §2.3 / §7.2). Rows hold ids and epochs only -- never a secret, a
+/// proof or the root key. In addition to the plain schema this migration
+/// performs the ONE-TIME idempotent import of the legacy file-based
+/// membership store (`jobsets.json` + the `job-jobsets/` directory) into
+/// these tables. Imported jobsets carry creator `''` and cannot gain members
+/// without a creator; they keep working for their existing members.
+fn jobset_tables_v6(conn: &Connection) -> Result<()> {
+    conn.execute_batch(JOBSET_TABLES_V6_SQL)
+        .context("Failed to initialize jobset tables")?;
+    jobset_import_from_files(conn)
+}
+
+const JOBSET_TABLES_V6_SQL: &str = "
+CREATE TABLE IF NOT EXISTS jobset (
+    jobset_id TEXT PRIMARY KEY,
+    creator_agent_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    ended INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    ended_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS jobset_member (
+    jobset_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    joined_at INTEGER NOT NULL,
+    PRIMARY KEY (jobset_id, agent_id)
+);
+CREATE INDEX IF NOT EXISTS jobset_member_agent_idx ON jobset_member (agent_id);
+";
+
+/// One-time idempotent import of the legacy `jobsets.json` membership store
+/// and the `job-jobsets/` remember-files into the `jobset` /
+/// `jobset_member` tables.
+///
+/// The state root the database lives under is derived from the connection's
+/// main database file (`<state_root>/state.sqlite`), so `jobsets.json` and
+/// `job-jobsets/` are the state-root siblings of the store. The `apply`
+/// signature is `fn(&Connection)`; this helper reads the root from the
+/// connection itself, which keeps the framework signature unchanged and makes
+/// the migration testable against any database path.
+///
+/// Semantics (design §4, row "3"):
+/// - every membership in `jobsets.json` becomes one `jobset_member` row;
+/// - each distinct jobset becomes one `jobset(creator = '', epoch, ended)`;
+/// - ended markers become tombstones (`ended = 1`);
+/// - `job-jobsets/` entries re-associate a job id with the jobset it was
+///   started into (the registry's `get_or_remembered` treats a remember-file
+///   as membership), one `jobset_member` row per (jobset, job) pair.
+///
+/// The import is additive and `INSERT OR IGNORE`-based: an existing
+/// `jobset`/`jobset_member` row is never overwritten, so re-running (or
+/// running against a store that already holds rows, e.g. after the C1 mirror
+/// hooks ran) is a no-op. Imported jobsets are created with `created_at`
+/// `0`: the legacy file carries no timestamps.
+///
+/// The imported files are deliberately left in place: C1 keeps the in-memory
+/// registry as the read/verification path and it still reloads from
+/// `jobsets.json` / `job-jobsets/` at startup ([`load_memberships`]),
+/// so renaming them away in C1 would regress restart persistence. The C5
+/// flag-day removes those readers and renames the files to `*.migrated`
+/// (design §4, "additive ... file renamed `*.migrated`"). The migration
+/// itself runs exactly once per database (tracked by `user_version`), so the
+/// import is one-time regardless of the files' presence afterwards.
+fn jobset_import_from_files(conn: &Connection) -> Result<()> {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+
+    let state_root = match conn
+        .query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
+        .ok()
+        .filter(|p| !p.is_empty())
+    {
+        Some(path) => PathBuf::from(path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default(),
+        None => PathBuf::new(),
+    };
+    if state_root.as_os_str().is_empty() {
+        // The in-memory test connections have an empty file name; there is
+        // nothing to import for them.
+        return Ok(());
+    }
+
+    let membership_path = state_root.join("jobsets.json");
+    if !membership_path.exists() {
+        return Ok(());
+    }
+
+    // A corrupt membership file is quarantine-territory of the registry load
+    // ([`load_memberships`] renames it aside and starts empty); the import
+    // matches that: a corrupt file skips the import instead of failing the
+    // whole upgrade. The file is left for the registry's own handling.
+    let doc: crate::core::jobset::MembershipDoc =
+        match serde_json::from_slice(&fs::read(&membership_path)?) {
+            Ok(d) => d,
+            Err(_e) => return Ok(()),
+        };
+
+    let now = chrono::Utc::now().timestamp();
+    let upsert_jobset =
+        |conn: &Connection, jobset_id: &str, epoch: u64, ended: bool, now: i64| -> Result<()> {
+            conn.execute(
+                "INSERT INTO jobset (jobset_id, creator_agent_id, epoch, ended, created_at) \
+             VALUES (?1, '', ?2, ?3, ?4) \
+             ON CONFLICT(jobset_id) DO NOTHING",
+                params![jobset_id, epoch, if ended { 1 } else { 0 }, now],
+            )
+            .context("Failed to insert an imported jobset row")?;
+            Ok(())
+        };
+
+    // Members -> jobset_member rows; distinct jobsets -> jobset rows.
+    for (agent_id, member) in doc
+        .members
+        .into_iter()
+        .take(crate::core::jobset::MEMBERSHIP_MAX_ENTRIES)
+    {
+        upsert_jobset(conn, &member.jobset_id, member.epoch, false, now)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO jobset_member (jobset_id, agent_id, joined_at) \
+             VALUES (?1, ?2, ?3)",
+            params![member.jobset_id, agent_id, now],
+        )
+        .context("Failed to insert an imported membership row")?;
+    }
+
+    // Ended markers -> tombstones.
+    for (jobset_id, ended_epoch) in doc
+        .ended
+        .into_iter()
+        .take(crate::core::jobset::ENDED_MAX_ENTRIES)
+    {
+        upsert_jobset(conn, &jobset_id, ended_epoch, true, now)?;
+    }
+
+    // The `job-jobsets/` directory: one `jobset_member` row per (jobset,
+    // remembered job) pair.
+    let job_jobsets_dir = state_root.join("job-jobsets");
+    let mut remembered: HashMap<String, String> = HashMap::new();
+    if let Ok(entries) = fs::read_dir(&job_jobsets_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if let Ok(content) = fs::read_to_string(entry.path()) {
+                    let id = content.trim().to_string();
+                    if !id.is_empty() {
+                        remembered.insert(name.to_string(), id);
+                    }
+                }
+            }
+        }
+    }
+    for (job_id, jobset_id) in &remembered {
+        upsert_jobset(conn, jobset_id, 0, false, now)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO jobset_member (jobset_id, agent_id, joined_at) \
+             VALUES (?1, ?2, ?3)",
+            params![jobset_id, job_id, now],
+        )
+        .context("Failed to insert an imported remember-file membership")?;
+    }
+
+    Ok(())
+}
+
+/// The A2A audit table (`a2a_audit`, migration 7, HL-125 stream 3 C2; SPEC
+/// §2.3/§7.15). One METADATA-ONLY row per delivered message: from/to, the
+/// jobset, the message id, the message size, the delivery channel, the
+/// delivery outcome and the timestamps. Message TEXT never lands here -- it
+/// exists only in `a2a_message.framed`, which is set `NULL` 60 s after
+/// injection and at once on expire/drop. Rows are deleted 14 days after their
+/// timestamp by the purge pass (startup + at least hourly).
+///
+/// Migration 7 also drops the `NOT NULL` on `a2a_message.framed` (SPEC §7.15:
+/// message text is set `NULL` 60 s after injection, so the column must accept
+/// `NULL`). SQLite cannot relax `NOT NULL` in place, so the table is rebuilt
+/// idempotently: the rebuild runs only when the column still says
+/// `NOT NULL` (i.e. once), copies every existing row verbatim, re-creates the
+/// partial `pending` index, and never touches another table or column. The
+/// relax is a pure loosening -- existing rows and their meaning are
+/// unchanged, which keeps it compatible with the additive-migration rule.
+///
+/// Note on numbering: the sibling stream-3 step C1 (JobsetStore) uses
+/// migration version 6 for its `jobset`/`jobset_member` tables. This step
+/// appends version 7, so the two additive migrations can land in any order on
+/// the same crate without renumbering.
+fn a2a_audit_v7(conn: &Connection) -> Result<()> {
+    a2a_message_framed_nullable(conn)?;
+    conn.execute_batch(A2A_AUDIT_V7_SQL)
+        .context("Failed to initialize the A2A audit table")
+}
+
+/// Relaxes `a2a_message.framed` from `NOT NULL` to nullable, idempotently.
+/// Runs at most once per database (guarded by a `PRAGMA table_info` check);
+/// a concurrent process that already relaxed it is tolerated.
+fn a2a_message_framed_nullable(conn: &Connection) -> Result<()> {
+    let framed_not_null = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(a2a_message)")
+            .context("Failed to inspect the a2a_message table")?;
+        let cols: Vec<(String, i64)> = stmt
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                let notnull: i64 = row.get(3)?;
+                Ok((name, notnull))
+            })
+            .context("Failed to read the a2a_message table columns")?
+            .filter_map(|r| r.ok())
+            .collect();
+        cols.iter()
+            .find(|(name, _)| name == "framed")
+            .map(|(_, notnull)| *notnull != 0)
+            // The a2a_message table does not exist (a fresh pre-v3 schema or a
+            // partial state): nothing to relax, migration 3 creates it later if
+            // at all.
+            .unwrap_or(false)
+    };
+    if !framed_not_null {
+        return Ok(());
+    }
+    // The table rebuild must be atomic: a failure must not leave a partial
+    // `a2a_message_new` behind (which would break the idempotent re-run from
+    // the guard). Migration bodies only see `&Connection`, so the transaction
+    // is opened and closed with explicit SQL inside the batch.
+    let res = conn.execute_batch(
+        "BEGIN IMMEDIATE;
+        CREATE TABLE a2a_message_new (
+            run_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            fake INTEGER NOT NULL DEFAULT 0,
+            sender TEXT NOT NULL,
+            hop INTEGER NOT NULL,
+            context_id TEXT,
+            task_id TEXT,
+            framed TEXT,
+            queued_at INTEGER NOT NULL,
+            claimed_at INTEGER,
+            injected_at INTEGER,
+            channel TEXT,
+            PRIMARY KEY (run_id, message_id)
+        );
+        INSERT INTO a2a_message_new
+            (run_id, message_id, fake, sender, hop, context_id, task_id,
+             framed, queued_at, claimed_at, injected_at, channel)
+            SELECT run_id, message_id, fake, sender, hop, context_id, task_id,
+                   framed, queued_at, claimed_at, injected_at, channel
+            FROM a2a_message;
+        DROP TABLE a2a_message;
+        ALTER TABLE a2a_message_new RENAME TO a2a_message;
+        CREATE INDEX IF NOT EXISTS a2a_message_pending_idx
+            ON a2a_message (run_id, injected_at, claimed_at, queued_at) WHERE fake = 0;
+        COMMIT;",
+    );
+    if let Err(e) = res {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(anyhow::anyhow!(e))
+            .context("Failed to relax a2a_message.framed to NULL (table rebuild)");
+    }
+    Ok(())
+}
+
+const A2A_AUDIT_V7_SQL: &str = "
+CREATE TABLE IF NOT EXISTS a2a_audit (
+    run_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    from_agent_id TEXT NOT NULL,
+    to_agent_id TEXT NOT NULL,
+    jobset_id TEXT,
+    message_size INTEGER NOT NULL,
+    channel TEXT,
+    delivered_at INTEGER,
+    injected_at INTEGER,
+    outcome TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    PRIMARY KEY (run_id, message_id, outcome)
+);
+CREATE INDEX IF NOT EXISTS a2a_audit_timestamp_idx ON a2a_audit (timestamp) WHERE outcome IS NOT NULL;
+CREATE INDEX IF NOT EXISTS a2a_audit_run_idx ON a2a_audit (run_id);
+";
+
 /// Every declared migration, in application order. Append new migrations at
 /// the end (additive, ascending version); see the module docs.
 pub const MIGRATIONS: &[Migration] = &[
@@ -300,6 +582,16 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "run_meta table",
         apply: run_meta_v5,
+    },
+    Migration {
+        version: 6,
+        name: "jobset and jobset_member tables",
+        apply: jobset_tables_v6,
+    },
+    Migration {
+        version: 7,
+        name: "A2A audit table",
+        apply: a2a_audit_v7,
     },
 ];
 
@@ -346,14 +638,29 @@ mod tests {
     use rusqlite::params;
 
     #[test]
-    fn migrations_are_ascending_and_contiguous() {
-        for (i, m) in MIGRATIONS.iter().enumerate() {
-            assert_eq!(
-                m.version,
-                (i + 1) as i64,
-                "migrations must be declared in strictly ascending, contiguous order"
+    fn migrations_are_ascending() {
+        for w in MIGRATIONS.windows(2) {
+            assert!(
+                w[0].version < w[1].version,
+                "migrations must be declared in strictly ascending order"
             );
         }
+        // The parallel stream-3 C1 step owns version 6 (JobsetStore), so this
+        // branch's array is expected to read [1..5, 7] until C1 lands. Every
+        // version below the highest must be unique.
+        let mut seen = std::collections::BTreeSet::new();
+        for m in MIGRATIONS {
+            assert!(
+                seen.insert(m.version),
+                "duplicate migration version {}",
+                m.version
+            );
+        }
+        assert_eq!(
+            MIGRATIONS.last().map(|m| m.version),
+            Some(7),
+            "the highest migration must be 7 (a2a_audit)"
+        );
     }
 
     #[test]
@@ -369,6 +676,9 @@ mod tests {
             "a2a_message",
             "a2a_expiry",
             "run_meta",
+            "jobset",
+            "jobset_member",
+            "a2a_audit",
         ] {
             let exists: bool = conn
                 .query_row(
@@ -436,17 +746,18 @@ mod tests {
     }
 
     #[test]
-    fn migrate_1_to_4_with_sample_rows_then_5() {
+    fn migrate_1_to_5_with_sample_rows_then_7() {
         let conn = Connection::open_in_memory().unwrap();
-        // Apply migrations 1 through 4 explicitly
-        for m in &MIGRATIONS[..4] {
+        // Apply the lower migrations explicitly (1 through 5; version 6 is
+        // owned by the parallel C1 JobsetStore step and not present here).
+        for m in MIGRATIONS.iter().filter(|m| m.version <= 5) {
             (m.apply)(&conn).unwrap();
             conn.pragma_update(None, "user_version", m.version).unwrap();
         }
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
 
         // Insert sample job and session row
@@ -460,10 +771,13 @@ mod tests {
             [],
         ).unwrap();
 
-        // Now run migrate(&conn), which applies migration 5
+        // Now run migrate(&conn), which applies migrations 5 and 6
         let version = migrate(&conn).unwrap();
-        assert_eq!(version, 5);
-        assert_eq!(current_version(), 5);
+        assert_eq!(version, current_version());
+        assert!(
+            version >= 6,
+            "the jobset tables migration must have applied"
+        );
 
         // Verify run_meta exists and accepts rows
         conn.execute(
@@ -480,6 +794,136 @@ mod tests {
             )
             .unwrap();
         assert_eq!(paused, 1);
+
+        // Verify the jobset tables exist and accept rows.
+        conn.execute(
+            "INSERT INTO jobset (jobset_id, creator_agent_id, epoch, ended, created_at) \
+             VALUES ('sample-js', '', 0, 0, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobset_member (jobset_id, agent_id, joined_at) \
+             VALUES ('sample-js', 'sample-agent', 1)",
+            [],
+        )
+        .unwrap();
+        // The audit table accepts a metadata-only row.
+        conn.execute(
+            "INSERT INTO a2a_audit (run_id, message_id, from_agent_id, to_agent_id, jobset_id, message_size, channel, delivered_at, injected_at, outcome, timestamp)
+             VALUES ('sample-job-1', 'm1', 'a', 'b', 'js', 42, 'hook', NULL, NULL, 'queued', 123)",
+            [],
+        ).unwrap();
+        let outcome: String = conn
+            .query_row(
+                "SELECT outcome FROM a2a_audit WHERE run_id = 'sample-job-1' AND message_id = 'm1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(outcome, "queued");
+    }
+
+    #[test]
+    fn migration_6_imports_jobsets_json_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("state");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join("job-jobsets")).unwrap();
+        // A legacy membership file: two members of one jobset, one ended
+        // marker, and a remember-file for a job.
+        std::fs::write(
+            root.join("jobsets.json"),
+            r#"{
+                "members": {
+                    "job-a": {"jobset_id": "js-a", "epoch": 0},
+                    "job-b": {"jobset_id": "js-a", "epoch": 0},
+                    "job-c": {"jobset_id": "js-c", "epoch": 2}
+                },
+                "ended": {"js-d": 7}
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("job-jobsets").join("job-b"), "js-a").unwrap();
+        std::fs::write(root.join("job-jobsets").join("job-x"), "js-remembered").unwrap();
+
+        let db_path = crate::state::StateDb::db_path(&root);
+        let conn = Connection::open(&db_path).unwrap();
+        let version = migrate(&conn).unwrap();
+        assert_eq!(version, current_version());
+
+        // Distinct jobsets created with creator '' and the right epochs.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobset", [], |r| r.get(0))
+            .unwrap();
+        // js-a, js-c, js-d, js-remembered
+        assert_eq!(count, 4);
+
+        let js_a: (u64, i64) = conn
+            .query_row(
+                "SELECT epoch, ended FROM jobset WHERE jobset_id = 'js-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(js_a, (0, 0));
+        let js_d: (u64, i64) = conn
+            .query_row(
+                "SELECT epoch, ended FROM jobset WHERE jobset_id = 'js-d'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(js_d, (7, 1), "ended marker becomes a tombstone");
+
+        // Members imported, job-b also from the remember-file (idempotent
+        // union), job-x from the remember-file only.
+        let members_of_js_a: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobset_member WHERE jobset_id = 'js-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(members_of_js_a, 2);
+        let members_of_js_remembered: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobset_member WHERE jobset_id = 'js-remembered'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(members_of_js_remembered, 1);
+
+        // The imported files stay in place (C1 keeps the file readers).
+        assert!(root.join("jobsets.json").exists());
+        assert!(root.join("job-jobsets").join("job-b").exists());
+        assert!(!root.join("jobsets.json.migrated").exists());
+
+        drop(conn);
+
+        // Re-opening the database must not re-import (the migration runs
+        // once), and the tables keep whatever they had.
+        let conn = Connection::open(&db_path).unwrap();
+        let again = migrate(&conn).unwrap();
+        assert_eq!(again, version);
+        let count_again: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobset", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_again, 4);
+    }
+
+    #[test]
+    fn migration_6_without_membership_file_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("state");
+        std::fs::create_dir_all(&root).unwrap();
+        let conn = Connection::open(crate::state::StateDb::db_path(&root)).unwrap();
+        migrate(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobset", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

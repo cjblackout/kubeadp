@@ -1,4 +1,5 @@
-//! Engine-agnostic durable per-run A2A inbox (design HL-113 §7.14, phase 3).
+//! Engine-agnostic durable per-run A2A inbox (design HL-113 §7.14, phase 3;
+//! design HL-125 stream 3 C2: refactored behind an [`InboxStore`] type).
 //!
 //! Every message accepted by the ingress (after the existing checks: framing
 //! as untrusted data, idempotency by message id, hop limit, size caps) is
@@ -47,6 +48,15 @@
 //! injection markers); they simply leave `pending`. A run's queued history is
 //! therefore bounded, its acknowledged history is monotonic.
 //!
+//! # Audit and text deletion (SPEC §7.15)
+//!
+//! Every lifecycle event writes a metadata-only row to `a2a_audit` through
+//! [`crate::core::a2a::audit`]: `queued` on accept, `injected` on injection,
+//! `expired` on TTL expiry, `dropped` on queue overflow. Message text exists
+//! only in `a2a_message.framed`; it is set to `NULL` 60 s after injection and
+//! at once on expire/drop. The 14-day purge ([`purge`]) runs at startup
+//! and at least hourly ([`start_purge_task`]).
+//!
 //! # Cross-process, crash-safe claims
 //!
 //! The inbox is safe for MANY threads AND MANY processes on the same
@@ -61,7 +71,7 @@
 //! # Layout (paths)
 //!
 //! ```text
-//! <state_root>/state.sqlite   the shared per-pod db (migration v3)
+//! <state_root>/state.sqlite   the shared per-pod db (migration v3; v7 for a2a_audit)
 //! ```
 //!
 //! The run's inbox dir `<state_root>/a2a-inbox/<run_id>/` is NOT a store any
@@ -73,6 +83,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+
+use crate::core::a2a::audit::{outcome, AuditRow};
 
 /// Environment variable naming the shared inbox state root, resolved EXACTLY
 /// like the agent-run `state_root` ([`inbox_state_root`]).
@@ -127,6 +139,18 @@ pub const CLAIM_LEASE_SECS: u64 = 60;
 /// the row is pruned so a long-lived run's acknowledged history (and the
 /// shared database) stays bounded.
 pub const INJECTED_RETENTION_SECS: u64 = 24 * 3600;
+
+/// How long the message TEXT survives on an injected inbox row (SPEC §7.15):
+/// 60 s after `injected_at` the `framed` column is set `NULL`, so a
+/// long-lived run keeps only metadata (and the exactly-once dedupe key), not
+/// the message body. Set `NULL` at once on `expired`/`dropped` (those rows are
+/// removed anyway; the audit row carries the metadata).
+pub const TEXT_NULL_AFTER_INJECTED_SECS: u64 = 60;
+
+/// The retention of [`crate::core::a2a::audit`] rows and of text-less inbox
+/// rows: 14 days after their timestamp (SPEC §7.15). Re-exported here so the
+/// inbox purge and the audit purge agree on one constant.
+pub use crate::core::a2a::audit::AUDIT_RETENTION_SECS as PURGE_RETENTION_SECS;
 
 /// The durable note recorded when the bounded queue dropped messages.
 pub const DROPPED_NOTE: &str = "[note] earlier message(s) dropped by the A2A inbox";
@@ -206,8 +230,13 @@ pub enum StorageKind {
 /// The root of a run's inbox. A real repo resolves the SHARED agent-run
 /// state root; the run's inbox dir ([`dir`]) is kept as the shared identity
 /// the injection processes key on, but the store is the database.
+///
+/// This is the stream-3 C2 `InboxStore` of DESIGN §3.3, built over the
+/// existing migration-3 tables plus the migration-7 `a2a_audit`. The shorter
+/// name [`Inbox`] remains as the compatibility alias so every existing caller
+/// (worker sink, orchestrator ladder, injection channels) compiles unchanged.
 #[derive(Debug, Clone)]
-pub struct Inbox {
+pub struct InboxStore {
     /// The run's inbox dir (`<state_root>/a2a-inbox/<run_id>/`), the identity
     /// both sides key on (`KUBEADP_A2A_INBOX_DIR`).
     dir: PathBuf,
@@ -221,6 +250,10 @@ pub struct Inbox {
     fake: bool,
     storage: StorageKind,
 }
+
+/// The compatibility name for [`InboxStore`]: every existing caller builds
+/// and uses an `Inbox`, which is the same type.
+pub type Inbox = InboxStore;
 
 /// The run's inbox DIR for a run whose host keeps its state in the shared
 /// `state_root`: `<state_root>/a2a-inbox/<run_id>/`. This is the identity the
@@ -353,6 +386,108 @@ pub fn sweep_retention(state_root: &Path) -> usize {
     messages + expiries
 }
 
+/// Performs one **purge pass** for the pod's state root (SPEC §7.15):
+///
+/// - sets `framed` to `NULL` on injected `a2a_message` rows whose injection is
+///   at least [`TEXT_NULL_AFTER_INJECTED_SECS`] (60 s) old -- the text is then
+///   gone from the box; the row (and its exactly-once key) stays,
+/// - deletes `a2a_audit` rows older than [`PURGE_RETENTION_SECS`] (14 days),
+/// - deletes text-less `a2a_message` rows (the injected ones whose text was
+///   nulled) and text-less `a2a_expiry` rows older than 14 days.
+///
+/// Runs at startup and then at least hourly ([`start_purge_task`]). Idempotent:
+/// a second pass with the same `now` removes nothing. Best effort; returns the
+/// number of rows changed (for tests and the startup log).
+pub fn purge(state_root: &Path) -> usize {
+    let Ok(conn) = open_db(state_root) else {
+        return 0;
+    };
+    let now = now_unix();
+    purge_at(&conn, now).unwrap_or(0)
+}
+
+/// The guts of [`purge`] with an injectable clock, so tests can drive the 60 s
+/// text-null and the 14-day row deletion deterministically.
+pub fn purge_at(conn: &Connection, now: u64) -> Result<usize, String> {
+    let mut changed = 0usize;
+    // 1. Null the text of injected rows past the 60 s window.
+    changed += conn
+        .execute(
+            "UPDATE a2a_message
+                SET framed=NULL
+              WHERE fake=0 AND injected_at IS NOT NULL
+                AND framed IS NOT NULL
+                AND (?1 - injected_at) >= ?2",
+            rusqlite::params![now as i64, TEXT_NULL_AFTER_INJECTED_SECS as i64],
+        )
+        .map_err(|e| format!("failed to null the A2A message text: {e}"))?;
+    // 2. Delete expired audit rows (14-day retention).
+    changed += crate::core::a2a::audit::AuditStore::purge_at(conn, now)?;
+    // 3. Delete the text-less inbox rows past 14 days: injected rows whose
+    //    text was nulled, and expiry records.
+    changed += conn
+        .execute(
+            "DELETE FROM a2a_message
+              WHERE fake=0 AND framed IS NULL AND injected_at IS NOT NULL
+                AND (?1 - injected_at) >= ?2",
+            rusqlite::params![now as i64, PURGE_RETENTION_SECS as i64],
+        )
+        .map_err(|e| format!("failed to purge the text-less A2A messages: {e}"))?;
+    changed += conn
+        .execute(
+            "DELETE FROM a2a_expiry WHERE fake=0 AND (?1 - expired_at) >= ?2",
+            rusqlite::params![now as i64, PURGE_RETENTION_SECS as i64],
+        )
+        .map_err(|e| format!("failed to purge the A2A expiry records: {e}"))?;
+    Ok(changed)
+}
+
+/// The hourly purge task: runs one [`purge`] pass at startup and then at least
+/// once per hour for the pod's state root, forever. The host (worker entry and
+/// orchestrator entry) spawns this once at startup on a background thread.
+pub fn start_purge_task(state_root: PathBuf) {
+    std::thread::spawn(move || loop {
+        let _ = purge(&state_root);
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    });
+}
+
+/// Expires and prunes every uninjected message whose TTL passed, for every run
+/// in the pod's inbox (a startup + periodic sweep; the per-message `expire`
+/// path audits each one). Mirrors the ladder's per-run expire but runs for ALL
+/// runs so a run with no watcher cannot grow unbounded. Returns the number of
+/// messages expired. Best effort, like the other sweeps.
+pub fn expire_due(state_root: &Path, ttl_secs: u64) -> usize {
+    let Ok(conn) = open_db(state_root) else {
+        return 0;
+    };
+    let now = now_unix();
+    let mut expired = 0usize;
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT DISTINCT run_id FROM a2a_message
+         WHERE fake=0 AND injected_at IS NULL AND (?1 - queued_at) >= ?2 ORDER BY run_id",
+    ) else {
+        return 0;
+    };
+    let runs: Vec<String> = stmt
+        .query_map(rusqlite::params![now, ttl_secs], |r| r.get(0))
+        .map(|r| r.flatten().collect())
+        .unwrap_or_default();
+    for run in runs {
+        // The inbox with the real TTL (NOT `u64::MAX`, which the ladder uses
+        // to apply the TTL itself): `pending_in` then filters to the expired
+        // rows only, so the per-message `expire` audits exactly the lapsed
+        // messages and never touches younger ones.
+        let inbox = Inbox::with_ttl(inbox_dir_for(state_root, &run), ttl_secs);
+        for msg in inbox.pending_in_expired() {
+            if inbox.expire(&msg.message_id, "ttl") {
+                expired += 1;
+            }
+        }
+    }
+    expired
+}
+
 /// Opens a connection to the shared state database (WAL + migrations).
 fn open_db(state_root: &Path) -> Result<Connection, String> {
     crate::core::job::open_state_db(state_root)
@@ -403,7 +538,7 @@ fn state_root_from_dir(dir: &Path) -> Option<PathBuf> {
     dir.parent()?.parent().map(Path::to_path_buf)
 }
 
-impl Inbox {
+impl InboxStore {
     /// An inbox rooted at `dir` with the default TTL. Resolves the shared
     /// state root when `dir` has the canonical `<root>/a2a-inbox/<run>` shape;
     /// otherwise an in-memory repository (tests).
@@ -510,6 +645,41 @@ impl Inbox {
         }
     }
 
+    /// The audit store on the same state root as this inbox. For the
+    /// in-memory test repo it writes to the shared in-memory `a2a_audit`
+    /// table (mirrored in [`crate::core::a2a::mem`]).
+    pub fn audit(&self) -> Option<crate::core::a2a::audit::AuditStore> {
+        let root = self.state_root.clone()?;
+        Some(crate::core::a2a::audit::AuditStore::new(root))
+    }
+
+    /// Records a metadata-only audit row for this run (SPEC §7.15), best
+    /// effort: an audit failure must never fail message delivery, so errors
+    /// are logged and swallowed. Never writes message text.
+    fn record_audit(&self, msg: &QueuedMessage) {
+        let Some(audit) = self.audit() else {
+            return;
+        };
+        let _ = audit.record(AuditRow {
+            run_id: self.run_id(),
+            message_id: msg.message_id.clone(),
+            from_agent_id: msg.sender.clone(),
+            to_agent_id: crate::core::jobset::local_agent_id(),
+            jobset_id: None,
+            message_size: msg.framed.len() as i64,
+            channel: None,
+            delivered_at: Some(msg.queued_at),
+            injected_at: None,
+            outcome: outcome::QUEUED.to_string(),
+            timestamp: msg.queued_at,
+        });
+    }
+
+    /// The audit store for a state root, used by the purge and by tests.
+    pub fn audit_store(state_root: &Path) -> crate::core::a2a::audit::AuditStore {
+        crate::core::a2a::audit::AuditStore::new(state_root)
+    }
+
     /// Appends `msg` to the inbox. A message id that is already queued or
     /// already injected is a no-op ([`EnqueueOutcome::Duplicate`]); the queue
     /// is pruned (injected + expired rows) and bounded (oldest dropped, a
@@ -517,7 +687,8 @@ impl Inbox {
     /// does.
     pub fn enqueue(&self, msg: QueuedMessage) -> Result<EnqueueOutcome, String> {
         let (run_id, message_id) = self.key(&msg.message_id);
-        self.with_conn(|conn| {
+        let mut dropped = Vec::new();
+        let outcome = self.with_conn(|conn| {
             conn.execute_batch("BEGIN IMMEDIATE")
                 .map_err(|e| format!("failed to begin enqueue transaction: {e}"))?;
             let outcome = (|| -> Result<EnqueueOutcome, String> {
@@ -544,11 +715,11 @@ impl Inbox {
                             run_id,
                             message_id,
                             i64::from(self.fake),
-                            msg.sender,
+                            &msg.sender,
                             msg.hop,
-                            msg.context_id,
-                            msg.task_id,
-                            msg.framed,
+                            &msg.context_id,
+                            &msg.task_id,
+                            &msg.framed,
                             msg.queued_at,
                         ],
                     )
@@ -556,7 +727,7 @@ impl Inbox {
                 if inserted == 0 {
                     return Ok(EnqueueOutcome::Duplicate);
                 }
-                self.prune_and_bound(conn, msg.queued_at)?;
+                self.prune_and_bound(conn, msg.queued_at, &mut dropped)?;
                 Ok(EnqueueOutcome::Stored)
             })();
             match outcome {
@@ -570,7 +741,41 @@ impl Inbox {
                     Err(e)
                 }
             }
-        })
+        });
+        // Audit (SPEC §7.15) AFTER the transaction commits: the audit store
+        // opens its own connection, so it must never run while this inbox
+        // holds the database write lock. Best effort.
+        if outcome == Ok(EnqueueOutcome::Stored) {
+            self.record_audit(&msg);
+        }
+        if !dropped.is_empty() {
+            self.record_dropped_audits(dropped);
+        }
+        outcome
+    }
+
+    /// Records the `dropped` audit rows for messages the bounded queue
+    /// removed, best effort.
+    fn record_dropped_audits(&self, dropped: Vec<QueuedMessage>) {
+        let Some(audit) = self.audit() else {
+            return;
+        };
+        let to = crate::core::jobset::local_agent_id();
+        for m in dropped {
+            let _ = audit.record(AuditRow {
+                run_id: self.run_id(),
+                message_id: m.message_id.clone(),
+                from_agent_id: m.sender.clone(),
+                to_agent_id: to.clone(),
+                jobset_id: None,
+                message_size: m.framed.len() as i64,
+                channel: None,
+                delivered_at: Some(m.queued_at),
+                injected_at: None,
+                outcome: outcome::DROPPED.to_string(),
+                timestamp: now_unix(),
+            });
+        }
     }
 
     /// Prunes (removes expired uninjected rows) and enforces the bounded
@@ -581,8 +786,15 @@ impl Inbox {
     /// exactly like the phase-1 injection markers. Only expired uninjected
     /// rows are removed. Overflows record a durable note as an ordinary
     /// `a2a_message` row (sender [`NOTE_SENDER`], newest `queued_at`), which
-    /// `pending`/`drain` serve and an injection consumes like any message.
-    fn prune_and_bound(&self, conn: &Connection, now: u64) -> Result<(), String> {
+    /// `pending`/`drain` serve and an injection consumes like any message. Any
+    /// dropped (bounded-queue) messages are pushed into `dropped` so the
+    /// caller can audit them (SPEC §7.15); their text is deleted at once.
+    fn prune_and_bound(
+        &self,
+        conn: &Connection,
+        now: u64,
+        dropped: &mut Vec<QueuedMessage>,
+    ) -> Result<(), String> {
         let (run_id,) = (self.run_id(),);
         conn.execute(
             "DELETE FROM a2a_message WHERE run_id=?1 AND fake=?2 AND injected_at IS NULL AND (?3 - queued_at) >= ?4",
@@ -608,7 +820,9 @@ impl Inbox {
         // injecting side as one durable note ([`DROPPED_NOTE`]); the note
         // counts toward the bound (it reserves one slot of the count and byte
         // budget once a drop happened), exactly like the phase-1 note message.
-        let mut dropped = false;
+        // Every dropped message is collected into `dropped` for the audit row
+        // (SPEC §7.15); its text is deleted at once.
+        let mut dropped_any = false;
         loop {
             let queued: (i64, i64) = conn
                 .query_row(
@@ -620,27 +834,29 @@ impl Inbox {
                 .map_err(|e| format!("failed to count the A2A queue: {e}"))?;
             let count = queued.0 as usize;
             let bytes = queued.1 as usize;
-            let note_count = if dropped { 1usize } else { 0usize };
+            let note_count = if dropped_any { 1usize } else { 0usize };
             let note_len = DROPPED_NOTE.len();
             if count + note_count <= MAX_QUEUED_MSGS && bytes + note_len <= MAX_QUEUED_BYTES {
                 break;
             }
-            let oldest: Option<String> = conn
+            let oldest: Option<(String, String, Option<String>)> = conn
                 .query_row(
-                    "SELECT message_id FROM a2a_message
+                    "SELECT message_id, sender, framed FROM a2a_message
                      WHERE run_id=?1 AND fake=?2 AND injected_at IS NULL
                      ORDER BY queued_at, message_id LIMIT 1",
                     rusqlite::params![run_id, i64::from(self.fake)],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .ok();
-            let Some(oldest) = oldest else { break };
+            let Some((oldest_msg_id, oldest_sender, oldest_framed)) = oldest else {
+                break;
+            };
             // Keep at least one message even if it overflows the bound.
             let remaining: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM a2a_message
                      WHERE run_id=?1 AND fake=?2 AND injected_at IS NULL AND message_id <> ?3",
-                    rusqlite::params![run_id, i64::from(self.fake), oldest],
+                    rusqlite::params![run_id, i64::from(self.fake), oldest_msg_id],
                     |r| r.get(0),
                 )
                 .map_err(|e| format!("failed to count the A2A queue: {e}"))?;
@@ -649,12 +865,23 @@ impl Inbox {
             }
             conn.execute(
                 "DELETE FROM a2a_message WHERE run_id=?1 AND fake=?2 AND message_id=?3",
-                rusqlite::params![run_id, i64::from(self.fake), oldest],
+                rusqlite::params![run_id, i64::from(self.fake), oldest_msg_id],
             )
             .map_err(|e| format!("failed to drop the oldest A2A message: {e}"))?;
-            dropped = true;
+            // The text is deleted at once (the row is gone) and the metadata
+            // is collected for the audit row.
+            dropped.push(QueuedMessage {
+                message_id: oldest_msg_id,
+                sender: oldest_sender,
+                hop: 0,
+                context_id: None,
+                task_id: None,
+                framed: oldest_framed.unwrap_or_default(),
+                queued_at: now,
+            });
+            dropped_any = true;
         }
-        if dropped {
+        if dropped_any {
             // Record the durable note as an ordinary queued message with a
             // fresh id (never colliding with agent traffic). It has the
             // newest queued_at, so later overflows drop real messages first.
@@ -728,6 +955,49 @@ impl Inbox {
         rows
     }
 
+    /// The messages whose TTL passed and that are still uninjected (the
+    /// exact complement of [`InboxStore::pending`]): the rows this inbox
+    /// would serve were it not for its own TTL. The expiry sweep uses it so
+    /// the per-message [`InboxStore::expire`] audits exactly the lapsed
+    /// messages. Claimed (leased) rows are included -- a claim that lapsed
+    /// past the TTL is equally due. Oldest first.
+    pub fn pending_in_expired(&self) -> Vec<QueuedMessage> {
+        self.with_conn(|conn| {
+            let now = now_unix();
+            let (run_id,) = (self.run_id(),);
+            let ttl = self.ttl_secs.min(i64::MAX as u64) as i64;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT message_id, sender, hop, context_id, task_id, framed, queued_at
+                     FROM a2a_message
+                     WHERE run_id=?1 AND fake=?2 AND injected_at IS NULL
+                       AND (?3 - queued_at) >= ?4
+                     ORDER BY queued_at, message_id",
+                )
+                .map_err(|e| format!("failed to prepare the expired-message query: {e}"))?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![run_id, i64::from(self.fake), now, ttl],
+                    |row| {
+                        Ok(QueuedMessage {
+                            message_id: row.get(0)?,
+                            sender: row.get(1)?,
+                            hop: row.get::<_, i64>(2)? as u32,
+                            context_id: row.get(3)?,
+                            task_id: row.get(4)?,
+                            framed: row.get(5)?,
+                            queued_at: row.get(6)?,
+                        })
+                    },
+                )
+                .map_err(|e| format!("failed to query the expired messages: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>();
+            Ok(rows)
+        })
+        .unwrap_or_default()
+    }
+
     /// The number of pending (queued, uninjected, unexpired) messages.
     pub fn pending_count(&self) -> usize {
         self.pending().len()
@@ -741,17 +1011,51 @@ impl Inbox {
     /// never both win.
     pub fn mark_injected(&self, message_id: &str, channel: &str) -> bool {
         let (run_id, mid) = self.key(message_id);
-        self.with_conn(|conn| {
-            let n = conn
-                .execute(
-                    "UPDATE a2a_message SET injected_at=?1, channel=?2
-                     WHERE run_id=?3 AND message_id=?4 AND fake=?5 AND injected_at IS NULL",
-                    rusqlite::params![now_unix(), channel, run_id, mid, i64::from(self.fake)],
-                )
-                .map_err(|e| format!("failed to mark the A2A message injected: {e}"))?;
-            Ok(n > 0)
-        })
-        .unwrap_or(false)
+        let now = now_unix();
+        let won = self
+            .with_conn(|conn| {
+                let n = conn
+                    .execute(
+                        "UPDATE a2a_message SET injected_at=?1, channel=?2
+                         WHERE run_id=?3 AND message_id=?4 AND fake=?5 AND injected_at IS NULL",
+                        rusqlite::params![now, channel, run_id, mid, i64::from(self.fake)],
+                    )
+                    .map_err(|e| format!("failed to mark the A2A message injected: {e}"))?;
+                Ok(n > 0)
+            })
+            .unwrap_or(false);
+        if won {
+            // Audit the injection (SPEC §7.15), best effort, after the row is
+            // committed. Only the metadata of the acknowledged message: the
+            // audit row carries the channel and timestamps, never the text.
+            if let Some(audit) = self.audit() {
+                let size = self
+                    .with_conn(|conn| {
+                        conn.query_row::<Option<String>, _, _>(
+                            "SELECT framed FROM a2a_message WHERE run_id=?1 AND message_id=?2 AND fake=?3",
+                            rusqlite::params![run_id, mid, i64::from(self.fake)],
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| e.to_string())
+                        .map(|s| s.map(|t| t.len() as i64).unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                let _ = audit.record(AuditRow {
+                    run_id: self.run_id(),
+                    message_id: message_id.to_string(),
+                    from_agent_id: String::new(),
+                    to_agent_id: crate::core::jobset::local_agent_id(),
+                    jobset_id: None,
+                    message_size: size,
+                    channel: Some(channel.to_string()),
+                    delivered_at: None,
+                    injected_at: Some(now),
+                    outcome: outcome::INJECTED.to_string(),
+                    timestamp: now,
+                });
+            }
+        }
+        won
     }
 
     /// Atomically claims the oldest pending messages for a HOST-side resume
@@ -927,6 +1231,26 @@ impl Inbox {
             }
         })
         .unwrap_or(false)
+        && {
+            // Audit the expiry (SPEC §7.15), best effort, after the row is
+            // removed. The text is deleted at once (the row is gone).
+            if let Some(audit) = self.audit() {
+                let _ = audit.record(AuditRow {
+                    run_id: self.run_id(),
+                    message_id: message_id.to_string(),
+                    from_agent_id: String::new(),
+                    to_agent_id: crate::core::jobset::local_agent_id(),
+                    jobset_id: None,
+                    message_size: 0,
+                    channel: None,
+                    delivered_at: None,
+                    injected_at: None,
+                    outcome: outcome::EXPIRED.to_string(),
+                    timestamp: now_unix(),
+                });
+            }
+            true
+        }
     }
 
     /// Whether `message_id` has been injected.
@@ -1083,6 +1407,7 @@ impl Inbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::a2a::audit::AuditStore;
     use rusqlite::params;
     use tempfile::tempdir;
 
@@ -1556,5 +1881,182 @@ mod tests {
         let root = tmp.path().join("state-root");
         assert_eq!(sweep_retention(&root), 1);
         assert!(!inbox.injected("m2"));
+    }
+
+    #[test]
+    fn audit_records_accept_and_inject_rows() {
+        // SPEC §7.15 / C2: every accepted message writes a metadata-only
+        // `queued` audit row; injecting it adds an `injected` row. Never the
+        // message text.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("state-root");
+        let dir = inbox_dir_for(&root, "run-audit-c2");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inbox = Inbox::new(dir.clone());
+        inbox.enqueue(msg("m1", "hello world")).unwrap();
+        let audit = AuditStore::new(root.clone());
+        let rows = audit.rows_for_run("run-audit-c2");
+        assert_eq!(rows.len(), 1, "one queued row on accept");
+        assert_eq!(rows[0].message_id, "m1");
+        assert_eq!(rows[0].outcome, outcome::QUEUED);
+        assert_eq!(
+            rows[0].message_size,
+            "--- A2A INCOMING MESSAGE ---\nhello world".len() as i64
+        );
+        assert!(!rows[0].to_agent_id.is_empty());
+        assert!(rows[0].delivered_at.is_some());
+        assert!(rows[0].injected_at.is_none());
+        assert!(rows[0].channel.is_none());
+
+        assert!(inbox.mark_injected("m1", "hook"));
+        let rows = audit.rows_for_run("run-audit-c2");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].outcome, outcome::INJECTED);
+        assert_eq!(rows[1].channel.as_deref(), Some("hook"));
+        assert!(
+            rows[1].injected_at.is_some(),
+            "injection records the injected-at timestamp"
+        );
+        assert_eq!(
+            rows[1].message_size,
+            "--- A2A INCOMING MESSAGE ---\nhello world".len() as i64
+        );
+        // The audit rows never carry the message text: `AuditRow` has no text
+        // field at all, so nothing here can hold the body.
+    }
+
+    #[test]
+    fn audit_records_expire_and_drop_rows() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("state-root");
+        let dir = inbox_dir_for(&root, "run-expire-drop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inbox = Inbox::new(dir);
+        let audit = AuditStore::new(root);
+
+        // Expire: the expired message's audit row appears.
+        inbox.enqueue(msg("m1", "one")).unwrap();
+        assert!(inbox.expire("m1", "ttl"));
+        assert_eq!(
+            audit
+                .rows_for_run("run-expire-drop")
+                .iter()
+                .filter(|r| r.outcome == outcome::EXPIRED)
+                .count(),
+            1
+        );
+
+        // Drop: overflow the bounded queue so the oldest is dropped.
+        inbox.enqueue(msg("m2", "two")).unwrap();
+        for i in 3..(MAX_QUEUED_MSGS + 20) {
+            inbox.enqueue(msg(&format!("m{i}"), "padding")).unwrap();
+        }
+        let rows = audit.rows_for_run("run-expire-drop");
+        assert!(
+            rows.iter().any(|r| r.outcome == outcome::DROPPED),
+            "an overflow must record a dropped audit row"
+        );
+        // Audit rows are metadata-only: `AuditRow` has no text field.
+    }
+
+    #[test]
+    fn purge_nulls_injected_text_after_60s_and_stays_idempotent() {
+        // SPEC §7.15 / C2 timing: injected text survives < 60 s, is NULL at
+        // >= 60 s, and a re-run with the same clock removes nothing more.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("state-root");
+        let dir = inbox_dir_for(&root, "run-text-null");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inbox = Inbox::new(dir);
+        let audit = AuditStore::new(root.clone());
+        inbox.enqueue(msg("m1", "secret body")).unwrap();
+        assert!(inbox.mark_injected("m1", "hook"));
+        // The test drives the purge clock from the STORED injection time (the
+        // one `mark_injected` wrote), so a wall-clock second boundary between
+        // the calls can never shift the window.
+        let injected_at: u64 = inbox
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT injected_at FROM a2a_message WHERE run_id=?1 AND message_id='m1'",
+                    params![inbox.run_id()],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+
+        // Before the 60 s window the text is still present.
+        let conn = open_db(&root).unwrap();
+        purge_at(&conn, injected_at + 59).unwrap();
+        drop(conn);
+        let text: Option<String> = inbox
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT framed FROM a2a_message WHERE run_id=?1 AND message_id='m1'",
+                    params![inbox.run_id()],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert!(text.is_some(), "text survives inside the 60 s window");
+
+        // At >= 60 s the text is NULL; the row (dedupe key) stays.
+        let conn = open_db(&root).unwrap();
+        purge_at(&conn, injected_at + 60).unwrap();
+        drop(conn);
+        let text: Option<String> = inbox
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT framed FROM a2a_message WHERE run_id=?1 AND message_id='m1'",
+                    params![inbox.run_id()],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(text, None, "text is NULL past the 60 s window");
+        assert!(inbox.injected("m1"), "the dedupe row survives");
+
+        // Idempotent: a second purge with the same `now` changes nothing and
+        // the audit row for the injection is untouched.
+        let conn = open_db(&root).unwrap();
+        let n = purge_at(&conn, injected_at + 60).unwrap();
+        drop(conn);
+        assert_eq!(n, 0, "a same-clock re-run is a no-op");
+        assert_eq!(audit.count(), 2, "the audit rows are not purged at 60 s");
+    }
+
+    #[test]
+    fn purge_deletes_audit_rows_after_retention() {
+        // SPEC §7.15 / C2: audit rows older than AUDIT_RETENTION_SECS are
+        // deleted; exactly-at-boundary rows and text are handled by
+        // `purge_at` (see audit.rs purge test for the boundary semantics).
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("state-root");
+        let dir = inbox_dir_for(&root, "run-audit-purge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inbox = Inbox::new(dir);
+        let audit = AuditStore::new(root.clone());
+        inbox.enqueue(msg("m1", "one")).unwrap();
+
+        // Backdate the queued audit row past the retention, then purge.
+        let old = now_unix() - PURGE_RETENTION_SECS - 1;
+        inbox
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE a2a_audit SET timestamp=?1, delivered_at=?1
+                     WHERE run_id=?2 AND message_id='m1' AND outcome=?3",
+                    params![old, inbox.run_id(), outcome::QUEUED],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(audit.count(), 1);
+        let now = now_unix();
+        let conn = open_db(&root).unwrap();
+        purge_at(&conn, now).unwrap();
+        drop(conn);
+        assert_eq!(audit.count(), 0, "audit rows past retention are removed");
     }
 }

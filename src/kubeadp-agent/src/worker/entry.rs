@@ -249,6 +249,10 @@ pub async fn run() -> Result<()> {
         // Messages queued before a restart have no ladder watcher: start one
         // per run that still holds an uninjected message.
         a2a_sink.recover_pending();
+        // Audit + text retention (SPEC §7.15): purge the expired `a2a_audit`
+        // rows and the text-less inbox rows 14 days after their timestamp. A
+        // pass runs at startup and then at least hourly on a background thread.
+        crate::core::a2a::inbox::start_purge_task(state_root.clone());
         // The A2A surface sits behind the SAME operator token as /api/v1
         // (see auth_state above): the verifier hashes the presented bearer
         // credential and compares digests in constant time, exactly like the

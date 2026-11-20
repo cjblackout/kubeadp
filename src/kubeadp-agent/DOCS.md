@@ -259,7 +259,7 @@ A *jobset* represents an isolated messaging group spanning worker jobs and orche
   secret = hex(HMAC-SHA256(root_key, "jobset" || 0x00 || jobset_id || 0x00 || epoch))
   ```
 - Processes holding the root key derive and verify secrets across restarts without keeping plaintext secrets in persistent storage.
-- Membership mappings (`agent_id -> {jobset_id, epoch}`) are stored in mode `0600` JSON files (`jobsets.json`).
+- Membership mappings (`agent_id -> {jobset_id, epoch}`) are stored in mode `0600` JSON files (`jobsets.json`). In addition (HL-125 stream 3 C1), the `jobset`/`jobset_member` tables of `state.sqlite` hold the same id+epoch membership with a persisted epoch, and migration 6 imports the legacy files once, idempotently; the in-memory registry still serves all callers, and the store is what the C5 flag day reads.
 
 ### 4.4 Ingress Message Processing and Framing
 
@@ -306,6 +306,8 @@ An agent's job worktree is NOT accessible to other agents: a job's sandbox grant
 ### 4.6 Harness-injected A2A delivery (HL-113)
 
 Incoming A2A messages for a run land in a durable per-run inbox (`core/a2a/inbox.rs`): since phase 3 the store is the shared per-pod SQLite database (`<state_root>/state.sqlite`, migration v3, table `a2a_message` keyed by `(run_id, message_id)`, states `queued -> injected`; the phase-1/2 per-run directory `<state_root>/a2a-inbox/<run_id>/` with one JSON file per message is no longer written — the directory survives only as the run key both sides derive). Bounded (8 messages / 8 KiB, oldest dropped with a durable note) with a TTL (`a2a_inbox_ttl_secs`, default 1 h). The harness — never the model — puts each message into the run's model context at the earliest safe boundary through one of the engine's injection channels (capability `a2a.inject`: both engines list `hook` + `tool_result` + `idle_turn`); the injection IS the acknowledgement, and the model never has to decide to read its messages. Nothing is killed by default.
+
+**Audit and text deletion (SPEC §7.15, stream 3 C2)**: every lifecycle event (accept `queued`, inject, expire, drop) writes one metadata-only row to the `a2a_audit` table (migration 7, `core/a2a/audit.rs`) — from/to agent, jobset, message id, message size, channel, timestamps, outcome — never the message text. The message body exists only in `a2a_message.framed`, which the purge pass sets `NULL` 60 s after injection and at once on expire/drop. An hourly purge task (`core/a2a/inbox::start_purge_task`, started once by each entry point) deletes `a2a_audit` rows and text-less inbox rows 14 days after their timestamp.
 
 `state_root` here is the agent-run state root, resolved by the ONE shared helper `core::a2a::inbox::inbox_state_root()` (the same resolution `http_server.rs` applies to the agent-run `Config`; `AGENT_RUN_STATE_ROOT` > config file > built-in `~/.agent-run`) that BOTH sides of a run's inbox use — the A2A sink (`orchestrate/a2a.rs` / `http_server.rs`, and `worker/a2a.rs`) and the launcher that names the run's inbox in `KUBEADP_A2A_INBOX_DIR` (`orchestrate/session.rs` via `SupervisorConfig::a2a_inbox_root()`, `core/runner.rs`). The session side never derives the inbox from the supervisor `state_file`'s parent (the default state file lives in `/tmp`, which the sink never writes and the pod wipes at every restart).
 

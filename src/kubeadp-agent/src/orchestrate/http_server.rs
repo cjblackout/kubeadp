@@ -139,6 +139,12 @@ pub fn build_router(
     })?;
 
     #[cfg(feature = "a2a")]
+    // Audit + text retention (SPEC §7.15): purge the expired `a2a_audit` rows
+    // and the text-less inbox rows 14 days after their timestamp. A pass runs
+    // at startup and then at least hourly on a background thread.
+    crate::core::a2a::inbox::start_purge_task(state_root.clone());
+
+    #[cfg(feature = "a2a")]
     let a2a_auth: Option<crate::core::a2a::AuthVerifier> =
         crate::core::server::auth::auth_verifier_from_state(&auth_state);
 
