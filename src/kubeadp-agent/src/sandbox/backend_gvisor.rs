@@ -360,6 +360,19 @@ pub fn relay_mount_plan(outer_socket: &Path, target: &Path) -> Vec<MountOp> {
     }]
 }
 
+/// Pure delivery-socket mount plan (SPEC §6.6 / §6.9): bind-mount the per-
+/// agent delivery socket the launcher bound before the fork onto its in-
+/// sandbox target under the private tmp (next to the relay socket), exactly
+/// like the relay socket. Applied by the shim after the main mount plan; any
+/// failure aborts the launch (exit 125). A `host:target` pair is computed
+/// from the policy by the a2a launcher; C5 wires it here.
+pub fn delivery_socket_mount_plan(host_sock: &Path, target: &Path) -> Vec<MountOp> {
+    vec![MountOp::BindRec {
+        src: host_sock.to_path_buf(),
+        target: target.to_path_buf(),
+    }]
+}
+
 /// Pure environment builder for the gVisor agent root process.
 ///
 /// Returns EXACTLY the `env_allow`-filtered variables, with `TMPDIR` forced to
@@ -1070,8 +1083,9 @@ mod tests {
     use super::super::init_shim::status_to_exit_code;
     use super::super::policy::SandboxPolicy;
     use super::{
-        build_agent_env, execute_gvisor, gvisor_grant_warnings, hide_is_file, plan_mounts,
-        relay_mount_plan, MountOp, MountSpec, AGENT_TMP_OPTS, SHM_PRIVATE_OPTS,
+        build_agent_env, delivery_socket_mount_plan, execute_gvisor, gvisor_grant_warnings,
+        hide_is_file, plan_mounts, relay_mount_plan, MountOp, MountSpec, AGENT_TMP_OPTS,
+        SHM_PRIVATE_OPTS,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -1869,6 +1883,25 @@ mod tests {
                 .any(|op| matches!(op, MountOp::BindRec { src, .. }
                 if src.as_os_str().to_string_lossy().contains("kubeadp-relay"))),
             "the host plan must carry no relay mount: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn test_delivery_socket_mount_plan_binds_the_agent_socket_into_private_tmp() {
+        // The delivery socket (the launcher's per-agent socket, SPEC §6.9) is
+        // bind-mounted onto its in-sandbox target under the private tmp next
+        // to the relay socket, with a single recursive bind -- the same shape
+        // as the relay mount.
+        let plan = delivery_socket_mount_plan(
+            Path::new("/tmp/kubeadp-a2a-agent-7/delivery.sock"),
+            Path::new("/tmp/agent-sandbox-job1/.delivery.sock"),
+        );
+        assert_eq!(
+            plan,
+            vec![MountOp::BindRec {
+                src: PathBuf::from("/tmp/kubeadp-a2a-agent-7/delivery.sock"),
+                target: PathBuf::from("/tmp/agent-sandbox-job1/.delivery.sock"),
+            }]
         );
     }
 

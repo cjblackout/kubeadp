@@ -49,6 +49,26 @@ pub struct GrantsConfig {
     pub env: Vec<String>,
 }
 
+/// Describes how one agent's A2A delivery socket becomes a harness mount for
+/// a given policy (SPEC §6.9): the backend-specific mount/grant inputs the
+/// a2a launcher derives from [`SandboxPolicy::delivery_socket_mount`]. Kept
+/// path-only (no `core::a2a` types) because the sandbox library compiles
+/// without the `a2a` feature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliverySocketMount {
+    /// The per-agent socket path the host bound before the fork (the OUTER
+    /// path, in the pod filesystem).
+    pub host_sock: PathBuf,
+    /// The in-sandbox path gVisor bind-mounts `host_sock` onto (under the
+    /// private tmp, next to the relay socket); exported as
+    /// `KUBEADP_A2A_LOCAL_SOCKET` for the gVisor backend.
+    pub gvisor_target: PathBuf,
+    /// The paths kata / runc-Landlock grant for the socket's resolution
+    /// (directory traversal only; pathname connect is not Landlock-restricted
+    /// below ABI 9). The launcher adds these to the Landlock domain.
+    pub landlock_paths: Vec<PathBuf>,
+}
+
 /// Sandbox policy matching CONTRACT v1:
 /// Unknown policy keys are an error (`deny_unknown_fields`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +351,44 @@ impl SandboxPolicy {
             Some(PathBuf::from(format!("/tmp/agent-sandbox-{agent}")))
         } else {
             Some(PathBuf::from(self.tmp.as_str()))
+        }
+    }
+
+    /// The harness mount of this agent's A2A delivery socket (SPEC §6.9):
+    /// how the per-agent socket path the launcher bound BEFORE the fork
+    /// becomes reachable inside this policy's sandbox.
+    ///
+    /// The sandbox module is compiled without the `a2a` feature, so this
+    /// takes the host socket PATH (never an A2A type) and cannot know the
+    /// exact in-sandbox value the a2a launcher picks for the env -- the three
+    /// fields are the inputs C5 uses per backend:
+    ///
+    /// - gVisor bind-mounts `host_sock` onto [`DeliverySocketMount::gvisor_target`]
+    ///   (under the private tmp, next to the relay socket) and exports that
+    ///   target as `KUBEADP_A2A_LOCAL_SOCKET`;
+    /// - kata / runc-Landlock use `host_sock` DIRECTLY (a pathname unix socket
+    ///   is not namespaced by a netns and needs no bind) and grant
+    ///   [`DeliverySocketMount::landlock_paths`] for the socket's resolution
+    ///   (pathname connect is not Landlock-restricted below ABI 9, so no
+    ///   socket rule is needed -- only directory traversal).
+    pub fn delivery_socket_mount(&self, host_sock: &Path) -> DeliverySocketMount {
+        let gvisor_target = match self.private_tmp_path() {
+            Some(tmp) => tmp.join(".delivery.sock"),
+            None => host_sock.to_path_buf(),
+        };
+        // The socket's private directory: granting it mirrors the private-tmp
+        // grant (access_flags_for_path chooses the directory flag set), so an
+        // agent can resolve `<dir>/delivery.sock`. The socket file itself
+        // needs no rule.
+        let landlock_paths = host_sock
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| vec![p.to_path_buf()])
+            .unwrap_or_default();
+        DeliverySocketMount {
+            host_sock: host_sock.to_path_buf(),
+            gvisor_target,
+            landlock_paths,
         }
     }
 

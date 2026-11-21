@@ -64,6 +64,12 @@ pub mod mem;
 pub mod http;
 
 #[cfg(feature = "a2a")]
+pub mod delivery_sock;
+
+#[cfg(feature = "a2a")]
+pub mod local_api;
+
+#[cfg(feature = "a2a")]
 pub mod client;
 
 #[cfg(feature = "a2a")]
@@ -375,6 +381,7 @@ pub(crate) mod testenv {
         "KUBEADP_A2A_INBOX_DIR",
         "KUBEADP_A2A_INBOX_TOKEN",
         "KUBEADP_A2A_INBOX_URL",
+        "KUBEADP_A2A_LOCAL_SOCKET",
         "AGENT_RUN_STATE_ROOT",
         "AGENT_RUN_WORKSPACE_ROOT",
         "AGENT_RUN_CONFIG",

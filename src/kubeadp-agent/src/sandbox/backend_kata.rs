@@ -1200,6 +1200,33 @@ pub(crate) fn create_owned_tmp_dir(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("failed to chmod private tmp {path:?} to 0700: {e}"))
 }
 
+/// The Landlock grant for the per-agent delivery socket (SPEC §6.9): the
+/// agents resolution paths a kata/runc-Landlock sandbox needs so the agent
+/// can connect to its OWN delivery socket. Kata/runc-Landlock use the OUTER
+/// socket path directly (a pathname unix socket is not namespaced by a netns,
+/// so no bind is needed), and pathname connect is not Landlock-restricted
+/// below ABI 9 -- only the directory traversal to reach the socket file needs
+/// a rule.
+///
+/// Returns the socket's parent directory (granted read-only: the agent must
+/// resolve `<dir>/delivery.sock` but must not write a sibling socket).
+/// `None` when the socket path has no parent (defensive: the launcher always
+/// binds under a real directory). The rules are applied by the launcher like
+/// every Landlock rule; the socket dir is a 0700 owner-checked directory the
+/// agent's own process may enter.
+pub fn delivery_socket_landlock_dir(host_sock: &Path) -> Option<PathBuf> {
+    host_sock
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+}
+
+/// The read-only Landlock access flags for a delivery-socket directory grant
+/// (a shallow re-export of the shared flag chooser for the launcher/wiring).
+pub fn delivery_socket_access_flags(path: &Path) -> u64 {
+    access_flags_for_path(path, false)
+}
+
 /// Confirms `path` is a real directory (not a symlink) owned by `euid`, after
 /// it was just created. Fails closed on any deviation.
 fn verify_owned_tmp_dir(path: &Path, euid: u32) -> Result<(), String> {
@@ -1408,6 +1435,37 @@ mod tests {
         assert_eq!(
             access_flags_for_path(&missing, false),
             landlock_ro_fs_flags(6)
+        );
+    }
+
+    // C4b: the per-agent delivery socket (SPEC §6.9). Kata uses the outer
+    // socket path directly (pathname connect is not Landlock-restricted below
+    // ABI 9); the only rule needed is the read-only grant on the socket's
+    // parent directory, so the agent can traverse to `<dir>/delivery.sock`.
+    #[test]
+    fn test_delivery_socket_landlock_grant() {
+        let sock = Path::new("/tmp/kubeadp-a2a-agent-7/delivery.sock");
+        assert_eq!(
+            delivery_socket_landlock_dir(sock),
+            Some(PathBuf::from("/tmp/kubeadp-a2a-agent-7"))
+        );
+        // The grant is the shared READ-ONLY directory access set (no write or
+        // create: the agent must reach its socket, never plant a sibling).
+        let dir = delivery_socket_landlock_dir(sock).unwrap();
+        assert_eq!(
+            delivery_socket_access_flags(&dir),
+            landlock_ro_fs_flags(6),
+            "the delivery-socket dir grant is read-only"
+        );
+        assert_eq!(
+            delivery_socket_access_flags(&dir) & LANDLOCK_ACCESS_FS_MAKE_DIR,
+            0,
+            "the delivery-socket dir grant must not allow creating a sibling"
+        );
+        // A socket path without a parent directory is refused (defensive).
+        assert_eq!(
+            delivery_socket_landlock_dir(Path::new("delivery.sock")),
+            None
         );
     }
 
