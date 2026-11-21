@@ -1215,6 +1215,14 @@ mod tests {
             inbox.injected("msg-int-1"),
             "watcher must inject queued interrupt message without waiting for ack_secs"
         );
+        // The watcher marks the message injected and then clears the pending
+        // entry in the same pass; wait for the clear instead of racing it.
+        let clear_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while sink.interrupt_pending.lock().unwrap().contains(session)
+            && std::time::Instant::now() < clear_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         assert!(
             !sink.interrupt_pending.lock().unwrap().contains(session),
             "interrupt_pending must be cleared after injection"

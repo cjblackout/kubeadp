@@ -540,7 +540,7 @@ impl A2aClientCtx {
 /// a single shared client apply to EVERY A2A HTTP call, so a hung or
 /// unreachable hub/peer always fails closed with a clear error within the
 /// deadline.
-fn shared_peer_client() -> Result<reqwest::Client, String> {
+pub(crate) fn shared_peer_client() -> Result<reqwest::Client, String> {
     static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
         std::sync::OnceLock::new();
     CLIENT

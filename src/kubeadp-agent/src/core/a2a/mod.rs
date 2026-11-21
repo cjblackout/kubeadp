@@ -72,13 +72,21 @@ pub mod receive;
 #[cfg(feature = "a2a")]
 pub mod sink;
 
-pub use auth::A2aAuthLayer;
+#[cfg(feature = "a2a")]
+pub mod jobset_routes;
+
+pub use auth::{A2aAuthLayer, JobsetAuthLayer, RATE_CAPACITY, RATE_REFILL_SECS};
+pub use auth::{
+    AGENT_ID_HEADER, AGENT_PROOF_HEADER, END_RETRY_ATTEMPTS, END_RETRY_BASE_SECS,
+    END_RETRY_MAX_SECS,
+};
 pub use backend::{map_job_status, A2AError, A2aTask, TaskBackend};
 pub use card::{
     advertised_url, pod_name, role_description, role_skills, A2aModel, A2A_URL_ENV,
     ROLE_ORCHESTRATOR, ROLE_WORKER, WELL_KNOWN_AGENT_CARD_PATH,
 };
 pub use handler::{a2a_rate_limited, DeliveryMeta, MessageSink, ServerRequestHandler};
+pub use jobset_routes::{HttpPeerEndNotifier, PeerEndNotifier};
 
 use std::sync::Arc;
 
@@ -86,6 +94,7 @@ use a2a_server::agent_card::agent_card_router;
 use a2a_server::rest::rest_router;
 use a2a_server::StaticAgentCard;
 use axum::http::HeaderMap;
+use axum::response::IntoResponse;
 use axum::Router;
 
 /// Caller-supplied request authorizer for the protected routes.
@@ -216,6 +225,119 @@ pub fn a2a_router_with_jobset(
     card_router.merge(rest)
 }
 
+/// The `kind` a host reports for the agents it serves in a `GET /a2a/agents`
+/// answer (SPEC §7.7 item 6): the run kind the role hosts (`job` on the
+/// worker, `session` on the orchestrator).
+fn a2a_host_kind() -> &'static str {
+    if std::env::var("KUBEADP_ROLE").as_deref() == Ok("worker") {
+        "job"
+    } else {
+        "session"
+    }
+}
+
+/// Builds the JOB SET-ONLY A2A router: the C4a target layer that accepts only
+/// the jobset credential (no bearer, no open pass-through) on every A2A route
+/// except the public agent card, plus the jobset-scoped routes outside the SDK
+/// set (`GET /a2a/agents`, `POST /a2a/jobsets/{id}:end`, SPEC §7.9).
+///
+/// This router is NOT mounted in production until C5 flips both pods together;
+/// it is selectable by constructor so C4a can build and test it while the
+/// bearer layer stays the default. `jobset` supplies the shared registry;
+/// `notifier` propagates the jobset end to the mesh peers (SPEC §7.16).
+pub fn a2a_router_with_jobset_only(
+    model: A2aModel,
+    backend: Arc<dyn TaskBackend>,
+    sink: Option<Arc<dyn MessageSink>>,
+    jobset: JobsetCred,
+    notifier: Arc<dyn jobset_routes::PeerEndNotifier>,
+) -> Router {
+    let handler = Arc::new(ServerRequestHandler::new(backend, sink));
+
+    // The SDK REST routes AND the jobset-scoped routes all sit behind ONE
+    // router-level jobset-only layer, so authorization runs before any body
+    // validation (§7.5); the public agent card is merged separately and is
+    // never gated.
+    let registry = jobset.registry.clone();
+    let kind = a2a_host_kind();
+    let rest = rest_router(handler)
+        .route(
+            "/a2a/agents",
+            axum::routing::get({
+                let registry = registry.clone();
+                let kind = kind.to_string();
+                move |headers: axum::http::HeaderMap| {
+                    let registry = registry.clone();
+                    let kind = kind.clone();
+                    async move {
+                        // The layer has already verified steps 1 + 2 against
+                        // the presented jobset; read the id from the request
+                        // headers (the layer passed them through untouched).
+                        match presented_jobset_id(&headers) {
+                            Some(jobset_id) => axum::Json(jobset_routes::agents_listing(
+                                &registry, &jobset_id, &kind,
+                            ))
+                            .into_response(),
+                            // Unreachable on the authorized path (the layer
+                            // verified the presented credential first); fail
+                            // closed with the A2A 401 envelope.
+                            None => (
+                                axum::http::StatusCode::UNAUTHORIZED,
+                                axum::Json(serde_json::json!({
+                                    "error": {
+                                        "code": 401,
+                                        "status": "UNAUTHENTICATED",
+                                        "message": "authentication required",
+                                    }
+                                })),
+                            )
+                                .into_response(),
+                        }
+                    }
+                }
+            }),
+        )
+        // The route is `POST /a2a/jobsets/{id}:end`; axum allows one parameter per path
+        // segment and no literal suffix after it, so the segment is captured whole and
+        // the `:end` verb is stripped here (any other verb is a 404).
+        .route(
+            "/a2a/jobsets/{id_verb}",
+            axum::routing::post({
+                let registry = registry.clone();
+                let notifier = notifier.clone();
+                move |axum::extract::Path(id_verb): axum::extract::Path<String>,
+                      headers: axum::http::HeaderMap| {
+                    let registry = registry.clone();
+                    let notifier = notifier.clone();
+                    async move {
+                        match id_verb.strip_suffix(":end").filter(|id| !id.is_empty()) {
+                            Some(id) => {
+                                let id = id.to_string();
+                                jobset_routes::apply_end(registry, notifier, headers, id).await
+                            }
+                            None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                }
+            }),
+        )
+        .layer(JobsetAuthLayer::new(jobset.registry.clone()));
+
+    let card_router = agent_card_router(Arc::new(StaticAgentCard::new(model.to_agent_card())));
+
+    card_router.merge(rest)
+}
+
+/// The presented jobset id (`X-Jobset-Id`), if present and non-empty.
+fn presented_jobset_id(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(crate::core::jobset::JOBSET_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Constant-time comparison of two byte strings, used to validate a bearer
 /// token (the hop-token MAC check in [`ingress`]) without leaking the
 /// length-independent comparison timing.
@@ -225,7 +347,6 @@ pub fn a2a_router_with_jobset(
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     crate::core::crypto::ct_eq(a, b)
 }
-
 /// Test-only helper: mutate the process environment (which the card helpers,
 /// the receive-side inbox helpers and the state-root resolution read) under a
 /// process-wide lock so env-touching unit tests never race each other (cargo
