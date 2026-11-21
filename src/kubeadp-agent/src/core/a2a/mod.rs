@@ -155,7 +155,7 @@ pub struct JobsetCred {
 
 impl JobsetCred {
     /// Build the context from the environment: reads the agent's jobset id and
-    /// the secret file named by `KUBEADP_JOBSET_SECRET_FILE`, registers this
+    /// the secret file named by `KUBEADP_JOBSET_CREDENTIALS_FILE`, registers this
     /// agent in a fresh registry, and returns `None` when the agent is not a
     /// jobset member (no jobset id, or the secret file is absent).
     ///

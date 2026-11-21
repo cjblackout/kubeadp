@@ -355,7 +355,13 @@ pub fn sandboxed(
     }
 
     crate::core::proxy::apply_proxy(&mut cmd, Some(config), meta.proxy.as_deref());
-    Ok((cmd, policy_path, jobset.map(|c| c.secret)))
+    // The secret channel carries the credential file (SPEC §6.5): the agent id,
+    // the jobset id, epoch, secret and member proof as JSON.
+    Ok((
+        cmd,
+        policy_path,
+        jobset.map(|c| crate::core::jobset::credential_file_json(&meta.job_id, &c)),
+    ))
 }
 
 pub fn build_command(
@@ -577,7 +583,7 @@ pub(crate) fn detached_session(cmd: &mut Command) {
 /// captured by the closure, so it stays open in the parent until `spawn()` and
 /// is dup'd onto fd 3 in the forked child before exec. The sandbox reads fd 3
 /// and writes it to a 0400 file in the agent's private tmp; the agent reads
-/// only the PATH of that file (`KUBEADP_JOBSET_SECRET_FILE`), never the secret.
+/// only the PATH of that file (`KUBEADP_JOBSET_CREDENTIALS_FILE`), never the secret.
 /// A jobset member whose `memfd` cannot be created fails loudly (the launch is
 /// aborted): it must not run without its secret channel.
 fn attach_session_and_secret(cmd: &mut Command, mut secret: Option<String>) -> Result<()> {

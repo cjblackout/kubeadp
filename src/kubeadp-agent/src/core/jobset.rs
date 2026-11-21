@@ -68,9 +68,10 @@ pub const JOBSET_ID_HEADER: &str = "X-Jobset-Id";
 pub const JOBSET_SECRET_HEADER: &str = "X-Jobset-Secret";
 /// Environment variable the launcher sets: the jobset id the agent belongs to.
 pub const JOBSET_ID_ENV: &str = "KUBEADP_JOBSET_ID";
-/// Environment variable the launcher sets: the PATH of the 0400 secret file in
-/// the agent's private tmp (never the secret value itself).
-pub const JOBSET_SECRET_FILE_ENV: &str = "KUBEADP_JOBSET_SECRET_FILE";
+/// Environment variable the launcher sets: the PATH of the 0400 credential file
+/// (`jobset-credentials.json`, SPEC §6.5) in the agent's private tmp (never a
+/// secret value itself).
+pub const CREDENTIALS_FILE_ENV: &str = "KUBEADP_JOBSET_CREDENTIALS_FILE";
 /// Environment variable naming the jobset root key file (shared by both roles;
 /// config key `jobset_root_key_file` maps to it).
 pub const ROOT_KEY_FILE_ENV: &str = "KUBEADP_JOBSET_ROOT_KEY_FILE";
@@ -79,9 +80,6 @@ pub const ROOT_KEY_FILE_ENV: &str = "KUBEADP_JOBSET_ROOT_KEY_FILE";
 /// secret value) so an agent started by a jobset member knows which epoch its
 /// secret is valid for.
 pub const JOBSET_EPOCH_ENV: &str = "KUBEADP_JOBSET_EPOCH";
-/// The jobset secret file's name inside the agent's private tmp. The launcher
-/// sets [`JOBSET_SECRET_FILE_ENV`] to the absolute path built from this name.
-pub const JOBSET_SECRET_FILE_NAME: &str = "jobset-secret";
 /// Byte length of a fresh jobset secret (32 bytes = 256 bits, above the 32-byte
 /// floor from the design).
 pub const JOBSET_SECRET_BYTES: usize = 32;
@@ -299,34 +297,20 @@ pub struct JobsetCredential {
 impl JobsetCredential {
     /// Load the presenting agent's own jobset credential from the environment.
     ///
-    /// The jobset id comes from [`JOBSET_ID_ENV`]; the secret is read from the
-    /// file whose path is named by [`JOBSET_SECRET_FILE_ENV`] (the 0400 file
-    /// the sandbox placed in the agent's private tmp). The secret is read from
-    /// the file, never carried in the environment. The epoch comes from
-    /// [`JOBSET_EPOCH_ENV`], defaulting to 0 when unset (a scalar, not a
-    /// secret).
+    /// The secret, its epoch and the jobset id are read from the 0400
+    /// credential file named by [`CREDENTIALS_FILE_ENV`] (the file the sandbox
+    /// placed in the agent's private tmp, SPEC §6.5); when the file holds
+    /// several jobsets the entry named by [`JOBSET_ID_ENV`] is used, else the
+    /// first. The secret is never carried in the environment.
     ///
-    /// Returns `None` when the agent is not a jobset member (no jobset id) or
-    /// when the secret file is missing/empty.
+    /// Returns `None` when the agent has no credential file or it is
+    /// missing, empty or corrupt.
     pub fn from_env() -> Option<Self> {
-        let jobset_id = jobset_id_from_env()?;
-        let path = std::env::var(JOBSET_SECRET_FILE_ENV)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| default_secret_file_path().to_string());
-        let secret = std::fs::read_to_string(&path)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())?;
-        let epoch = std::env::var(JOBSET_EPOCH_ENV)
-            .ok()
-            .and_then(|e| e.trim().parse::<Epoch>().ok())
-            .unwrap_or(EPOCH_ZERO);
+        let entry = credential_entry_from_env()?;
         Some(Self {
-            jobset_id,
-            secret,
-            epoch,
+            jobset_id: entry.jobset_id,
+            secret: entry.secret,
+            epoch: entry.epoch,
         })
     }
 
@@ -343,23 +327,76 @@ impl JobsetCredential {
     }
 }
 
-/// The default path of the jobset secret file inside the agent's private tmp,
-/// used when [`JOBSET_SECRET_FILE_ENV`] is unset. Mirrors the sandbox's
+/// The default path of the credential file inside the agent's private tmp,
+/// used when [`CREDENTIALS_FILE_ENV`] is unset. Mirrors the sandbox's
 /// `$TMPDIR/<dest>` placement (see the `secret` policy channel).
-fn default_secret_file_path() -> String {
+fn default_credential_file_path() -> String {
     let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
     std::path::Path::new(&base)
-        .join(JOBSET_SECRET_FILE_NAME)
+        .join(CREDENTIAL_FILE_NAME)
         .to_string_lossy()
         .to_string()
 }
 
-/// The absolute path of the jobset secret file for the given private tmp
-/// root. The launcher sets [`JOBSET_SECRET_FILE_ENV`] to this value so the
-/// agent knows where to read its secret without the launcher (or any log)
-/// exposing the secret itself.
-pub fn secret_file_path(tmp_root: &std::path::Path) -> std::path::PathBuf {
-    tmp_root.join(JOBSET_SECRET_FILE_NAME)
+/// The credential file of this process: the path in [`CREDENTIALS_FILE_ENV`]
+/// (or the private-tmp default) parsed, `None` when absent. A corrupt file is
+/// treated as absent (callers fail closed on a missing credential).
+fn credential_file_from_env() -> Option<CredentialFile> {
+    let path = std::env::var(CREDENTIALS_FILE_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(default_credential_file_path);
+    read_credential_file(std::path::Path::new(&path))
+        .ok()
+        .flatten()
+}
+
+/// The credential entry this process presents: the entry of its
+/// [`CREDENTIALS_FILE_ENV`] file matching [`JOBSET_ID_ENV`] when set, else the
+/// file's first entry.
+pub fn credential_entry_from_env() -> Option<CredentialEntry> {
+    let file = credential_file_from_env()?;
+    let wanted = jobset_id_from_env();
+    let entry = match wanted {
+        Some(id) => file.jobsets.iter().find(|e| e.jobset_id == id),
+        None => file.jobsets.first(),
+    }
+    .or_else(|| file.jobsets.first())?;
+    (!entry.jobset_id.is_empty() && !entry.secret.is_empty()).then(|| entry.clone())
+}
+
+/// This agent's identity for the sender headers (SPEC §7.4): the agent id and
+/// the member proof of the entry [`credential_entry_from_env`] selects. `None`
+/// when there is no credential file or the entry carries no proof (a pod
+/// without a root key cannot derive one).
+pub fn agent_identity_from_env() -> Option<(String, String)> {
+    let file = credential_file_from_env()?;
+    let entry = credential_entry_from_env()?;
+    (!file.agent_id.is_empty() && !entry.member_proof.is_empty())
+        .then(|| (file.agent_id.clone(), entry.member_proof))
+}
+
+/// The serialized credential file for `agent_id` holding the one jobset
+/// `credential` names (SPEC §6.5 layout). The member proof is derived from the
+/// root key when one is configured, otherwise empty (readers then present no
+/// agent identity). Handed to the agent through the sandbox secret channel,
+/// never written to the state store, argv, environment or logs.
+pub fn credential_file_json(agent_id: &str, credential: &JobsetCredential) -> String {
+    let member_proof = global_registry()
+        .root_key()
+        .map(|k| derive_member_proof(&k, &credential.jobset_id, credential.epoch, agent_id))
+        .unwrap_or_default();
+    let file = CredentialFile {
+        agent_id: agent_id.to_string(),
+        jobsets: vec![CredentialEntry {
+            jobset_id: credential.jobset_id.clone(),
+            epoch: credential.epoch,
+            secret: credential.secret.clone(),
+            member_proof,
+        }],
+    };
+    serde_json::to_string(&file).unwrap_or_default()
 }
 
 /// This process's own agent identity, used as the local agent id the incoming
@@ -703,7 +740,7 @@ pub fn global_registry() -> Arc<JobsetRegistry> {
 ///
 /// A member is one whose environment carries [`JOBSET_ID_ENV`] (set by the
 /// parent through [`build_jobset_env`]); the secret is read from the 0400 file
-/// named by [`JOBSET_SECRET_FILE_ENV`]. An agent that was started by an
+/// named by [`CREDENTIALS_FILE_ENV`]. An agent that was started by an
 /// operator request (a plain API server with no jobset in its environment) is
 /// not a member and returns `None`; such an agent gives every agent it starts
 /// a *fresh* jobset (see [`fresh_jobset_credential`]).
@@ -1386,7 +1423,7 @@ pub fn verify_jobset_credential(
 /// The sandbox-policy side of handing a *new* agent its jobset: a clone of the
 /// caller's base [`crate::sandbox::policy::SandboxPolicy`] with the `secret`
 /// channel configured to write the jobset secret into the agent's private tmp
-/// (as the 0400 file [`JOBSET_SECRET_FILE_NAME`]).
+/// (as the 0400 file [`CREDENTIAL_FILE_NAME`]).
 ///
 /// The policy carries only the secret *channel* (an inherited fd and the
 /// destination name), never the secret value: the value is read by the
@@ -1402,14 +1439,14 @@ pub fn build_jobset_policy(
         // dups; the launcher opens the secret file read-only on fd 3 before
         // exec (see the sandbox harness `exec 3<"$sec"`).
         fd: 3,
-        dest: JOBSET_SECRET_FILE_NAME.to_string(),
+        dest: CREDENTIAL_FILE_NAME.to_string(),
     };
     let mut policy = base.clone();
     policy.secret = Some(secret);
     // The jobset env vars are already covered by the default `KUBEADP_*`
     // allow pattern, but be explicit so a custom `env_allow` cannot silently
     // drop them.
-    for var in [JOBSET_ID_ENV, JOBSET_SECRET_FILE_ENV, JOBSET_EPOCH_ENV] {
+    for var in [JOBSET_ID_ENV, CREDENTIALS_FILE_ENV, JOBSET_EPOCH_ENV] {
         if !policy
             .env_allow
             .iter()
@@ -1429,12 +1466,12 @@ pub fn build_jobset_env(
     credential: &JobsetCredential,
     private_tmp: &std::path::Path,
 ) -> Vec<(String, String)> {
-    let file = secret_file_path(private_tmp);
+    let file = credential_file_path(private_tmp);
     vec![
         (JOBSET_ID_ENV.to_string(), credential.jobset_id.clone()),
         (JOBSET_EPOCH_ENV.to_string(), credential.epoch.to_string()),
         (
-            JOBSET_SECRET_FILE_ENV.to_string(),
+            CREDENTIALS_FILE_ENV.to_string(),
             file.to_string_lossy().to_string(),
         ),
     ]
@@ -1800,23 +1837,37 @@ mod tests {
 
     // ---- credential from env ----------------------------------------------------
 
+    /// Writes a credential file for tests: one entry for `jobset` with `secret`.
+    fn write_test_credential_file(path: &std::path::Path, jobset: &str, secret: &str) {
+        let file = CredentialFile {
+            agent_id: "agent-x".to_string(),
+            jobsets: vec![CredentialEntry {
+                jobset_id: jobset.to_string(),
+                epoch: EPOCH_ZERO,
+                secret: secret.to_string(),
+                member_proof: "proof-x".to_string(),
+            }],
+        };
+        write_credential_file(path, &file).unwrap();
+    }
+
     #[test]
     fn credential_from_env_reads_id_and_secret_file() {
         with_env_guard(|| {
             let dir = tempfile::tempdir().unwrap();
-            let secret_file = dir.path().join(JOBSET_SECRET_FILE_NAME);
-            std::fs::write(&secret_file, "the-secret\n").unwrap();
+            let secret_file = dir.path().join(CREDENTIAL_FILE_NAME);
+            write_test_credential_file(&secret_file, "js-env", "the-secret");
 
             // Env vars are process-global; use distinct names via a child scope
             // is not possible, so set/remove around the call under the lock.
             std::env::set_var(JOBSET_ID_ENV, "js-env");
             std::env::set_var(
-                JOBSET_SECRET_FILE_ENV,
+                CREDENTIALS_FILE_ENV,
                 secret_file.to_string_lossy().to_string(),
             );
             let c = JobsetCredential::from_env();
             std::env::remove_var(JOBSET_ID_ENV);
-            std::env::remove_var(JOBSET_SECRET_FILE_ENV);
+            std::env::remove_var(CREDENTIALS_FILE_ENV);
 
             assert_eq!(
                 c,
@@ -1830,7 +1881,7 @@ mod tests {
     fn credential_from_env_absent_when_not_a_member() {
         with_env_guard(|| {
             std::env::remove_var(JOBSET_ID_ENV);
-            std::env::remove_var(JOBSET_SECRET_FILE_ENV);
+            std::env::remove_var(CREDENTIALS_FILE_ENV);
             assert_eq!(JobsetCredential::from_env(), None);
         });
     }
@@ -1858,7 +1909,7 @@ mod tests {
         assert!(matches!(
             &policy.secret,
             Some(crate::sandbox::policy::SecretConfig { fd: 3, dest })
-                if dest == JOBSET_SECRET_FILE_NAME
+                if dest == CREDENTIAL_FILE_NAME
         ));
 
         // The env carries the id and the PATH of the secret file -- never the
@@ -1867,9 +1918,11 @@ mod tests {
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         assert_eq!(env_kv.get(JOBSET_ID_ENV), Some(&"js-1"));
         assert_eq!(env_kv.get(JOBSET_EPOCH_ENV), Some(&"0"));
-        let expected_file = secret_file_path(dir.path()).to_string_lossy().to_string();
+        let expected_file = credential_file_path(dir.path())
+            .to_string_lossy()
+            .to_string();
         assert_eq!(
-            env_kv.get(JOBSET_SECRET_FILE_ENV),
+            env_kv.get(CREDENTIALS_FILE_ENV),
             Some(&expected_file.as_str())
         );
         // The secret value appears in no env value.
@@ -1905,10 +1958,10 @@ mod tests {
 
     #[test]
     fn secret_file_path_uses_tmp_root() {
-        let p = secret_file_path(std::path::Path::new("/sandbox/tmp"));
+        let p = credential_file_path(std::path::Path::new("/sandbox/tmp"));
         assert_eq!(
             p,
-            std::path::Path::new("/sandbox/tmp").join(JOBSET_SECRET_FILE_NAME)
+            std::path::Path::new("/sandbox/tmp").join(CREDENTIAL_FILE_NAME)
         );
     }
 
@@ -1991,11 +2044,11 @@ mod tests {
                 // env, secret read from a file named by the env (as the launcher
                 // sets it).
                 let dir = tempfile::tempdir().unwrap();
-                let secret_file = dir.path().join(JOBSET_SECRET_FILE_NAME);
-                std::fs::write(&secret_file, "host-secret-value").unwrap();
+                let secret_file = dir.path().join(CREDENTIAL_FILE_NAME);
+                write_test_credential_file(&secret_file, "host-js", "host-secret-value");
                 std::env::set_var(JOBSET_ID_ENV, "host-js");
                 std::env::set_var(
-                    JOBSET_SECRET_FILE_ENV,
+                    CREDENTIALS_FILE_ENV,
                     secret_file.to_string_lossy().to_string(),
                 );
                 let host = host_jobset().expect("host is a member");
@@ -2010,7 +2063,7 @@ mod tests {
                 let get = headers(Some("host-js"), Some("host-secret-value"));
                 assert!(verify_jobset_credential(&global_registry(), "job-d", &get));
                 std::env::remove_var(JOBSET_ID_ENV);
-                std::env::remove_var(JOBSET_SECRET_FILE_ENV);
+                std::env::remove_var(CREDENTIALS_FILE_ENV);
             });
         });
     }

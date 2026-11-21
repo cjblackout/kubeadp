@@ -936,11 +936,11 @@ mod tests {
             policy.secret,
             Some(SecretConfig {
                 fd: 3,
-                dest: crate::core::jobset::JOBSET_SECRET_FILE_NAME.to_string()
+                dest: crate::core::jobset::CREDENTIAL_FILE_NAME.to_string()
             })
         );
         assert!(policy.is_env_allowed(crate::core::jobset::JOBSET_ID_ENV));
-        assert!(policy.is_env_allowed(crate::core::jobset::JOBSET_SECRET_FILE_ENV));
+        assert!(policy.is_env_allowed(crate::core::jobset::CREDENTIALS_FILE_ENV));
         assert!(policy.is_env_allowed(crate::core::jobset::JOBSET_EPOCH_ENV));
         // The secret value is not an environment variable at all: even if it
         // were (wrongly) set, it would be filtered out (not `KUBEADP_*`-named
@@ -958,13 +958,13 @@ mod tests {
         let env = crate::core::jobset::build_jobset_env(&cred, &tmp);
         let env_str: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
         let joined = env_str.join("\n");
-        // Exactly three vars: the jobset id, the epoch, and the secret file
+        // Exactly three vars: the jobset id, the epoch, and the credential file
         // PATH (never the secret value).
         assert_eq!(env.len(), 3);
         assert!(joined.contains(&format!("{}=js-1", crate::core::jobset::JOBSET_ID_ENV)));
         assert!(joined.contains(&format!(
-            "{}={}/jobset-secret",
-            crate::core::jobset::JOBSET_SECRET_FILE_ENV,
+            "{}={}/jobset-credentials.json",
+            crate::core::jobset::CREDENTIALS_FILE_ENV,
             tmp.display()
         )));
         assert!(joined.contains(&format!("{}=0", crate::core::jobset::JOBSET_EPOCH_ENV)));

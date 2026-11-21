@@ -611,26 +611,31 @@ fn send_summary(resp: &SendMessageResponse, hop: u32) -> serde_json::Value {
 /// A [`CallInterceptor`] that attaches the per-jobset credential to every
 /// outgoing A2A request.
 ///
-/// A jobset member knows its jobset id (`KUBEADP_JOBSET_ID`) and the path of
-/// the 0400 secret file (`KUBEADP_JOBSET_SECRET_FILE`); the interceptor reads
-/// them once (see [`crate::core::jobset::JobsetCredential::from_env`]) and
-/// injects the [`crate::core::jobset::JOBSET_ID_HEADER`] and
-/// [`crate::core::jobset::JOBSET_SECRET_HEADER`] headers so the target agent's
-/// jobset check can verify membership. Both transports (JSON-RPC and REST)
+/// A jobset member holds a 0400 credential file (`KUBEADP_JOBSET_CREDENTIALS_FILE`);
+/// the interceptor reads it once (see [`crate::core::jobset::JobsetCredential::from_env`])
+/// and injects the [`crate::core::jobset::JOBSET_ID_HEADER`] and
+/// [`crate::core::jobset::JOBSET_SECRET_HEADER`] headers, plus the sender
+/// identity headers (`X-Agent-Id`, `X-Agent-Proof`) when the file carries a
+/// member proof, so the target agent's jobset check can verify membership. Both transports (JSON-RPC and REST)
 /// apply `ServiceParams` as HTTP headers, so this is transport-agnostic.
 pub struct JobsetCredentialInterceptor {
     jobset_id: String,
     secret: String,
+    /// The sender identity (SPEC §7.4): agent id and member proof, present when
+    /// the credential file carries a proof (a root key was configured at launch).
+    identity: Option<(String, String)>,
 }
 
 impl JobsetCredentialInterceptor {
     /// Build the interceptor from a credential, or `None` when the caller is
-    /// not a jobset member (no credential to attach).
+    /// not a jobset member (no credential to attach). The sender identity is
+    /// read from the same credential file ([`crate::core::jobset::agent_identity_from_env`]).
     pub fn from_credential(cred: &crate::core::jobset::JobsetCredential) -> Option<Self> {
         match (cred.jobset_id_header(), cred.secret_header()) {
             (Some(id), Some(secret)) => Some(Self {
                 jobset_id: id.to_string(),
                 secret: secret.to_string(),
+                identity: crate::core::jobset::agent_identity_from_env(),
             }),
             _ => None,
         }
@@ -648,6 +653,16 @@ impl CallInterceptor for JobsetCredentialInterceptor {
             .entry(crate::core::jobset::JOBSET_SECRET_HEADER.to_string())
             .or_default()
             .push(self.secret.clone());
+        if let Some((agent_id, proof)) = &self.identity {
+            params
+                .entry(crate::core::a2a::AGENT_ID_HEADER.to_string())
+                .or_default()
+                .push(agent_id.clone());
+            params
+                .entry(crate::core::a2a::AGENT_PROOF_HEADER.to_string())
+                .or_default()
+                .push(proof.clone());
+        }
         Ok(())
     }
 }
@@ -656,7 +671,7 @@ impl CallInterceptor for JobsetCredentialInterceptor {
 /// jobset member.
 ///
 /// Reads the credential from the environment (jobset id + the secret file
-/// named by `KUBEADP_JOBSET_SECRET_FILE`). Returns `None` when the agent has no
+/// named by `KUBEADP_JOBSET_CREDENTIALS_FILE`). Returns `None` when the agent has no
 /// jobset id or its secret file is absent -- such an agent is not a jobset
 /// member and presents no credential.
 fn jobset_credential_interceptor() -> Option<JobsetCredentialInterceptor> {

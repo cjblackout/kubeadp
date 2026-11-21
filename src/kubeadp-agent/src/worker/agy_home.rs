@@ -13,7 +13,7 @@
 //! `mcp_config.json`, keeping every other server entry. The merge is idempotent (rerunning
 //! with the same exe leaves the file unchanged) and atomic. The tool reads its own
 //! identity/credential from the job environment (`A2A_SELF_NAME`, `KUBEADP_JOBSET_ID`,
-//! `KUBEADP_JOBSET_SECRET_FILE`); nothing secret is ever written into this file.
+//! `KUBEADP_JOBSET_CREDENTIALS_FILE`); nothing secret is ever written into this file.
 
 use std::fs;
 use std::io::Write;

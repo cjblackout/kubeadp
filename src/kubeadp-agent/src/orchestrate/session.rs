@@ -988,7 +988,9 @@ fn run_session_iteration(
             for (k, v) in crate::core::jobset::build_jobset_env(cred, &private_tmp) {
                 sandboxed_cmd.env(k, v);
             }
-            session_secret_fd = Some(crate::orchestrate::pty::secret_memfd(&cred.secret));
+            session_secret_fd = Some(crate::orchestrate::pty::secret_memfd(
+                &crate::core::jobset::credential_file_json(&session.name, cred),
+            ));
         }
 
         // Pass through granted environment variables from the supervisor's process environment
