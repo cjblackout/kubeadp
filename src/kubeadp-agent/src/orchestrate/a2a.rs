@@ -37,7 +37,6 @@ use crate::core::a2a::{
     advertised_url, pod_name, role_description, role_skills, A2AError, A2aModel, A2aTask,
     AuthVerifier, TaskBackend, ROLE_ORCHESTRATOR,
 };
-use crate::engine::capability::InjectChannel;
 use crate::orchestrate::sessions_api;
 use a2a::TaskState;
 use axum::Router;
@@ -264,7 +263,10 @@ impl SessionMessageSink {
     /// One ladder pass for the session: computes the step for the oldest
     /// pending message and applies it (the queued PTY input). A free function
     /// over the shared state pieces so the watcher thread needs no handle on
-    /// the sink.
+    /// the sink. Stream-3 C3: this is the SHARED ladder state machine of
+    /// `core/a2a/sink.rs`, the same one the worker's JobMessageSink runs,
+    /// driven through a [`SessionLadder`] adapter that applies the queued PTY
+    /// input (never a kill) and reports a session idle only while Running.
     fn ladder_pass(
         state: &sessions_api::SessionsApiState,
         inbox_root: &std::path::Path,
@@ -272,94 +274,16 @@ impl SessionMessageSink {
         session: &str,
         interrupt: bool,
     ) -> LadderStep {
-        let inbox_dir = crate::core::a2a::inbox::inbox_dir_for(inbox_root, session);
-        // The inbox is read WITHOUT its own TTL filter: the ladder applies
-        // the TTL itself so the expiry is recorded when a message lapses.
-        let inbox = Inbox::with_ttl(&inbox_dir, u64::MAX);
-        let pending = inbox.pending();
-        if pending.is_empty() {
-            if inbox.uninjected_count() > 0 {
-                // A channel holds the rest under a claim lease: it either
-                // acknowledges them or the lease lapses and they come back.
-                return LadderStep::Queued;
-            }
-            // Nothing left to deliver: the session's last expiry (if any) is
-            // the terminal state the sender sees, else all was injected.
-            return match crate::core::a2a::delivery::read_expiry(&inbox_dir) {
-                Some(record) => LadderStep::Expired {
-                    reason: record.reason,
-                },
-                None => LadderStep::Injected,
-            };
-        }
-        let running = {
-            let st = state
-                .supervisor_state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            st.sessions
-                .get(session)
-                .is_some_and(|s| s.status == SessionStatus::Running)
-        };
-        let step =
-            crate::core::a2a::delivery::next_step(&crate::core::a2a::delivery::LadderInput {
-                now: crate::core::a2a::inbox::now_unix(),
-                queued_at: pending[0].queued_at,
-                interrupt,
-                idle_turn_available: running,
-                expired: false,
-                config: ladder,
-            });
-        match step {
-            LadderStep::Expired { reason } => {
-                // Record the expiry AND remove the row: an expired message
-                // must not be served by a hook later, nor block the younger
-                // messages behind it (the watcher keeps going for those).
-                inbox.expire(&pending[0].message_id, &reason);
-                LadderStep::Expired { reason }
-            }
-            LadderStep::IdleTurn | LadderStep::Interrupt => {
-                // The queued PTY input (design §7.14: "queued PTY input or
-                // the Stop hook"). A bracketed paste queues the message as
-                // the next user input; nothing is killed.
-                //
-                // The messages are CLAIMED atomically first and exactly the
-                // claimed ones are written and acknowledged: a message that
-                // arrives during the write is not marked injected without
-                // ever being written, and a message a hook claimed in the
-                // meantime is not written a second time. NotRunning / a
-                // throttled budget hands the claim back (still queued).
-                let claimed = inbox.claim_for_resume();
-                if claimed.is_empty() {
-                    return LadderStep::Queued;
-                }
-                let joined = join_framed(&claimed);
-                let channel = match step {
-                    LadderStep::Interrupt => InjectChannel::Interrupt,
-                    _ => InjectChannel::IdleTurn,
-                };
-                // N7: the A2A sink charged this message at acceptance, so
-                // the ladder's PTY write does not charge again.
-                if let sessions_api::DeliverOutcome::Accepted { .. } = sessions_api::deliver_message(
-                    state,
-                    session,
-                    &claimed[0].sender,
-                    &joined,
-                    false,
-                ) {
-                    for msg in &claimed {
-                        inbox.mark_injected(&msg.message_id, channel.as_str());
-                    }
-                    step
-                } else {
-                    for msg in &claimed {
-                        inbox.release_claim(&msg.message_id);
-                    }
-                    LadderStep::Queued
-                }
-            }
-            other => other,
-        }
+        crate::core::a2a::sink::ladder_pass(
+            &SessionLadder {
+                state,
+                inbox_root,
+                ladder,
+            },
+            session,
+            interrupt,
+            crate::core::a2a::inbox::now_unix(),
+        )
     }
 
     /// Ensures the ladder watcher is running for the session (one per
@@ -402,6 +326,82 @@ impl SessionMessageSink {
                 empty
             },
         );
+    }
+}
+
+/// The orchestrator's [`crate::core::a2a::sink::AgentSink`] adapter
+/// (stream-3 C3): what the SHARED ladder ([`crate::core::a2a::sink::ladder_pass`])
+/// drives on the session path, replacing the old in-sink ladder. The
+/// `idle_turn` and `interrupt` steps BOTH apply the queued PTY input (a
+/// bracketed paste; nothing is ever killed on the session path) with the
+/// shared A2A message budget charged at acceptance (N7), and a session is
+/// idle only while it is Running (Starting/Backoff are not idle). The
+/// `undeliverable` predicate: a session that no longer exists must never be
+/// woken.
+struct SessionLadder<'a> {
+    state: &'a sessions_api::SessionsApiState,
+    inbox_root: &'a std::path::Path,
+    ladder: &'a LadderConfig,
+}
+
+impl crate::core::a2a::sink::AgentSink for SessionLadder<'_> {
+    fn ladder_config(&self) -> LadderConfig {
+        *self.ladder
+    }
+
+    fn inbox_dir(&self, run_id: &str) -> PathBuf {
+        crate::core::a2a::inbox::inbox_dir_for(self.inbox_root, run_id)
+    }
+
+    fn undeliverable(&self, run_id: &str) -> Option<String> {
+        let st = self
+            .state
+            .supervisor_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if st.sessions.contains_key(run_id) {
+            None
+        } else {
+            Some(format!(
+                "A2A message not delivered: session '{run_id}' no longer exists"
+            ))
+        }
+    }
+
+    fn is_idle(&self, run_id: &str) -> bool {
+        let st = self
+            .state
+            .supervisor_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        st.sessions
+            .get(run_id)
+            .is_some_and(|s| s.status == SessionStatus::Running)
+    }
+
+    fn apply_idle_turn(&self, run_id: &str, claimed: &[QueuedMessage]) -> bool {
+        // The queued PTY input: a bracketed paste queues the message as the
+        // next user input; nothing is killed.
+        let joined = join_framed(claimed);
+        // N7: the A2A sink charged this message at acceptance, so the
+        // ladder's PTY write does not charge again.
+        matches!(
+            sessions_api::deliver_message(self.state, run_id, &claimed[0].sender, &joined, false,),
+            sessions_api::DeliverOutcome::Accepted { .. }
+        )
+    }
+
+    fn apply_interrupt(&self, run_id: &str, claimed: &[QueuedMessage]) -> bool {
+        // On the session path the `interrupt` step is the SAME queued PTY
+        // input, delivered immediately for `interrupt: true`; nothing is
+        // killed (a session has no kill-and-resume).
+        self.apply_idle_turn(run_id, claimed)
+    }
+
+    fn unclaimed_step(&self) -> LadderStep {
+        // A session's watchers re-poll while a lease is held (Starting/Backoff
+        // candidates), so an empty claim stays Queued, not Injected.
+        LadderStep::Queued
     }
 }
 

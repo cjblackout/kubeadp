@@ -69,6 +69,9 @@ pub mod client;
 #[cfg(feature = "a2a")]
 pub mod receive;
 
+#[cfg(feature = "a2a")]
+pub mod sink;
+
 pub use auth::A2aAuthLayer;
 pub use backend::{map_job_status, A2AError, A2aTask, TaskBackend};
 pub use card::{

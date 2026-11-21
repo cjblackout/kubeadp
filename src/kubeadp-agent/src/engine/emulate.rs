@@ -648,6 +648,14 @@ impl Engine for EmulatingEngine {
         self.inner.job_status(run).await
     }
 
+    fn is_idle(&self, run: &Run) -> Result<bool, EngineError> {
+        self.inner.is_idle(run)
+    }
+
+    async fn idle_turn(&self, run: &Run, joined: &str) -> Result<(), EngineError> {
+        self.inner.idle_turn(run, joined).await
+    }
+
     async fn start_session(
         &self,
         spec: SessionSpec,

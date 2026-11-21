@@ -201,6 +201,32 @@ pub trait Engine: Send + Sync {
     /// Extracts or returns the engine-specific conversation context identifier.
     fn conversation_id(&self, job: &JobMetadata) -> Option<ContextId>;
 
+    // ---- A2A idle step (design HL-113 §7.14, stream-3 C3) -----------------
+
+    /// Whether the run is idle at a turn boundary -- the `idle_turn` step of
+    /// the A2A escalation ladder (§7.14) may start the next turn with a queued
+    /// message only when this is true. A finished job is idle; a RUNNING agy
+    /// job is idle only while a live stdin channel can carry the message; a
+    /// running interactive session is idle between turns. The ladder watchers
+    /// (`core/a2a/sink.rs`) consult this through the engine before applying an
+    /// `idle_turn`. Default: unsupported.
+    fn is_idle(&self, run: &Run) -> Result<bool, EngineError> {
+        let _ = run;
+        Err(EngineError::unsupported(self.id(), "a2a.inject.idle_turn"))
+    }
+
+    /// Starts the run's next turn with `joined` (the joined framed text of the
+    /// claimed pending messages) as the input to the agent's context -- the
+    /// `idle_turn` channel of §7.14. For a finished job this resumes the same
+    /// conversation with the message as the follow-up turn; for a RUNNING live
+    /// agy job it writes the framed message into the live stdin channel; for a
+    /// running interactive session it delivers the message as the next user
+    /// input. Never kills. Default: unsupported.
+    async fn idle_turn(&self, run: &Run, joined: &str) -> Result<(), EngineError> {
+        let _ = (run, joined);
+        Err(EngineError::unsupported(self.id(), "a2a.inject.idle_turn"))
+    }
+
     // ---- shared control (E4 emulation layer fronts these) -----------------
 
     /// Interrupts a run. Default: unsupported.

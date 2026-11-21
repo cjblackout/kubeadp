@@ -44,7 +44,7 @@ use kubeadp_agent::core::a2a::inbox::{
 use kubeadp_agent::core::a2a::inject::{join_framed, run_a2a_hook};
 use kubeadp_agent::engine::capability::{inject_channels, CapabilityTable, InjectChannel};
 use kubeadp_agent::engine::{
-    Engine, EngineCtx, EngineError, JobSpec, Run, RunId, RunStatus, SessionSpec, Transport,
+    Engine, EngineCtx, EngineError, JobSpec, Run, RunId, RunKind, RunStatus, SessionSpec, Transport,
 };
 use kubeadp_agent::mcp_a2a::A2aMcpServer;
 use rmcp::model::CallToolRequestParams;
@@ -60,6 +60,11 @@ use tempfile::TempDir;
 struct FakeEngine {
     id: &'static str,
     kills: Mutex<Vec<String>>,
+    /// The idle answer the parity suite configures (a finished/idle run).
+    idle: std::sync::atomic::AtomicBool,
+    /// Recorded `idle_turn` deliveries (`run_id`, `joined`) for the parity
+    /// contract: the idle member is started with the message, never killed.
+    idle_turns: Mutex<Vec<(String, String)>>,
 }
 
 impl FakeEngine {
@@ -67,11 +72,17 @@ impl FakeEngine {
         Arc::new(Self {
             id,
             kills: Mutex::new(Vec::new()),
+            idle: std::sync::atomic::AtomicBool::new(true),
+            idle_turns: Mutex::new(Vec::new()),
         })
     }
 
     fn kill_count(&self) -> usize {
         self.kills.lock().unwrap().len()
+    }
+
+    fn idle_turn_count(&self) -> usize {
+        self.idle_turns.lock().unwrap().len()
     }
 }
 
@@ -169,6 +180,24 @@ impl Engine for FakeEngine {
             .transport(Transport::StreamJson)
             .native(&["a2a.inject"])
             .build()
+    }
+
+    /// Whether the run is idle (`true` unless the parity suite parks it for
+    /// the "busy is never killed" contract).
+    fn is_idle(&self, _run: &Run) -> Result<bool, EngineError> {
+        Ok(self.idle.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The engine-side idle turn: the queued prompt is passed to the
+    /// (still running) engine as the next turn input -- it is never killed.
+    /// The parity suite asserts this ran via [`FakeEngine::idle_turn_count`]
+    /// and that no kill was recorded.
+    async fn idle_turn(&self, run: &Run, joined: &str) -> Result<(), EngineError> {
+        self.idle_turns
+            .lock()
+            .unwrap()
+            .push((run.id.clone(), joined.to_string()));
+        Ok(())
     }
 }
 
@@ -772,4 +801,198 @@ fn i_l_ladder_contracts_both_engines() {
     inbox.enqueue(queued_msg("m1", "idle member")).unwrap();
     assert!(inbox.mark_injected("m1", InjectChannel::IdleTurn.as_str()));
     assert!(inbox.pending().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Stream-3 C3: the engines supply the idle step through the Engine trait, and
+// the SHARED ladder (core/a2a/sink.rs) applies it uniformly for both engines.
+// The parity contract: an idle run gets an idle_turn (NEVER a kill) via
+// `Engine::is_idle`+`idle_turn`, and only an explicit `interrupt` escalates to
+// kill-and-resume. The ladder is driven with an injectable clock, so no step
+// depends on wall-clock timing.
+// ---------------------------------------------------------------------------
+
+/// An [`AgentSink`] whose idle step comes from the **Engine trait**
+/// (`is_idle`/`idle_turn`) -- exactly how the production sinks consult the
+/// engine -- so the parity test drives the REAL contract through the trait
+/// for each engine.
+struct EngineDrivenSink {
+    inbox_root: std::path::PathBuf,
+    engine: Arc<FakeEngine>,
+    run: Run,
+    /// Kept alive so the inbox directory exists for the whole test (the
+    /// shared ladder opens its own `Inbox` at the same path).
+    _tmp: TempDir,
+}
+
+impl EngineDrivenSink {
+    fn new(run_id: &str, engine: Arc<FakeEngine>) -> Self {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        Self {
+            inbox_root: root,
+            engine,
+            run: Run::new(run_id.to_string(), RunKind::Job, "/workspace/proj"),
+            _tmp: tmp,
+        }
+    }
+
+    fn inbox(&self) -> Inbox {
+        Inbox::new(kubeadp_agent::core::a2a::inbox::inbox_dir_for(
+            &self.inbox_root,
+            &self.run.id,
+        ))
+    }
+}
+
+impl kubeadp_agent::core::a2a::sink::AgentSink for EngineDrivenSink {
+    fn ladder_config(&self) -> kubeadp_agent::core::a2a::delivery::LadderConfig {
+        kubeadp_agent::core::a2a::delivery::LadderConfig {
+            ack_secs: 45,
+            force_secs: 0,
+            ttl_secs: 3600,
+        }
+    }
+
+    fn inbox_dir(&self, run_id: &str) -> std::path::PathBuf {
+        kubeadp_agent::core::a2a::inbox::inbox_dir_for(&self.inbox_root, run_id)
+    }
+
+    fn undeliverable(&self, _run_id: &str) -> Option<String> {
+        None
+    }
+
+    fn is_idle(&self, _run_id: &str) -> bool {
+        self.engine
+            .is_idle(&self.run)
+            .expect("the engine's idle test answers")
+    }
+
+    fn apply_idle_turn(&self, _run_id: &str, claimed: &[QueuedMessage]) -> bool {
+        // The real contract: the engine's `idle_turn` with the joined text.
+        let joined = join_framed(claimed);
+        // The trait method is async; the ladder is synchronous, so the test
+        // runs it on a fresh current-thread runtime.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(self.engine.idle_turn(&self.run, &joined))
+            .is_ok()
+    }
+
+    fn apply_interrupt(&self, _run_id: &str, _claimed: &[QueuedMessage]) -> bool {
+        // The interrupt application is kill-and-resume: the engine records the
+        // kill. (The resume input is the joined text; the fake engine ignores
+        // it.)
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Engine::interrupt(&*self.engine, &self.run))
+            .is_ok()
+    }
+}
+
+/// The parity contract for C3, driven through the Engine trait + the SHARED
+/// ladder for BOTH engines:
+/// - an idle run: the `idle_turn` applies after `ack_secs` (no kill, exactly
+///   one recorded idle_turn, never an `interrupt`/kill);
+/// - a busy run (engine parked as not idle): still queued however late (no
+///   kill);
+/// - only `interrupt: true` escalates to the interrupt application.
+#[test]
+fn c3_shared_ladder_idle_via_engine_trait_both_engines() {
+    use kubeadp_agent::core::a2a::inbox::now_unix;
+    use kubeadp_agent::core::a2a::sink;
+
+    for engine in [&FakeEngine::new("agy"), &FakeEngine::new("claude")] {
+        let engine = Arc::clone(engine);
+        let sink = EngineDrivenSink::new(&format!("run-{}", engine.id), engine.clone());
+        let inbox = sink.inbox();
+        inbox.enqueue(queued_msg("m1", "idle member")).unwrap();
+        let now = now_unix();
+        // Age the queued message past ack_secs (the SAME `now` drives the
+        // pass, so the step is deterministic).
+        let _ = inbox.with_conn(|conn| {
+            conn.execute(
+                "UPDATE a2a_message SET queued_at=?1 WHERE run_id=?2 AND message_id=?3 AND fake=?4",
+                rusqlite::params![now - 45, inbox.run_id(), "m1", i64::from(inbox.fake())],
+            )
+            .map_err(|e| format!("failed to age: {e}"))?;
+            Ok(())
+        });
+
+        // Inside the ack window nothing applies, nothing is killed.
+        assert_eq!(
+            sink::ladder_pass(&sink, &sink.run.id, false, now - 50),
+            kubeadp_agent::core::a2a::delivery::LadderStep::Queued
+        );
+        assert_eq!(
+            engine.kill_count(),
+            0,
+            "{}: busy window never kills",
+            engine.id
+        );
+        assert_eq!(engine.idle_turn_count(), 0);
+
+        // Past ack_secs with the run idle: ONE idle_turn through the trait,
+        // never a kill.
+        assert_eq!(
+            sink::ladder_pass(&sink, &sink.run.id, false, now),
+            kubeadp_agent::core::a2a::delivery::LadderStep::IdleTurn
+        );
+        assert_eq!(engine.idle_turn_count(), 1, "{}: one idle_turn", engine.id);
+        assert_eq!(
+            engine.kill_count(),
+            0,
+            "{}: idle_turn never kills",
+            engine.id
+        );
+        assert!(inbox.pending().is_empty(), "the idle_turn acknowledges");
+
+        // A BUSY run (parked not idle) is never killed, however late: the
+        // message stays queued until TTL.
+        engine
+            .idle
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        inbox.enqueue(queued_msg("m2", "busy member")).unwrap();
+        let _ = inbox.with_conn(|conn| {
+            conn.execute(
+                "UPDATE a2a_message SET queued_at=?1 WHERE run_id=?2 AND message_id=?3 AND fake=?4",
+                rusqlite::params![now - 3599, inbox.run_id(), "m2", i64::from(inbox.fake())],
+            )
+            .map_err(|e| format!("failed to age: {e}"))?;
+            Ok(())
+        });
+        assert_eq!(
+            sink::ladder_pass(&sink, &sink.run.id, false, now),
+            kubeadp_agent::core::a2a::delivery::LadderStep::Queued,
+            "{}: a busy member is never killed",
+            engine.id
+        );
+        assert_eq!(
+            engine.kill_count(),
+            0,
+            "{}: busy is never killed",
+            engine.id
+        );
+
+        // Only `interrupt: true` escalates to the interrupt application.
+        assert_eq!(
+            sink::ladder_pass(&sink, &sink.run.id, true, now),
+            kubeadp_agent::core::a2a::delivery::LadderStep::Interrupt
+        );
+        // The interrupt application is the ONLY kill recorded for the run.
+        assert_eq!(
+            engine.kill_count(),
+            1,
+            "{}: interrupt is the only kill",
+            engine.id
+        );
+        assert!(inbox.pending().is_empty(), "interrupt acknowledges");
+        engine
+            .idle
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }

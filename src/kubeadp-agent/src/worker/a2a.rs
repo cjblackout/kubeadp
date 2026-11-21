@@ -527,106 +527,17 @@ impl JobMessageSink {
     /// The caller also holds the per-job gate (see [`ensure_ladder`]) so
     /// in-process passages are serialized on top.
     fn ladder_pass_impl(config: &Config, job_id: &str, interrupt: bool) -> LadderStep {
-        let ladder_cfg = Self::ladder_config(config);
-        let inbox_dir = crate::core::a2a::inbox::inbox_dir_for(&config.state_root, job_id);
-        // The inbox is read WITHOUT its own TTL filter: the ladder applies
-        // the TTL itself so the expiry is recorded when a message lapses.
-        let inbox = Inbox::with_ttl(&inbox_dir, u64::MAX);
-        let pending = inbox.pending();
-        if pending.is_empty() {
-            if inbox.uninjected_count() > 0 {
-                // A channel holds the rest under a claim lease: it either
-                // acknowledges them or the lease lapses and they come back.
-                return LadderStep::Queued;
-            }
-            // Nothing left to deliver: the run's last expiry (if any) is the
-            // terminal state the sender sees, else everything was injected.
-            return match crate::core::a2a::delivery::read_expiry(&inbox_dir) {
-                Some(record) => LadderStep::Expired {
-                    reason: record.reason,
-                },
-                None => LadderStep::Injected,
-            };
-        }
-        // A message must never wake a job the operator killed (the ingress
-        // refuses it up front, but the job can be killed while its message
-        // is still queued), and a job that no longer exists cannot receive
-        // it: fail the sender's task instead of resuming or waiting.
-        let undeliverable = match JobMetadata::resolve(&config.state_root, job_id) {
-            Ok(meta) if meta.status == Some(JobStatus::Killed) => Some(format!(
-                "A2A message not delivered: job '{job_id}' was killed by the operator"
-            )),
-            Ok(_) => None,
-            Err(_) => Some(format!(
-                "A2A message not delivered: job '{job_id}' no longer exists"
-            )),
-        };
-        if let Some(reason) = undeliverable {
-            for msg in &pending {
-                inbox.expire(&msg.message_id, &reason);
-            }
-            return LadderStep::Expired { reason };
-        }
-        let step =
-            crate::core::a2a::delivery::next_step(&crate::core::a2a::delivery::LadderInput {
-                now: crate::core::a2a::inbox::now_unix(),
-                queued_at: pending[0].queued_at,
-                interrupt,
-                idle_turn_available: Self::idle_turn_available(config, job_id),
-                expired: false,
-                config: &ladder_cfg,
-            });
-        match step {
-            LadderStep::Expired { reason } => {
-                // Record the expiry AND remove the row: an expired message
-                // must not be served by a hook later, nor block the younger
-                // messages behind it (the watcher keeps going for those).
-                inbox.expire(&pending[0].message_id, &reason);
-                LadderStep::Expired { reason }
-            }
-            LadderStep::IdleTurn => {
-                let claimed = inbox.claim_for_resume();
-                if claimed.is_empty() {
-                    // Another pass already claimed (or injected) the message:
-                    // nothing left for THIS pass to resume.
-                    return LadderStep::Injected;
-                }
-                let joined = join_framed(&claimed);
-                if Self::apply_idle_turn(config, job_id, &joined) {
-                    for msg in &claimed {
-                        inbox.mark_injected(&msg.message_id, InjectChannel::IdleTurn.as_str());
-                    }
-                    LadderStep::IdleTurn
-                } else {
-                    // Resume did not apply: hand the claim back so a later
-                    // pass (or channel) can retry the same message.
-                    for msg in &claimed {
-                        inbox.release_claim(&msg.message_id);
-                    }
-                    LadderStep::Queued
-                }
-            }
-            LadderStep::Interrupt => {
-                let claimed = inbox.claim_for_resume();
-                if claimed.is_empty() {
-                    return LadderStep::Injected;
-                }
-                let joined = join_framed(&claimed);
-                if let Ok(meta) = JobMetadata::resolve(&config.state_root, job_id) {
-                    if Self::resume_with(config, &meta, &joined).is_ok() {
-                        for msg in &claimed {
-                            inbox.mark_injected(&msg.message_id, InjectChannel::Interrupt.as_str());
-                        }
-                        return LadderStep::Interrupt;
-                    }
-                }
-                for msg in &claimed {
-                    inbox.release_claim(&msg.message_id);
-                }
-                LadderStep::Queued
-            }
-            other => other,
-        }
+        // Stream-3 C3: the SAME ladder state machine the orchestrator's
+        // SessionMessageSink runs, over the same InboxStore surface
+        // (core/a2a/sink.rs). The adapter supplies the §7.11 idle test/the
+        // idle_turn and the interrupt application exactly as the pre-C3
+        // ladder did, so no behaviour moves.
+        crate::core::a2a::sink::ladder_pass(
+            &JobLadder { config },
+            job_id,
+            interrupt,
+            crate::core::a2a::inbox::now_unix(),
+        )
     }
 
     /// Resume the job's conversation with `prompt` as the next turn. For a
@@ -810,6 +721,58 @@ impl MessageSink for JobMessageSink {
         self.mark_seen(task_id, message_id);
         self.ensure_ladder_for_delivery(task_id);
         Ok(())
+    }
+}
+
+/// The worker's [`crate::core::a2a::sink::AgentSink`] adapter (stream-3 C3):
+/// this is what the SHARED ladder ([`crate::core::a2a::sink::ladder_pass`])
+/// drives for the worker role, replacing the old in-worker ladder
+/// `ladder_pass_impl`. Every hook delegates to the SAME logic the pre-C3
+/// ladder used, so no behaviour moves: the ladder configuration, the §7.11
+/// idle test, the `idle_turn` (never a kill) and the `interrupt` (the
+/// kill-and-resume via [`JobMessageSink::resume_with`]) all keep their exact
+/// semantics; the sink also resolves undeliverability (a killed or vanished
+/// job must never be woken).
+struct JobLadder<'a> {
+    config: &'a Config,
+}
+
+impl crate::core::a2a::sink::AgentSink for JobLadder<'_> {
+    fn ladder_config(&self) -> LadderConfig {
+        JobMessageSink::ladder_config(self.config)
+    }
+
+    fn inbox_dir(&self, run_id: &str) -> std::path::PathBuf {
+        crate::core::a2a::inbox::inbox_dir_for(&self.config.state_root, run_id)
+    }
+
+    fn undeliverable(&self, run_id: &str) -> Option<String> {
+        match JobMetadata::resolve(&self.config.state_root, run_id) {
+            Ok(meta) if meta.status == Some(JobStatus::Killed) => Some(format!(
+                "A2A message not delivered: job '{run_id}' was killed by the operator"
+            )),
+            Ok(_) => None,
+            Err(_) => Some(format!(
+                "A2A message not delivered: job '{run_id}' no longer exists"
+            )),
+        }
+    }
+
+    fn is_idle(&self, run_id: &str) -> bool {
+        JobMessageSink::idle_turn_available(self.config, run_id)
+    }
+
+    fn apply_idle_turn(&self, run_id: &str, claimed: &[QueuedMessage]) -> bool {
+        let joined = join_framed(claimed);
+        JobMessageSink::apply_idle_turn(self.config, run_id, &joined)
+    }
+
+    fn apply_interrupt(&self, run_id: &str, claimed: &[QueuedMessage]) -> bool {
+        let joined = join_framed(claimed);
+        match JobMetadata::resolve(&self.config.state_root, run_id) {
+            Ok(meta) => JobMessageSink::resume_with(self.config, &meta, &joined).is_ok(),
+            Err(_) => false,
+        }
     }
 }
 

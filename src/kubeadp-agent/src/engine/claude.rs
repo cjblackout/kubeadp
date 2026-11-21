@@ -484,6 +484,60 @@ impl Engine for ClaudeEngine {
         }
     }
 
+    fn is_idle(&self, run: &Run) -> Result<bool, EngineError> {
+        // A finished job is idle (its next turn can be started with the queued
+        // message); a live job child is busy until it exits. A session is idle
+        // when it is RUNNING (between turns: the PTY is idle, so the bracketed
+        // paste of the `idle_turn` can be delivered). Everything else (pending,
+        // stopped, failed, backoff) is not idle.
+        match run.kind {
+            RunKind::Job => {
+                let jobs = self
+                    .jobs
+                    .lock()
+                    .map_err(|e| EngineError::Internal(format!("claude job map poisoned: {e}")))?;
+                let handle = jobs.get(&run.id).ok_or_else(|| EngineError::NotFound {
+                    run: run.id.clone(),
+                })?;
+                Ok(handle.terminal.is_some())
+            }
+            RunKind::Session => {
+                let adapter = self.adapter("a2a.inject.idle_turn")?;
+                let st = adapter
+                    .state
+                    .supervisor_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                Ok(st
+                    .sessions
+                    .get(&run.id)
+                    .is_some_and(|s| s.status == crate::orchestrate::state::SessionStatus::Running))
+            }
+        }
+    }
+
+    async fn idle_turn(&self, run: &Run, joined: &str) -> Result<(), EngineError> {
+        // The `idle_turn` step of §7.14: the queued message starts the run's
+        // NEXT turn. A finished job is resumed with the joined framed text; a
+        // running interactive session gets it as the next user input (the PTY
+        // bracketed paste). Never kills.
+        match run.kind {
+            RunKind::Job => self.resume_job(run, joined).await,
+            RunKind::Session => {
+                let adapter = self.adapter("a2a.inject.idle_turn")?;
+                let run_for = Run::new(run.id.clone(), RunKind::Session, &run.workdir);
+                let outcome = crate::orchestrate::sessions_api::deliver_message(
+                    &adapter.state,
+                    &run.id,
+                    crate::orchestrate::sessions_api::REST_SENDER,
+                    joined,
+                    false,
+                );
+                crate::engine::claude::session_pty::outcome_to_error(outcome, &run_for)
+            }
+        }
+    }
+
     async fn start_session(
         &self,
         spec: SessionSpec,

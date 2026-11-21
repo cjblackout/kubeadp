@@ -231,6 +231,60 @@ impl Engine for AgyEngine {
         Ok(self.classify(&meta).into())
     }
 
+    fn is_idle(&self, run: &Run) -> Result<bool, EngineError> {
+        // A finished job is idle (the next turn can be started with the
+        // message); a RUNNING job is idle only while a live stdin channel can
+        // carry the framed message (§7.14). Mirrors the worker sink's
+        // `idle_turn_available`.
+        let meta = JobMetadata::load(&self.config.state_root, &run.id)
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        if compute_status(&meta, &self.config.state_root) != JobStatus::Running {
+            return Ok(true);
+        }
+        Ok(self.config.a2a_live_stdin && crate::core::a2a_live::lookup(&run.id).is_some())
+    }
+
+    async fn idle_turn(&self, run: &Run, joined: &str) -> Result<(), EngineError> {
+        // The `idle_turn` step of §7.14: the message is started as the run's
+        // NEXT turn. A finished job is resumed with the joined framed text; a
+        // RUNNING live-channel job gets it over the pipe. Never kills.
+        let meta = JobMetadata::load(&self.config.state_root, &run.id)
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        if compute_status(&meta, &self.config.state_root) == JobStatus::Running {
+            if !self.config.a2a_live_stdin {
+                return Err(EngineError::unsupported(self.id(), "a2a.inject.idle_turn"));
+            }
+            if let Some(channel) = crate::core::a2a_live::lookup(&run.id) {
+                if channel.is_alive_for(meta.pid, meta.pid_start_time) {
+                    if channel.deliver_line(joined).is_ok() {
+                        channel.touch();
+                        return Ok(());
+                    }
+                    crate::core::a2a_live::close_for(&run.id);
+                }
+            }
+            return Err(EngineError::Internal(
+                "no live stdin channel for the RUNNING job".to_string(),
+            ));
+        }
+        // A finished job is resumed with the message as the follow-up turn.
+        // The resume goes through `commands::retry` with a follow-up prompt,
+        // which continues the SAME conversation (conversation_id) with the new
+        // turn; it never marks the job user-killed or failed. (A RUNNING job
+        // was already handled above; the worker's `resume_with` additionally
+        // stops the running attempt, but the `idle_turn` step never needs to
+        // kill -- the live-channel path is the only RUNNING case.)
+        let args = crate::core::args::RetryArgs {
+            job_id: run.id.clone(),
+            prompt: Some(joined.to_string()),
+            ..Default::default()
+        };
+        crate::core::commands::retry::run(&self.config, &args).map_err(|e| {
+            EngineError::Internal(format!("failed to resume job '{}': {e}", run.id))
+        })?;
+        Ok(())
+    }
+
     async fn start_session(
         &self,
         spec: SessionSpec,
