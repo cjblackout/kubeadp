@@ -67,7 +67,7 @@ echo "Building kubeadp-agent binary..."
 # A prebuilt binary (CARGO_TARGET_DIR/debug/kubeadp-agent) is used as is; the
 # suite only builds when it is missing.
 if [ ! -x "$BIN" ]; then
-    cargo build --manifest-path "${CRATE_DIR}/Cargo.toml" --bin kubeadp-agent --features test-hooks --quiet
+    cargo build --manifest-path "${CRATE_DIR}/Cargo.toml" --bin kubeadp-agent --features a2a,test-hooks --quiet
 fi
 stop_supervisor() {
     local pid="$1"
