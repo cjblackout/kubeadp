@@ -214,6 +214,24 @@ fn is_full_sha(base_ref: &str) -> bool {
     base_ref.len() == 40 && base_ref.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// The fetch arguments for the private repo: shallow (`--depth=1`) by default,
+/// but an already complete repo (not shallow, with fetched refs, e.g. one an
+/// operator unshallowed because a job needs older history such as a fork
+/// point) is fetched incrementally, so a start never cuts its history again.
+fn fetch_args<'a>(repo: &Path, rest: &[&'a str]) -> Vec<&'a str> {
+    let complete = git_stdout(repo, &["rev-parse", "--is-shallow-repository"]).as_deref()
+        == Some("false")
+        && git_stdout(repo, &["for-each-ref", "--count=1", "refs/remotes"])
+            .map(|o| !o.trim().is_empty())
+            .unwrap_or(false);
+    let mut args = vec!["fetch", "-q"];
+    if !complete {
+        args.push("--depth=1");
+    }
+    args.extend_from_slice(rest);
+    args
+}
+
 /// Creates (first use) and refreshes the project's private bare repository,
 /// guaranteeing that `base_ref` (a branch name, "HEAD", or a full commit
 /// SHA) is present locally and, for a ref-based base, that the repo's HEAD
@@ -266,18 +284,9 @@ pub fn ensure_private_repo(
         // against hosts (e.g. GitHub) that allow it.
         if !ref_exists(&repo, base_ref) {
             let mut first_error: Option<String> = None;
-            git_run(
-                &repo,
-                &["fetch", "-q", "--depth=1", "origin", base_ref],
-                true,
-            )
-            .or_else(|e| {
+            git_run(&repo, &fetch_args(&repo, &["origin", base_ref]), true).or_else(|e| {
                 first_error = Some(e.to_string());
-                git_run(
-                    &repo,
-                    &["fetch", "-q", "--depth=1", &source, base_ref],
-                    true,
-                )
+                git_run(&repo, &fetch_args(&repo, &[&source, base_ref]), true)
             })?;
             if !ref_exists(&repo, base_ref) {
                 bail!(
@@ -293,10 +302,10 @@ pub fn ensure_private_repo(
         // fetched tip so HEAD-based resolutions stay current.
         let target = if base_ref == "HEAD" { "HEAD" } else { base_ref };
         let mut first_error: Option<String> = None;
-        let fetch_result = git_run(&repo, &["fetch", "-q", "--depth=1", "origin", target], true)
-            .or_else(|e| {
+        let fetch_result =
+            git_run(&repo, &fetch_args(&repo, &["origin", target]), true).or_else(|e| {
                 first_error = Some(e.to_string());
-                git_run(&repo, &["fetch", "-q", "--depth=1", &source, target], true)
+                git_run(&repo, &fetch_args(&repo, &[&source, target]), true)
             });
         let first_error_detail = first_error.clone().unwrap_or_else(|| {
             "the fetch reported success but the object is still missing".to_string()
