@@ -233,6 +233,26 @@ pub fn build_command_and_args(
 /// On success the returned `Command` wraps `sandbox-exec ... -- <agy> ...`;
 /// the policy file path is also reported back in `policy_path` so callers can
 /// surface it in job status/info output.
+/// The private bare repository a job worktree is linked to: the `gitdir:`
+/// pointer of its `.git` file (`<repos_root>/<project>.git/worktrees/<id>`)
+/// resolved to `<repos_root>/<project>.git`, and only when that directory lies
+/// directly under `repos_root`. `None` for a self-contained worktree, a missing
+/// or malformed pointer, or a pointer outside the repositories agent-run
+/// manages.
+fn job_project_repo(
+    worktree: &std::path::Path,
+    repos_root: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let target = crate::core::git::worktree_gitdir_target(worktree)?;
+    let gitdir = std::fs::canonicalize(&target).ok()?;
+    let repo = gitdir.parent()?.parent()?;
+    if gitdir.parent()?.file_name()? != "worktrees" {
+        return None;
+    }
+    let root = std::fs::canonicalize(repos_root).ok()?;
+    (repo.parent()? == root).then(|| repo.to_path_buf())
+}
+
 /// Wraps a [`crate::engine::LaunchPlan`] with `sandbox-exec` in exactly one function,
 /// for every engine and role.
 pub fn sandboxed(
@@ -240,13 +260,20 @@ pub fn sandboxed(
     config: &Config,
     meta: &JobMetadata,
 ) -> Result<(Command, std::path::PathBuf, Option<String>)> {
-    let base_policy = crate::sandbox::SandboxPolicy::for_job(
+    let mut base_policy = crate::sandbox::SandboxPolicy::for_job(
         &meta.job_id,
         &meta.worktree_path,
         None,
         Some(&plan.program),
         Some(vec![config.sandbox_home.clone()]),
     );
+    // A job worktree is a linked worktree of the project's private bare repo,
+    // which the sandbox hides with every other repo under `repos_root`: without
+    // this grant git inside the job fails ("not a git repository"). Only the
+    // job's OWN project repo is re-exposed (never another project's).
+    if let Some(repo) = job_project_repo(&meta.worktree_path, &config.repos_root) {
+        base_policy.rw.push(repo);
+    }
 
     let jobset = crate::core::jobset::agent_jobset(&meta.job_id);
     let policy = match &jobset {
@@ -1585,6 +1612,41 @@ fn poll_conversation_id(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn job_project_repo_resolves_only_the_projects_own_bare_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        let repo = repos.join("proj.git");
+        std::fs::create_dir_all(repo.join("worktrees").join("j1")).unwrap();
+        let wt = tmp.path().join("jobs").join("j1");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", repo.join("worktrees").join("j1").display()),
+        )
+        .unwrap();
+        let got = job_project_repo(&wt, &repos).unwrap();
+        assert_eq!(got, std::fs::canonicalize(&repo).unwrap());
+        // A pointer outside repos_root yields no grant.
+        let other = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(other.join("x.git").join("worktrees").join("j2")).unwrap();
+        let wt2 = tmp.path().join("jobs").join("j2");
+        std::fs::create_dir_all(&wt2).unwrap();
+        std::fs::write(
+            wt2.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                other.join("x.git").join("worktrees").join("j2").display()
+            ),
+        )
+        .unwrap();
+        assert!(job_project_repo(&wt2, &repos).is_none());
+        // A self-contained worktree (.git directory) yields none.
+        let wt3 = tmp.path().join("jobs").join("j3");
+        std::fs::create_dir_all(wt3.join(".git")).unwrap();
+        assert!(job_project_repo(&wt3, &repos).is_none());
+    }
+
     use super::*;
     use crate::engine::{EngineRegistry, StdinMode, TurnInput};
     use chrono::Utc;
