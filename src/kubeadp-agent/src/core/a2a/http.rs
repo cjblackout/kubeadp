@@ -159,7 +159,12 @@ impl InboxHttpState {
     fn live_run_token(&self, run_id: &str) -> Result<String, String> {
         let secs = match crate::core::job::JobMetadata::load(&self.state_root, run_id) {
             Ok(meta) => {
-                if meta.status != Some(crate::core::job::JobStatus::Running) {
+                // A running job's stored `status` column is NULL (the live
+                // status is derived from its pid and start time), so liveness
+                // is the derived status, never the raw column.
+                if crate::core::job::compute_status(&meta, &self.state_root)
+                    != crate::core::job::JobStatus::Running
+                {
                     return Err(format!("run '{run_id}' is not live"));
                 }
                 let started_at = meta
@@ -561,6 +566,41 @@ mod tests {
             engine: None,
         };
         meta.save(root).unwrap();
+    }
+
+    /// A running worker job has a NULL `status` column and a live pid: the
+    /// token check must treat it as live (the derived status), and refuse a
+    /// finished job (HL-132: every hook call of a live job was refused).
+    #[test]
+    fn live_run_token_uses_the_derived_status_of_a_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        seed_live_run(root, "run-derived");
+        let state = InboxHttpState::with_key(key(), root);
+
+        // Running: NULL status, pid of a live process with its start time.
+        let mut meta = crate::core::job::JobMetadata::load(root, "run-derived").unwrap();
+        let pid = std::process::id();
+        meta.status = None;
+        meta.pid = Some(pid);
+        meta.pid_start_time = crate::core::job::get_process_start_time(pid);
+        meta.save(root).unwrap();
+        assert!(
+            state.live_run_token("run-derived").is_ok(),
+            "a job whose process is alive is live even with a NULL status column"
+        );
+
+        // Finished: no pid, a recorded exit, old row.
+        meta.pid = None;
+        meta.pid_start_time = None;
+        meta.exit_code = Some(0);
+        meta.status = Some(crate::core::job::JobStatus::Done);
+        meta.created_at = chrono::Utc::now() - chrono::Duration::minutes(10);
+        meta.save(root).unwrap();
+        assert!(
+            state.live_run_token("run-derived").is_err(),
+            "a finished job has no valid token"
+        );
     }
 
     fn token(state: &InboxHttpState, run: &str) -> String {
