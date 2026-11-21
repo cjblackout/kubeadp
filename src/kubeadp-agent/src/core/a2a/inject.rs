@@ -13,6 +13,18 @@
 //! `pre-invocation` returns `injectSteps` (or `{}` when empty),
 //! `post-invocation` adds `terminationBehavior: force_continue` (the agy
 //! `idle_turn` channel) and `stop` returns `{"decision":"continue",...}`.
+//!
+//! User-visible echo (HL-125 3.7): the Claude Code hooks additionally answer
+//! a top-level `systemMessage` -- a short visible line per incoming message
+//! ("A2A from \<sender\> (hop n): \<first 200 chars\>") -- so the user sees
+//! every message in the transcript while the full framed text stays model-only.
+//! `systemMessage` is a universal Claude Code hook-output field Claude Code
+//! shows to the user (a sibling of `hookSpecificOutput`, `continue`,
+//! `stopReason`, `decision`, `reason`; nested inside `hookSpecificOutput` it
+//! would be ignored). agy, which already delivers a model-visible
+//! `systemMessage` through `injectSteps` and has no transcript the harness
+//! reaches, is left unchanged. The whole echo is behind ONE switch
+//! ([`A2A_ECHO_ENV`]/`KUBEADP_A2A_ECHO`, default on).
 
 use std::io::Write;
 
@@ -25,6 +37,30 @@ use crate::engine::capability::InjectChannel;
 /// response cap so a tool result plus its injected messages stay bounded.
 pub const MAX_INJECT_BYTES: usize = 16 * 1024;
 
+/// The user-visible A2A echo (HL-125 3.7): in addition to the full framed text
+/// in the model channel (`additionalContext`), the Claude Code hooks answer a
+/// `systemMessage` line the transcript shows, so the user SEES every incoming
+/// message ("A2A from \<sender\> (hop n): \<first 200 characters\>") and every
+/// outgoing `send_message`/`reply` ("A2A to \<target\> (hop n): ...").
+/// `systemMessage` is a TOP-LEVEL universal hook-output field Claude Code
+/// shows to the user (a sibling of `hookSpecificOutput`, `continue`,
+/// `stopReason`, `decision`, `reason`); inside `hookSpecificOutput` -- which
+/// only carries `hookEventName` and event-specific fields such as
+/// `additionalContext` -- it would be ignored. Even at the full byte cap of an
+/// inbox message ([`crate::core::a2a::ingress::MAX_INGRESS_TEXT_BYTES`] +
+/// framing) the echo stays a single short line.
+///
+/// Hard cap on the echoed message TEXT (characters), enforced on every echo
+/// line including the outgoing tools: the echoed content never exceeds it.
+pub const ECHO_CHAR_CAP: usize = 200;
+
+/// The environment variable that turns the A2A echo ON or OFF inside a run
+/// (`a2a-hook`, `mcp-a2a`). The launcher sets it from the resolved host config
+/// (`[worker] a2a_echo` / `AGENT_RUN_A2A_ECHO`). The `KUBEADP_*` prefix keeps
+/// it inside the default sandbox `env_allow` pattern, so the sandbox passes it
+/// through.
+pub const A2A_ECHO_ENV: &str = "KUBEADP_A2A_ECHO";
+
 /// Joins the framed texts of `messages` (oldest first, the queue order) into
 /// one block, separated by a blank line. Pure (no I/O).
 pub fn join_framed(messages: &[QueuedMessage]) -> String {
@@ -33,6 +69,98 @@ pub fn join_framed(messages: &[QueuedMessage]) -> String {
         .map(|m| m.framed.as_str())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Whether the user-visible A2A echo is ON in this run. Reads
+/// [`A2A_ECHO_ENV`] (`KUBEADP_A2A_ECHO`). Default ON. Recognized true values
+/// are `1`/`true`/`yes`/`on`, false values `0`/`false`/`no`/`off`; an
+/// unrecognized value (a garbled override) falls back to the default ON
+/// rather than silently flipping delivery-visible behaviour either way.
+pub fn a2a_echo_enabled() -> bool {
+    match std::env::var(A2A_ECHO_ENV) {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => true,
+        },
+        Err(_) => true,
+    }
+}
+
+/// The echo line for ONE message: `A2A <direction> <peer> (hop <hop>): <text>`
+/// (`direction` is "from" for incoming, "to" for outgoing; `text` is the
+/// single-line, [`ECHO_CHAR_CAP`]-capped message text). Pure (no I/O).
+pub fn a2a_echo_line(direction: &str, peer: &str, hop: u32, text: &str) -> String {
+    format!("A2A {direction} {peer} (hop {hop}): {}", echo_text(text))
+}
+
+/// The user-visible echo block for the queued inbound `messages` (oldest
+/// first, one line per message), so the transcript shows EVERY incoming
+/// message. Empty when there is nothing to show. Pure (no I/O).
+pub fn a2a_echo_block(messages: &[QueuedMessage]) -> String {
+    messages
+        .iter()
+        .map(|m| a2a_echo_line("from", &m.sender, m.hop, &message_text(m.framed.as_str())))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The message text a framing carries without the frame: the content between
+/// the `--- BEGIN CONTENT (nonce) ---` and `--- END CONTENT (nonce) ---`
+/// delimiters of `core::a2a::ingress::frame_message`; for a frame without the
+/// delimiters (the older `--- A2A INCOMING MESSAGE ---` test form) everything
+/// after the header line. Falls back to the whole `framed` text when not even
+/// a header is present. The caller sanitizes/caps it for the user-visible
+/// echo. Pure (no I/O).
+fn message_text(framed: &str) -> String {
+    if let (Some(begin), Some(end)) = (
+        framed.find("--- BEGIN CONTENT ("),
+        framed.rfind("\n--- END CONTENT ("),
+    ) {
+        let start = framed[begin..]
+            .find('\n')
+            .map(|i| begin + i + 1)
+            .unwrap_or(begin);
+        return framed[start..end].to_string();
+    }
+    if let Some(rest) = framed.strip_prefix("--- A2A INCOMING MESSAGE") {
+        if let Some(cs) = rest.strip_prefix(" (claimed sender: ") {
+            if let Some(start) = cs.find(") ---\n") {
+                return cs[start + ") ---\n".len()..].to_string();
+            }
+        }
+        if let Some(text) = rest.strip_prefix(" ---\n") {
+            return text.to_string();
+        }
+        return rest.to_string();
+    }
+    framed.to_string()
+}
+
+/// The capped single-line echo text: control characters are replaced by a
+/// space (newline/tab) or dropped (the rest), so an echo can never smuggle
+/// escape sequences or span transcript lines; then whitespace-collapsed and
+/// trimmed, and cut at [`ECHO_CHAR_CAP`] characters with an explicit ellipsis
+/// -- the echoed content NEVER exceeds the cap. Pure (no I/O).
+fn echo_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_control() {
+            if matches!(c, '\n' | '\t' | '\r') {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    let collapsed: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = collapsed.trim();
+    if collapsed.chars().count() > ECHO_CHAR_CAP {
+        let head: String = collapsed.chars().take(ECHO_CHAR_CAP - 1).collect();
+        format!("{head}\u{2026}")
+    } else {
+        collapsed.to_string()
+    }
 }
 
 /// The Claude Code / agy hook JSON for one event and the joined framed
@@ -84,6 +212,44 @@ pub fn hook_json(event: &str, framed: &str) -> Result<serde_json::Value, String>
             "unknown a2a-hook event '{other}' (expected PostToolUse, UserPromptSubmit, Stop, pre-invocation, post-invocation or stop)"
         )),
     }
+}
+
+/// The hook JSON with the user-visible echo included: [`hook_json`] with a
+/// TOP-LEVEL editable `systemMessage` added (`systemMessage` is a universal
+/// Claude Code hook-output field shown to the user, a sibling of
+/// `hookSpecificOutput` / `continue` / `stopReason` / `decision` / `reason`;
+/// nested inside `hookSpecificOutput` it would be ignored). The full framed
+/// text stays ONLY in the model channel (`additionalContext` / `reason` /
+/// `injectSteps`); `systemMessage` is the transcript-visible echo the Claude
+/// Code hooks answer so the user SEES each incoming message ("A2A from
+/// \<sender\> (hop n): ...").
+///
+/// - Claude Code `PostToolUse` / `UserPromptSubmit`: the echo line (or the
+///   joined lines) as a top-level `systemMessage` next to the
+///   `hookSpecificOutput.additionalContext` model channel.
+/// - Claude Code `Stop`: `{"decision":"block","reason":<framed>}` plus the
+///   echo line as a top-level `systemMessage` next to it (the turn re-enters
+///   with `decision: block`, so the transcript shows the echo while the model
+///   sees the full framed text).
+/// - agy events are left unchanged: agy already delivers a *model-visible*
+///   `systemMessage` through `injectSteps` and has no transcript the harness
+///   reaches, so an echo there would only dilute the injected model context.
+///
+/// Returns None for the agy events.
+pub fn hook_json_with_echo(
+    event: &str,
+    framed: &str,
+    echo: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    if is_agy_event(event) {
+        return Ok(None);
+    }
+    let mut value = hook_json(event, framed)?;
+    let echo_object = value
+        .as_object_mut()
+        .ok_or_else(|| "non-object hook JSON".to_string())?;
+    echo_object.insert("systemMessage".to_string(), serde_json::json!(echo));
+    Ok(Some(value))
 }
 
 /// The injection channel a hook event delivers through (the inbox marker's
@@ -191,7 +357,7 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
         };
     }
     let framed = join_framed(&messages);
-    match hook_json(event, &framed) {
+    match hook_output(event, &framed, &messages) {
         Ok(json) => {
             let mut out = std::io::stdout();
             match (writeln!(out, "{json}"), out.flush()) {
@@ -246,6 +412,27 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// The hook JSON for `event`/`framed` with the user-visible echo included:
+/// [`hook_json`] with the top-level `systemMessage`
+/// (one short line per incoming message) added for the Claude Code events,
+/// driven by the one [`a2a_echo_enabled`] switch. agy events are left
+/// unchanged. The full framed text always stays ONLY in the model channel.
+/// Pure (no I/O), so tests can check the exact output without stdout capture.
+fn hook_output(
+    event: &str,
+    framed: &str,
+    messages: &[QueuedMessage],
+) -> Result<serde_json::Value, String> {
+    if !is_agy_event(event) && a2a_echo_enabled() {
+        let echo = a2a_echo_block(messages);
+        if !echo.is_empty() {
+            return hook_json_with_echo(event, framed, &echo)
+                .map(|v| v.expect("non-agy echo is Some"));
+        }
+    }
+    hook_json(event, framed)
 }
 
 /// Prints the empty agy hook object (`{}`): agy parses the stdout of every
@@ -348,6 +535,124 @@ mod tests {
         // An unknown event is an error, never a guessed shape.
         assert!(hook_json("PreToolUse", "MSG").is_err());
         assert!(hook_json("SessionStart", "MSG").is_err());
+    }
+
+    #[test]
+    fn a2a_echo_line_keeps_the_model_channel_and_caps_the_text() {
+        // The full framed text stays in the model channel; the echo is the
+        // short visible line (HL-125 3.7).
+        let v = hook_json_with_echo("PostToolUse", "FULL", "A2A from peer (hop 1): hello")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            v["hookSpecificOutput"]["additionalContext"], "FULL",
+            "the full framed text stays in the model channel"
+        );
+        assert_eq!(v["systemMessage"], "A2A from peer (hop 1): hello");
+        assert!(
+            v["hookSpecificOutput"].get("systemMessage").is_none(),
+            "systemMessage is a top-level field, never nested in hookSpecificOutput"
+        );
+        // Stop: block + top-level echo next to it.
+        let v = hook_json_with_echo("Stop", "FULL", "A2A from peer (hop 2): hi")
+            .unwrap()
+            .unwrap();
+        assert_eq!(v["decision"], "block");
+        assert_eq!(v["reason"], "FULL");
+        assert_eq!(v["systemMessage"], "A2A from peer (hop 2): hi");
+        assert!(
+            v["hookSpecificOutput"].get("systemMessage").is_none(),
+            "Stop: no systemMessage inside hookSpecificOutput"
+        );
+        // agy events are left unchanged (no echo): None.
+        for event in ["pre-invocation", "post-invocation", "stop"] {
+            assert!(
+                hook_json_with_echo(event, "FULL", "e").unwrap().is_none(),
+                "{event}"
+            );
+        }
+        // The echo line itself: direction, peer, hop and capped text.
+        assert_eq!(
+            a2a_echo_line("from", "peer", 1, "hello"),
+            "A2A from peer (hop 1): hello"
+        );
+        assert_eq!(
+            a2a_echo_line("to", "ops/peer", 3, "thanks"),
+            "A2A to ops/peer (hop 3): thanks"
+        );
+        // The cap: at/under 200 the text survives; above it the line cuts at
+        // exactly 200 chars with the ellipsis (never more than the cap).
+        let at_cap = "x".repeat(ECHO_CHAR_CAP);
+        assert_eq!(echo_text(&at_cap).chars().count(), ECHO_CHAR_CAP);
+        let over = "y".repeat(ECHO_CHAR_CAP + 50);
+        let cut = echo_text(&over);
+        assert!(cut.ends_with('\u{2026}'));
+        assert!(
+            cut.chars().count() < ECHO_CHAR_CAP + 2,
+            "cut stays within the cap"
+        );
+        // Control characters never reach the echo (escape sequences, CR, NUL
+        // are dropped/collapsed; newline/tab become a space).
+        assert!(!echo_text("a\u{1b}b\u{0}c").contains('\u{1b}'));
+        assert!(!echo_text("a\r\nb\tc").contains('\n'));
+        assert!(!echo_text("a\nb").contains('\n'));
+        // The switch defaults ON and only the recognized values turn it off.
+        let _g = crate::test_env_lock();
+        std::env::remove_var(A2A_ECHO_ENV);
+        assert!(a2a_echo_enabled(), "default ON");
+        for off in ["0", "false", "no", "off"] {
+            std::env::set_var(A2A_ECHO_ENV, off);
+            assert!(!a2a_echo_enabled(), "{off} turns it off");
+        }
+        for (on, _) in [("1"), ("true"), ("yes"), ("on")]
+            .into_iter()
+            .map(|v| (v, ()))
+        {
+            std::env::set_var(A2A_ECHO_ENV, on);
+            assert!(a2a_echo_enabled(), "{on} turns it on");
+        }
+        std::env::set_var(A2A_ECHO_ENV, "garbage");
+        assert!(
+            a2a_echo_enabled(),
+            "a garbled override falls back to the default ON"
+        );
+        std::env::remove_var(A2A_ECHO_ENV);
+        drop(_g);
+    }
+
+    #[test]
+    fn a2a_echo_block_takes_the_message_text_not_the_frame() {
+        // The classic production frame: the echo shows only the content, not
+        // the nonce-delimited frame headers.
+        let framed =
+            "--- A2A INCOMING MESSAGE (claimed sender: peer, hop: 1) ---\nabc\n--- BEGIN CONTENT (deadbeef) ---\nthe actual message\n--- END CONTENT (deadbeef) ---";
+        let m = QueuedMessage {
+            message_id: "m1".to_string(),
+            sender: "peer".to_string(),
+            hop: 1,
+            context_id: None,
+            task_id: None,
+            framed: framed.to_string(),
+            queued_at: crate::core::a2a::inbox::now_unix(),
+        };
+        let block = a2a_echo_block(std::slice::from_ref(&m));
+        assert_eq!(block, "A2A from peer (hop 1): the actual message");
+        assert!(!block.contains("BEGIN CONTENT"));
+        assert!(!block.contains("END CONTENT"));
+        // The simpler framed test form without nonces.
+        let m = QueuedMessage {
+            message_id: "m2".to_string(),
+            sender: "peer".to_string(),
+            hop: 2,
+            context_id: None,
+            task_id: None,
+            framed: "--- A2A INCOMING MESSAGE ---\nhello".to_string(),
+            queued_at: crate::core::a2a::inbox::now_unix(),
+        };
+        assert_eq!(
+            a2a_echo_block(std::slice::from_ref(&m)),
+            "A2A from peer (hop 2): hello"
+        );
     }
 
     #[test]

@@ -210,6 +210,8 @@ async fn mcp_a2a_tools_round_trip() {
     // Override the discovery URL so the client reaches the in-process server.
     std::env::set_var("A2A_URL_OVERRIDES", format!("peer={base}"));
     std::env::set_var("A2A_SELF_NAME", "sender-test");
+    // The outgoing echo is ON by default (this test asserts it).
+    std::env::remove_var(kubeadp_agent::core::a2a::inject::A2A_ECHO_ENV);
 
     let server = mcp_server(port).await;
 
@@ -289,6 +291,13 @@ async fn mcp_a2a_tools_round_trip() {
     let val: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(val["id"], "t-1");
     assert_eq!(val["status"]["state"], "TASK_STATE_WORKING");
+    // USER-VISIBLE ECHO (HL-125 3.7): the outgoing result carries the
+    // transcript line for the sent message, capped to 200 chars.
+    let echo = val["a2a_echo"].as_str().unwrap_or_default();
+    assert!(
+        echo.starts_with("A2A to peer (hop 1): hello peer"),
+        "outgoing echo: {echo}"
+    );
 
     // The peer delivered it with the sender from A2A_SELF_NAME.
     {
@@ -329,6 +338,15 @@ async fn mcp_a2a_tools_round_trip() {
             .map(|c| c.as_text().map(|t| t.text.clone()).unwrap_or_default())
             .collect::<Vec<_>>()
     );
+    {
+        let text = res.content[0].as_text().unwrap().text.clone();
+        let val: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let echo = val["a2a_echo"].as_str().unwrap_or_default();
+        assert!(
+            echo.starts_with("A2A to peer (hop 1): thanks, back to you"),
+            "reply echo: {echo}"
+        );
+    }
     // The reply arrived at the peer from us (sender-test) with the reply text.
     {
         let delivered = sink.delivered.lock().unwrap();
@@ -396,6 +414,91 @@ async fn mcp_a2a_tools_round_trip() {
         .expect("call get_task missing");
     assert_eq!(res.is_error, Some(true));
 
+    std::env::remove_var("A2A_URL_OVERRIDES");
+    std::env::remove_var("A2A_SELF_NAME");
+}
+
+/// The outgoing echo (HL-125 3.7): the sent text is echoed to the transcript
+/// as "A2A to <target> (hop n): ...", capped at 200 characters with no
+/// control characters -- and the ONE switch off removes the echo while the
+/// send summary shape stays intact. The echo is snapshotted at server build
+/// from `KUBEADP_A2A_ECHO`, so this test builds its own server per case.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn mcp_a2a_outgoing_echo_is_capped_and_switchable() {
+    let _guard = env_lock();
+    use kubeadp_agent::core::a2a::inject::{a2a_echo_enabled, A2A_ECHO_ENV, ECHO_CHAR_CAP};
+
+    let backend = FakeBackend::with(vec![task("t-1", "ctx-1", TaskState::Working)]);
+    let base = serve(backend, Arc::new(RecordingSink::default())).await;
+
+    // Long text: the echo must cap at 200 chars with the ellipsis, and never
+    // contain control characters.
+    let long = format!("{}\u{1b}tail", "x".repeat(ECHO_CHAR_CAP + 30));
+    std::env::set_var("A2A_URL_OVERRIDES", format!("peer={base}"));
+    std::env::set_var("A2A_SELF_NAME", "sender-test");
+    std::env::remove_var(A2A_ECHO_ENV);
+    assert!(a2a_echo_enabled(), "default ON");
+
+    let port: u64 = base.rsplit(':').next().unwrap().parse().unwrap();
+    let client = mcp_client(mcp_server(port).await).await;
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("send_message").with_arguments(
+                serde_json::json!({ "agent": "peer", "text": long, "task_id": "t-1" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("call send_message long");
+    assert_eq!(res.is_error, Some(false));
+    let text = res.content[0].as_text().unwrap().text.clone();
+    let val: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let echo = val["a2a_echo"].as_str().expect("echo present when ON");
+    assert!(echo.starts_with("A2A to peer (hop 1): "), "{echo}");
+    let body = &echo["A2A to peer (hop 1): ".len()..];
+    assert!(
+        body.ends_with('\u{2026}'),
+        "truncated with ellipsis: {echo}"
+    );
+    assert!(
+        body.chars().count() <= ECHO_CHAR_CAP,
+        "echo body never exceeds the cap: {echo}"
+    );
+    assert!(
+        !body.contains('\u{1b}'),
+        "control chars never reach the echo"
+    );
+
+    // The switch OFF: fresh server built with the env cleared -> NO echo, and
+    // the fixed send summary (id/status/hop/delivered) stays intact.
+    std::env::set_var(A2A_ECHO_ENV, "0");
+    assert!(!a2a_echo_enabled());
+    let client = mcp_client(mcp_server(port).await).await;
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("send_message").with_arguments(
+                serde_json::json!({ "agent": "peer", "text": "short", "task_id": "t-1" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("call send_message off");
+    let text = res.content[0].as_text().unwrap().text.clone();
+    let val: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        val.get("a2a_echo").is_none(),
+        "echo switch off removes the a2a_echo line: {val}"
+    );
+    assert_eq!(val["id"], "t-1");
+    assert_eq!(val["delivered"], true);
+    assert_eq!(val["status"]["state"], "TASK_STATE_WORKING");
+
+    std::env::remove_var(A2A_ECHO_ENV);
     std::env::remove_var("A2A_URL_OVERRIDES");
     std::env::remove_var("A2A_SELF_NAME");
 }

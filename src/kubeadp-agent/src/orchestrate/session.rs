@@ -1031,6 +1031,16 @@ fn run_session_iteration(
     // session's grants filter), so it passes through.
     #[cfg(feature = "a2a")]
     cmd.env(crate::core::a2a::inbox::INBOX_ENV, &a2a_inbox_dir);
+    // USER-VISIBLE A2A ECHO (HL-125 3.7): hand the resolved supervisor config
+    // down as `KUBEADP_A2A_ECHO` so the in-session harness (`a2a-hook`,
+    // `mcp-a2a`) echoes every message to the transcript. `KUBEADP_*` passes
+    // the default sandbox env filter (and the session's grants filter). The
+    // child reads it verbatim ("0"/"false" turns the echo off).
+    #[cfg(feature = "a2a")]
+    cmd.env(
+        crate::core::a2a::inject::A2A_ECHO_ENV,
+        if core_config.a2a_echo { "1" } else { "0" },
+    );
     // Record the attempt's start timestamp BEFORE minting the per-run inbox
     // token and saving `session_state` so `start_time_epoch` in SQLite and the
     // HMAC-bound token given to the child agree on the exact second (N3).

@@ -1342,7 +1342,11 @@ having to read a mailbox.
 | `interrupt` | kill-and-resume (§7.11) | same |
 
   Both engines support `hook`, `tool_result` and `idle_turn`, so a busy agent of
-  either engine receives a message at its next model call.
+  either engine receives a message at its next model call. In addition to the
+  model channel, the Claude Code hooks answer a user-visible echo (a TOP-LEVEL
+  `systemMessage`, one short line per message, §7.14.1); the
+  outgoing `send_message`/`reply` results echo themselves the same way, behind
+  the one `a2a_echo` switch.
 - **`a2a-hook <event>`** (subcommand, events `PostToolUse`, `UserPromptSubmit`,
   `Stop`, `pre-invocation`, `post-invocation`, `stop`): claims (leases) up to
   16 KiB (`MAX_INJECT_BYTES`) for the event's channel, prints the event's JSON
@@ -1430,8 +1434,23 @@ Two receive methods work on the same inbox. Both acknowledge a row exactly once
   that calls `wait_message` in a loop sees its messages there and not through the
   hooks.
 - Claude Code shows hook context (`additionalContext`) to the model only, not in
-  the user's transcript; agy's `systemMessage` is shown. A user-visible echo for
-  Claude Code sessions is planned.
+  the user's transcript; agy's `systemMessage` is shown. So the Claude Code hooks
+  additionally answer a TOP-LEVEL `systemMessage` with a user-visible echo: one
+  short line per message the transcript shows ("A2A from \<sender\> (hop n):
+  \<first 200 characters\>"), so the user sees every incoming message.
+  `systemMessage` is a universal Claude Code hook-output field Claude Code shows
+  to the user (a sibling of `hookSpecificOutput`, `continue`, `stopReason`,
+  `decision`, `reason`; a `systemMessage` nested inside `hookSpecificOutput`
+  would be ignored), so the echo never enters the model context. The full framed
+  text stays only in the model context (`additionalContext` / `reason`); the
+  echoed content is the message text without the frame, control characters
+  removed and capped at 200 characters (`ECHO_CHAR_CAP`) with an ellipsis. The
+  outgoing `send_message`/`reply` results show the same as "A2A to \<target\>
+  (hop n): \<first 200 characters\>" (`a2a_echo` field), for the same reason.
+  The whole echo is behind ONE switch (`a2a_echo`, `AGENT_RUN_A2A_ECHO`,
+  default on, §9); with the switch off, the model channel is untouched and
+  nothing extra is shown. agy is unchanged: it already shows `systemMessage` to
+  the model and has no user transcript the harness reaches.
 
 ### 7.15 Audit and retention
 - Every accepted, rejected-after-authorization, sent, injected, expired and
@@ -1636,6 +1655,7 @@ sections; they are the separate trusted config of §4.2.
 | `a2a_mcp_enabled` | `AGENT_RUN_A2A_MCP_ENABLED` | boolean, default true; `false` leaves agents without messaging tools |
 | `a2a_ack_secs` | `AGENT_RUN_A2A_ACK_SECS` | 45 (0 = escalate the moment the run is idle); the escalation-ladder ack window, the worker job path and the orchestrator session path alike |
 | `a2a_force_secs` | `AGENT_RUN_A2A_FORCE_SECS` | 0 = never kill; the escalation-ladder force timeout (`interrupt` step) |
+| `a2a_echo` | `AGENT_RUN_A2A_ECHO` | boolean, default true; the user-visible A2A echo (§7.14.1): the Claude Code hooks answer `systemMessage` per message and the outgoing `send_message`/`reply` echo themselves, so the user sees every message in the transcript; `false` turns the echo off (the model channel is unaffected) |
 | `a2a_inbox_ttl_secs` | `AGENT_RUN_A2A_INBOX_TTL_SECS` | 3600 (min 10); TTL for uninjected inbox messages, the sender task then fails (§7.14) |
 
 The `a2a_*` keys are read by both roles (the session path and the job path use
@@ -1660,6 +1680,7 @@ never logged.
 | `KUBEADP_A2A_INBOX_DIR` | `a2a-hook`, `mcp-a2a` | the run's A2A inbox identity (`<state_root>/a2a-inbox/<run>/`, §7.14); set by the launcher only |
 | `KUBEADP_A2A_INBOX_TOKEN` | `a2a-hook`, `mcp-a2a` | per-run bearer token for the pod-local inbox API (§7.14); derived host-side, set by the launcher only |
 | `KUBEADP_A2A_INBOX_URL` | `a2a-hook`, `mcp-a2a` | pod-local inbox API base URL, default `http://127.0.0.1:8002` (§7.14); set by the launcher only |
+| `KUBEADP_A2A_ECHO` | `a2a-hook`, `mcp-a2a` | user-visible A2A echo (`1`/`0`, the resolved `a2a_echo`, §7.14.1); set by the launcher only |
 | `KUBEADP_JOBSET` | `agent-run start` | jobset to join; may only name the caller's own default jobset (§7.2) |
 | `AGENT_ORCHESTRATE_AGY_PATH` | orchestrator | agy binary for agy sessions |
 | `KUBEADP_INSTRUCTIONS_SESSIONS_DIR` | both roles | sessions base for the per-session / per-project instruction files (`<name>.md` / `<project>.md`), default `/etc/kubeadp-agent/instructions/sessions`; env-only, no config-file key (§4.10) |

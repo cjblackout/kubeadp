@@ -681,6 +681,13 @@ pub struct A2aMcpServer {
     /// under the per-run token; a trusted/local invocation uses the direct
     /// database inbox.
     inbox: Option<ReceiveInbox>,
+    /// Whether the user-visible A2A echo is ON (HL-125 3.7): an outgoing
+    /// `send_message`/`reply` result additionally carries an `a2a_echo`
+    /// line ("A2A to \<target\> (hop n): \<first 200 chars\>") so the user
+    /// sees every message this run sends. Snapshot at server build from
+    /// [`crate::core::a2a::inject::a2a_echo_enabled`] (the launcher sets
+    /// `KUBEADP_A2A_ECHO`); the full framed text stays model-only either way.
+    a2a_echo: bool,
     tool_router: ToolRouter<Self>,
 }
 
@@ -724,6 +731,7 @@ impl A2aMcpServer {
         Self {
             ctx,
             inbox,
+            a2a_echo: crate::core::a2a::inject::a2a_echo_enabled(),
             tool_router: Self::tool_router(),
         }
     }
@@ -750,6 +758,30 @@ impl A2aMcpServer {
     /// limit still protects the agent's context.
     fn tool_result(&self, value: serde_json::Value) -> String {
         serde_json::to_string(&self.tool_result_value(value)).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// The result of a SUCCESSFUL outgoing `send_message`/`reply`: the
+    /// [`Self::tool_result_value`] result (the fixed-shape send summary plus
+    /// the drained `a2a_incoming`/budget handling) THIS time also carries,
+    /// when the user-visible A2A echo is ON (HL-125 3.7), an `a2a_echo` line
+    /// ("A2A to \<target\> (hop n): \<first 200 characters\>") so the user
+    /// sees every message this run sends. The `hop` comes from the send
+    /// result (the hop the outgoing message carries); the echoed `text` is the
+    /// sent text, capped at [`crate::core::a2a::inject::ECHO_CHAR_CAP`] by the
+    /// same shared sanitizer the hooks use, so an echo can never exceed the
+    /// cap or smuggle control characters. The full sent text stays model-only
+    /// in the tool result. The echo only ever ADDS a field to a delivered
+    /// message's result (never changes the fixed summary shape).
+    fn outbound_result(&self, value: serde_json::Value, target: &str, text: &str) -> String {
+        let mut out = self.tool_result_value(value);
+        if self.a2a_echo {
+            let hop = out["hop"].as_u64().unwrap_or(0) as u32;
+            let echo = crate::core::a2a::inject::a2a_echo_line("to", target, hop, text);
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("a2a_echo".to_string(), serde_json::json!(echo));
+            }
+        }
+        serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string())
     }
 
     /// [`Self::tool_result`] as a value (the structured tool errors).
@@ -955,7 +987,7 @@ impl A2aMcpServer {
             .send_message(&p.agent, &p.text, p.context_id, p.task_id, p.incoming_hop);
         match tokio::time::timeout(CALL_TIMEOUT, fut).await {
             Ok(Ok(value)) => {
-                CallToolResult::success(vec![ContentBlock::text(self.tool_result(value))])
+                CallToolResult::success(vec![ContentBlock::text(self.outbound_result(value, &p.agent, &p.text))])
             }
             Ok(Err(e)) => {
                 let delivery = terminal_refusal(&e).then_some("terminal");
@@ -989,9 +1021,9 @@ impl A2aMcpServer {
             .ctx
             .send_message(&p.to, &p.text, p.context_id, p.task_id, p.incoming_hop);
         match tokio::time::timeout(CALL_TIMEOUT, fut).await {
-            Ok(Ok(value)) => {
-                CallToolResult::success(vec![ContentBlock::text(self.tool_result(value))])
-            }
+            Ok(Ok(value)) => CallToolResult::success(vec![ContentBlock::text(
+                self.outbound_result(value, &p.to, &p.text),
+            )]),
             Ok(Err(e)) => {
                 let delivery = terminal_refusal(&e).then_some("terminal");
                 CallToolResult::structured_error(self.tool_result_value(send_error_value(

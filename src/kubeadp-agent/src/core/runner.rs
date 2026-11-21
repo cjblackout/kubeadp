@@ -332,6 +332,15 @@ pub fn sandboxed(
         let a2a_inbox_dir =
             crate::core::a2a::inbox::inbox_dir_for(&config.state_root, &meta.job_id);
         cmd.env(crate::core::a2a::inbox::INBOX_ENV, &a2a_inbox_dir);
+        // USER-VISIBLE A2A ECHO (HL-125 3.7): hand the resolved host config
+        // down as `KUBEADP_A2A_ECHO` so the in-run harness (`a2a-hook`,
+        // `mcp-a2a`) echoes every message to the transcript. `KUBEADP_*`
+        // passes the default sandbox env filter. The child reads it verbatim
+        // ("0"/"false" turns the echo off).
+        cmd.env(
+            crate::core::a2a::inject::A2A_ECHO_ENV,
+            if config.a2a_echo { "1" } else { "0" },
+        );
         if let Some(started_at) = meta.started_at {
             let secs = u64::try_from(started_at.timestamp()).unwrap_or(0);
             if let Some(token) = crate::core::a2a::http::token_for_run(&a2a_inbox_dir, secs) {

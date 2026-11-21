@@ -81,6 +81,7 @@
 //!   a2a_live_stdin          -> AGENT_RUN_A2A_LIVE_STDIN
 //!   a2a_live_idle_secs      -> AGENT_RUN_A2A_LIVE_IDLE_SECS
 //!   a2a_mcp_enabled         -> AGENT_RUN_A2A_MCP_ENABLED
+//!   a2a_echo                -> AGENT_RUN_A2A_ECHO
 //!   hindsight_api_key       -> (rejected: secret, set AGENT_RUN_HINDSIGHT_API_KEY from a Secret)
 //! ```
 //!
@@ -330,6 +331,7 @@ fn var_for_section_key(section: &str, key: &str) -> Option<String> {
         ("worker", "a2a_live_stdin") => Some("AGENT_RUN_A2A_LIVE_STDIN".to_string()),
         ("worker", "a2a_live_idle_secs") => Some("AGENT_RUN_A2A_LIVE_IDLE_SECS".to_string()),
         ("worker", "a2a_mcp_enabled") => Some("AGENT_RUN_A2A_MCP_ENABLED".to_string()),
+        ("worker", "a2a_echo") => Some("AGENT_RUN_A2A_ECHO".to_string()),
 
         _ => None,
     }
@@ -456,6 +458,7 @@ fn section_keys(section: &str) -> Vec<&'static str> {
             "a2a_live_stdin",
             "a2a_live_idle_secs",
             "a2a_mcp_enabled",
+            "a2a_echo",
         ],
         _ => Vec::new(),
     }
@@ -601,6 +604,27 @@ a2a_live_idle_secs = 300
         assert_eq!(
             var_for_section_key("worker", "a2a_live_idle_secs").as_deref(),
             Some("AGENT_RUN_A2A_LIVE_IDLE_SECS")
+        );
+    }
+
+    #[test]
+    fn test_a2a_echo_maps_to_env() {
+        let toml = r#"
+[worker]
+a2a_echo = false
+"#;
+        let vars = parse(toml);
+        assert_eq!(
+            vars.get("AGENT_RUN_A2A_ECHO").map(|s| s.as_str()),
+            Some("false")
+        );
+        // Inverse mapping recovers the key over the table.
+        let (section, key) = section_and_key_for_var("AGENT_RUN_A2A_ECHO").unwrap();
+        assert_eq!(section, "worker");
+        assert_eq!(key, "a2a_echo");
+        assert_eq!(
+            var_for_section_key("worker", "a2a_echo").as_deref(),
+            Some("AGENT_RUN_A2A_ECHO")
         );
     }
 

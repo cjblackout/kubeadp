@@ -59,6 +59,13 @@ pub const DEFAULT_A2A_LIVE_IDLE_SECS: u64 = 120;
 /// response), so values below this are clamped up. `0` (never close) is
 /// unaffected.
 pub const MIN_A2A_LIVE_IDLE_SECS: u64 = 10;
+/// Whether the user-visible A2A echo is ON by default (HL-125 3.7): the
+/// Claude Code hooks additionally answer a top-level `systemMessage` per
+/// incoming message and the outgoing `send_message`/`reply` tools echo
+/// themselves, so the user sees every message in the transcript. `false` turns
+/// the echo off everywhere (the full framed text stays in the model channel
+/// either way).
+pub const DEFAULT_A2A_ECHO: bool = true;
 pub const DEFAULT_HINDSIGHT_PATH: &str = "hindsight";
 pub const DEFAULT_REMOTE_CONTROL_CHECK_SECS: u64 = 60;
 pub const MIN_REMOTE_CONTROL_CHECK_SECS: u64 = 10;
@@ -161,6 +168,13 @@ pub struct ConfigFile {
     /// (see [`DEFAULT_A2A_INBOX_TTL_SECS`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub a2a_inbox_ttl_secs: Option<u64>,
+    /// Whether the user-visible A2A echo is ON (see [`DEFAULT_A2A_ECHO`]):
+    /// the Claude Code hooks additionally answer a top-level `systemMessage`
+    /// per incoming message and the outgoing `send_message`/`reply` tools echo
+    /// themselves, so the user sees every message in the transcript. `false`
+    /// turns the echo off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a2a_echo: Option<bool>,
 }
 
 /// Fully resolved, layered runtime configuration for the agent-run engine.
@@ -271,6 +285,12 @@ pub struct Config {
     /// past it the message stops being served and the sender's task fails
     /// with a clear reason.
     pub a2a_inbox_ttl_secs: u64,
+    /// Whether the user-visible A2A echo is ON (HL-125 3.7): the Claude Code
+    /// hooks additionally answer a top-level `systemMessage` per incoming
+    /// message and the outgoing `send_message`/`reply` tools echo themselves
+    /// (see [`DEFAULT_A2A_ECHO`]). `false` turns the echo off
+    /// everywhere; the full framed text stays in the model channel either way.
+    pub a2a_echo: bool,
 }
 
 impl Default for Config {
@@ -319,6 +339,7 @@ impl Default for Config {
             a2a_ack_secs: DEFAULT_A2A_ACK_SECS,
             a2a_force_secs: DEFAULT_A2A_FORCE_SECS,
             a2a_inbox_ttl_secs: DEFAULT_A2A_INBOX_TTL_SECS,
+            a2a_echo: DEFAULT_A2A_ECHO,
         }
     }
 }
@@ -703,6 +724,17 @@ impl Config {
                 .max(MIN_A2A_INBOX_TTL_SECS)
         };
 
+        // 10e7. Resolve a2a_echo: whether the user-visible A2A echo is ON
+        // (HL-125 3.7). Boolean env values parse exactly like the other
+        // boolean settings; an unparseable value fails loud (a mistyped flag
+        // defaulting one way could silently flip the visible echo, with no
+        // reset point for the transcript).
+        let a2a_echo = if let Some(env_val) = env_vars.get("AGENT_RUN_A2A_ECHO") {
+            parse_bool_env("AGENT_RUN_A2A_ECHO", env_val)?
+        } else {
+            file_cfg.a2a_echo.unwrap_or(DEFAULT_A2A_ECHO)
+        };
+
         // 10f. Resolve max_runtime (the server-wide DEFAULT job runtime).
         // UNSET BY DEFAULT: absent/empty means no default limit, jobs run
         // unbounded -- unlike the settings above there is NO fallback value,
@@ -995,6 +1027,7 @@ impl Config {
             a2a_ack_secs,
             a2a_force_secs,
             a2a_inbox_ttl_secs,
+            a2a_echo,
         })
     }
 }
@@ -1106,6 +1139,26 @@ mod tests {
         assert_eq!(cfg.a2a_ack_secs, DEFAULT_A2A_ACK_SECS);
         assert_eq!(cfg.a2a_force_secs, DEFAULT_A2A_FORCE_SECS);
         assert_eq!(cfg.a2a_inbox_ttl_secs, DEFAULT_A2A_INBOX_TTL_SECS);
+        assert_eq!(cfg.a2a_echo, DEFAULT_A2A_ECHO, "the echo defaults ON");
+    }
+
+    #[test]
+    fn test_a2a_echo_env_and_fallback() {
+        // Env boolean parses like the other boolean settings.
+        let env = env_with(&[("AGENT_RUN_A2A_ECHO", "false")]);
+        let cfg = Config::load_with_env(&env).expect("load echo false");
+        assert!(!cfg.a2a_echo);
+        let env = env_with(&[("AGENT_RUN_A2A_ECHO", "true")]);
+        let cfg = Config::load_with_env(&env).expect("load echo true");
+        assert!(cfg.a2a_echo);
+        // Invalid boolean fails loud (a mistyped flag must not silently flip
+        // the visible echo either way).
+        let env = env_with(&[("AGENT_RUN_A2A_ECHO", "garbage")]);
+        assert!(Config::load_with_env(&env).is_err());
+        // Unset falls back to the default (ON).
+        let env = HashMap::new();
+        let cfg = Config::load_with_env(&env).expect("load echo default");
+        assert_eq!(cfg.a2a_echo, DEFAULT_A2A_ECHO);
     }
 
     #[test]
