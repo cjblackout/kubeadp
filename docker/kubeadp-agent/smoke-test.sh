@@ -152,9 +152,14 @@ else
   ara_work=$(mktemp -d)
   ara_state=$(mktemp -d)
   ara_port=$($TCMD python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()' 2>/dev/null || echo $((20000 + RANDOM % 10000)))
+  # The A2A surface requires a jobset root key (jobset-only authorization).
+  ara_rootkey="$ara_state/jobset-root-key"
+  head -c 48 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ara_rootkey"
+  chmod 0400 "$ara_rootkey"
   KUBEADP_ROLE=worker \
   KUBEADP_API_ALLOW_UNAUTHENTICATED=1 \
   KUBEADP_API_ALLOW_OPEN=1 \
+  KUBEADP_JOBSET_ROOT_KEY_FILE="$ara_rootkey" \
   AGENT_RUN_API_LISTEN="127.0.0.1:$ara_port" \
   AGENT_RUN_WORKSPACE_ROOT="$ara_work" \
   AGENT_RUN_STATE_ROOT="$ara_state" \

@@ -253,37 +253,18 @@ pub async fn run() -> Result<()> {
         // rows and the text-less inbox rows 14 days after their timestamp. A
         // pass runs at startup and then at least hourly on a background thread.
         crate::core::a2a::inbox::start_purge_task(state_root.clone());
-        // The A2A surface sits behind the SAME operator token as /api/v1
-        // (see auth_state above): the verifier hashes the presented bearer
-        // credential and compares digests in constant time, exactly like the
-        // shared layer. With no token the A2A routes stay open only when
-        // KUBEADP_API_ALLOW_OPEN is set; otherwise the mount is refused below
-        // (fail closed, never an accidentally open surface).
-        // The operator token gate (same credential as /api/v1) plus, when this
-        // worker is a jobset member, the per-jobset credential as an
-        // independent alternative on the A2A routes (never on /api/v1).
-        let a2a_auth = crate::core::server::auth::auth_verifier_from_state(&auth_state);
-        // Fail closed: a `None` operator verifier (no KUBEADP_API_TOKEN_FILE)
-        // means open only when KUBEADP_API_ALLOW_OPEN=true is set explicitly;
-        // otherwise the server refuses to start with a clear error naming the
-        // flag. Production deployments always configure the token.
-        if !crate::core::server::token::a2a_open_permitted(
-            a2a_auth.is_some(),
-            crate::core::server::token::allow_open_from_env(),
-        ) {
-            anyhow::bail!(
-                "agent-run-api: no operator api token configured (KUBEADP_API_TOKEN_FILE) and \
-                 KUBEADP_API_ALLOW_OPEN is not set; refusing to mount open A2A routes -- \
-                 supply the operator token or explicitly set KUBEADP_API_ALLOW_OPEN=true"
-            );
-        }
-        let a2a_jobset = crate::core::a2a::JobsetCred::from_host();
-        let a2a_routes = crate::core::a2a::a2a_router_with_jobset(
+        // The A2A surface authenticates with jobset credentials only (SPEC
+        // §7.4): no operator bearer and no open mode. It requires the jobset
+        // root key; without it the server refuses to start (fail closed).
+        crate::core::a2a::require_root_key("agent-run-api")?;
+        let a2a_jobset = crate::core::a2a::JobsetCred::from_host()
+            .ok_or_else(|| anyhow::anyhow!("agent-run-api: no jobset registry available"))?;
+        let a2a_routes = crate::core::a2a::a2a_router_with_jobset_only(
             a2a_model,
             a2a_backend,
             Some(a2a_sink),
-            a2a_auth,
             a2a_jobset,
+            crate::core::a2a::peer_end_notifier_from_env(),
         );
         // The sandboxed run's inbox API: reachable pod-locally by the run's
         // own process under a per-run token, NEVER the operator bearer

@@ -785,6 +785,24 @@ impl A2aMcpServer {
     }
 
     /// [`Self::tool_result`] as a value (the structured tool errors).
+    /// Fail closed without a jobset credential: every outbound A2A call needs
+    /// the agent's credential file (jobset id, secret, member proof; SPEC §8).
+    /// Without it the tool answers `a2a_no_credentials` and sends no request,
+    /// never an unauthenticated or bearer-authenticated one.
+    fn require_credentials(&self) -> Option<CallToolResult> {
+        let present = crate::core::jobset::JobsetCredential::from_env().is_some()
+            && crate::core::jobset::agent_identity_from_env().is_some();
+        if present {
+            return None;
+        }
+        Some(CallToolResult::structured_error(self.tool_result_value(
+            serde_json::json!({
+                "code": "a2a_no_credentials",
+                "message": "no jobset credential available (KUBEADP_JOBSET_CREDENTIALS_FILE missing, unreadable or without a member proof); A2A calls are refused",
+            }),
+        )))
+    }
+
     fn tool_result_value(&self, value: serde_json::Value) -> serde_json::Value {
         // The pod-local inbox drain FAILS CLOSED: an unreachable or stuck
         // inbox is never a silent empty. The tool itself still succeeds (its
@@ -926,13 +944,17 @@ fn fit_to_budget(value: serde_json::Value, budget: usize) -> serde_json::Value {
 /// was not delivered and will never be): the sender's `delivery` is
 /// `terminal`. The peer's error text carries the reason (the `taskNotFound`
 /// code or the "task not found" / "no longer exists" / "was killed by the
-/// operator" messages); matched best effort.
+/// operator" messages, or -- since jobset authorization -- the 403 for a
+/// recipient that is no longer a member of the presented jobset, which is what
+/// a removed or ended target looks like); matched best effort.
 fn terminal_refusal(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     m.contains("task not found")
         || m.contains("tasknotfound")
         || m.contains("no longer exists")
         || m.contains("was killed")
+        || m.contains("not a member of the presented jobset")
+        || m.contains("no_shared_jobset")
 }
 
 /// The structured error of a failed send/reply: the code, the peer's message,
@@ -981,6 +1003,9 @@ impl A2aMcpServer {
         )
     )]
     pub async fn send_message(&self, args: Parameters<SendMessageArgs>) -> CallToolResult {
+        if let Some(refused) = self.require_credentials() {
+            return refused;
+        }
         let p = args.0;
         let fut = self
             .ctx
@@ -1016,6 +1041,9 @@ impl A2aMcpServer {
         )
     )]
     pub async fn reply(&self, args: Parameters<ReplyArgs>) -> CallToolResult {
+        if let Some(refused) = self.require_credentials() {
+            return refused;
+        }
         let p = args.0;
         let fut = self
             .ctx
@@ -1055,6 +1083,9 @@ impl A2aMcpServer {
         )
     )]
     pub async fn get_task(&self, args: Parameters<GetTaskArgs>) -> CallToolResult {
+        if let Some(refused) = self.require_credentials() {
+            return refused;
+        }
         let p = args.0;
         let fut = self.ctx.get_task(
             &p.agent,

@@ -9,7 +9,11 @@
 #![cfg(feature = "a2a")]
 
 use a2a::{Artifact, Part, TaskState};
-use kubeadp_agent::core::a2a::{a2a_router, A2aModel, A2aTask, TaskBackend};
+use kubeadp_agent::core::a2a::jobset_routes::PeerEndNotifier;
+use kubeadp_agent::core::a2a::{
+    a2a_router_with_jobset_only, A2aModel, A2aTask, JobsetCred, TaskBackend,
+};
+use kubeadp_agent::core::jobset::{derive_jobset_secret, derive_member_proof, JobsetRegistry};
 use kubeadp_agent::mcp_a2a::A2aMcpServer;
 use rmcp::model::CallToolRequestParams;
 use rmcp::ServiceExt;
@@ -127,6 +131,19 @@ impl kubeadp_agent::core::a2a::MessageSink for RecordingSink {
     }
 }
 
+const TEST_ROOT: &[u8] = b"mcp-test-root-key-0123456789abcdef0123456789abcdef";
+const TEST_JOBSET: &str = "js-test";
+
+#[derive(Debug)]
+struct NoopNotifier;
+
+#[async_trait::async_trait]
+impl PeerEndNotifier for NoopNotifier {
+    async fn notify(&self, _jobset_id: &str, _headers: &axum::http::HeaderMap) -> usize {
+        0
+    }
+}
+
 /// Start the SDK A2A server on an ephemeral port; return the base URL.
 async fn serve(backend: Arc<FakeBackend>, sink: Arc<RecordingSink>) -> String {
     let model = A2aModel {
@@ -136,7 +153,24 @@ async fn serve(backend: Arc<FakeBackend>, sink: Arc<RecordingSink>) -> String {
         skills: vec![],
         url: "http://127.0.0.1/unused".to_string(),
     };
-    let app = a2a_router(model, backend, Some(sink), None);
+    // The peer authenticates with jobset credentials only: every task the fake
+    // backend serves is a member of the test jobset, the sender holds the
+    // matching credential file (see `install_test_credentials`).
+    let registry = Arc::new(JobsetRegistry::new());
+    registry.set_root_key(Some(Arc::from(TEST_ROOT)));
+    for id in backend.tasks.lock().unwrap().keys() {
+        registry.register(
+            id,
+            TEST_JOBSET,
+            derive_jobset_secret(TEST_ROOT, TEST_JOBSET, 0),
+        );
+    }
+    let jobset = JobsetCred {
+        registry,
+        local_agent_id: "peer-agent".to_string(),
+    };
+    let app =
+        a2a_router_with_jobset_only(model, backend, Some(sink), jobset, Arc::new(NoopNotifier));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -194,7 +228,35 @@ async fn mcp_client(
 /// `A2A_SELF_NAME`). The crate-wide test env lock serializes them so parallel runners cannot
 /// clobber each other's overrides.
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    kubeadp_agent::test_env_lock()
+    let guard = kubeadp_agent::test_env_lock();
+    install_test_credentials();
+    guard
+}
+
+/// Every outbound MCP call needs a jobset credential (fail closed without
+/// one): write a credential file (jobset id, secret, member proof) once per
+/// process and point `KUBEADP_JOBSET_CREDENTIALS_FILE` at it.
+fn install_test_credentials() {
+    use kubeadp_agent::core::jobset::{
+        write_credential_file, CredentialEntry, CredentialFile, CREDENTIALS_FILE_ENV,
+    };
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let path = PATH.get_or_init(|| {
+        let path =
+            std::env::temp_dir().join(format!("mcp-test-credentials-{}.json", std::process::id()));
+        let file = CredentialFile {
+            agent_id: "sender-test".to_string(),
+            jobsets: vec![CredentialEntry {
+                jobset_id: TEST_JOBSET.to_string(),
+                epoch: 0,
+                secret: derive_jobset_secret(TEST_ROOT, TEST_JOBSET, 0),
+                member_proof: derive_member_proof(TEST_ROOT, TEST_JOBSET, 0, "sender-test"),
+            }],
+        };
+        write_credential_file(&path, &file).expect("write the test credential file");
+        path
+    });
+    std::env::set_var(CREDENTIALS_FILE_ENV, path);
 }
 
 #[tokio::test]
@@ -1160,4 +1222,45 @@ async fn mcp_a2a_delivery_field_and_terminal_refusal() {
     );
 
     std::env::remove_var("A2A_URL_OVERRIDES");
+}
+
+/// Without a jobset credential every outbound tool is refused with
+/// `a2a_no_credentials` and no request reaches the peer (fail closed).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn mcp_a2a_refuses_without_a_jobset_credential() {
+    let _guard = env_lock();
+    let backend = FakeBackend::with(vec![task("t1", "c1", TaskState::Working)]);
+    let sink = Arc::new(RecordingSink::default());
+    let base = serve(backend, sink.clone()).await;
+    std::env::set_var("A2A_URL_OVERRIDES", format!("peer={base}"));
+    std::env::set_var("A2A_SELF_NAME", "sender-test");
+    // No credential file at all.
+    std::env::remove_var(kubeadp_agent::core::jobset::CREDENTIALS_FILE_ENV);
+    std::env::set_var("TMPDIR", "/nonexistent-credentials-dir");
+
+    let server =
+        mcp_server_with(|_base: &str, _token: Option<&str>| async move { Ok(vec![]) }).await;
+    let client = mcp_client(server).await;
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("send_message").with_arguments(
+                serde_json::json!({"agent": "peer", "text": "hello", "task_id": "t1"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("tool call");
+    assert_eq!(res.is_error, Some(true));
+    let text = format!("{:?}", res.content);
+    assert!(text.contains("a2a_no_credentials"), "result: {text}");
+    assert!(
+        sink.delivered.lock().unwrap().is_empty(),
+        "nothing may reach the peer without a credential"
+    );
+    std::env::remove_var("TMPDIR");
+    std::env::remove_var("A2A_URL_OVERRIDES");
+    std::env::remove_var("A2A_SELF_NAME");
 }

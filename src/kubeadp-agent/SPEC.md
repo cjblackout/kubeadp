@@ -1084,12 +1084,9 @@ A request that names no recipient (`GET /tasks`, `GET /a2a/agents`) needs 1 and
   at `SEND_BODY_LIMIT` (64 KiB).
 - Error bodies are `application/problem+json` with `WWW-Authenticate: Bearer`
   on `401`.
-- A request that presents no jobset credential is accepted only when the
-  operator bearer verifier accepts it: the A2A surface sits behind the same
-  bearer as `/api/v1`, mounted only when a token is configured or
-  `KUBEADP_API_ALLOW_OPEN` is set (a server without a token refuses to mount
-  the A2A routes otherwise). A presented-but-invalid jobset credential is
-  refused outright and never downgraded to the bearer.
+- A request without a valid jobset credential is refused (`401`): the A2A
+  routes accept no operator bearer and have no open mode. `/api/v1` keeps its
+  own bearer, unchanged.
 - The guarded send path charges a per-jobset message budget; over the budget
   the answer is `429` + `Retry-After` (`code:"rate_limited"`). Inbox-API
   authentication failures are answered `401` and counted.
@@ -1954,15 +1951,7 @@ code. Rows are removed when they reach `implemented` and nothing else in the
 section is outstanding.
 
 ### 13.1 State store (§2.3)
-| Item | Status | Note |
-|---|---|---|
-| migrations 1–2 (`jobs`, `supervisor_state`, `session_state`), WAL, busy timeout | implemented | |
-| migration 4 (`heartbeat_epoch_ms`, supervisor heartbeat in milliseconds) | implemented | sub-second stale detection with a strict threshold comparison; the whole-second epoch is kept in sync for older readers |
-| refusal of a newer `user_version` | implemented | |
-| migration 3 (`jobset`, `jobset_member`, `jobsets.json` import) | implemented (migration 6) | `jobset`/`jobset_member` tables plus the one-time idempotent import of `jobsets.json` and the `job-jobsets/` remember-files; the in-memory registry still serves all callers (dual-write; the store is the C5 read target) |
-| `a2a_message`/`a2a_expiry` inbox tables, per-run inbox in the shared database | implemented | the code's migration 3; the `<state_root>/a2a-inbox/<run>/` directory survives only as the run key, the sandboxed receive side reads through the pod-local HTTP API |
-| migration 5 (`run_meta`), run registry as a view | implemented | run registry is a view over `jobs`/`session_state` and `run_meta`; compact record and message queue integrate with `run_meta` and `a2a_message` |
-| migration 7 (`a2a_audit`, `a2a_message.framed` nullable) | implemented | stream-3 step C2; version 6 is reserved for the parallel C1 `jobset` tables |
+Implemented: migrations 1–7 (`jobs`, supervisor and session state, heartbeat in milliseconds, `jobset`/`jobset_member` with the one-time import of `jobsets.json`, `a2a_message`/`a2a_expiry`, `run_meta`, `a2a_audit`), WAL with busy timeout, refusal of a newer `user_version`, the run registry as a view. Nothing outstanding.
 
 ### 13.2 Engines (§3, §5.4, §5.5)
 | Item | Status | Note |
@@ -1982,33 +1971,23 @@ section is outstanding.
 | conformance suite (§12.6) | implemented | |
 
 ### 13.3 Jobset messaging (§7, §8)
+Implemented: derived secrets and the mandatory root key (both roles refuse to start without one), member proof and the authorization order of §7.4 on jobset-only A2A routes (no operator bearer, no open mode), the verified `X-Agent-Id` as the framed sender, the credential file handed through the sandbox secret channel, `GET /a2a/agents`, the creator-authorized jobset end with peer propagation, the per-agent delivery socket, inbox, channels, `a2a-hook` and the ladder, audit and text deletion, `mcp-a2a` (fails closed with `a2a_no_credentials`, registered for sessions and claude jobs).
+
 | Item | Status | Note |
 |---|---|---|
-| derived jobset secret, root key handling, hidden root key | implemented | |
-| root key mandatory with `a2a` | planned | a random in-memory secret is used without a root key (made mandatory at the C5 flag day) |
 | multi-jobset membership, default jobset per agent, join at start only | partial (C1) | the SQLite store holds multi-jobset membership and a persisted epoch; the in-memory registry (one jobset per agent) still serves all callers, so joining several jobsets is a C5 read-path concern |
 | creator proof on start (§7.2), `jobset_creator_required` | planned | |
-| member proof, verified sender, authorization order and codes (§7.4) | planned | `derive_member_proof` (SPEC §7.3) and the `CredentialFile` read/write of `jobset-credentials.json` (0400) exist; the sender is still claimed in the frame, and C4 wires the proof into the authorization order |
-| API bearer accepted on A2A routes (operator credential) | implemented | the A2A surface sits behind the same operator token as `/api/v1`, mounted only with a token or `KUBEADP_API_ALLOW_OPEN`; a presented-but-invalid jobset credential is never downgraded to the bearer |
-| one credential file with all jobsets (§6.5) | partial | file layout, write (0400) and read helpers exist (`jobset-credentials.json`); the launcher still hands the single-jobset secret file + `KUBEADP_JOBSET_ID`/`_EPOCH`/`_SECRET_FILE` in C1 |
+| one credential file with all jobsets (§6.5) | partial | the launcher hands one `jobset-credentials.json` (agent id plus the agent's jobset with secret and member proof) through the sandbox secret channel, `KUBEADP_JOBSET_CREDENTIALS_FILE` names it; a file with several jobsets awaits multi-jobset membership |
 | limits of §7.6 | partial | size, queue bound, TTL, hop cap, interrupt interval implemented; the guarded A2A send path charges a per-jobset budget (60/min, 500 lifetime) answered `429` + `Retry-After`, the session PTY message route keeps 30/min per (session, sender); the hop is read server-side from the signed `a2a.hop_token`, never from the claimed integer |
-| discovery, agent card, SDK REST surface, task mapping | implemented | card still declares a bearer scheme; `GET /a2a/agents` planned |
-| framing with verified sender and jobset (§7.12) | planned | frame says `claimed sender: <sender>` |
-| inbox, channels, `a2a-hook`, hook installation, ladder (§7.14) | implemented | the inbox is the shared state database (`a2a_message`/`a2a_expiry`); the sandboxed receive side reads it through the pod-local inbox API under a per-run token |
 | absent recipient queued, `delivery` in the send answer | partial | queue and TTL implemented; the send answer carries no `delivery` value |
-| audit and text deletion (§7.15) | implemented | stream-3 step C2: metadata-only `a2a_audit` rows on accept/inject/expire/drop (never the text), `framed` set `NULL` 60 s after injection and at once on expire/drop, 14-day purge at startup + hourly |
-| end by creator, tombstone, peer propagation (§7.16) | partial | operator end route and epoch bump implemented, per pod only |
 | `mcp-a2a` tools | partial | all five tools exist; fixed-shape `send_message`/`reply` result (`delivered`, `delivery`), bounded `get_task` (`history_length`, truncation markers), cut-not-error response cap, canonical argument names with case-variant aliases, oversize-text refusal naming the limit, credential fail-closed; jobset-scoped `list_agents`, `jobset`/`interrupt` parameters and registration for claude jobs and sessions planned; `a2a_mcp_enabled` defaults to false |
 
 ### 13.4 Sandbox, configuration, API (§5, §6, §9)
+Implemented: the sandbox (§6.1–§6.9 including the per-agent delivery socket), the `a2a_ack_secs`/`a2a_force_secs`/`a2a_inbox_ttl_secs` configuration keys, rejection of a session name that looks like a job id, and everything else in §4, §5, §9 and §11. Outstanding:
+
 | Item | Status | Note |
 |---|---|---|
-| sandbox §6.1–§6.8 | implemented | |
-| per-agent delivery socket (§6.9) | planned | |
 | API bearer file grant for sessions (§6.6) | transitional, removal planned | granted to the `homelab` session today; removed in the last refactor step together with the code paths that read the bearer inside a sandbox |
-| `a2a_ack_secs`, `a2a_force_secs`, `a2a_inbox_ttl_secs` in `KUBEADP_CONFIG_FILE` | partial | honoured as environment variables and in the agent-run config file; the TOML mapping of §9.2 does not list them and rejects them as unknown keys |
-| `session` name colliding with a job id rejected | planned | |
-| everything else in §4, §5, §9, §11 | implemented | |
 
 ## Open Points
 - After the API bearer grant is removed (§6.6), an agent has no REST access:

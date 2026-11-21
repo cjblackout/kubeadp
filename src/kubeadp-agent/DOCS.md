@@ -248,7 +248,7 @@ Protected A2A routes enforce authentication **before** parsing request bodies:
    }
    ```
 
-**No-token fail closed**: with no operator token configured (`KUBEADP_API_TOKEN_FILE` unset or empty), the A2A routes stay open only when the env `KUBEADP_API_ALLOW_OPEN=true` is set explicitly; otherwise the server refuses to start with an error naming `KUBEADP_API_ALLOW_OPEN` (fail closed: a missing token never means an accidentally open A2A surface). Both Deployments that run the agent (`kubeadp-agent-worker`, `ai-server`) set the token file, so production is unaffected.
+**Jobset authorization only**: the A2A routes (except the public agent card) accept jobset credentials only (`X-Jobset-Id`, `X-Jobset-Secret`, `X-Agent-Id`, `X-Agent-Proof`, SPEC §7.4); the operator bearer and the retired `KUBEADP_API_ALLOW_OPEN` have no effect on them (the bearer stays on `/api/v1`). Both long-lived roles refuse to start without a usable jobset root key (`KUBEADP_JOBSET_ROOT_KEY_FILE`, error names the variable, never a value). The verified `X-Agent-Id` is the sender in the message frame; a sender claimed in the body is ignored. `mcp-a2a` answers `a2a_no_credentials` without any request when the agent has no credential file.
 
 ### 4.3 Jobsets and Derived Secrets
 

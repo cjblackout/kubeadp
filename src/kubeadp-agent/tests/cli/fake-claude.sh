@@ -98,7 +98,7 @@ while [ $# -gt 0 ]; do
         shift 1
       fi
       ;;
-    --input-format|--output-format|--model|--session-id|--append-system-prompt|--add-dir)
+    --input-format|--output-format|--model|--session-id|--append-system-prompt|--add-dir|--mcp-config)
       if [ $# -gt 1 ]; then
         shift 2
       else

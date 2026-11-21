@@ -415,6 +415,7 @@ where
                     &hop_guard,
                     &recipient,
                     &presented_id,
+                    &sender,
                 ) {
                     Ok(rewritten) => text = rewritten,
                     Err(reject) => return Ok(reject.into_response()),
@@ -690,6 +691,7 @@ fn guarded_send_body_jobset(
     guard: &HopGuard,
     target: &str,
     verified_jobset: &str,
+    verified_sender: &str,
 ) -> Result<String, LayerReject> {
     let request: a2a::SendMessageRequest =
         serde_json::from_str(text).map_err(|_| LayerReject::Unauthenticated)?;
@@ -745,6 +747,12 @@ fn guarded_send_body_jobset(
         meta.insert(
             crate::core::a2a::client::META_HOP.to_string(),
             json!(verified.hop),
+        );
+        // The verified sender replaces whatever the body claimed: the framing
+        // shows the identity the proof bound to the jobset, never a claim.
+        meta.insert(
+            crate::core::a2a::client::META_SENDER.to_string(),
+            json!(verified_sender),
         );
         meta.remove(ingress::META_HOP_TOKEN);
     }

@@ -32,10 +32,12 @@ use std::sync::Arc;
 use crate::core::a2a::delivery::{sender_task_state, LadderConfig, LadderStep, SenderTaskState};
 use crate::core::a2a::inbox::{Inbox, QueuedMessage};
 use crate::core::a2a::inject::join_framed;
+#[cfg(test)]
+use crate::core::a2a::AuthVerifier;
 use crate::core::a2a::DeliveryMeta;
 use crate::core::a2a::{
     advertised_url, pod_name, role_description, role_skills, A2AError, A2aModel, A2aTask,
-    AuthVerifier, TaskBackend, ROLE_ORCHESTRATOR,
+    TaskBackend, ROLE_ORCHESTRATOR,
 };
 use crate::orchestrate::sessions_api;
 use a2a::TaskState;
@@ -502,21 +504,19 @@ impl crate::core::a2a::MessageSink for SessionMessageSink {
     }
 }
 
-/// Builds the A2A router for agent-orchestrate.
-///
-/// `api_state` is the SAME [`sessions_api::SessionsApiState`] the REST
-/// `/api/v1/sessions` router uses: the A2A `SendMessage` sink and the REST
-/// `POST .../message` handler therefore share ONE rate limiter (the claimed
-/// "shared budget" is real), rather than the A2A router building a second one.
-pub fn a2a_router(
+/// The model, sink and backend of the orchestrator's A2A surface (shared by
+/// the production builder and the test builder).
+fn orchestrator_parts(
     state: Arc<std::sync::Mutex<SupervisorState>>,
     controls: SessionControlRegistry,
     api_state: Arc<sessions_api::SessionsApiState>,
-    auth: Option<AuthVerifier>,
-    jobset: Option<crate::core::a2a::JobsetCred>,
     a2a_inbox_root: PathBuf,
     ladder: LadderConfig,
-) -> Router {
+) -> (
+    A2aModel,
+    Arc<SupervisorTaskBackend>,
+    Arc<SessionMessageSink>,
+) {
     // The agent card identifies the RUNNING POD (not the retired
     // agent-orchestrate image): the name is the pod's own name, the
     // description and skills name the orchestrator role, the version is the
@@ -540,6 +540,47 @@ pub fn a2a_router(
     // session that still holds an uninjected message.
     sink.recover_pending();
     let backend = Arc::new(SupervisorTaskBackend::new(state, controls, a2a_inbox_root));
+    (model, backend, sink)
+}
+
+/// Builds the orchestrator's A2A router: every route except the public agent
+/// card sits behind jobset authorization only (SPEC §7.4, §7.5): no operator
+/// bearer and no open mode.
+///
+/// `api_state` is the SAME [`sessions_api::SessionsApiState`] the REST
+/// `/api/v1/sessions` router uses: the A2A `SendMessage` sink and the REST
+/// `POST .../message` handler therefore share ONE rate limiter (the claimed
+/// "shared budget" is real), rather than the A2A router building a second one.
+/// `notifier` propagates a jobset end to the mesh peers (SPEC §7.16).
+pub fn a2a_router_jobset_only(
+    state: Arc<std::sync::Mutex<SupervisorState>>,
+    controls: SessionControlRegistry,
+    api_state: Arc<sessions_api::SessionsApiState>,
+    jobset: crate::core::a2a::JobsetCred,
+    notifier: Arc<dyn crate::core::a2a::jobset_routes::PeerEndNotifier>,
+    a2a_inbox_root: PathBuf,
+    ladder: LadderConfig,
+) -> Router {
+    let (model, backend, sink) =
+        orchestrator_parts(state, controls, api_state, a2a_inbox_root, ladder);
+    crate::core::a2a::a2a_router_with_jobset_only(model, backend, Some(sink), jobset, notifier)
+}
+
+/// Test-harness builder with the operator-bearer verifier (the handler and
+/// sink mechanics these unit tests cover are independent of the auth layer).
+/// Never mounted in production.
+#[cfg(test)]
+pub fn a2a_router(
+    state: Arc<std::sync::Mutex<SupervisorState>>,
+    controls: SessionControlRegistry,
+    api_state: Arc<sessions_api::SessionsApiState>,
+    auth: Option<AuthVerifier>,
+    jobset: Option<crate::core::a2a::JobsetCred>,
+    a2a_inbox_root: PathBuf,
+    ladder: LadderConfig,
+) -> Router {
+    let (model, backend, sink) =
+        orchestrator_parts(state, controls, api_state, a2a_inbox_root, ladder);
     crate::core::a2a::a2a_router_with_jobset(model, backend, Some(sink), auth, jobset)
 }
 

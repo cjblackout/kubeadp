@@ -231,6 +231,29 @@ pub fn a2a_router_with_jobset(
     card_router.merge(rest)
 }
 
+/// Fails the startup of an A2A-serving process without a jobset root key
+/// (SPEC §7.3): jobset authorization derives every secret and member proof
+/// from it, so there is no random in-memory secret and no open mode. The error
+/// names the file that must hold the key, never a value.
+pub fn require_root_key(role: &str) -> anyhow::Result<()> {
+    if crate::core::jobset::global_registry().root_key().is_some() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{role}: no jobset root key configured ({} unset or empty); the A2A surface \
+         authenticates with jobset credentials derived from it and refuses to start without one",
+        crate::core::jobset::ROOT_KEY_FILE_ENV
+    )
+}
+
+/// The notifier that propagates a jobset end to the statically configured peer
+/// pods (`A2A_PEERS`, SPEC §7.16); an empty list is valid (single-pod mesh).
+pub fn peer_end_notifier_from_env() -> Arc<dyn jobset_routes::PeerEndNotifier> {
+    Arc::new(jobset_routes::HttpPeerEndNotifier::new(
+        client::static_peer_urls(),
+    ))
+}
+
 /// The `kind` a host reports for the agents it serves in a `GET /a2a/agents`
 /// answer (SPEC §7.7 item 6): the run kind the role hosts (`job` on the
 /// worker, `session` on the orchestrator).
@@ -442,6 +465,22 @@ pub(crate) mod testenv {
 #[cfg(test)]
 mod jobset_router_tests {
     use super::*;
+
+    #[test]
+    fn require_root_key_refuses_a_pod_without_a_root_key() {
+        crate::core::jobset::with_isolated_registry(|| {
+            let err = require_root_key("agent-orchestrate")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("KUBEADP_JOBSET_ROOT_KEY_FILE") && err.contains("agent-orchestrate"),
+                "error: {err}"
+            );
+            crate::core::jobset::global_registry()
+                .set_root_key(Some(Arc::from(&b"0123456789abcdef0123456789abcdef"[..])));
+            assert!(require_root_key("agent-orchestrate").is_ok());
+        });
+    }
     use a2a::TaskState;
     use axum::body::Body;
     use axum::http::{header, Request, StatusCode};

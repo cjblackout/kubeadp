@@ -350,6 +350,59 @@ async fn send_with_valid_jobset_credential_is_forwarded_to_sink() {
     assert_eq!(deliveries.len(), 1);
 }
 
+/// The framing and the sink see the VERIFIED sender (the `X-Agent-Id` the
+/// member proof bound to the jobset), never the sender the body claims.
+#[tokio::test]
+async fn verified_sender_replaces_the_claimed_sender() {
+    let (reg, jobset_id, _, recipient) = registry_with_jobset();
+    let sink = RecordingSink::default();
+    let backend = KnownTasks::with(&["agent-a", "agent-b"]);
+    let app = router(reg, backend, sink.clone());
+    let mut headers = member_headers(&jobset_id, 0, "agent-a");
+    headers.insert("a2a-version", "1.0".parse().unwrap());
+    headers.insert("content-type", "application/json".parse().unwrap());
+    // The body claims to come from "liar" (`a2a.sender` metadata).
+    let secret = derive_jobset_secret(ROOT, &jobset_id, 0);
+    let token = kubeadp_agent::core::a2a::ingress::issue_hop_token(
+        1,
+        "m-liar",
+        secret.as_bytes(),
+        kubeadp_agent::core::a2a::inbox::now_unix(),
+    );
+    let mut message = a2a::Message::new(a2a::Role::User, vec![a2a::Part::text("hello")]);
+    message.message_id = "m-liar".to_string();
+    message.task_id = Some(recipient.clone());
+    message.metadata = Some(std::collections::HashMap::from([
+        ("a2a.hop_token".to_string(), serde_json::json!(token)),
+        ("a2a.sender".to_string(), serde_json::json!("liar")),
+    ]));
+    let body = serde_json::to_string(&a2a::SendMessageRequest {
+        message,
+        configuration: None,
+        metadata: None,
+        tenant: None,
+    })
+    .unwrap();
+    let resp = app
+        .oneshot(request_with_headers(
+            "/message:send",
+            "POST",
+            headers,
+            Body::from(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let deliveries = sink.deliveries.lock().unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].1, "agent-a", "the verified sender is framed");
+    assert!(
+        deliveries[0].2.contains("agent-a") && !deliveries[0].2.contains("liar"),
+        "framed text: {}",
+        deliveries[0].2
+    );
+}
+
 #[tokio::test]
 async fn recipient_not_in_jobset_answers_403_no_shared_jobset() {
     let (reg, jobset_id, sender, _) = registry_with_jobset();

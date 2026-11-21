@@ -286,6 +286,26 @@ fn spawn_job(
     Ok((child, stdin_buf))
 }
 
+/// The `--mcp-config` JSON that registers the harness-owned `mcp-a2a` stdio
+/// server (this very binary with the `mcp-a2a` subcommand). The server reads
+/// its credential file and A2A env from the job's own environment. `None` when
+/// the current executable cannot be resolved.
+#[cfg(feature = "a2a")]
+fn a2a_mcp_config() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    Some(
+        serde_json::json!({
+            "mcpServers": {
+                "a2a": {
+                    "command": exe.to_string_lossy(),
+                    "args": ["mcp-a2a"],
+                }
+            }
+        })
+        .to_string(),
+    )
+}
+
 #[async_trait]
 impl Engine for ClaudeEngine {
     fn id(&self) -> EngineId {
@@ -582,6 +602,14 @@ impl Engine for ClaudeEngine {
         if let Some(m) = &job.model {
             args.push("--model".to_string());
             args.push(m.clone());
+        }
+
+        // The harness-owned `mcp-a2a` server is the agent's only way to send
+        // A2A messages (SPEC §8); claude jobs register it explicitly.
+        #[cfg(feature = "a2a")]
+        if let Some(config) = a2a_mcp_config() {
+            args.push("--mcp-config".to_string());
+            args.push(config);
         }
 
         let prompt = match turn {
@@ -1279,6 +1307,10 @@ exit 0
                 "--model",
                 "claude-3-5-sonnet-20241022",
             ]
+            .into_iter()
+            .map(String::from)
+            .chain(mcp_config_args())
+            .collect::<Vec<_>>()
         );
         assert_eq!(plan.env, Vec::<(String, String)>::new());
         let mut expected_json = render_text_request("implement feature X");
@@ -1290,6 +1322,22 @@ exit 0
             }
         );
         assert!(!plan.pty);
+    }
+
+    /// The `--mcp-config` argument pair the job command adds for the
+    /// harness-owned `mcp-a2a` server (only in the `a2a` build).
+    fn mcp_config_args() -> Vec<String> {
+        #[cfg(feature = "a2a")]
+        {
+            vec![
+                "--mcp-config".to_string(),
+                a2a_mcp_config().expect("current exe"),
+            ]
+        }
+        #[cfg(not(feature = "a2a"))]
+        {
+            Vec::new()
+        }
     }
 
     #[test]
@@ -1321,6 +1369,10 @@ exit 0
                 "--permission-mode",
                 "plan",
             ]
+            .into_iter()
+            .map(String::from)
+            .chain(mcp_config_args())
+            .collect::<Vec<_>>()
         );
         let mut expected_json = render_text_request("investigate issue");
         expected_json.push('\n');
@@ -1358,9 +1410,12 @@ exit 0
                 "--output-format",
                 "stream-json",
                 "--verbose",
-                "--resume",
-                "sess-uuid-789",
             ]
+            .into_iter()
+            .map(String::from)
+            .chain(mcp_config_args())
+            .chain(["--resume", "sess-uuid-789"].into_iter().map(String::from))
+            .collect::<Vec<_>>()
         );
         let mut expected_json = render_text_request("continue with next step");
         expected_json.push('\n');

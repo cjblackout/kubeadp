@@ -1049,6 +1049,15 @@ fn url_override(name: &str, namespace: &str) -> Option<String> {
     }
 }
 
+/// The base URLs of the statically configured peers (`A2A_PEERS`), for the
+/// jobset end propagation (SPEC §7.16).
+pub fn static_peer_urls() -> Vec<String> {
+    static_peers(None)
+        .into_iter()
+        .map(|(_, _, url)| url)
+        .collect()
+}
+
 /// Parse the `A2A_PEERS` static peer registry into (namespace, name) -> URL
 /// entries.
 ///

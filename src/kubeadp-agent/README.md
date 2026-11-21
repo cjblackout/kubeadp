@@ -151,7 +151,7 @@ Variables that are read at runtime and have no configuration-file key. Environme
 | Variable | Used by | Default / Notes |
 |---|---|---|
 | `CLAUDE_SANDBOX` | Orchestrator (generated sessions) | Sandbox override for GENERATED sessions (the legacy default session and `CLAUDE_WORKSPACES` workspace sessions): wins over the supervisor session config's `default_sandbox` (default `true`). Has no configuration-file key; file-defined sessions always use their own `sandbox` key. |
-| `KUBEADP_API_ALLOW_OPEN` | A2A routes (both long-lived roles) | Boolean; with no operator token configured the A2A routes stay open only when `true` — without it the server refuses to mount them and exits with an error naming this variable (fail closed). Has no configuration-file key. |
+| `KUBEADP_API_ALLOW_OPEN` | none | Retired: the A2A routes accept jobset credentials only, so this flag no longer changes anything. |
 | `KUBEADP_AGY_HOME` | Conversation recovery / `agy` home | Path override for `Config::agy_home` holding `agy`'s own state (`~/.gemini/antigravity-cli`). Passes into the sandbox via `KUBEADP_*`. |
 | `KUBEADP_SANDBOX_HOME` | Sandbox policy | Path override for `Config::sandbox_home` (default `/home/agent`) granted `shared_rw` in sandboxed worker jobs. |
 | `KUBEADP_INSTRUCTIONS_SESSIONS_DIR` | Both long-lived roles | Sessions base for the per-session / per-project instruction files (`<name>.md` / `<project>.md`, default `/etc/kubeadp-agent/instructions/sessions`); env-only, no config-file key (`SPEC.md` §4.10). |
@@ -159,8 +159,8 @@ Variables that are read at runtime and have no configuration-file key. Environme
 | `A2A_PEERS` | A2A discovery (`mcp-a2a`, A2A client) | Static peer registry, comma-separated `name=url` or `namespace/name=url`; needs no Kubernetes service account, so a sandboxed job without an SA token still reaches configured peers. |
 | `A2A_SELF_NAME` | A2A card and client | Outbound sender identity and the `name` field of the agent card (precedence over `POD_NAME`/`HOSTNAME`). Default: `kubeadp-agent`. |
 | `A2A_SELF_PREFIX` | Worker jobs | Prefix for each job's A2A sender identity; a launched job's `A2A_SELF_NAME` is set to `<A2A_SELF_PREFIX>/<job_id>`. |
-| `KUBEADP_JOBSET_ID` | A2A jobset members | The jobset id handed to an agent by its launcher (secret travels via `KUBEADP_JOBSET_SECRET_FILE`, never this variable). |
-| `KUBEADP_JOBSET_SECRET_FILE` | A2A jobset members | Path to the mode `0400` file holding the derived jobset secret. |
+| `KUBEADP_JOBSET_ID` | A2A jobset members | The jobset id handed to an agent by its launcher (the secret and member proof travel in the credential file named by `KUBEADP_JOBSET_CREDENTIALS_FILE`, never this variable). |
+| `KUBEADP_JOBSET_CREDENTIALS_FILE` | A2A jobset members | Path to the mode `0400` `jobset-credentials.json` (agent id, jobset id, epoch, secret, member proof); `mcp-a2a` refuses every call without it. |
 | `KUBEADP_REPO_SYNC_CONFIG` | `repo-sync` | Path to the repo-sync TOML file (default `/etc/kubeadp-agent/repo-sync.toml`, used only if it exists). |
 | `KUBEADP_REPO_SYNC_TOKEN_ENV` | `repo-sync` | Name of the environment variable holding the git token (overrides the file's `token_env`). |
 | `KUBEADP_REPO_SYNC_TOKEN_FILE` | `repo-sync` | Path to a file whose trimmed content is the git token (overrides the file's `token_file`; re-read every cycle). |

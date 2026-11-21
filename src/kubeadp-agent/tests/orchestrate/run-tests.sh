@@ -8,6 +8,12 @@ for v in $(compgen -v | grep ^KUBEADP); do unset "$v"; done
 export KUBEADP_ROLE=orchestrator
 export KUBEADP_API_ALLOW_UNAUTHENTICATED=true
 export KUBEADP_API_ALLOW_OPEN=true
+# The A2A surface requires a jobset root key (jobset-only authorization): one generated key
+# file shared by every server this suite starts.
+JOBSET_ROOT_KEY_DIR="$(mktemp -d)"
+head -c 48 /dev/urandom | od -An -tx1 | tr -d ' \n' > "${JOBSET_ROOT_KEY_DIR}/jobset-root-key"
+chmod 0400 "${JOBSET_ROOT_KEY_DIR}/jobset-root-key"
+export KUBEADP_JOBSET_ROOT_KEY_FILE="${JOBSET_ROOT_KEY_DIR}/jobset-root-key"
 # Unset ambient supervisor and entrypoint environment variables to ensure test hermeticity
 unset AGENT_ORCHESTRATE_CONFIG CLAUDE_SUPERVISOR_CONFIG CLAUDE_DEFAULT_SESSION \
       CLAUDE_DEFAULT_SESSION_ID CLAUDE_WORKSPACES CLAUDE_WORKSPACE_ROOT CLAUDE_REMOTE_PREFIX \

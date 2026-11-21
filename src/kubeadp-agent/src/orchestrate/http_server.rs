@@ -144,32 +144,18 @@ pub fn build_router(
     // at startup and then at least hourly on a background thread.
     crate::core::a2a::inbox::start_purge_task(state_root.clone());
 
+    // The A2A surface authenticates with jobset credentials only (SPEC §7.4):
+    // no operator bearer and no open mode. It therefore requires the jobset
+    // root key: without it the server refuses to start (fail closed).
     #[cfg(feature = "a2a")]
-    let a2a_auth: Option<crate::core::a2a::AuthVerifier> =
-        crate::core::server::auth::auth_verifier_from_state(&auth_state);
+    crate::core::a2a::require_root_key("agent-orchestrate")?;
 
-    // Fail closed: a `None` operator verifier (no KUBEADP_API_TOKEN_FILE)
-    // means open only when KUBEADP_API_ALLOW_OPEN=true is set explicitly;
-    // otherwise the server refuses to start with a clear error naming the
-    // flag. Production deployments always configure the token.
-    #[cfg(feature = "a2a")]
-    if !crate::core::server::token::a2a_open_permitted(
-        a2a_auth.is_some(),
-        crate::core::server::token::allow_open_from_env(),
-    ) {
-        anyhow::bail!(
-            "agent-orchestrate: no operator api token configured (KUBEADP_API_TOKEN_FILE) and \
-             KUBEADP_API_ALLOW_OPEN is not set; refusing to mount open A2A routes -- \
-             supply the operator token or explicitly set KUBEADP_API_ALLOW_OPEN=true"
-        );
-    }
-
-    #[cfg(feature = "a2a")]
     // The A2A router shares the SAME SessionsApiState (and thus the same
     // message rate limiter) as the REST /api/v1/sessions router above, so the
     // REST and A2A message paths compete for one budget per (session, sender).
     #[cfg(feature = "a2a")]
-    let a2a_jobset = crate::core::a2a::JobsetCred::from_host();
+    let a2a_jobset = crate::core::a2a::JobsetCred::from_host()
+        .ok_or_else(|| anyhow::anyhow!("agent-orchestrate: no jobset registry available"))?;
     // The session inbox root is the shared agent-run state root: the ONE
     // definition both the sink and the session launcher resolve
     // (`core::a2a::inbox::inbox_state_root`, derived exactly like the
@@ -178,12 +164,12 @@ pub fn build_router(
     // delivered message lands in the directory the session's hook/mcp-a2a
     // reader and sandbox grant cover.
     #[cfg(feature = "a2a")]
-    let a2a_routes = crate::orchestrate::a2a::a2a_router(
+    let a2a_routes = crate::orchestrate::a2a::a2a_router_jobset_only(
         state.clone(),
         controls.clone(),
         api_state,
-        a2a_auth,
         a2a_jobset,
+        crate::core::a2a::peer_end_notifier_from_env(),
         crate::core::a2a::inbox::inbox_state_root(),
         a2a_ladder,
     );

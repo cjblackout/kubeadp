@@ -65,6 +65,13 @@ for _kvar in $(compgen -v KUBEADP_ 2>/dev/null || env | grep -o '^KUBEADP_[^=]*'
   unset "$_kvar"
 done
 
+# The A2A surface requires a jobset root key (jobset-only authorization): one generated key file
+# shared by every server this suite starts.
+JOBSET_ROOT_KEY_DIR="$(mktemp -d)"
+head -c 48 /dev/urandom | od -An -tx1 | tr -d ' \n' > "${JOBSET_ROOT_KEY_DIR}/jobset-root-key"
+chmod 0400 "${JOBSET_ROOT_KEY_DIR}/jobset-root-key"
+export KUBEADP_JOBSET_ROOT_KEY_FILE="${JOBSET_ROOT_KEY_DIR}/jobset-root-key"
+
 # --- tool dependencies -------------------------------------------------------
 for tool in git curl pkill; do
   command -v "$tool" >/dev/null 2>&1 || die "required tool '$tool' not found in PATH"

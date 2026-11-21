@@ -815,7 +815,17 @@ mod tests {
         );
         assert!(crate::core::job::is_pid_alive(pid));
 
-        // No anchor: plausible cmdline ("sleep") is signalled.
+        // No anchor: plausible cmdline ("sleep") is signalled. Between fork
+        // and exec the child still shows the parent's cmdline, so wait until
+        // the exec happened instead of racing it.
+        let exec_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < exec_deadline {
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            if String::from_utf8_lossy(&cmdline).contains("sleep") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let sent = signal_process_group_if_target(pid, None, libc::SIGTERM);
         assert!(sent, "the no-anchor fallback must signal a plausible child");
         let status = child.wait().expect("reap child");
