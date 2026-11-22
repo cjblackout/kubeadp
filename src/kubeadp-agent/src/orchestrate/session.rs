@@ -1162,6 +1162,7 @@ fn run_session_iteration(
             sess_st.start_time = Some(start_rfc3339);
             sess_st.start_time_epoch = Some(start_epoch);
             sess_st.status = SessionStatus::Running;
+            sess_st.restart_count = *restart_count;
         }
         st.clone()
     };
