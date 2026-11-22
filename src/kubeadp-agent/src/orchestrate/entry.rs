@@ -327,6 +327,7 @@ fn spawn_session_thread(
     let shut_clone = Arc::clone(shutdown_flag);
     let paused_flag = control.paused.clone();
     let pty_input = control.pty_input.clone();
+    let child_start_tracker = control.child_start_tracker.clone();
     control.running.store(true, Ordering::SeqCst);
     let stdout_sender = stdout_writer.sender();
 
@@ -341,6 +342,7 @@ fn spawn_session_thread(
                 shut_clone,
                 paused_flag,
                 pty_input,
+                child_start_tracker,
                 stdout_sender,
             );
         });
@@ -639,19 +641,28 @@ fn run_supervisor(config_path: Option<PathBuf>) {
         let _ = t.join();
     }
 
-    // Collect all active child PIDs from state
-    let active_pids: Vec<u32> = {
+    // Collect all active child PIDs and their start times from controls / state
+    let active_targets: Vec<(u32, Option<u64>)> = {
         let st = state.lock().unwrap_or_else(|e| e.into_inner());
-        st.sessions.values().filter_map(|s| s.pid).collect()
+        st.sessions
+            .iter()
+            .filter_map(|(name, s)| {
+                let pid = s.pid?;
+                let start_time = controls
+                    .get(name)
+                    .and_then(|c| {
+                        let ticks = c.child_start_tracker.load(Ordering::SeqCst);
+                        (ticks > 0).then_some(ticks)
+                    })
+                    .or_else(|| crate::core::job::get_process_start_time(pid));
+                Some((pid, start_time))
+            })
+            .collect()
     };
 
-    // Send SIGTERM to all child process groups
-    for &pid in &active_pids {
-        // Identity-verified: a session PID that was recorded in state but whose
-        // process has since exited and been reused by an unrelated process is
-        // never signalled (`start_time` is not persisted in session state, so
-        // the helper's cmdline-plausibility fallback guards the PID instead).
-        crate::orchestrate::pty::signal_process_group_if_target(pid, None, libc::SIGTERM);
+    // Send SIGTERM to all child process groups with process identity verification
+    for &(pid, start_time) in &active_targets {
+        crate::orchestrate::pty::signal_process_group_if_target(pid, start_time, libc::SIGTERM);
     }
 
     // Wait up to shutdown_grace_secs for threads to finish (bounded, never blocking indefinitely on join)
@@ -670,15 +681,36 @@ fn run_supervisor(config_path: Option<PathBuf>) {
     // Escalate with SIGKILL only to child processes still tracked as live in
     // session state after the grace window (processes reaped during
     // shutdown_grace cleared their `pid` in state and must not be signaled
-    // again, avoiding PID reuse hazards).
-    let tracked_pids: Vec<u32> = {
+    // again, avoiding PID reuse hazards). Re-verify process identity immediately
+    // before signaling.
+    let tracked_targets: Vec<(u32, Option<u64>)> = {
         let st = state.lock().unwrap_or_else(|e| e.into_inner());
-        st.sessions.values().filter_map(|s| s.pid).collect()
+        st.sessions
+            .iter()
+            .filter_map(|(name, s)| {
+                let pid = s.pid?;
+                let start_time = controls
+                    .get(name)
+                    .and_then(|c| {
+                        let ticks = c.child_start_tracker.load(Ordering::SeqCst);
+                        (ticks > 0).then_some(ticks)
+                    })
+                    .or_else(|| {
+                        active_targets
+                            .iter()
+                            .find(|(p, _)| *p == pid)
+                            .and_then(|(_, st)| *st)
+                    });
+                Some((pid, start_time))
+            })
+            .collect()
     };
 
-    for &pid in &tracked_pids {
-        crate::orchestrate::pty::signal_process_group_if_target(pid, None, libc::SIGKILL);
+    for &(pid, start_time) in &tracked_targets {
+        crate::orchestrate::pty::signal_process_group_if_target(pid, start_time, libc::SIGKILL);
     }
+
+    let tracked_pids: Vec<u32> = tracked_targets.iter().map(|(p, _)| *p).collect();
 
     // Fix #7: Reap only tracked child processes (never waitpid(-1) because session
     // threads may still be running and own their own children).

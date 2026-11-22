@@ -97,9 +97,20 @@ The kill/control path signals only after a PID sanity check: the process must
 be alive, its documented start time must match, and its `/proc` command line or
 executable must look like a launch target of the job's engine (`agy`, the
 `claude` harness), the always-on `sandbox-exec` wrapper, or the
-`agent-run`/`kubeadp-agent` launcher. A recycled or unrelated PID is never
-signalled, and a finished job whose PID was recycled reports not-running
-(exit `0`), never `killed`.
+`agent-run`/`kubeadp-agent` launcher. This identity check is re-performed
+immediately before every signal, including before escalating to SIGKILL. A
+recycled or unrelated PID is never signalled, and a finished job whose PID was
+recycled reports not-running (exit `0`), never `killed`.
+
+### 2.1.1 Zombie Reaper and Subreaper
+The in-server zombie reaper (`core/reaper.rs`) runs as a detached background
+thread in the worker daemon only when running as PID 1 (`is_pid1()`), calling
+`reap_round()` every 100 ms to reap orphaned background children (`[sleep] <defunct>`).
+In non-PID 1 environments (local test suites, nested wrappers, developer machines)
+the background reaper thread is NOT started, preventing background `waitpid(-1)`
+drain loops from racing test runners and stealing child exit statuses (`ECHILD`).
+Every job monitor explicitly calls `mark_child_subreaper()` (`PR_SET_CHILD_SUBREAPER`)
+so orphaned grandchildren reparent to the server/subreaper rather than an external init.
 
 ### 2.2 Job record
 One row per job in the `jobs` table (§2.3); `created_at` stores integer epoch
@@ -479,8 +490,10 @@ load: negative, non-finite or values above `MAX_DURATION_SECS` (30 days) rejecte
 - Every session process-group kill is identity-verified: the recorded
   `/proc/<pid>/stat` start ticks (recorded at spawn) must still match the PID's
   current start ticks, so a recycled PID now held by an unrelated process is
-  never signalled (the same guarantee the job kill path of §2.1 gives). See
-  `pty::is_same_process` / `pty::signal_process_group_if_target`.
+  never signalled (the same guarantee the job kill path of §2.1 gives). This
+  identity check is re-verified immediately before every signal on both the
+  session loop and supervisor shutdown paths. See `pty::is_same_process` /
+  `pty::signal_process_group_if_target`.
 - An unusable/corrupt transcript is quarantined (`quarantine_corrupt_session_file`)
   and the session starts fresh; a missing transcript resumes.
 - Only the `resume-not-found` error class is quarantined after
@@ -1114,6 +1127,8 @@ A request that names no recipient (`GET /tasks`, `GET /a2a/agents`) needs 1 and
 | message text before framing | `MESSAGE_MAX_BYTES` = 8192 bytes | rejected (`INVALID_PARAMS`), never truncated |
 | queue per recipient | `MAX_QUEUED_MSGS` = 8 messages and `MAX_QUEUED_BYTES` = 8 KiB of text | oldest queued message dropped (`state = dropped`), one durable drop note injected with the next delivery |
 | rate per (sender, recipient) | token bucket: capacity 5, refill 1 per 6 s (10 per minute) | `429` + `Retry-After`, `code:"rate_limited"` |
+| tracked rate limit buckets | `MAX_RATE_BUCKETS` = 10,000 | oldest entry evicted on capacity overflow |
+| hop guard tracked jobsets | `MAX_JOBSET_STATES` = 10,000 | oldest entry evicted on capacity overflow |
 | hop | `MAX_HOP` = 4 | rejected (`INVALID_PARAMS`, `code:"hop_limit"`) |
 | queued lifetime | `a2a_inbox_ttl_secs`, default 3600 | `state = expired`, sender task fails (§7.10) |
 | interrupt step per job | `a2a_interrupt_min_secs`, default 20 (`0` off) | interrupt refused, message stays queued |

@@ -479,12 +479,16 @@ fn sender_recipient_allow(
 mod rlimits {
     use std::collections::HashMap;
 
+    /// Maximum number of tracked (sender, recipient) rate limit buckets.
+    /// Documented in SPEC §7.6.
+    pub const MAX_RATE_BUCKETS: usize = 10_000;
+
     /// A per-(sender, recipient) token bucket: capacity `capacity` tokens,
     /// refilled `1` every `refill_secs`.
     pub struct Buckets {
         capacity: u64,
         refill_secs: u64,
-        last: HashMap<(String, String), (u64, u64)>,
+        pub(crate) last: HashMap<(String, String), (u64, u64)>,
     }
 
     impl Buckets {
@@ -514,11 +518,26 @@ mod rlimits {
                     .refill_secs
                     .saturating_sub(elapsed % self.refill_secs)
                     .max(1);
-                self.last.insert(key, (tokens, since));
+                self.insert_bounded(key, (tokens, since));
                 return Some(retry_after);
             }
-            self.last.insert(key, (tokens - 1, since));
+            self.insert_bounded(key, (tokens - 1, since));
             None
+        }
+
+        pub(crate) fn insert_bounded(&mut self, key: (String, String), val: (u64, u64)) {
+            if self.last.len() >= MAX_RATE_BUCKETS && !self.last.contains_key(&key) {
+                // Evict the entry with the oldest `since` timestamp
+                if let Some(oldest_key) = self
+                    .last
+                    .iter()
+                    .min_by_key(|(_, (_, since))| *since)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.last.remove(&oldest_key);
+                }
+            }
+            self.last.insert(key, val);
         }
     }
 }
@@ -1211,4 +1230,52 @@ pub(crate) fn unauthenticated_response() -> Response {
         Json(body),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rlimits::{Buckets, MAX_RATE_BUCKETS};
+
+    #[test]
+    fn test_buckets_evict_oldest_on_capacity_overflow() {
+        let mut buckets = Buckets::new(5, 6);
+        // Pre-fill up to MAX_RATE_BUCKETS
+        for i in 0..MAX_RATE_BUCKETS {
+            let sender = format!("sender-{i}");
+            let recipient = format!("recipient-{i}");
+            let key = (sender, recipient);
+            // older since timestamps for smaller i
+            buckets.insert_bounded(key, (5, 1000 + i as u64));
+        }
+
+        assert_eq!(buckets.last.len(), MAX_RATE_BUCKETS);
+        assert!(buckets
+            .last
+            .contains_key(&("sender-0".to_string(), "recipient-0".to_string())));
+
+        // Next insert to a new key must evict the oldest key ("sender-0", "recipient-0")
+        let new_key = (
+            "sender-overflow".to_string(),
+            "recipient-overflow".to_string(),
+        );
+        buckets.insert_bounded(new_key.clone(), (5, 200_000));
+
+        assert_eq!(buckets.last.len(), MAX_RATE_BUCKETS);
+        assert!(
+            !buckets
+                .last
+                .contains_key(&("sender-0".to_string(), "recipient-0".to_string())),
+            "oldest bucket must be evicted"
+        );
+        assert!(
+            buckets.last.contains_key(&new_key),
+            "new key must be present"
+        );
+        assert!(
+            buckets
+                .last
+                .contains_key(&("sender-1".to_string(), "recipient-1".to_string())),
+            "newer keys must remain"
+        );
+    }
 }

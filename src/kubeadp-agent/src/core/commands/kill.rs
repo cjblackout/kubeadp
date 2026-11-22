@@ -370,8 +370,9 @@ pub fn terminate_process_to(
     }
 
     if !terminated {
-        // Re-verify process identity before escalating to SIGKILL:
-        // if the PID no longer refers to the target process, it has already terminated.
+        // Re-verify process identity immediately before escalating to SIGKILL:
+        // if the PID no longer refers to the target process, it has already terminated
+        // and may have been reused by an unrelated process.
         if identity.is_still_target(config) {
             if let Some(expected_retry) = expected_retry_count {
                 let current_meta = JobMetadata::load(&config.state_root, job_id)
@@ -390,6 +391,13 @@ pub fn terminate_process_to(
                         current_meta.retry_count
                     );
                 }
+            }
+
+            // Immediately before sending the escalated SIGKILL signal, re-verify
+            // process identity so a process that exited right at grace period expiry
+            // and had its PID reused is never killed.
+            if !identity.is_still_target(config) {
+                return Ok(());
             }
 
             emit(

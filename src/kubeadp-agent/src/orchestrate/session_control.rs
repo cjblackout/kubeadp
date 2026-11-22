@@ -9,7 +9,7 @@
 //! map itself is behind a mutex.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::orchestrate::config::SessionConfig;
@@ -32,6 +32,9 @@ pub struct SessionControl {
     /// API writes messages into it; a stale slot left behind by a dead thread
     /// is reclaimed on the next respawn.
     pub pty_input: Arc<Mutex<PtyInput>>,
+    /// Anchor tracking the child's start ticks (`/proc/<pid>/stat` start time).
+    /// Used during graceful shutdown and restarts to verify identity before signaling.
+    pub child_start_tracker: Arc<AtomicU64>,
 }
 
 impl SessionControl {
@@ -42,6 +45,7 @@ impl SessionControl {
             running: Arc::new(AtomicBool::new(false)),
             restart: Arc::new(AtomicBool::new(false)),
             pty_input: Arc::new(Mutex::new(PtyInput::new(-1))),
+            child_start_tracker: Arc::new(AtomicU64::new(0)),
         }
     }
 }

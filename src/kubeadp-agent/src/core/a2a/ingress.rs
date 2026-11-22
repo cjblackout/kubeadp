@@ -452,6 +452,10 @@ impl JobsetBudget {
     }
 }
 
+/// Maximum number of tracked jobsets in the hop guard in-memory state.
+/// Documented in SPEC §7.6.
+pub const MAX_JOBSET_STATES: usize = 10_000;
+
 /// Receiver-authoritative hop guard.
 ///
 /// State is in-memory only (bounded per jobset). All per-jobset state lives
@@ -471,6 +475,7 @@ pub struct HopGuard {
 struct JobsetState {
     seen: SeenQueue,
     budget: JobsetBudget,
+    last_admit_secs: u64,
 }
 
 impl HopGuard {
@@ -586,7 +591,18 @@ impl HopGuard {
     /// `BudgetExhausted` (429 + Retry-After).
     pub fn admit(&self, jobset: &str, message_id: &str, now: u64) -> Result<(), A2aReject> {
         let mut state = self.lock_state();
+        if state.len() >= MAX_JOBSET_STATES && !state.contains_key(jobset) {
+            // Evict the jobset with the oldest last_admit_secs
+            if let Some(oldest_key) = state
+                .iter()
+                .min_by_key(|(_, s)| s.last_admit_secs)
+                .map(|(k, _)| k.clone())
+            {
+                state.remove(&oldest_key);
+            }
+        }
         let js = state.entry(jobset.to_string()).or_default();
+        js.last_admit_secs = now;
 
         // Prune replay entries that have expired with their token.
         while let Some(&(_, exp)) = js.seen.front() {
@@ -1344,5 +1360,40 @@ mod tests {
         // The guard constructor applies the same validation.
         assert!(HopGuard::with_limits_config(0, 300, 4096, 60, 500).is_err());
         assert!(HopGuard::with_limits_config(4, 300, 4096, 60, 500).is_ok());
+    }
+
+    #[test]
+    fn test_hop_guard_evicts_oldest_jobset_on_overflow() {
+        let guard = HopGuard::new();
+        // Fill up to MAX_JOBSET_STATES with timestamps 100..
+        {
+            let mut state = guard.lock_state();
+            for i in 0..MAX_JOBSET_STATES {
+                state.insert(
+                    format!("js-{i}"),
+                    JobsetState {
+                        seen: std::collections::VecDeque::new(),
+                        budget: JobsetBudget::default(),
+                        last_admit_secs: 100 + i as u64,
+                    },
+                );
+            }
+            assert_eq!(state.len(), MAX_JOBSET_STATES);
+        }
+
+        // Admitting to a new jobset "js-overflow" triggers eviction of the oldest ("js-0")
+        assert!(guard.admit("js-overflow", "msg-1", 200_000).is_ok());
+
+        let state = guard.lock_state();
+        assert_eq!(state.len(), MAX_JOBSET_STATES);
+        assert!(
+            !state.contains_key("js-0"),
+            "oldest jobset js-0 must be evicted"
+        );
+        assert!(
+            state.contains_key("js-overflow"),
+            "new jobset must be present"
+        );
+        assert!(state.contains_key("js-1"), "newer jobsets must remain");
     }
 }

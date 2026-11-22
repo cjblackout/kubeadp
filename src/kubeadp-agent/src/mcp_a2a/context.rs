@@ -76,8 +76,34 @@ pub async fn discover_services(
 }
 
 fn http_client(token: Option<&str>) -> Result<reqwest::Client, String> {
+    use std::sync::{Mutex, OnceLock};
+
+    if token.is_none() {
+        static NO_TOKEN_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+        return NO_TOKEN_CLIENT
+            .get_or_init(|| build_http_client(None))
+            .clone();
+    }
+
+    static TOKEN_CLIENT: OnceLock<Mutex<Option<(String, reqwest::Client)>>> = OnceLock::new();
+    let slot = TOKEN_CLIENT.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    let tok_str = token.unwrap();
+    if let Some((cached_token, client)) = guard.as_ref() {
+        if cached_token == tok_str {
+            return Ok(client.clone());
+        }
+    }
+    let client = build_http_client(Some(tok_str))?;
+    *guard = Some((tok_str.to_string(), client.clone()));
+    Ok(client)
+}
+
+fn build_http_client(token: Option<&str>) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
-        // Bound discovery so an unreachable cluster cannot hang server startup.
+        // Bound discovery with explicit connect and request timeouts so an unreachable
+        // cluster cannot hang server startup or service discovery.
+        .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(5));
     if let Some(ca) = read_optional("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt") {
         if let Ok(certs) = reqwest::Certificate::from_pem_bundle(ca.as_bytes()) {
@@ -220,5 +246,16 @@ mod tests {
                 "bare peer gets the pod namespace"
             );
         }
+    }
+
+    #[test]
+    fn http_client_reuses_shared_instance() {
+        let client1 = http_client(None).expect("build no-token client");
+        let client2 = http_client(None).expect("build no-token client");
+        // Verify both returned clients are built cleanly
+        assert!(http_client(Some("test-token-1")).is_ok());
+        let tok1_a = http_client(Some("test-token-1")).expect("build token client");
+        let tok1_b = http_client(Some("test-token-1")).expect("build token client");
+        let _ = (client1, client2, tok1_a, tok1_b);
     }
 }

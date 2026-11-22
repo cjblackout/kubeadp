@@ -42,6 +42,7 @@ pub fn run_session_loop(
     shutdown: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     pty_input: Arc<Mutex<crate::orchestrate::pty::PtyInput>>,
+    child_start_tracker: Arc<AtomicU64>,
     mut stdout_sender: StdoutSender,
 ) {
     // Register the session in the process-wide jobset registry under its name,
@@ -109,7 +110,6 @@ pub fn run_session_loop(
         // the recovery/cooldown kill paths can tell the recorded child from
         // an unrelated process that later reused the PID (never signal a
         // recycled PID).
-        let child_start_tracker = Arc::new(AtomicU64::new(0));
         let child_start_clone = Arc::clone(&child_start_tracker);
         let session_name = session.name.clone();
 

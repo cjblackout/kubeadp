@@ -764,6 +764,7 @@ where
 
     let mut agents = HashMap::new();
     let http_client = reqwest::Client::builder()
+        .connect_timeout(A2A_CONNECT_TIMEOUT)
         .timeout(CARD_FETCH_TIMEOUT)
         .build()
         .ok();
