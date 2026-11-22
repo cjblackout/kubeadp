@@ -562,6 +562,18 @@ pub(crate) fn shared_peer_client() -> Result<reqwest::Client, String> {
 /// the ack window); a terminal/unknown target refuses the send (the tool
 /// error).
 fn delivery_of_response(resp: &SendMessageResponse) -> &'static str {
+    if let SendMessageResponse::Task(t) = resp {
+        if let Some(meta) = &t.metadata {
+            if let Some(d) = meta.get("delivery").and_then(|v| v.as_str()) {
+                return match d {
+                    "queued" => "queued",
+                    "claimed" => "claimed",
+                    "injected" => "injected",
+                    _ => "injected",
+                };
+            }
+        }
+    }
     let state = match resp {
         SendMessageResponse::Task(t) => {
             serde_json::to_value(&t.status.state).unwrap_or(serde_json::Value::Null)

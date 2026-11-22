@@ -761,6 +761,10 @@ async fn start_job(
             eprintln!("kubeadp-agent: warning: failed to persist jobset creator: {e}");
         }
         req.jobset_id = Some(caller.jobset_id.clone());
+    } else if req.jobset_id.is_some() {
+        // With the API bearer alone, specifying a jobset_id is refused: joining
+        // an existing jobset requires the creator proof (SPEC §5.2, §7.2.4).
+        return jobset_creator_required();
     }
     // HL-91 E3/E5: engine selection for this job with the documented
     // precedence -- request (`engine` in the body) > configured default
@@ -3861,5 +3865,35 @@ mod tests {
         }))
         .expect("parse StartRequest");
         assert_eq!(req.jobset_id, None);
+    }
+
+    #[tokio::test]
+    async fn start_job_with_bearer_and_jobset_id_returns_403_creator_required() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = router(
+            Arc::new(Config {
+                workspace_root: tmp.path().join("ws"),
+                state_root: tmp.path().join("state"),
+                agy_path: tmp.path().join("no-such-agy"),
+                claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+                ..Default::default()
+            }),
+            Arc::new(AuthManager::new()),
+        );
+
+        let res = app
+            .oneshot(post_json_request(
+                "/api/v1/jobs",
+                r#"{"project":"p","prompt":"hi","jobset_id":"js-123"}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let text = body_string(res.into_body()).await;
+        assert!(
+            text.contains("jobset_creator_required"),
+            "expected jobset_creator_required, got: {text}"
+        );
     }
 }

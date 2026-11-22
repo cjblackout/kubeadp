@@ -276,6 +276,13 @@ async fn sdk_client_send_message_delivers_to_sink() {
         a2a::SendMessageResponse::Task(t) => {
             assert_eq!(t.id, "sess-1");
             assert_eq!(t.status.state, TaskState::Working);
+            assert_eq!(
+                t.metadata
+                    .as_ref()
+                    .and_then(|m| m.get("delivery"))
+                    .and_then(|v| v.as_str()),
+                Some("injected")
+            );
         }
         a2a::SendMessageResponse::Message(_) => panic!("expected Task response"),
     }

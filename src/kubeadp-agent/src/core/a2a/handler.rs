@@ -238,6 +238,18 @@ impl RequestHandler for ServerRequestHandler {
         // Non-streaming delivery per A2A §7.4.2: return the (long-lived) task
         // in its current state; the session keeps running. The client then
         // observes terminal events via GetTask.
+        // SPEC §7.9, §7.14: populate metadata.delivery with "queued" or "injected".
+        let mut task = task;
+        let delivery = if task.status.state == a2a::TaskState::Submitted {
+            "queued"
+        } else {
+            "injected"
+        };
+        let meta = task
+            .metadata
+            .get_or_insert_with(std::collections::HashMap::new);
+        meta.insert("delivery".to_string(), serde_json::json!(delivery));
+
         Ok(SendMessageResponse::Task(task))
     }
 
