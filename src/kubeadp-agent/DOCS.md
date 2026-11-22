@@ -641,6 +641,7 @@ Network and authentication failures are logged without secrets and never delete 
 
 ### 7.1 Authentication Failures (HTTP 401 / 429)
 
+- **Inside an agent**: `agent-run` has no API token; it presents the agent's jobset identity from its credential file and may only start, read and control jobs of its own jobset (`403 job_not_controlled` otherwise; use full job ids).
 - **401 Unauthorized**: Ensure `Authorization: Bearer <token>` matches the contents of `KUBEADP_API_TOKEN_FILE`. Check that the token file is readable and non-empty.
 - **429 Too Many Requests**: Triggered when more than 10 failed authentication attempts occur within 60 seconds from a single IP address. Wait for the `Retry-After` duration before retrying.
 

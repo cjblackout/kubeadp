@@ -291,6 +291,16 @@ fn validate_grant_path(path: &Path, field: &str, session_name: &str) -> Result<(
             path.display()
         ));
     }
+    if crate::sandbox::policy::operator_token_file_path().as_deref() == Some(path) {
+        return Err(format!(
+            "Configuration error: field 'grants.{}' in session '{}' names the operator API \
+             token file '{}': no sandboxed agent may hold the API bearer (agents control \
+             their jobs with their jobset identity)",
+            field,
+            session_name,
+            path.display()
+        ));
+    }
     let s = path.to_string_lossy();
     if s == "/" || s == "/proc" || s.starts_with("/proc/") || s == "/dev" || s.starts_with("/dev/")
     {
@@ -721,6 +731,16 @@ pub fn resolve_base_config_from_sources(
 
 #[cfg(test)]
 mod tests {
+
+    /// A grant of the operator API token file is refused (SPEC §6.6).
+    #[test]
+    fn grant_of_the_operator_token_file_is_refused() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("KUBEADP_API_TOKEN_FILE", "/var/run/kubeadp/api-token");
+        let r = validate_grant_path(Path::new("/var/run/kubeadp/api-token"), "ro_paths", "s");
+        std::env::remove_var("KUBEADP_API_TOKEN_FILE");
+        assert!(r.unwrap_err().contains("API bearer"));
+    }
     use super::*;
 
     #[test]

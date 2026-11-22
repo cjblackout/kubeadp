@@ -759,6 +759,26 @@ accepted on an A2A route (§7.5).
   peer table bounded (1024, evicts one on overflow).
 - `/healthz`,`/readyz` never auth-gated; `/metrics` auth-gated.
 
+### 5.6.1 Job control by agents (jobset identity)
+An agent (a session) controls the jobs it started without the API bearer: it
+presents `X-Jobset-Id`, `X-Jobset-Secret`, `X-Agent-Id`, `X-Agent-Proof` (§7.3)
+instead of `Authorization`. `agent-run` inside an agent uses its credential file
+(§6.5) whenever no readable API token file exists.
+- The identity verifies statelessly from the root key (secret and member proof
+  at the jobset's epoch, base epoch for a jobset hosted elsewhere); an ended
+  jobset or a missing root key → `401`.
+- The first job start into a jobset records the presenting agent as its
+  creator (persisted in `jobsets.json`); an agent hosted by the pod itself (a
+  job) can never become a creator. Start always joins the caller's jobset (a
+  different `jobset_id` → `403 jobset_creator_required`).
+- Allowed: `GET /projects /info /models /quota /capabilities`, `POST|GET /jobs`
+  (list is filtered), `POST /jobs/wait`, `/jobs/{id}[/sub]` for every sub-route
+  except `repair`, `/runs/{id}/*`, `POST /jobsets/{own}/end`. Per-job routes
+  need the job to be a member of the presented jobset and the caller to be its
+  creator (`403 job_not_controlled`), with the full job id (no prefix). Every
+  other route (`gc`, `init`, `repair`, `auth*`, `remote-control*`, `/metrics`,
+  other jobsets) → `403 jobset_route_forbidden`.
+
 ### 5.7 Metrics
 `GET /metrics` (Prometheus text, auth-gated): `agent_process_uptime_seconds`,
 `agent_state{status="<label>"}` (jobs by status / sessions by state, grouped
@@ -920,12 +940,9 @@ derived from the root key.
   §6.9). Harness
   mounts are not grants, are allowed for workers, and never include a secret,
   the state store or another agent's paths.
-- **Transitional**: the API bearer file may be granted to a session as a
-  single read-only file for REST control (`agent-run` against `/api/v1`). It is
-  never needed and never accepted for messaging. The grant, and every code
-  path that reads the API bearer inside a sandbox, is removed as the last step
-  of the refactor (§13.4); from then on no sandboxed agent of any role can hold
-  the API bearer and a policy granting the token file is a validation error.
+- The API bearer file can never be granted: a grant naming it is dropped at
+  session load with a warning, and no sandboxed agent of any role holds the API
+  bearer (agents use §5.6.1).
 
 ### 6.7 Network modes
 - `host`/`shared`: agent retains the pod netns.
@@ -1723,9 +1740,8 @@ to stderr; `--once` exits 1 on any failure, 0 on success.
    a configured-but-unreadable token file is fatal.
 3. Failed bearer attempts throttled per peer (10 within 60 s → 429 +
    `Retry-After`); bounded peer table (1024).
-4. The token file is hidden from every sandboxed agent. Transitional: a
-   session may be granted it as a single read-only file for REST control until
-   the grant is removed (§6.6, §13.4). Jobs never hold it.
+4. The token file is hidden from every sandboxed agent and cannot be granted
+   (§6.6); agents control jobs with their jobset identity (§5.6.1).
 
 ### 10.2 Jobset credentials
 1. Secrets and member proofs are HMACs of the root key (§7.3), handed to an

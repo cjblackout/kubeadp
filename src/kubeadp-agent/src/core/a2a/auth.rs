@@ -52,10 +52,10 @@ pub const END_RETRY_ATTEMPTS: usize = 8;
 /// Header the sender of a jobset-authenticated request presents: its own agent
 /// id (SPEC §7.4). Verified against the derived member proof; any sender name
 /// inside the message body or metadata is ignored.
-pub const AGENT_ID_HEADER: &str = "X-Agent-Id";
+pub use crate::core::jobset::AGENT_ID_HEADER;
 /// Header the sender of a jobset-authenticated request presents: its derived
 /// member proof (SPEC §7.3/§7.4). Binds the sender's agent id to the jobset.
-pub const AGENT_PROOF_HEADER: &str = "X-Agent-Proof";
+pub use crate::core::jobset::AGENT_PROOF_HEADER;
 
 /// Largest `/message:send` body the auth layer reads to resolve the target (the
 /// server's own message cap is far below this).

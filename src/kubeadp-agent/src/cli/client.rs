@@ -195,6 +195,32 @@ fn bearer_token_middleware(
     move |req, next| next.handle(req.set("Authorization", &format!("Bearer {token}")))
 }
 
+/// ureq middleware stamping the jobset identity headers on every request.
+#[allow(clippy::result_large_err)]
+fn jobset_identity_middleware(
+    identity: (String, String, String, String),
+) -> impl Fn(ureq::Request, ureq::MiddlewareNext) -> Result<ureq::Response, ureq::Error> {
+    use crate::core::jobset::{
+        AGENT_ID_HEADER, AGENT_PROOF_HEADER, JOBSET_ID_HEADER, JOBSET_SECRET_HEADER,
+    };
+    move |req, next| {
+        next.handle(
+            req.set(JOBSET_ID_HEADER, &identity.0)
+                .set(JOBSET_SECRET_HEADER, &identity.1)
+                .set(AGENT_ID_HEADER, &identity.2)
+                .set(AGENT_PROOF_HEADER, &identity.3),
+        )
+    }
+}
+
+/// The jobset identity of the calling agent (jobset id, secret, agent id,
+/// member proof) from its credential file, when it has one.
+fn jobset_identity() -> Option<(String, String, String, String)> {
+    let entry = crate::core::jobset::credential_entry_from_env()?;
+    let (agent, proof) = crate::core::jobset::agent_identity_from_env()?;
+    Some((entry.jobset_id, entry.secret, agent, proof))
+}
+
 /// Build a ureq agent with timeouts appropriate for the given call type.
 ///
 /// `read_timeout` of `None` means "no read timeout" (unbounded); used for
@@ -216,6 +242,13 @@ fn build_agent(read_timeout: Option<Duration>) -> ureq::Agent {
     match resolve_api_token() {
         Ok(Some(token)) => {
             builder = builder.middleware(bearer_token_middleware(token));
+        }
+        // No usable operator token: an agent controls the jobs it started
+        // with its jobset identity (SPEC §5.6).
+        Ok(None) | Err(_) if jobset_identity().is_some() => {
+            builder = builder.middleware(jobset_identity_middleware(
+                jobset_identity().unwrap_or_default(),
+            ));
         }
         Ok(None) => {}
         Err(message) => {

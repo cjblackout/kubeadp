@@ -102,6 +102,16 @@ fn short_duration(secs: u64) -> String {
 }
 
 pub fn run(config: &Config, args: &ListArgs) -> Result<CommandOutput> {
+    run_filtered(config, args, &|_| true)
+}
+
+/// [`run`] restricted to the jobs `keep` accepts (the job-control API lists
+/// only the jobs a jobset-authenticated caller may control, SPEC §5.6).
+pub fn run_filtered(
+    config: &Config,
+    args: &ListArgs,
+    keep: &dyn Fn(&JobMetadata) -> bool,
+) -> Result<CommandOutput> {
     // An empty/blank --project value means "no filter" rather than
     // "match rows with project = ''" (which exists for no job and would
     // report an empty list even when jobs are present).
@@ -110,7 +120,10 @@ pub fn run(config: &Config, args: &ListArgs) -> Result<CommandOutput> {
         .as_deref()
         .map(str::trim)
         .filter(|p| !p.is_empty());
-    let jobs = list_jobs(&config.state_root, project_filter)?;
+    let jobs: Vec<JobMetadata> = list_jobs(&config.state_root, project_filter)?
+        .into_iter()
+        .filter(|job| keep(job))
+        .collect();
 
     // Compute each job's (live) status once: it drives both the --status
     // filter and the display (including the running-job stall markers).

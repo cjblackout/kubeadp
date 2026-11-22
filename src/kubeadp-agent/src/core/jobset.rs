@@ -66,6 +66,11 @@ use super::crypto;
 pub const JOBSET_ID_HEADER: &str = "X-Jobset-Id";
 /// Header carrying the presented jobset secret.
 pub const JOBSET_SECRET_HEADER: &str = "X-Jobset-Secret";
+/// Header a jobset-authenticated caller presents with its own agent id
+/// (SPEC §7.4); verified against the derived member proof.
+pub const AGENT_ID_HEADER: &str = "X-Agent-Id";
+/// Header carrying the caller's derived member proof (SPEC §7.3/§7.4).
+pub const AGENT_PROOF_HEADER: &str = "X-Agent-Proof";
 /// Environment variable the launcher sets: the jobset id the agent belongs to.
 pub const JOBSET_ID_ENV: &str = "KUBEADP_JOBSET_ID";
 /// Environment variable the launcher sets: the PATH of the 0400 credential file
@@ -487,6 +492,10 @@ pub struct JobsetRegistry {
     /// The data/state dir the persisted membership file lives under.
     /// `None` until [`init_global_jobsets`] runs (or a test sets it).
     data_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// Jobset id -> the agent that created it (the first agent that proved
+    /// its identity when starting a job into it). Only the creator may
+    /// control the jobs of its jobset through `/api/v1` (SPEC §5.6).
+    creators: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl JobsetRegistry {
@@ -583,6 +592,48 @@ impl JobsetRegistry {
     pub fn root_key(&self) -> Option<Arc<[u8]>> {
         let k = self.root_key.lock().unwrap_or_else(|e| e.into_inner());
         k.clone()
+    }
+
+    /// The creator of `jobset_id`, if one has been recorded.
+    pub fn creator_of(&self, jobset_id: &str) -> Option<String> {
+        let map = self.creators.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(jobset_id).cloned()
+    }
+
+    /// Records `agent_id` as the creator of `jobset_id` when none is recorded
+    /// yet. Returns whether `agent_id` is the creator afterwards.
+    pub fn claim_creator(&self, jobset_id: &str, agent_id: &str) -> bool {
+        let mut map = self.creators.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= MEMBERSHIP_MAX_ENTRIES && !map.contains_key(jobset_id) {
+            return false;
+        }
+        let creator = map
+            .entry(jobset_id.to_string())
+            .or_insert_with(|| agent_id.to_string());
+        creator == agent_id
+    }
+
+    /// A snapshot of the creators map (for persistence).
+    pub fn creators_snapshot(&self) -> HashMap<String, String> {
+        let map = self.creators.lock().unwrap_or_else(|e| e.into_inner());
+        map.clone()
+    }
+
+    /// Seeds the creators map from a loaded document (at startup).
+    pub fn seed_creators(&self, creators: HashMap<String, String>) {
+        let mut map = self.creators.lock().unwrap_or_else(|e| e.into_inner());
+        *map = creators;
+    }
+
+    /// The epoch this process holds for `jobset_id`: the highest epoch of a
+    /// live member, else the base epoch.
+    pub fn jobset_epoch(&self, jobset_id: &str) -> Epoch {
+        let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        map.values()
+            .filter(|e| e.jobset_id == jobset_id)
+            .map(|e| e.epoch)
+            .max()
+            .unwrap_or(EPOCH_ZERO)
     }
 
     /// Whether the jobset has been ended (its id is in the ended map).
@@ -1071,6 +1122,9 @@ pub struct MembershipDoc {
     /// ended jobset id -> the epoch it was ended at.
     #[serde(default)]
     pub ended: HashMap<String, u64>,
+    /// jobset id -> the agent id that created it.
+    #[serde(default)]
+    pub creators: HashMap<String, String>,
 }
 
 /// One persisted membership: the jobset id and the epoch (never a secret).
@@ -1122,6 +1176,7 @@ pub fn load_memberships(state_root: &std::path::Path) -> Result<(), String> {
         registry.note_jobset(jobset_id);
     }
     registry.seed_ended(doc.ended);
+    registry.seed_creators(doc.creators);
     Ok(())
 }
 
@@ -1150,6 +1205,7 @@ pub fn save_memberships_to(state_root: &std::path::Path) -> Result<(), String> {
     let mut doc = MembershipDoc {
         members: HashMap::new(),
         ended: registry.ended_snapshot(),
+        creators: registry.creators_snapshot(),
     };
 
     // Walk a snapshot of the entries (bounded).
@@ -1418,6 +1474,56 @@ pub fn verify_jobset_credential(
         // loses it, which the one-time warning at creation says).
         None => crypto::digest_eq(presented_secret.as_bytes(), entry.secret.as_bytes()),
     }
+}
+
+/// Verifies the identity an agent presents to the job-control API (SPEC §5.6):
+/// the jobset secret and the member proof of `agent_id`, both re-derived
+/// statelessly from the root key at the epoch this process holds for the
+/// jobset (the base epoch for a jobset hosted on another pod), compared in
+/// constant time. Fails closed without a root key and for an ended jobset.
+pub fn verify_agent_identity(
+    registry: &JobsetRegistry,
+    jobset_id: &str,
+    secret: &str,
+    agent_id: &str,
+    proof: &str,
+) -> bool {
+    if jobset_id.is_empty() || secret.is_empty() || agent_id.is_empty() || proof.is_empty() {
+        return false;
+    }
+    if registry.is_ended(jobset_id) {
+        return false;
+    }
+    let Some(root_key) = registry.root_key() else {
+        return false;
+    };
+    let epoch = registry.jobset_epoch(jobset_id);
+    let secret_ok = crypto::digest_eq(
+        secret.as_bytes(),
+        derive_jobset_secret(&root_key, jobset_id, epoch).as_bytes(),
+    );
+    let proof_ok = crypto::digest_eq(
+        proof.as_bytes(),
+        derive_member_proof(&root_key, jobset_id, epoch, agent_id).as_bytes(),
+    );
+    secret_ok && proof_ok
+}
+
+/// Whether `agent_id` (a verified identity of `jobset_id`) may control job
+/// `job_id` through `/api/v1`: the job is a member of the jobset and the agent
+/// is the jobset's creator. A member job can never control its peers.
+pub fn agent_controls_job(
+    registry: &JobsetRegistry,
+    jobset_id: &str,
+    agent_id: &str,
+    job_id: &str,
+) -> bool {
+    if registry.creator_of(jobset_id).as_deref() != Some(agent_id) {
+        return false;
+    }
+    registry
+        .get_or_remembered(job_id)
+        .is_some_and(|e| e.jobset_id == jobset_id)
 }
 
 /// The sandbox-policy side of handing a *new* agent its jobset: a clone of the

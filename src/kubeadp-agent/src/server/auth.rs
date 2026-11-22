@@ -212,6 +212,147 @@ fn problem_json(status: StatusCode, title: &str, code: &str) -> Response {
         .into_response()
 }
 
+/// The verified identity of a jobset-authenticated `/api/v1` caller (an agent
+/// controlling the jobs it started, SPEC §5.6). Inserted into the request
+/// extensions by [`BearerAuth`]; absent for a bearer-authenticated request.
+#[derive(Clone, Debug)]
+pub struct JobsetCaller {
+    pub jobset_id: String,
+    pub agent_id: String,
+}
+
+fn header_str(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// The credential headers of a request, when all four are present. Verification
+/// happens in [`authorize_caller`].
+fn caller_from_headers(headers: &axum::http::HeaderMap) -> Option<PresentedCaller> {
+    use crate::core::jobset::{
+        AGENT_ID_HEADER, AGENT_PROOF_HEADER, JOBSET_ID_HEADER, JOBSET_SECRET_HEADER,
+    };
+    Some(PresentedCaller {
+        caller: JobsetCaller {
+            jobset_id: header_str(headers, JOBSET_ID_HEADER)?,
+            agent_id: header_str(headers, AGENT_ID_HEADER)?,
+        },
+        secret: header_str(headers, JOBSET_SECRET_HEADER)?,
+        proof: header_str(headers, AGENT_PROOF_HEADER)?,
+    })
+}
+
+struct PresentedCaller {
+    caller: JobsetCaller,
+    secret: String,
+    proof: String,
+}
+
+/// Job-control sub-routes a jobset-authenticated caller may use on a job it
+/// controls (everything of `/jobs/{id}` except `repair`).
+const CALLER_JOB_SUBROUTES: &[&str] = &[
+    "",
+    "clean",
+    "kill",
+    "retry",
+    "commit",
+    "discard",
+    "export",
+    "review",
+    "log",
+    "diff",
+    "files",
+    "cat",
+    "result",
+    "events",
+    "interrupt",
+    "pause",
+    "message",
+    "compact",
+    "fork",
+    "revert",
+    "todo",
+    "permissions",
+];
+
+/// Authorizes a jobset-authenticated request (SPEC §5.6): the identity must
+/// verify (secret and member proof, not ended), and the route must be one of
+/// the job-control routes; per-job routes additionally need the job to be a
+/// member of the caller's jobset and the caller to be its creator. Routes that
+/// carry job ids in the body (`start`, `wait`) or filter their answer (`list`)
+/// are checked by their handlers through the [`JobsetCaller`] extension.
+/// Returns `(status, code)` on refusal; the caller is inserted by the layer.
+fn authorize_caller(
+    registry: &crate::core::jobset::JobsetRegistry,
+    presented: &PresentedCaller,
+    method: &axum::http::Method,
+    path: &str,
+) -> Result<(), (StatusCode, &'static str)> {
+    use axum::http::Method;
+    let caller = &presented.caller;
+    if !crate::core::jobset::verify_agent_identity(
+        registry,
+        &caller.jobset_id,
+        &presented.secret,
+        &caller.agent_id,
+        &presented.proof,
+    ) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let forbidden = (StatusCode::FORBIDDEN, "jobset_route_forbidden");
+    let Some(rest) = path.strip_prefix("/api/v1/") else {
+        return Err(forbidden);
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    let read = method == Method::GET;
+    match parts.as_slice() {
+        ["projects" | "info" | "models" | "quota" | "capabilities"] if read => Ok(()),
+        ["jobs"] if read || method == Method::POST => Ok(()),
+        ["jobs", "wait"] if method == Method::POST => Ok(()),
+        ["jobs", id, rest @ ..] if rest.len() <= 1 => {
+            let sub = rest.first().copied().unwrap_or("");
+            if !CALLER_JOB_SUBROUTES.contains(&sub) {
+                return Err(forbidden);
+            }
+            if crate::core::jobset::agent_controls_job(
+                registry,
+                &caller.jobset_id,
+                &caller.agent_id,
+                id,
+            ) {
+                Ok(())
+            } else {
+                Err((StatusCode::FORBIDDEN, "job_not_controlled"))
+            }
+        }
+        ["runs", id, _] => {
+            if crate::core::jobset::agent_controls_job(
+                registry,
+                &caller.jobset_id,
+                &caller.agent_id,
+                id,
+            ) {
+                Ok(())
+            } else {
+                Err((StatusCode::FORBIDDEN, "job_not_controlled"))
+            }
+        }
+        ["jobsets", id, "end"] if method == Method::POST => {
+            if *id == caller.jobset_id
+                && registry.creator_of(id).as_deref() == Some(caller.agent_id.as_str())
+            {
+                Ok(())
+            } else {
+                Err((StatusCode::FORBIDDEN, "job_not_controlled"))
+            }
+        }
+        _ => Err(forbidden),
+    }
+}
+
 /// A [`tower::Layer`] that guards a route group with the optional bearer
 /// token. See the module docs.
 #[derive(Clone)]
@@ -323,6 +464,40 @@ where
             return Box::pin(async move { inner.call(request).await });
         }
 
+        // No bearer presented: an agent may instead present its jobset
+        // identity (SPEC §5.6). A verified caller is confined to the job
+        // surface of its own jobset by `authorize_caller`.
+        if !request.headers().contains_key(header::AUTHORIZATION) {
+            if let Some(caller) = caller_from_headers(request.headers()) {
+                let verdict = authorize_caller(
+                    &crate::core::jobset::global_registry(),
+                    &caller,
+                    request.method(),
+                    request.uri().path(),
+                );
+                match verdict {
+                    Ok(()) => {
+                        let mut request = request;
+                        request.extensions_mut().insert(caller.caller);
+                        let mut inner = self.inner.clone();
+                        return Box::pin(async move { inner.call(request).await });
+                    }
+                    Err((status, code)) => {
+                        if status == StatusCode::UNAUTHORIZED {
+                            if let Some(throttle) = &throttle {
+                                throttle
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .record_failure(&peer, Instant::now());
+                            }
+                        }
+                        let response = problem_json(status, code, code);
+                        return Box::pin(async move { Ok(response) });
+                    }
+                }
+            }
+        }
+
         if let Some(throttle) = &throttle {
             throttle
                 .lock()
@@ -367,6 +542,83 @@ mod tests {
     async fn body_string(body: axum::body::Body) -> String {
         let bytes = body.collect().await.expect("body").to_bytes();
         String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    fn presented(root: &[u8], jobset: &str, agent: &str) -> PresentedCaller {
+        use crate::core::jobset::{derive_jobset_secret, derive_member_proof, EPOCH_ZERO};
+        PresentedCaller {
+            caller: JobsetCaller {
+                jobset_id: jobset.to_string(),
+                agent_id: agent.to_string(),
+            },
+            secret: derive_jobset_secret(root, jobset, EPOCH_ZERO),
+            proof: derive_member_proof(root, jobset, EPOCH_ZERO, agent),
+        }
+    }
+
+    /// A jobset identity controls exactly the jobs of its own jobset that it
+    /// created; a member job, another jobset and every operator route are refused.
+    #[test]
+    fn caller_authorization_is_confined_to_own_jobs() {
+        use crate::core::jobset::JobsetRegistry;
+        use axum::http::Method;
+        let root = vec![7u8; 32];
+        let reg = JobsetRegistry::new();
+        reg.set_root_key(Some(std::sync::Arc::from(root.clone().into_boxed_slice())));
+        reg.register_at("job-1", "js-a", "x", 0);
+        reg.register_at("job-2", "js-b", "x", 0);
+        assert!(reg.claim_creator("js-a", "sess"));
+
+        let own = presented(&root, "js-a", "sess");
+        let ok = |p: &PresentedCaller, m: Method, path: &str| authorize_caller(&reg, p, &m, path);
+        assert!(ok(&own, Method::GET, "/api/v1/jobs/job-1/log").is_ok());
+        assert!(ok(&own, Method::POST, "/api/v1/jobs/job-1/kill").is_ok());
+        assert!(ok(&own, Method::POST, "/api/v1/jobs").is_ok());
+        assert!(ok(&own, Method::GET, "/api/v1/runs/job-1/todo").is_ok());
+        assert!(ok(&own, Method::POST, "/api/v1/jobsets/js-a/end").is_ok());
+        // another jobset's job, a repair, operator routes
+        assert_eq!(
+            ok(&own, Method::GET, "/api/v1/jobs/job-2/log")
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(ok(&own, Method::POST, "/api/v1/jobs/job-1/repair").is_err());
+        assert!(ok(&own, Method::POST, "/api/v1/gc").is_err());
+        assert!(ok(&own, Method::POST, "/api/v1/jobs/repair").is_err());
+        assert!(ok(&own, Method::POST, "/api/v1/auth").is_err());
+        assert!(ok(&own, Method::POST, "/api/v1/jobsets/js-b/end").is_err());
+        assert!(ok(&own, Method::GET, "/metrics").is_err());
+        // a member job of the same jobset is not the creator
+        let member = presented(&root, "js-a", "job-1");
+        assert!(ok(&member, Method::GET, "/api/v1/jobs/job-1/log").is_err());
+        // a wrong secret or proof is a 401
+        let mut bad = presented(&root, "js-a", "sess");
+        bad.proof = "0".repeat(64);
+        assert_eq!(
+            ok(&bad, Method::GET, "/api/v1/jobs").unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+        // an ended jobset stops verifying
+        reg.end_jobset("js-a");
+        assert_eq!(
+            ok(&own, Method::GET, "/api/v1/jobs").unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// Without a root key no jobset identity verifies (fail closed).
+    #[test]
+    fn caller_without_root_key_is_refused() {
+        use axum::http::Method;
+        let reg = crate::core::jobset::JobsetRegistry::new();
+        let p = presented(&[7u8; 32], "js-a", "sess");
+        assert_eq!(
+            authorize_caller(&reg, &p, &Method::GET, "/api/v1/jobs")
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

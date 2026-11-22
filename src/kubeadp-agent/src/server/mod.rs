@@ -736,8 +736,32 @@ struct AuthCodeRequest {
 async fn start_job(
     State(config): State<AppState>,
     Extension(engines): Extension<Arc<EngineRegistry>>,
-    ApiJson(req): ApiJson<StartRequest>,
+    caller: Option<Extension<auth::JobsetCaller>>,
+    ApiJson(mut req): ApiJson<StartRequest>,
 ) -> Response {
+    // A jobset-authenticated caller (SPEC §5.6) starts jobs only into its own
+    // jobset, of which it must be (or become, on its first start) the creator.
+    if let Some(Extension(caller)) = &caller {
+        if req
+            .jobset_id
+            .as_deref()
+            .is_some_and(|id| id != caller.jobset_id)
+        {
+            return jobset_creator_required();
+        }
+        let registry = crate::core::jobset::global_registry();
+        // A job hosted here is a member, never a creator: it cannot claim a
+        // jobset by starting jobs into it.
+        if registry.get_or_remembered(&caller.agent_id).is_some()
+            || !registry.claim_creator(&caller.jobset_id, &caller.agent_id)
+        {
+            return jobset_creator_required();
+        }
+        if let Err(e) = crate::core::jobset::save_memberships() {
+            eprintln!("kubeadp-agent: warning: failed to persist jobset creator: {e}");
+        }
+        req.jobset_id = Some(caller.jobset_id.clone());
+    }
     // HL-91 E3/E5: engine selection for this job with the documented
     // precedence -- request (`engine` in the body) > configured default
     // (`default_engine` / `AGENT_RUN_DEFAULT_ENGINE`) > per-role default.
@@ -807,7 +831,11 @@ async fn info_cmd(State(config): State<AppState>, ApiQuery(_args): ApiQuery<Info
 /// `status` is a repeatable key (optionally comma-separated per value), which
 /// a struct-based extractor cannot fold into `Vec<String>`; see
 /// [`parse_list_query`].
-async fn list_jobs(State(config): State<AppState>, RawQuery(raw_query): RawQuery) -> Response {
+async fn list_jobs(
+    State(config): State<AppState>,
+    caller: Option<Extension<auth::JobsetCaller>>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
     let query = match parse_list_query(raw_query.as_deref()) {
         Ok(query) => query,
         // A malformed query is a client error: 400 with the parse message
@@ -826,10 +854,36 @@ async fn list_jobs(State(config): State<AppState>, RawQuery(raw_query): RawQuery
         engine: query.engine,
     };
     let config = Arc::clone(&config);
-    match run_blocking(move || commands::list::run(&config, &args)).await {
+    let caller = caller.map(|Extension(c)| c);
+    match run_blocking(move || {
+        commands::list::run_filtered(&config, &args, &|job| match &caller {
+            Some(c) => crate::core::jobset::agent_controls_job(
+                &crate::core::jobset::global_registry(),
+                &c.jobset_id,
+                &c.agent_id,
+                &job.job_id,
+            ),
+            None => true,
+        })
+    })
+    .await
+    {
         Ok(output) => Json(output).into_response(),
         Err(err) => error_to_response(err),
     }
+}
+
+/// `403 jobset_creator_required`: a jobset-authenticated start that does not
+/// prove the creator of the jobset it names (SPEC §5.2).
+fn jobset_creator_required() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "only the creator of a jobset can start jobs into it",
+            "code": "jobset_creator_required",
+        })),
+    )
+        .into_response()
 }
 
 /// `GET /api/v1/projects` -- projects.
@@ -1317,7 +1371,27 @@ async fn result_job(State(config): State<AppState>, ApiPath(job_id): ApiPath<Str
 /// `POST /api/v1/jobs/wait` -- one long request: the core blocks (500ms poll
 /// loop, deadline math via `gc::parse_duration_string`) until the wait
 /// condition is met or the timeout expires. Runs off the worker threads.
-async fn wait_jobs(State(config): State<AppState>, ApiJson(args): ApiJson<WaitArgs>) -> Response {
+async fn wait_jobs(
+    State(config): State<AppState>,
+    caller: Option<Extension<auth::JobsetCaller>>,
+    ApiJson(args): ApiJson<WaitArgs>,
+) -> Response {
+    if let Some(Extension(c)) = &caller {
+        let registry = crate::core::jobset::global_registry();
+        let all_controlled = args.job_ids.iter().all(|id| {
+            crate::core::jobset::agent_controls_job(&registry, &c.jobset_id, &c.agent_id, id)
+        });
+        if !all_controlled {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "a job is not controlled by this agent",
+                    "code": "job_not_controlled",
+                })),
+            )
+                .into_response();
+        }
+    }
     let config = Arc::clone(&config);
     match run_blocking(move || commands::wait::run(&config, &args)).await {
         Ok(output) => Json(output).into_response(),
