@@ -1145,4 +1145,101 @@ mod tests {
             PathBuf::from("/tmp/sess/homelab.md")
         );
     }
+
+    #[test]
+    fn test_instructions_hierarchy_full_lifecycle_and_invariants() {
+        let root = unique_temp_dir("hierarchy-invariants");
+        let home = root.join("home");
+        let work = root.join("repo-workdir");
+        std::fs::create_dir_all(&work).unwrap();
+        git_init(&work);
+
+        // Pre-create project's AGENTS.md in repo root
+        let repo_agents = work.join("AGENTS.md");
+        let original_repo_agents = "# User Project Docs\nDo not modify.\n";
+        std::fs::write(&repo_agents, original_repo_agents).unwrap();
+
+        // 1. Files exist -> global + per-session text materialised into witness files
+        let (outcome1, _log1) = materialize(
+            "claude",
+            &home,
+            &work,
+            Some((PathBuf::from("/global.md"), "GLOBAL-RULE\n".to_string())),
+            Some((PathBuf::from("/per.md"), "PER-RULE\n".to_string())),
+        );
+        assert_eq!(outcome1, MaterializeOutcome::Written);
+        let gfile = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
+        assert!(gfile.contains("GLOBAL-RULE"));
+        let pfile = std::fs::read_to_string(work.join("CLAUDE.md")).unwrap();
+        assert!(pfile.contains("PER-RULE"));
+        // Project's AGENTS.md is untouched
+        assert_eq!(
+            std::fs::read_to_string(&repo_agents).unwrap(),
+            original_repo_agents
+        );
+
+        // For agy: global + per-session text combined in ~/.gemini/config/AGENTS.md
+        let (outcome_agy, _log_agy) = materialize(
+            "agy",
+            &home,
+            &work,
+            Some((PathBuf::from("/global.md"), "GLOBAL-RULE\n".to_string())),
+            Some((PathBuf::from("/per.md"), "PER-RULE\n".to_string())),
+        );
+        assert_eq!(outcome_agy, MaterializeOutcome::Written);
+        let agy_agents = std::fs::read_to_string(home.join(".gemini/config/AGENTS.md")).unwrap();
+        assert!(agy_agents.contains("GLOBAL-RULE"));
+        assert!(agy_agents.contains("PER-RULE"));
+        assert_eq!(
+            std::fs::read_to_string(&repo_agents).unwrap(),
+            original_repo_agents
+        );
+
+        // 2. Files do not exist (None / Missing) -> no error, witness managed block removed/noop
+        let (outcome2, _log2) = materialize("claude", &home, &work, None, None);
+        assert_eq!(outcome2, MaterializeOutcome::Written); // removed previously written block
+        let pfile_after = std::fs::read_to_string(work.join("CLAUDE.md")).unwrap();
+        assert_eq!(pfile_after, "");
+        assert_eq!(
+            std::fs::read_to_string(&repo_agents).unwrap(),
+            original_repo_agents
+        );
+
+        // Missing file on read produces ReadOutcome::Missing (logged once as info line)
+        let missing_path = root.join("nonexistent.md");
+        assert_eq!(
+            read(&missing_path),
+            ReadOutcome::Missing(missing_path.clone())
+        );
+
+        // 3. Existing but unreadable file produces ReadOutcome::Unreadable (logged as error line)
+        let unreadable_dir = root.join("unreadable-dir.md");
+        std::fs::create_dir_all(&unreadable_dir).unwrap();
+        let unreadable_outcome = read(&unreadable_dir);
+        assert!(matches!(
+            unreadable_outcome,
+            ReadOutcome::Unreadable { ref path, ref reason } if *path == unreadable_dir && reason == "not a regular file"
+        ));
+
+        // 4. In agy job, verify repo workdir never gets CLAUDE.md created, repo AGENTS.md untouched
+        let agy_work = root.join("agy-work");
+        std::fs::create_dir_all(&agy_work).unwrap();
+        git_init(&agy_work);
+        let agy_repo_agents = agy_work.join("AGENTS.md");
+        std::fs::write(&agy_repo_agents, "# AGY Repo Docs\n").unwrap();
+        materialize(
+            "agy",
+            &home,
+            &agy_work,
+            Some((PathBuf::from("/global.md"), "RULE-A\n".to_string())),
+            Some((PathBuf::from("/per.md"), "RULE-B\n".to_string())),
+        );
+        assert!(!agy_work.join("CLAUDE.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(&agy_repo_agents).unwrap(),
+            "# AGY Repo Docs\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
