@@ -808,6 +808,70 @@ impl Engine for EmulatingEngine {
     fn capabilities(&self) -> CapabilityTable {
         self.table()
     }
+
+    fn display_name(&self) -> &str {
+        self.inner.display_name()
+    }
+
+    fn normalize_prompt(&self, prompt: &str, job_id: &str, retry_count: u32) -> String {
+        self.inner.normalize_prompt(prompt, job_id, retry_count)
+    }
+
+    fn configured_program(&self, config: &crate::core::config::Config) -> PathBuf {
+        self.inner.configured_program(config)
+    }
+
+    fn prepare_session(
+        &self,
+        session: &crate::engine::SessionDef,
+        cfg_path: &std::path::Path,
+        settings_path: &std::path::Path,
+    ) -> Result<(), String> {
+        self.inner.prepare_session(session, cfg_path, settings_path)
+    }
+
+    fn readiness(
+        &self,
+        session: &crate::engine::SessionDef,
+        poll_interval: std::time::Duration,
+        shutdown: &std::sync::atomic::AtomicBool,
+        paused: &std::sync::atomic::AtomicBool,
+    ) -> (bool, String) {
+        self.inner
+            .readiness(session, poll_interval, shutdown, paused)
+    }
+
+    fn session_file(
+        &self,
+        supervisor_config: &crate::orchestrate::config::SupervisorConfig,
+        session: &crate::engine::SessionDef,
+    ) -> PathBuf {
+        self.inner.session_file(supervisor_config, session)
+    }
+
+    fn has_session_transcript(&self) -> bool {
+        self.inner.has_session_transcript()
+    }
+
+    fn supports_legacy_memory_file(&self) -> bool {
+        self.inner.supports_legacy_memory_file()
+    }
+
+    fn frame_pty_message(&self, payload: &[u8]) -> Vec<u8> {
+        self.inner.frame_pty_message(payload)
+    }
+
+    fn materialize_instructions(
+        &self,
+        home: &std::path::Path,
+        workdir: &std::path::Path,
+        global_text: Option<(PathBuf, String)>,
+        per_session_text: Option<(PathBuf, String)>,
+        log: &mut Vec<String>,
+    ) -> bool {
+        self.inner
+            .materialize_instructions(home, workdir, global_text, per_session_text, log)
+    }
 }
 
 fn find_state_root(run: &Run) -> Option<PathBuf> {

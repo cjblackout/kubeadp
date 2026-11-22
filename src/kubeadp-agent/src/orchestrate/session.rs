@@ -1,5 +1,4 @@
 use crate::orchestrate::backoff::{BackoffManager, CrashWindowTracker, SlideWindowBackoff};
-use crate::orchestrate::claude_config::ensure_claude_config;
 use crate::orchestrate::config::{warn_if_symlink_workdir, SessionConfig, SupervisorConfig};
 use crate::orchestrate::logging::log_event;
 use crate::orchestrate::pty::{
@@ -555,41 +554,44 @@ fn run_session_iteration(
                 .ok()
                 .and_then(|c| c.default_session_engine)
         });
-    let engine = session.effective_engine(default_session_engine.as_deref());
+    let core_config = crate::core::config::Config::load().unwrap_or_default();
+    let registry = crate::engine::EngineRegistry::with_builtin(&core_config);
+    let eng = match registry.resolve(
+        crate::engine::RunKind::Session,
+        session.engine.as_deref(),
+        default_session_engine.as_deref(),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            log_event(
+                &session.name,
+                &format!("failed to resolve session engine: {}", e),
+            );
+            handle_spawn_error(
+                &ctx,
+                swb,
+                crash_tracker,
+                restart_count,
+                format!("engine-resolve-error: {}", e),
+            );
+            return true;
+        }
+    };
+    let engine = eng.id();
 
     // 1. Engine-specific setup. claude needs its headless configuration
     // (onboarding/trust/dangerous-mode), the A2A hook settings, the
     // per-project CLAUDE.md and the transcript machinery; an agy session
     // needs none of those (its prompts travel as stream-json lines, and A2A
     // delivery uses the typed user events below).
-    if engine == "agy" {
-        // (nothing to configure for agy: no claude config, no CLAUDE.md, no
-        // cjson transcript; the sandbox still applies below)
-    } else {
-        // 1. Ensure Claude configuration (onboarding, trust, dangerous mode bypass)
-        if let Err(e) = ensure_claude_config(cfg_path, settings_path, &[&session.workdir]) {
-            log_event(
-                &session.name,
-                &format!("Failed to update Claude configuration: {}", e),
-            );
-        }
-
-        // 1b. Merge the A2A hooks into the session settings (design HL-113
-        // §7.14, phase 2): PostToolUse / UserPromptSubmit / Stop pointing at
-        // `kubeadp-agent a2a-hook`, so the hook channel injects queued messages
-        // at the next tool call / prompt / turn boundary. Existing hook entries
-        // are kept; the merge is idempotent. FAIL-OPEN: on error, log and start
-        // the session without the hooks (the ladder's escalation steps still
-        // deliver).
-        if let Err(e) = crate::orchestrate::claude_config::ensure_a2a_hooks(settings_path) {
-            log_event(
-                &session.name,
-                &format!("Failed to merge the a2a hook settings: {}", e),
-            );
-        }
+    if let Err(e) = eng.prepare_session(session, cfg_path, settings_path) {
+        log_event(
+            &session.name,
+            &format!("Failed to prepare session configuration: {}", e),
+        );
     }
 
-    // 2. Wait until Claude is installed and logged in
+    // 2. Wait until engine is installed and ready
     {
         let mut st = shared_state.lock().unwrap_or_else(|e| e.into_inner());
         let sess_st = st
@@ -600,30 +602,17 @@ fn run_session_iteration(
             // A session state created before engine selection (or by a path
             // that did not seed it) records the effective engine so the API
             // reports it and a restart keeps the engine stable (HL-91 E5).
-            sess_st.engine = Some(session.effective_engine(default_session_engine.as_deref()));
+            sess_st.engine = Some(engine.clone());
         }
         sess_st.status = SessionStatus::Starting;
     }
 
-    let (ready, health_reason) = if engine == "agy" {
-        // An agy session needs no login gate: agy runs headless in stream-json
-        // mode. Readiness = the binary resolves and answers `--version`.
-        crate::orchestrate::readiness::binary_ready(
-            &session.agy_binary,
-            &session.env,
-            Duration::from_secs_f64(session.readiness_poll_secs),
-            shutdown,
-        )
-    } else {
-        crate::orchestrate::readiness::wait_until_ready_with_pause(
-            &session.claude_binary,
-            &session.env,
-            &session.name,
-            Duration::from_secs_f64(session.readiness_poll_secs),
-            shutdown,
-            paused,
-        )
-    };
+    let (ready, health_reason) = eng.readiness(
+        session,
+        Duration::from_secs_f64(session.readiness_poll_secs),
+        shutdown,
+        paused,
+    );
 
     {
         let mut st = shared_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -710,7 +699,7 @@ fn run_session_iteration(
                     &format!(
                         "instructions: per-session file {} not present{}",
                         path.display(),
-                        if engine == "claude" && session.memory_file.is_some() {
+                        if eng.supports_legacy_memory_file() && session.memory_file.is_some() {
                             "; falling back to the legacy memory_file"
                         } else {
                             "; continuing without it"
@@ -741,7 +730,7 @@ fn run_session_iteration(
             // precedence over legacy memory_file when present.
             if per_session.is_some() {
                 per_session
-            } else if engine == "claude" {
+            } else if eng.supports_legacy_memory_file() {
                 session.memory_file.as_ref().and_then(|mf| {
                     match instructions::read(mf) {
                         ReadOutcome::Content { path, text } => Some((path, text)),
@@ -781,12 +770,8 @@ fn run_session_iteration(
     // 3. Check session transcript validity (fix #2: new policy). Claude-only:
     // agy sessions have no ~/.claude transcript; `resolve_session_file` and
     // the quarantine/resume logic are claude-specific.
-    let session_file = if engine == "agy" {
-        std::path::PathBuf::new()
-    } else {
-        supervisor_config.resolve_session_file(session)
-    };
-    if engine != "agy" {
+    let session_file = eng.session_file(supervisor_config, session);
+    if eng.has_session_transcript() {
         match classify_transcript(&session_file) {
             TranscriptStatus::Unusable => {
                 // Empty / garbage file: quarantine and start fresh.
@@ -819,30 +804,6 @@ fn run_session_iteration(
     let is_resume = *force_resume || session_file.exists();
 
     // 4. Build command arguments using the resolved engine's session_command (design B2).
-    let core_config = crate::core::config::Config::load().unwrap_or_default();
-    let registry = crate::engine::EngineRegistry::with_builtin(&core_config);
-    let eng = match registry.resolve(
-        crate::engine::RunKind::Session,
-        session.engine.as_deref(),
-        default_session_engine.as_deref(),
-    ) {
-        Ok(e) => e,
-        Err(e) => {
-            log_event(
-                &session.name,
-                &format!("failed to resolve session engine: {}", e),
-            );
-            handle_spawn_error(
-                &ctx,
-                swb,
-                crash_tracker,
-                restart_count,
-                format!("engine-resolve-error: {}", e),
-            );
-            return true;
-        }
-    };
-
     let resume_mode = if is_resume {
         crate::engine::ResumeMode::Resume
     } else {
@@ -1426,7 +1387,7 @@ fn run_session_iteration(
     // resumes a claude transcript (its conversation lives in agy's own store,
     // keyed by `--conversation`), so the `already in use` switch and the
     // fast-resume quarantine do not apply.
-    if engine != "agy" {
+    if eng.has_session_transcript() {
         if !is_resume && uptime <= 15.0 && !*force_resume && tail_str.contains("already in use") {
             log_event(
                 &session.name,

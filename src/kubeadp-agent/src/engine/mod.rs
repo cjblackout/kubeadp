@@ -126,12 +126,39 @@ pub struct LaunchPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnInput<'a> {
     /// Initial start turn with prompt.
-    Start { prompt: &'a str },
-    /// Resumed/retry turn with prompt and optional conversation identifier.
+    Start { prompt: &'a str, live: bool },
+    /// Resumed/retry turn with prompt, optional conversation identifier, and live mode flag.
     Resume {
         prompt: &'a str,
         conversation: Option<&'a str>,
+        live: bool,
     },
+}
+
+impl<'a> TurnInput<'a> {
+    /// Convenience helper returning the prompt text for this turn.
+    pub fn prompt(&self) -> &'a str {
+        match self {
+            TurnInput::Start { prompt, .. } => prompt,
+            TurnInput::Resume { prompt, .. } => prompt,
+        }
+    }
+
+    /// Convenience helper returning whether live stdin mode was requested.
+    pub fn is_live(&self) -> bool {
+        match self {
+            TurnInput::Start { live, .. } => *live,
+            TurnInput::Resume { live, .. } => *live,
+        }
+    }
+
+    /// Convenience helper returning the resume conversation identifier, if any.
+    pub fn conversation(&self) -> Option<&'a str> {
+        match self {
+            TurnInput::Start { .. } => None,
+            TurnInput::Resume { conversation, .. } => *conversation,
+        }
+    }
 }
 
 /// Resume mode for [`Engine::session_command`].
@@ -270,6 +297,92 @@ pub trait Engine: Send + Sync {
 
     /// The engine's capability report (see [`capability`]).
     fn capabilities(&self) -> CapabilityTable;
+
+    // ---- engine identity and normalization -------------------------------
+
+    /// User-facing display name of the engine (defaults to `id()`).
+    fn display_name(&self) -> &str {
+        "engine"
+    }
+
+    /// Normalizes a prompt before execution (e.g. adding reference tags or normalizing retries).
+    /// Default: identity.
+    fn normalize_prompt(&self, prompt: &str, _job_id: &str, _retry_count: u32) -> String {
+        prompt.to_string()
+    }
+
+    /// Returns the engine's configured program binary path from `Config`.
+    fn configured_program(&self, config: &crate::core::config::Config) -> PathBuf {
+        config.agy_path.clone()
+    }
+
+    // ---- session lifecycle and inspection --------------------------------
+
+    /// Performs engine-specific session directory and configuration preparation.
+    fn prepare_session(
+        &self,
+        _session: &SessionDef,
+        _cfg_path: &std::path::Path,
+        _settings_path: &std::path::Path,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Performs engine-specific readiness checks for a session.
+    fn readiness(
+        &self,
+        session: &SessionDef,
+        poll_interval: std::time::Duration,
+        shutdown: &std::sync::atomic::AtomicBool,
+        _paused: &std::sync::atomic::AtomicBool,
+    ) -> (bool, String) {
+        crate::orchestrate::readiness::binary_ready(
+            &session.agy_binary,
+            &session.env,
+            poll_interval,
+            shutdown,
+        )
+    }
+
+    /// Resolves the transcript/session file path for a session, if supported by the engine.
+    fn session_file(
+        &self,
+        _supervisor_config: &crate::orchestrate::config::SupervisorConfig,
+        _session: &SessionDef,
+    ) -> PathBuf {
+        PathBuf::new()
+    }
+
+    /// Whether this engine has session transcripts tracked and managed by the supervisor.
+    fn has_session_transcript(&self) -> bool {
+        false
+    }
+
+    /// Whether this engine supports falling back to the legacy `memory_file` when `instructions_file` is absent.
+    fn supports_legacy_memory_file(&self) -> bool {
+        false
+    }
+
+    /// Encodes a user message into the byte sequence expected on the session's PTY input channel.
+    fn frame_pty_message(&self, payload: &[u8]) -> Vec<u8> {
+        let line = crate::core::a2a_live::frame_user_line(&String::from_utf8_lossy(payload));
+        let mut frame = Vec::with_capacity(line.len() + 1);
+        frame.extend_from_slice(line.as_bytes());
+        frame.push(b'\r');
+        frame
+    }
+
+    /// Materialises instruction files into the engine's witness file(s).
+    fn materialize_instructions(
+        &self,
+        home: &std::path::Path,
+        _workdir: &std::path::Path,
+        global_text: Option<(PathBuf, String)>,
+        per_session_text: Option<(PathBuf, String)>,
+        log: &mut Vec<String>,
+    ) -> bool {
+        crate::core::instructions::materialize_agy(home, global_text, per_session_text, log)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -691,5 +804,62 @@ mod tests {
                 "expected Unsupported('{key}'), got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn engine_trait_parity_unit_tests() {
+        let config = crate::core::config::Config {
+            agy_path: PathBuf::from("/bin/custom-agy"),
+            claude_path: PathBuf::from("/bin/custom-claude"),
+            ..Default::default()
+        };
+        let agy = AgyEngine::new(std::sync::Arc::new(config.clone()));
+        let claude = crate::engine::claude::ClaudeEngine::new(config.claude_path.clone(), None);
+
+        // 1. Display name
+        assert_eq!(agy.display_name(), "agy");
+        assert_eq!(claude.display_name(), "claude");
+
+        // 2. Normalization
+        let raw_prompt = "Fix bug";
+        let norm_agy = agy.normalize_prompt(raw_prompt, "job-1", 1);
+        assert!(norm_agy.contains("[agent-run ref job-1#1]"));
+        let norm_claude = claude.normalize_prompt(raw_prompt, "job-1", 1);
+        assert_eq!(norm_claude, raw_prompt);
+
+        // 3. Configured program
+        assert_eq!(
+            agy.configured_program(&config),
+            PathBuf::from("/bin/custom-agy")
+        );
+        assert_eq!(
+            claude.configured_program(&config),
+            PathBuf::from("/bin/custom-claude")
+        );
+
+        // 4. Session transcript tracking
+        assert!(!agy.has_session_transcript());
+        assert!(claude.has_session_transcript());
+
+        // 5. Legacy memory_file support
+        assert!(!agy.supports_legacy_memory_file());
+        assert!(claude.supports_legacy_memory_file());
+
+        // 6. PTY framing
+        let msg = b"hello agent";
+        let agy_frame = agy.frame_pty_message(msg);
+        let agy_expected = format!(
+            "{}\r",
+            crate::core::a2a_live::frame_user_line("hello agent")
+        );
+        assert_eq!(agy_frame, agy_expected.as_bytes());
+
+        let claude_frame = claude.frame_pty_message(msg);
+        let mut claude_expected = Vec::new();
+        claude_expected.extend_from_slice(crate::server::sessions::PASTE_START);
+        claude_expected.extend_from_slice(msg);
+        claude_expected.extend_from_slice(crate::server::sessions::PASTE_END);
+        claude_expected.push(b'\r');
+        assert_eq!(claude_frame, claude_expected);
     }
 }

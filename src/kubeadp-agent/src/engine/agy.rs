@@ -36,6 +36,7 @@ use crate::engine::{
     Engine, EngineCtx, EngineError, JobSpec, LaunchPlan, ResumeMode, SessionDef, SessionSpec,
     StdinMode, TurnInput,
 };
+use std::path::PathBuf;
 
 /// The stable agy engine id (the value `config`/request `engine` bodies and
 /// the capability tables carry).
@@ -310,9 +311,10 @@ impl Engine for AgyEngine {
         job: &JobMetadata,
         turn: TurnInput<'_>,
     ) -> Result<LaunchPlan, EngineError> {
-        let live = self.config.a2a_live_stdin
-            && (crate::core::jobset::host_jobset().is_some()
-                || crate::core::a2a_live::live_member(&self.config.state_root, &job.job_id));
+        let live = turn.is_live()
+            || (self.config.a2a_live_stdin
+                && (crate::core::jobset::host_jobset().is_some()
+                    || crate::core::a2a_live::live_member(&self.config.state_root, &job.job_id)));
 
         let mut args: Vec<String> = vec![
             "--dangerously-skip-permissions".to_string(),
@@ -323,7 +325,7 @@ impl Engine for AgyEngine {
         ];
 
         let stdin = match turn {
-            TurnInput::Start { prompt } => {
+            TurnInput::Start { prompt, .. } => {
                 if live {
                     args.push("--print".to_string());
                     args.push("".to_string());
@@ -347,6 +349,7 @@ impl Engine for AgyEngine {
             TurnInput::Resume {
                 prompt,
                 conversation,
+                ..
             } => {
                 if let Some(conv_id) = conversation {
                     args.push("--conversation".to_string());
@@ -508,6 +511,77 @@ impl Engine for AgyEngine {
             .native(native)
             .emulated(emulated)
             .build()
+    }
+
+    fn display_name(&self) -> &str {
+        "agy"
+    }
+
+    fn normalize_prompt(&self, prompt: &str, job_id: &str, retry_count: u32) -> String {
+        crate::core::agy_conversations::normalize_ref_prompt(prompt, job_id, retry_count)
+    }
+
+    fn configured_program(&self, config: &crate::core::config::Config) -> PathBuf {
+        config.agy_path.clone()
+    }
+
+    fn prepare_session(
+        &self,
+        _session: &SessionDef,
+        _cfg_path: &std::path::Path,
+        _settings_path: &std::path::Path,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn readiness(
+        &self,
+        session: &SessionDef,
+        poll_interval: std::time::Duration,
+        shutdown: &std::sync::atomic::AtomicBool,
+        _paused: &std::sync::atomic::AtomicBool,
+    ) -> (bool, String) {
+        crate::orchestrate::readiness::binary_ready(
+            &session.agy_binary,
+            &session.env,
+            poll_interval,
+            shutdown,
+        )
+    }
+
+    fn session_file(
+        &self,
+        _supervisor_config: &crate::orchestrate::config::SupervisorConfig,
+        _session: &SessionDef,
+    ) -> PathBuf {
+        PathBuf::new()
+    }
+
+    fn has_session_transcript(&self) -> bool {
+        false
+    }
+
+    fn supports_legacy_memory_file(&self) -> bool {
+        false
+    }
+
+    fn frame_pty_message(&self, payload: &[u8]) -> Vec<u8> {
+        let line = crate::core::a2a_live::frame_user_line(&String::from_utf8_lossy(payload));
+        let mut frame = Vec::with_capacity(line.len() + 1);
+        frame.extend_from_slice(line.as_bytes());
+        frame.push(b'\r');
+        frame
+    }
+
+    fn materialize_instructions(
+        &self,
+        home: &std::path::Path,
+        _workdir: &std::path::Path,
+        global_text: Option<(PathBuf, String)>,
+        per_session_text: Option<(PathBuf, String)>,
+        log: &mut Vec<String>,
+    ) -> bool {
+        crate::core::instructions::materialize_agy(home, global_text, per_session_text, log)
     }
 }
 
@@ -929,6 +1003,7 @@ some non-json noise line
                 &meta,
                 TurnInput::Start {
                     prompt: "initial task prompt",
+                    live: false,
                 },
             )
             .expect("plan");
@@ -979,6 +1054,7 @@ some non-json noise line
                 TurnInput::Resume {
                     prompt: "continue with next step",
                     conversation: Some("conv-12345"),
+                    live: false,
                 },
             )
             .expect("plan");
@@ -1021,6 +1097,7 @@ some non-json noise line
                 TurnInput::Resume {
                     prompt: "continue prompt",
                     conversation: None,
+                    live: false,
                 },
             )
             .expect("plan");
@@ -1066,6 +1143,7 @@ some non-json noise line
                 &meta,
                 TurnInput::Start {
                     prompt: "live mesh prompt",
+                    live: true,
                 },
             )
             .expect("plan");

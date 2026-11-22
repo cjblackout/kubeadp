@@ -57,11 +57,21 @@ Runs are resolved through the unified `RunRegistry` view over the authoritative 
 
 ### 2.2.1 Launch Plan and Trait Methods
 
-Engines build their process launch parameters through the `Engine` trait:
+Engines build their process launch parameters and dispatch lifecycle operations through the `Engine` trait:
 - `job_command(job, turn) -> Result<LaunchPlan, EngineError>`: Emits a `LaunchPlan` specifying executable program, arguments, environment variables, `StdinMode` (`Null` or `Pipe { first_line }`), and pseudo-terminal allocation (`pty`).
 - `session_command(session, resume) -> Result<LaunchPlan, EngineError>`: Emits a `LaunchPlan` for orchestrator sessions according to `ResumeMode` (`Start` vs `Resume`).
 - `classify_exit(exit, log_tail) -> JobStatus`: Interprets process exit code/signals and output log tail according to the engine's status taxonomy.
 - `conversation_id(job) -> Option<ContextId>`: Extracts the engine's conversation/session identifier from job metadata or execution logs.
+- `normalize_prompt(prompt, job_id, retry_count) -> String`: Normalizes prompt text before execution (e.g. agy reference line tags); default is identity.
+- `display_name() -> &str`: Returns the user-facing display name of the engine (e.g. `"agy"`, `"claude"`).
+- `configured_program(config) -> PathBuf`: Returns the engine's configured binary path from `Config`.
+- `prepare_session(session, cfg_path, settings_path) -> Result<(), String>`: Performs engine-specific setup (e.g. Claude headless config and A2A hooks).
+- `readiness(session, poll_interval, shutdown, paused) -> (bool, String)`: Verifies engine readiness before session startup (e.g. binary exec check vs Claude login wait).
+- `session_file(supervisor_config, session) -> PathBuf`: Resolves transcript file path for the session if supported.
+- `has_session_transcript() -> bool`: Reports whether the engine uses session transcripts.
+- `supports_legacy_memory_file() -> bool`: Reports whether legacy `memory_file` fallback is supported when `instructions_file` is absent.
+- `frame_pty_message(payload) -> Vec<u8>`: Formats PTY input frames (e.g. NDJSON user line for agy; bracketed paste for Claude).
+- `materialize_instructions(home, workdir, global, per, log) -> bool`: Materialises instruction witness files into engine-specific locations (`~/.claude/CLAUDE.md` + `<workdir>/CLAUDE.md` vs `<home>/.gemini/config/AGENTS.md`).
 
 ### 2.3 Engine Selection Precedence
 

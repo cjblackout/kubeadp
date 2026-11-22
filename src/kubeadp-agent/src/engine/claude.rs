@@ -29,7 +29,7 @@ use crate::engine::{
 use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::{Arc, Mutex};
 
@@ -613,10 +613,11 @@ impl Engine for ClaudeEngine {
         }
 
         let prompt = match turn {
-            TurnInput::Start { prompt } => prompt,
+            TurnInput::Start { prompt, .. } => prompt,
             TurnInput::Resume {
                 prompt,
                 conversation,
+                ..
             } => {
                 if let Some(conv_id) = conversation {
                     args.push("--resume".to_string());
@@ -768,6 +769,97 @@ impl Engine for ClaudeEngine {
                 "a2a.send_message",
             ])
             .build()
+    }
+
+    fn display_name(&self) -> &str {
+        "claude"
+    }
+
+    fn normalize_prompt(&self, prompt: &str, _job_id: &str, _retry_count: u32) -> String {
+        prompt.to_string()
+    }
+
+    fn configured_program(&self, config: &crate::core::config::Config) -> PathBuf {
+        config.claude_path.clone()
+    }
+
+    fn prepare_session(
+        &self,
+        session: &SessionDef,
+        cfg_path: &std::path::Path,
+        settings_path: &std::path::Path,
+    ) -> Result<(), String> {
+        crate::orchestrate::claude_config::ensure_claude_config(
+            cfg_path,
+            settings_path,
+            &[&session.workdir],
+        )?;
+        crate::orchestrate::claude_config::ensure_a2a_hooks(settings_path)?;
+        Ok(())
+    }
+
+    fn readiness(
+        &self,
+        session: &SessionDef,
+        poll_interval: std::time::Duration,
+        shutdown: &std::sync::atomic::AtomicBool,
+        paused: &std::sync::atomic::AtomicBool,
+    ) -> (bool, String) {
+        crate::orchestrate::readiness::wait_until_ready_with_pause(
+            &session.claude_binary,
+            &session.env,
+            &session.name,
+            poll_interval,
+            shutdown,
+            paused,
+        )
+    }
+
+    fn session_file(
+        &self,
+        supervisor_config: &crate::orchestrate::config::SupervisorConfig,
+        session: &SessionDef,
+    ) -> PathBuf {
+        supervisor_config.resolve_session_file(session)
+    }
+
+    fn has_session_transcript(&self) -> bool {
+        true
+    }
+
+    fn supports_legacy_memory_file(&self) -> bool {
+        true
+    }
+
+    fn frame_pty_message(&self, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(
+            crate::server::sessions::PASTE_START.len()
+                + payload.len()
+                + crate::server::sessions::PASTE_END.len()
+                + 1,
+        );
+        frame.extend_from_slice(crate::server::sessions::PASTE_START);
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(crate::server::sessions::PASTE_END);
+        frame.push(b'\r');
+        frame
+    }
+
+    fn materialize_instructions(
+        &self,
+        home: &std::path::Path,
+        workdir: &std::path::Path,
+        global_text: Option<(PathBuf, String)>,
+        per_session_text: Option<(PathBuf, String)>,
+        log: &mut Vec<String>,
+    ) -> bool {
+        crate::core::instructions::materialize_claude(
+            home,
+            workdir,
+            global_text,
+            per_session_text,
+            log,
+        )
     }
 }
 
@@ -1289,6 +1381,7 @@ exit 0
                 &meta,
                 TurnInput::Start {
                     prompt: "implement feature X",
+                    live: false,
                 },
             )
             .expect("plan");
@@ -1352,6 +1445,7 @@ exit 0
                 &meta,
                 TurnInput::Start {
                     prompt: "investigate issue",
+                    live: false,
                 },
             )
             .expect("plan");
@@ -1396,6 +1490,7 @@ exit 0
                 TurnInput::Resume {
                     prompt: "continue with next step",
                     conversation: Some("sess-uuid-789"),
+                    live: false,
                 },
             )
             .expect("plan");

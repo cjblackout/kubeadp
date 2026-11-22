@@ -101,6 +101,7 @@ pub fn build_command_and_args(
         let turn = match mode {
             InvocationMode::Start { resolved_prompt } => TurnInput::Start {
                 prompt: resolved_prompt,
+                live,
             },
             InvocationMode::Retry {
                 conversation_id,
@@ -108,22 +109,10 @@ pub fn build_command_and_args(
             } => TurnInput::Resume {
                 prompt: prompt.as_deref().unwrap_or_default(),
                 conversation: conversation_id.as_deref(),
+                live,
             },
         };
-        if let Ok(mut plan) = eng.job_command(meta, turn) {
-            if live && eng.id() == "agy" {
-                for i in 0..plan.args.len() {
-                    if plan.args[i] == "-p" {
-                        plan.args[i] = "--print".to_string();
-                        if i + 1 < plan.args.len() {
-                            plan.args[i + 1] = "".to_string();
-                        }
-                        break;
-                    }
-                }
-                plan.args.push("--input-format".to_string());
-                plan.args.push("stream-json".to_string());
-            }
+        if let Ok(plan) = eng.job_command(meta, turn) {
             return (plan.program, plan.args);
         }
     }
@@ -1064,52 +1053,31 @@ pub fn run_internal_runner(
 
     // Construct TurnInput for the engine
     let prompt_text = if meta.retry_count > 0 {
-        if engine.id() == "agy" {
-            agy_conversations::normalize_ref_prompt(
-                meta.retry_prompt.as_deref().unwrap_or_default(),
-                &meta.job_id,
-                meta.retry_count,
-            )
-        } else {
-            meta.retry_prompt.clone().unwrap_or_default()
-        }
+        engine.normalize_prompt(
+            meta.retry_prompt.as_deref().unwrap_or_default(),
+            &meta.job_id,
+            meta.retry_count,
+        )
     } else {
-        if engine.id() == "agy" {
-            agy_conversations::normalize_ref_prompt(&meta.resolved_prompt, &meta.job_id, 0)
-        } else {
-            meta.resolved_prompt.clone()
-        }
+        engine.normalize_prompt(&meta.resolved_prompt, &meta.job_id, 0)
     };
 
     let turn_input = if meta.retry_count > 0 {
         TurnInput::Resume {
             prompt: &prompt_text,
             conversation: meta.conversation_id.as_deref(),
+            live,
         }
     } else {
         TurnInput::Start {
             prompt: &prompt_text,
+            live,
         }
     };
 
-    let mut plan = engine
+    let plan = engine
         .job_command(&meta, turn_input)
         .map_err(|e| anyhow::anyhow!("engine failed to build job command: {e}"))?;
-
-    // If live mode is active on an agy job, adjust argv for live stdin
-    if live && engine.id() == "agy" {
-        for i in 0..plan.args.len() {
-            if plan.args[i] == "-p" {
-                plan.args[i] = "--print".to_string();
-                if i + 1 < plan.args.len() {
-                    plan.args[i + 1] = "".to_string();
-                }
-                break;
-            }
-        }
-        plan.args.push("--input-format".to_string());
-        plan.args.push("stream-json".to_string());
-    }
 
     let stdin_mode = plan.stdin.clone();
     let (cmd, policy_path, jobset_secret) = sandboxed(plan, config, &meta).with_context(|| {
@@ -1175,17 +1143,9 @@ pub fn run_internal_runner(
                 &log_path,
                 &format!(
                     "Failed to spawn {}: {} (configured path: {})",
-                    if engine.id() == "claude" {
-                        "claude"
-                    } else {
-                        "agy"
-                    },
+                    engine.display_name(),
                     e,
-                    if engine.id() == "claude" {
-                        config.claude_path.display()
-                    } else {
-                        config.agy_path.display()
-                    }
+                    engine.configured_program(config).display()
                 ),
             );
             bail!(
@@ -3498,6 +3458,7 @@ mod tests {
         // Start turn
         let start_turn = TurnInput::Start {
             prompt: "Test prompt [agent-run ref test-job-agy#0]",
+            live: false,
         };
         let plan = engine.job_command(&meta, start_turn).expect("start plan");
         assert_eq!(plan.program, PathBuf::from("/usr/local/bin/agy"));
@@ -3519,6 +3480,7 @@ mod tests {
         let resume_turn = TurnInput::Resume {
             prompt: "Next turn [agent-run ref test-job-agy#1]",
             conversation: Some("conv-1234"),
+            live: false,
         };
         let plan_resume = engine.job_command(&meta, resume_turn).expect("resume plan");
         assert_eq!(plan_resume.program, PathBuf::from("/usr/local/bin/agy"));
@@ -3549,6 +3511,7 @@ mod tests {
         // Start turn
         let start_turn = TurnInput::Start {
             prompt: "Hello claude",
+            live: false,
         };
         let plan = engine.job_command(&meta, start_turn).expect("start plan");
         assert_eq!(plan.program, PathBuf::from("/usr/local/bin/claude"));
@@ -3574,6 +3537,7 @@ mod tests {
         let resume_turn = TurnInput::Resume {
             prompt: "Continue work",
             conversation: Some("sess-9876"),
+            live: false,
         };
         let plan_resume = engine.job_command(&meta, resume_turn).expect("resume plan");
         assert_eq!(plan_resume.program, PathBuf::from("/usr/local/bin/claude"));
@@ -3608,6 +3572,7 @@ mod tests {
 
         let turn = TurnInput::Start {
             prompt: "FAKE_FAIL FAKE_WRITE=result.txt claude prompt",
+            live: false,
         };
         let plan = engine.job_command(&meta, turn).expect("plan");
 

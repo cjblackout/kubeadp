@@ -1989,8 +1989,8 @@ Implemented: migrations 1–7 (`jobs`, supervisor and session state, heartbeat i
 |---|---|---|
 | trait, registry, capability endpoint, error mapping | implemented | |
 | both engines registered by both roles | implemented | |
-| agy job mode, claude job mode (`stream_json`) | partial | work, but the job commands and the runner branch on the engine name instead of calling the trait |
-| claude sessions (`pty_remote_control`), agy sessions (live stream-json) | partial | work on the orchestrator; the session supervisor branches on the engine name; claude `stream_json` sessions planned |
+| agy job mode, claude job mode (`stream_json`) | implemented | |
+| claude sessions (`pty_remote_control`), agy sessions (live stream-json) | partial | work on the orchestrator behind the engine trait; claude `stream_json` sessions planned |
 | engine persisted per run and used by retry/restart | implemented | |
 | built-in default by run kind only | implemented | |
 | capability table of §3.4 | implemented | implemented capability tables match §3.4: `claude` gets native `job.list`/`job.kill`/`job.result`/`workspace.*`, `interrupt`/`pause`/`fork` emulated for both engines; only `permissions` remains `unsupported` |

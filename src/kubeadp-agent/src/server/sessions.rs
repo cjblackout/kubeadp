@@ -358,9 +358,9 @@ async fn get_session_log(
 pub const MESSAGE_MAX_BYTES: usize = 8192;
 /// Bracketed paste open: the child treats everything until `CSI 201~` as
 /// pasted input, so embedded newlines never submit early.
-const PASTE_START: &[u8] = b"\x1b[200~";
+pub const PASTE_START: &[u8] = b"\x1b[200~";
 /// Bracketed paste close.
-const PASTE_END: &[u8] = b"\x1b[201~";
+pub const PASTE_END: &[u8] = b"\x1b[201~";
 /// Messages allowed per (session, sender) per minute.
 pub const MESSAGE_RATE_MAX: usize = 30;
 const MESSAGE_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -650,34 +650,30 @@ pub fn deliver_message(
             // is issued as a single batch rather than split across multiple
             // write_all calls.
             let deadline = Instant::now() + crate::orchestrate::pty::PTY_WRITE_TOTAL_DEADLINE;
-            let written = if engine == "agy" {
-                // A single NDJSON user line (framed JSON, embedded newlines
-                // escaped) followed by Enter, exactly what agy's live
-                // stream-json stdin consumes as the next turn.
-                let line =
-                    crate::core::a2a_live::frame_user_line(&String::from_utf8_lossy(&payload));
-                let mut frame = Vec::with_capacity(line.len() + 1);
-                frame.extend_from_slice(line.as_bytes());
-                frame.push(b'\r');
-                slot.write_all(&frame, deadline)
+            let core_config = crate::core::config::Config::load().unwrap_or_default();
+            let registry = crate::engine::EngineRegistry::with_builtin(&core_config);
+            let frame = if let Ok(eng) =
+                registry.resolve(crate::engine::RunKind::Session, Some(&engine), None)
+            {
+                eng.frame_pty_message(&payload)
             } else {
-                let mut frame =
+                let mut f =
                     Vec::with_capacity(PASTE_START.len() + payload.len() + PASTE_END.len() + 1);
-                frame.extend_from_slice(PASTE_START);
-                frame.extend_from_slice(&payload);
-                frame.extend_from_slice(PASTE_END);
-                frame.push(b'\r');
-                let res = slot.write_all(&frame, deadline);
-                if res.is_err() {
-                    // Best-effort close the bracketed paste if a partial write
-                    // opened PASTE_START before timing out, so the terminal is
-                    // not left wedged inside paste mode.
-                    let close_deadline = Instant::now() + Duration::from_millis(50);
-                    let _ = slot.write_all(PASTE_END, close_deadline);
-                }
-                res
+                f.extend_from_slice(PASTE_START);
+                f.extend_from_slice(&payload);
+                f.extend_from_slice(PASTE_END);
+                f.push(b'\r');
+                f
             };
-            written.is_ok()
+            let res = slot.write_all(&frame, deadline);
+            if res.is_err() && frame.starts_with(PASTE_START) {
+                // Best-effort close the bracketed paste if a partial write
+                // opened PASTE_START before timing out, so the terminal is
+                // not left wedged inside paste mode.
+                let close_deadline = Instant::now() + Duration::from_millis(50);
+                let _ = slot.write_all(PASTE_END, close_deadline);
+            }
+            res.is_ok()
         }
     };
     let n = payload.len();

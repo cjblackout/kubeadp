@@ -217,12 +217,16 @@ pub fn materialize(
     per_session_text: Option<(PathBuf, String)>,
 ) -> (MaterializeOutcome, Vec<String>) {
     let mut log: Vec<String> = Vec::new();
-    let mut written = false;
-    if engine == "agy" {
-        written |= materialize_agy(home, global_text, per_session_text, &mut log);
+    let core_config = crate::core::config::Config::load().unwrap_or_default();
+    let registry = crate::engine::EngineRegistry::with_builtin(&core_config);
+    let written = if let Ok(eng) = registry.resolve(crate::engine::RunKind::Job, Some(engine), None)
+    {
+        eng.materialize_instructions(home, workdir, global_text, per_session_text, &mut log)
+    } else if let Ok(eng) = registry.resolve(crate::engine::RunKind::Session, Some(engine), None) {
+        eng.materialize_instructions(home, workdir, global_text, per_session_text, &mut log)
     } else {
-        written |= materialize_claude(home, workdir, global_text, per_session_text, &mut log);
-    }
+        materialize_claude(home, workdir, global_text, per_session_text, &mut log)
+    };
     let outcome = if written {
         MaterializeOutcome::Written
     } else {
@@ -236,7 +240,7 @@ pub fn materialize(
 /// [`BLOCK_BEGIN`]) so user content outside the block is kept; the workdir
 /// file is excluded via `.git/info/exclude` (a tracked `CLAUDE.md` is never
 /// touched).
-fn materialize_claude(
+pub fn materialize_claude(
     home: &Path,
     workdir: &Path,
     global_text: Option<(PathBuf, String)>,
@@ -315,7 +319,7 @@ fn materialize_claude(
 /// managed block holds the global text first and the per-session text after
 /// it; the file may carry other user content (it doubles as the MCP
 /// configuration) which is left untouched.
-fn materialize_agy(
+pub fn materialize_agy(
     home: &Path,
     global_text: Option<(PathBuf, String)>,
     per_session_text: Option<(PathBuf, String)>,
