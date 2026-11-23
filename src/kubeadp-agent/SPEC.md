@@ -1796,8 +1796,10 @@ to stderr; `--once` exits 1 on any failure, 0 on success.
 
 ### 10.5 Outer layer
 CiliumNetworkPolicies restrict ingress/egress between the worker and the
-orchestrator and require Cilium mutual authentication (SPIRE mutual-TLS). The
-application layer does not rely on the network being the only gate.
+orchestrator by pod label and ServiceAccount. The application layer does not
+rely on the network being the only gate: the worker API authenticates callers
+itself (operator bearer or jobset identity on `/api/v1`, jobset secret + proof
+on the A2A routes).
 
 ## 11. Deployment Constraints
 
@@ -1828,8 +1830,8 @@ builds push an `rc` tag only; candidates are tested in throwaway pods first.
   --loop` (token via `GH_TOKEN`, read-only).
 - Service: cluster-internal, label `a2a.homelab/agent: "true"`, port 8002 named
   `a2a`. Network policies: ingress from the ai-server pod only (label +
-  ServiceAccount match) with Cilium mutual auth required; egress likewise
-  (§10.5).
+  ServiceAccount match); egress likewise (§10.5). The API layer authenticates
+  independently (bearer/jobset identity).
 
 ### 11.3 Orchestrator deployment
 - home, `runtimeClassName: kata`, amd64; ServiceAccount `ai-server`,
@@ -1848,8 +1850,8 @@ builds push an `rc` tag only; candidates are tested in throwaway pods first.
 - `AGENT_ORCHESTRATE_CONFIG` = generated supervisor config;
   `AGENT_ORCHESTRATE_LISTEN=0.0.0.0:8002`; `CLAUDE_DEFAULT_SESSION=0`.
 - Service labelled `a2a.homelab/agent: "true"` (ttyd 8443 + a2a 8002); network
-  policies for kube-apiserver egress, worker egress/ingress (mutual auth),
-  info-hub egress, additive to the namespace-wide default-deny
+  policies for kube-apiserver egress, worker egress/ingress, info-hub egress,
+  additive to the namespace-wide default-deny
   `opencode-agent-isolation`.
 - The ai-server holds write-scoped credentials (e.g. a write GitHub PAT) by
   design; the worker only read-only ones; jobs never hold the API bearer. Messaging needs only the root key on the pod and the credential file in the sandbox.

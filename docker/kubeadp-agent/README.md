@@ -71,7 +71,7 @@ Incoming A2A messages are validated and framed before reaching session sinks:
 - **Size limit**: Message text exceeding 20 KB (after trimming) is rejected with `A2AError::invalid_params("message text is too large")`.
 - **Hop limit**: Metadata `a2a.hop` is parsed (defaulting to 0 if absent; non-numeric, negative or exceeding `MAX_HOP` maps to `MAX_HOP + 1`). If `hop > MAX_HOP` (where `MAX_HOP = 4`), the message is rejected before delivery to the sink.
 - **Claimed sender & untrusted data framing**: Metadata `a2a.sender` is claimed, never authenticated. It is sanitized (control characters and newlines stripped, capped at 64 characters; defaults to `"unknown"` if absent or empty). Messages without any metadata are also framed with claimed sender `"unknown"` and hop 0. The incoming content is enclosed in a delimiter notice explicitly marking it as untrusted data from another agent that must not override owner instructions.
-- **Access control**: In-cluster CiliumNetworkPolicies and mutual authentication (SPIRE/mTLS) remain the true gate for peer-to-peer agent network communication.
+- **Access control**: In-cluster CiliumNetworkPolicies restrict which peers may reach the agent; the API layer itself authenticates callers (operator bearer or jobset identity on `/api/v1`, jobset secret + proof on A2A), so the network rules are not the only gate.
 
 ## How it is built
 
