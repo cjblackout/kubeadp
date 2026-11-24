@@ -42,9 +42,9 @@ pub fn agents_listing(
 ) -> AgentsResponse {
     let mut seen = std::collections::BTreeSet::new();
     let mut agents = Vec::new();
-    // The in-memory registry's live memberships.
-    for (agent_id, entry) in registry.snapshot() {
-        if entry.jobset_id == jobset_id && seen.insert(agent_id.clone()) {
+    // The in-memory registry's live memberships across all memberships.
+    for (agent_id, entries) in registry.snapshot_all() {
+        if entries.iter().any(|e| e.jobset_id == jobset_id) && seen.insert(agent_id.clone()) {
             agents.push(serde_json::json!({
                 "agent_id": agent_id,
                 "kind": kind,

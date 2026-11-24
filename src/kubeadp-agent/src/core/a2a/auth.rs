@@ -649,8 +649,9 @@ fn target_is_member(
     target: &str,
 ) -> bool {
     store_is_member(registry, jobset_id, target).unwrap_or(false)
+        || (registry.is_member(target, jobset_id) && !registry.is_ended(jobset_id))
         || registry
-            .get(target)
+            .get_or_remembered(target)
             .is_some_and(|e| e.jobset_id == jobset_id && !registry.is_ended(jobset_id))
 }
 
@@ -670,10 +671,11 @@ fn store_epoch(
     // No store row: fall back to a live member's epoch (the registry's
     // authoritative value for the running process).
     registry
-        .snapshot()
-        .into_iter()
-        .find(|(_, e)| e.jobset_id == jobset_id)
-        .map(|(_, e)| e.epoch)
+        .snapshot_all()
+        .into_values()
+        .flatten()
+        .find(|e| e.jobset_id == jobset_id)
+        .map(|e| e.epoch)
 }
 
 /// Whether `agent` is a `jobset_member` row of `jobset_id` in the SQLite

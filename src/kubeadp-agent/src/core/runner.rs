@@ -349,7 +349,9 @@ pub fn sandboxed(
     Ok((
         cmd,
         policy_path,
-        jobset.map(|c| crate::core::jobset::credential_file_json(&meta.job_id, &c)),
+        crate::core::jobset::agent_credential_file_json(&meta.job_id).or_else(|| {
+            jobset.map(|c| crate::core::jobset::credential_file_json(&meta.job_id, &c))
+        }),
     ))
 }
 

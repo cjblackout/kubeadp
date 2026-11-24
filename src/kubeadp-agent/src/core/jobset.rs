@@ -346,7 +346,7 @@ fn default_credential_file_path() -> String {
 /// The credential file of this process: the path in [`CREDENTIALS_FILE_ENV`]
 /// (or the private-tmp default) parsed, `None` when absent. A corrupt file is
 /// treated as absent (callers fail closed on a missing credential).
-fn credential_file_from_env() -> Option<CredentialFile> {
+pub fn credential_file_from_env() -> Option<CredentialFile> {
     let path = std::env::var(CREDENTIALS_FILE_ENV)
         .ok()
         .map(|s| s.trim().to_string())
@@ -388,20 +388,148 @@ pub fn agent_identity_from_env() -> Option<(String, String)> {
 /// agent identity). Handed to the agent through the sandbox secret channel,
 /// never written to the state store, argv, environment or logs.
 pub fn credential_file_json(agent_id: &str, credential: &JobsetCredential) -> String {
-    let member_proof = global_registry()
-        .root_key()
-        .map(|k| derive_member_proof(&k, &credential.jobset_id, credential.epoch, agent_id))
+    let registry = global_registry();
+    let root_key = registry.root_key();
+
+    // Query SQLite store and in-memory registry for all memberships of agent_id
+    let mut entries: Vec<CredentialEntry> = Vec::new();
+    let mut seen_jobsets = std::collections::HashSet::new();
+
+    // Primary credential passed in
+    let primary_proof = root_key
+        .as_ref()
+        .map(|k| derive_member_proof(k, &credential.jobset_id, credential.epoch, agent_id))
         .unwrap_or_default();
+    entries.push(CredentialEntry {
+        jobset_id: credential.jobset_id.clone(),
+        epoch: credential.epoch,
+        secret: credential.secret.clone(),
+        member_proof: primary_proof,
+    });
+    seen_jobsets.insert(credential.jobset_id.clone());
+
+    // From SQLite store
+    if let Some(dir) = registry.data_dir() {
+        if let Ok(store) = crate::state::jobsets::JobsetStore::open_path(&dir) {
+            if let Ok(memberships) = store.memberships(agent_id) {
+                for js in memberships {
+                    if !seen_jobsets.insert(js.jobset_id.clone()) {
+                        continue;
+                    }
+                    let secret = root_key
+                        .as_ref()
+                        .map(|k| derive_jobset_secret(k, &js.jobset_id, js.epoch))
+                        .unwrap_or_default();
+                    let member_proof = root_key
+                        .as_ref()
+                        .map(|k| derive_member_proof(k, &js.jobset_id, js.epoch, agent_id))
+                        .unwrap_or_default();
+                    entries.push(CredentialEntry {
+                        jobset_id: js.jobset_id,
+                        epoch: js.epoch,
+                        secret,
+                        member_proof,
+                    });
+                }
+            }
+        }
+    }
+
+    // From in-memory registry
+    for entry in registry.memberships(agent_id) {
+        if !seen_jobsets.insert(entry.jobset_id.clone()) {
+            continue;
+        }
+        let secret = if let Some(k) = &root_key {
+            derive_jobset_secret(k, &entry.jobset_id, entry.epoch)
+        } else {
+            entry.secret().to_string()
+        };
+        let member_proof = root_key
+            .as_ref()
+            .map(|k| derive_member_proof(k, &entry.jobset_id, entry.epoch, agent_id))
+            .unwrap_or_default();
+        entries.push(CredentialEntry {
+            jobset_id: entry.jobset_id,
+            epoch: entry.epoch,
+            secret,
+            member_proof,
+        });
+    }
+
     let file = CredentialFile {
         agent_id: agent_id.to_string(),
-        jobsets: vec![CredentialEntry {
-            jobset_id: credential.jobset_id.clone(),
-            epoch: credential.epoch,
-            secret: credential.secret.clone(),
-            member_proof,
-        }],
+        jobsets: entries,
     };
     serde_json::to_string(&file).unwrap_or_default()
+}
+
+/// Serializes all memberships of `agent_id` into a [`CredentialFile`] JSON string.
+pub fn agent_credential_file_json(agent_id: &str) -> Option<String> {
+    let registry = global_registry();
+    let root_key = registry.root_key();
+
+    let mut entries: Vec<CredentialEntry> = Vec::new();
+    let mut seen_jobsets = std::collections::HashSet::new();
+
+    // From SQLite store
+    if let Some(dir) = registry.data_dir() {
+        if let Ok(store) = crate::state::jobsets::JobsetStore::open_path(&dir) {
+            if let Ok(memberships) = store.memberships(agent_id) {
+                for js in memberships {
+                    if !seen_jobsets.insert(js.jobset_id.clone()) {
+                        continue;
+                    }
+                    let secret = root_key
+                        .as_ref()
+                        .map(|k| derive_jobset_secret(k, &js.jobset_id, js.epoch))
+                        .unwrap_or_default();
+                    let member_proof = root_key
+                        .as_ref()
+                        .map(|k| derive_member_proof(k, &js.jobset_id, js.epoch, agent_id))
+                        .unwrap_or_default();
+                    entries.push(CredentialEntry {
+                        jobset_id: js.jobset_id,
+                        epoch: js.epoch,
+                        secret,
+                        member_proof,
+                    });
+                }
+            }
+        }
+    }
+
+    // From in-memory registry
+    for entry in registry.memberships(agent_id) {
+        if !seen_jobsets.insert(entry.jobset_id.clone()) {
+            continue;
+        }
+        let secret = if let Some(k) = &root_key {
+            derive_jobset_secret(k, &entry.jobset_id, entry.epoch)
+        } else {
+            entry.secret().to_string()
+        };
+        let member_proof = root_key
+            .as_ref()
+            .map(|k| derive_member_proof(k, &entry.jobset_id, entry.epoch, agent_id))
+            .unwrap_or_default();
+        entries.push(CredentialEntry {
+            jobset_id: entry.jobset_id,
+            epoch: entry.epoch,
+            secret,
+            member_proof,
+        });
+    }
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    let file = CredentialFile {
+        agent_id: agent_id.to_string(),
+        jobsets: entries,
+    };
+    Some(serde_json::to_string(&file).unwrap_or_default())
 }
 
 /// This process's own agent identity, used as the local agent id the incoming
@@ -475,7 +603,7 @@ impl fmt::Debug for JobsetEntry {
 /// then a lookup of the *target* agent's entry.
 #[derive(Default)]
 pub struct JobsetRegistry {
-    entries: std::sync::Mutex<HashMap<String, JobsetEntry>>,
+    entries: std::sync::Mutex<HashMap<String, Vec<JobsetEntry>>>,
     /// Ended jobsets: jobset id -> the epoch it was ended at. A credential
     /// presented for an ended jobset id is always rejected.
     ended: std::sync::Mutex<HashMap<String, u64>>,
@@ -515,7 +643,9 @@ impl JobsetRegistry {
     }
 
     /// Register (or replace) the jobset an agent belongs to, at the given
-    /// epoch (the epoch this jobset's secret was derived at).
+    /// epoch (the epoch this jobset's secret was derived at). Supports multi-jobset
+    /// membership: if the agent already has an entry for `jobset_id`, it is replaced
+    /// and moved to the front (as the latest registered jobset); otherwise inserted at the front.
     pub fn register_at(
         &self,
         agent_id: impl Into<String>,
@@ -526,28 +656,48 @@ impl JobsetRegistry {
         let jobset_id = jobset_id.into();
         let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let id = agent_id.into();
-        map.insert(id, JobsetEntry::new(jobset_id.clone(), secret, epoch));
+        let list = map.entry(id).or_default();
+        let new_entry = JobsetEntry::new(jobset_id.clone(), secret, epoch);
+        if let Some(pos) = list.iter().position(|e| e.jobset_id == jobset_id) {
+            list.remove(pos);
+        }
+        list.insert(0, new_entry);
         drop(map);
         self.note_jobset(&jobset_id);
     }
 
-    /// Drop an agent's entry (called when the agent's job/session ends). The
+    /// Drop an agent's entries (called when the agent's job/session ends). The
     /// persisted membership is retained (a retried job re-joins its jobset via
     /// [`register_agent`], which re-derives the same secret), and the jobset
-    /// id stays "known" so the end route can still recognise it.
+    /// ids stay "known" so the end route can still recognise them.
     pub fn drop(&self, agent_id: &str) {
         let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = map.remove(agent_id);
+        let entries = map.remove(agent_id);
         drop(map);
-        if let Some(entry) = entry {
-            self.note_jobset(&entry.jobset_id);
+        if let Some(entries) = entries {
+            for entry in entries {
+                self.note_jobset(&entry.jobset_id);
+            }
         }
     }
 
-    /// The entry for `agent_id`, if present.
+    /// The primary/first entry for `agent_id`, if present.
     pub fn get(&self, agent_id: &str) -> Option<JobsetEntry> {
         let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        map.get(agent_id).cloned()
+        map.get(agent_id).and_then(|list| list.first().cloned())
+    }
+
+    /// All registered memberships for `agent_id`.
+    pub fn memberships(&self, agent_id: &str) -> Vec<JobsetEntry> {
+        let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(agent_id).cloned().unwrap_or_default()
+    }
+
+    /// Whether `agent_id` is a member of `jobset_id` in the in-memory registry.
+    pub fn is_member(&self, agent_id: &str, jobset_id: &str) -> bool {
+        let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(agent_id)
+            .is_some_and(|list| list.iter().any(|e| e.jobset_id == jobset_id))
     }
 
     /// The jobset entry of `agent_id`: the live registration, else (for a
@@ -568,7 +718,7 @@ impl JobsetRegistry {
     /// Whether `agent_id` has a registered jobset.
     pub fn contains(&self, agent_id: &str) -> bool {
         let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        map.contains_key(agent_id)
+        map.get(agent_id).is_some_and(|list| !list.is_empty())
     }
 
     pub fn len(&self) -> usize {
@@ -584,6 +734,14 @@ impl JobsetRegistry {
     /// A snapshot of all entries: agent id -> cloned entry. Used by the
     /// persistence layer so the lock is held only for the clone.
     pub fn snapshot(&self) -> HashMap<String, JobsetEntry> {
+        let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .filter_map(|(k, v)| v.first().map(|e| (k.clone(), e.clone())))
+            .collect()
+    }
+
+    /// A snapshot of all memberships: agent id -> list of entries.
+    pub fn snapshot_all(&self) -> HashMap<String, Vec<JobsetEntry>> {
         let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         map.clone()
     }
@@ -630,6 +788,7 @@ impl JobsetRegistry {
     pub fn jobset_epoch(&self, jobset_id: &str) -> Epoch {
         let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         map.values()
+            .flat_map(|list| list.iter())
             .filter(|e| e.jobset_id == jobset_id)
             .map(|e| e.epoch)
             .max()
@@ -671,7 +830,8 @@ impl JobsetRegistry {
             return true;
         }
         let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        map.values().any(|e| e.jobset_id == jobset_id)
+        map.values()
+            .any(|list| list.iter().any(|e| e.jobset_id == jobset_id))
     }
 
     /// Remembers a jobset id this process has served, so a later `end_jobset`
@@ -731,11 +891,15 @@ impl JobsetRegistry {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
             let max_ep = entries
                 .values()
+                .flat_map(|list| list.iter())
                 .filter(|e| e.jobset_id == jobset_id)
                 .map(|e| e.epoch)
                 .max()
                 .unwrap_or(0);
-            entries.retain(|_, e| e.jobset_id != jobset_id);
+            for list in entries.values_mut() {
+                list.retain(|e| e.jobset_id != jobset_id);
+            }
+            entries.retain(|_, list| !list.is_empty());
             max_ep
         };
         let new_epoch = max_member_epoch + 1;
@@ -1453,11 +1617,24 @@ pub fn verify_jobset_credential(
     }
 
     // Membership check: the TARGET agent must be a member of the presented
-    // jobset (its registered jobset id matches the presented one).
-    let Some(entry) = registry.get_or_remembered(target_agent_id) else {
-        return false;
-    };
-    if !crypto::digest_eq(presented_id.as_bytes(), entry.jobset_id.as_bytes()) {
+    // jobset. Check the SQLite store when reachable, then in-memory memberships.
+    let is_store_member = registry
+        .data_dir()
+        .and_then(|dir| crate::state::jobsets::JobsetStore::open_path(&dir).ok())
+        .and_then(|store| store.is_member(&presented_id, target_agent_id).ok())
+        .unwrap_or(false);
+
+    let matching_entry = registry
+        .memberships(target_agent_id)
+        .into_iter()
+        .find(|e| crypto::digest_eq(presented_id.as_bytes(), e.jobset_id.as_bytes()))
+        .or_else(|| {
+            registry
+                .get_or_remembered(target_agent_id)
+                .filter(|e| crypto::digest_eq(presented_id.as_bytes(), e.jobset_id.as_bytes()))
+        });
+
+    if !is_store_member && matching_entry.is_none() {
         return false;
     }
 
@@ -1466,13 +1643,23 @@ pub fn verify_jobset_credential(
         // for the presented id at the jobset's current epoch and comparing in
         // constant time. No secret lookup is needed in the registry.
         Some(root_key) => {
-            let derived = derive_jobset_secret(&root_key, &entry.jobset_id, entry.epoch);
+            let epoch = registry
+                .data_dir()
+                .and_then(|dir| crate::state::jobsets::JobsetStore::open_path(&dir).ok())
+                .and_then(|store| store.get(&presented_id).ok().flatten())
+                .map(|j| j.epoch)
+                .or_else(|| matching_entry.as_ref().map(|e| e.epoch))
+                .unwrap_or(EPOCH_ZERO);
+            let derived = derive_jobset_secret(&root_key, &presented_id, epoch);
             crypto::digest_eq(presented_secret.as_bytes(), derived.as_bytes())
         }
-        // No root key: the secret is random and lives only in the registry (the
-        // in-process behaviour from before the derived-secret design; a restart
-        // loses it, which the one-time warning at creation says).
-        None => crypto::digest_eq(presented_secret.as_bytes(), entry.secret.as_bytes()),
+        // No root key: the secret is random and lives only in the registry.
+        None => {
+            let Some(entry) = matching_entry else {
+                return false;
+            };
+            crypto::digest_eq(presented_secret.as_bytes(), entry.secret.as_bytes())
+        }
     }
 }
 
@@ -1518,8 +1705,29 @@ pub fn agent_controls_job(
     agent_id: &str,
     job_id: &str,
 ) -> bool {
-    if registry.creator_of(jobset_id).as_deref() != Some(agent_id) {
+    // Check creator: creator in registry or in SQLite store
+    let creator = registry.creator_of(jobset_id).or_else(|| {
+        registry
+            .data_dir()
+            .and_then(|dir| crate::state::jobsets::JobsetStore::open_path(&dir).ok())
+            .and_then(|store| store.get(jobset_id).ok().flatten())
+            .map(|j| j.creator_agent_id)
+    });
+    if creator.as_deref() != Some(agent_id) {
         return false;
+    }
+    // Check membership: store first, then in-memory memberships or remembered
+    if let Some(dir) = registry.data_dir() {
+        if let Ok(store) = crate::state::jobsets::JobsetStore::open_path(&dir) {
+            if let Ok(is_mem) = store.is_member(jobset_id, job_id) {
+                if is_mem {
+                    return true;
+                }
+            }
+        }
+    }
+    if registry.is_member(job_id, jobset_id) {
+        return true;
     }
     registry
         .get_or_remembered(job_id)
@@ -2886,5 +3094,190 @@ mod tests {
             &cred.jobset_id,
             cred.epoch,
         )
+    }
+
+    #[test]
+    fn multi_jobset_membership_verification() {
+        let root = b"test-root-key-0123456789abcdef0123456789abcdef";
+        let reg = JobsetRegistry::new();
+        reg.set_root_key(Some(Arc::from(&root[..])));
+
+        let s1 = derive_jobset_secret(root, "js-1", 0);
+        let s2 = derive_jobset_secret(root, "js-2", 0);
+        let s3 = derive_jobset_secret(root, "js-3", 0);
+
+        reg.register_at("agent-multi", "js-1", &s1, 0);
+        reg.register_at("agent-multi", "js-2", &s2, 0);
+
+        assert!(reg.is_member("agent-multi", "js-1"));
+        assert!(reg.is_member("agent-multi", "js-2"));
+        assert!(!reg.is_member("agent-multi", "js-3"));
+
+        let h = |id: &str, sec: &str| -> HeaderGetter {
+            let id = id.to_string();
+            let sec = sec.to_string();
+            Arc::new(move |name: &str| match name {
+                JOBSET_ID_HEADER => Some(id.clone()),
+                JOBSET_SECRET_HEADER => Some(sec.clone()),
+                _ => None,
+            })
+        };
+
+        // Verifies against js-1
+        assert!(verify_jobset_credential(
+            &reg,
+            "agent-multi",
+            &h("js-1", &s1)
+        ));
+        // Verifies against js-2
+        assert!(verify_jobset_credential(
+            &reg,
+            "agent-multi",
+            &h("js-2", &s2)
+        ));
+        // Does not verify against js-3
+        assert!(!verify_jobset_credential(
+            &reg,
+            "agent-multi",
+            &h("js-3", &s3)
+        ));
+    }
+
+    #[test]
+    fn credential_file_multi_jobset_round_trip_and_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CREDENTIAL_FILE_NAME);
+        let file = CredentialFile {
+            agent_id: "agent-x".to_string(),
+            jobsets: vec![
+                CredentialEntry {
+                    jobset_id: "js-alpha".to_string(),
+                    epoch: 0,
+                    secret: "sec-alpha".to_string(),
+                    member_proof: "proof-alpha".to_string(),
+                },
+                CredentialEntry {
+                    jobset_id: "js-beta".to_string(),
+                    epoch: 1,
+                    secret: "sec-beta".to_string(),
+                    member_proof: "proof-beta".to_string(),
+                },
+            ],
+        };
+        write_credential_file(&path, &file).unwrap();
+
+        let read_back = read_credential_file(&path).unwrap().expect("file exists");
+        assert_eq!(read_back.agent_id, "agent-x");
+        assert_eq!(read_back.jobsets.len(), 2);
+        assert_eq!(read_back.jobsets[0].jobset_id, "js-alpha");
+        assert_eq!(read_back.jobsets[1].jobset_id, "js-beta");
+
+        // Test credential_entry selection with env var
+        with_env_guard(|| {
+            let prev_file = std::env::var(CREDENTIALS_FILE_ENV).ok();
+            let prev_id = std::env::var(JOBSET_ID_ENV).ok();
+
+            std::env::set_var(CREDENTIALS_FILE_ENV, path.to_str().unwrap());
+            std::env::set_var(JOBSET_ID_ENV, "js-beta");
+
+            let entry = credential_entry_from_env().expect("entry found");
+            assert_eq!(entry.jobset_id, "js-beta");
+            assert_eq!(entry.secret, "sec-beta");
+
+            let (aid, proof) = agent_identity_from_env().expect("identity");
+            assert_eq!(aid, "agent-x");
+            assert_eq!(proof, "proof-beta");
+
+            // Without JOBSET_ID_ENV, selects first
+            std::env::remove_var(JOBSET_ID_ENV);
+            let entry = credential_entry_from_env().expect("entry found");
+            assert_eq!(entry.jobset_id, "js-alpha");
+
+            if let Some(v) = prev_file {
+                std::env::set_var(CREDENTIALS_FILE_ENV, v);
+            } else {
+                std::env::remove_var(CREDENTIALS_FILE_ENV);
+            }
+            if let Some(v) = prev_id {
+                std::env::set_var(JOBSET_ID_ENV, v);
+            } else {
+                std::env::remove_var(JOBSET_ID_ENV);
+            }
+        });
+    }
+
+    #[test]
+    fn end_one_of_two_jobsets_keeps_other_active() {
+        let root = b"test-root-key-0123456789abcdef0123456789abcdef";
+        let reg = JobsetRegistry::new();
+        reg.set_root_key(Some(Arc::from(&root[..])));
+
+        let s1 = derive_jobset_secret(root, "js-1", 0);
+        let s2 = derive_jobset_secret(root, "js-2", 0);
+
+        reg.register_at("agent-multi", "js-1", &s1, 0);
+        reg.register_at("agent-multi", "js-2", &s2, 0);
+
+        assert!(reg.is_member("agent-multi", "js-1"));
+        assert!(reg.is_member("agent-multi", "js-2"));
+
+        let h = |id: &str, sec: &str| -> HeaderGetter {
+            let id = id.to_string();
+            let sec = sec.to_string();
+            Arc::new(move |name: &str| match name {
+                JOBSET_ID_HEADER => Some(id.clone()),
+                JOBSET_SECRET_HEADER => Some(sec.clone()),
+                _ => None,
+            })
+        };
+
+        // End js-1
+        let bumped = reg.end_jobset("js-1").expect("ended");
+        assert_eq!(bumped, 1);
+        assert!(reg.is_ended("js-1"));
+        assert!(!reg.is_ended("js-2"));
+
+        // js-1 no longer member / verifies
+        assert!(!reg.is_member("agent-multi", "js-1"));
+        assert!(!verify_jobset_credential(
+            &reg,
+            "agent-multi",
+            &h("js-1", &s1)
+        ));
+
+        // js-2 still member and verifies!
+        assert!(reg.is_member("agent-multi", "js-2"));
+        assert!(verify_jobset_credential(
+            &reg,
+            "agent-multi",
+            &h("js-2", &s2)
+        ));
+    }
+
+    #[test]
+    fn job_control_with_member_of_two_jobsets() {
+        let reg = JobsetRegistry::new();
+        assert!(reg.claim_creator("js-1", "creator-1"));
+        assert!(reg.claim_creator("js-2", "creator-2"));
+
+        reg.register_at("job-multi", "js-1", "s1", 0);
+        reg.register_at("job-multi", "js-2", "s2", 0);
+
+        // creator-1 controls job-multi through js-1
+        assert!(agent_controls_job(&reg, "js-1", "creator-1", "job-multi"));
+        // creator-2 controls job-multi through js-2
+        assert!(agent_controls_job(&reg, "js-2", "creator-2", "job-multi"));
+
+        // creator-1 cannot control job-multi claiming js-2
+        assert!(!agent_controls_job(&reg, "js-2", "creator-1", "job-multi"));
+        // creator-2 cannot control job-multi claiming js-1
+        assert!(!agent_controls_job(&reg, "js-1", "creator-2", "job-multi"));
+        // non-creator cannot control job-multi
+        assert!(!agent_controls_job(
+            &reg,
+            "js-1",
+            "other-agent",
+            "job-multi"
+        ));
     }
 }

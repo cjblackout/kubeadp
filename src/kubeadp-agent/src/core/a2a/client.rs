@@ -337,25 +337,36 @@ impl A2aClientCtx {
         entry: &AgentEntry,
         base: &str,
         override_configured: bool,
+        jobset_interceptor: Option<Arc<dyn CallInterceptor>>,
     ) -> Vec<Arc<dyn CallInterceptor>> {
         let mut interceptors = self.interceptors.clone();
         let static_peer = self
             .static_peer_keys
             .contains(&(entry.namespace.clone(), entry.name.clone()));
         if secret_header_allowed(base, override_configured, static_peer) {
-            if let Some(js) = &self.jobset_interceptor {
-                interceptors.push(Arc::clone(js));
+            let js = jobset_interceptor.or_else(|| self.jobset_interceptor.clone());
+            if let Some(js) = js {
+                interceptors.push(js);
             }
         }
         interceptors
     }
 
     fn client_for(&self, entry: &AgentEntry) -> Result<A2AClient<RestTransport>, String> {
+        self.client_for_jobset(entry, None)
+    }
+
+    fn client_for_jobset(
+        &self,
+        entry: &AgentEntry,
+        jobset_interceptor: Option<Arc<dyn CallInterceptor>>,
+    ) -> Result<A2AClient<RestTransport>, String> {
         let override_base = url_override(&entry.name, &entry.namespace);
         let base = override_base.clone().unwrap_or_else(|| entry.url.clone());
         let http = shared_peer_client()?;
         let transport = RestTransport::new(http, base.trim_end_matches('/').to_string());
-        let interceptors = self.interceptors_for(entry, &base, override_base.is_some());
+        let interceptors =
+            self.interceptors_for(entry, &base, override_base.is_some(), jobset_interceptor);
         Ok(A2AClient::new(transport).with_interceptors(interceptors))
     }
 
@@ -457,7 +468,7 @@ impl A2aClientCtx {
         // target fills it (so a reply to `<worker>/<job>` addresses that job).
         let task_id = task_id.or(suffix_task);
 
-        let message = self.build_send_message(text, context_id, task_id, incoming_hop)?;
+        let mut message = self.build_send_message(text, context_id, task_id, incoming_hop)?;
         // The outgoing hop the message carries (the sender's summary).
         let hop = message
             .metadata
@@ -466,6 +477,58 @@ impl A2aClientCtx {
             .and_then(|h| h.as_u64())
             .unwrap_or(0) as u32;
 
+        // Multi-jobset selection: if credential file has multiple jobsets and recipient is known,
+        // select the matching jobset credential.
+        let cred_file = crate::core::jobset::credential_file_from_env();
+        let selected_entry = if let Some(ref file) = cred_file {
+            if file.jobsets.len() > 1 {
+                let target_name = &agent;
+                let mut found = None;
+                // Check if target is member of any of our jobsets in local store/registry
+                let registry = crate::core::jobset::global_registry();
+                for e in &file.jobsets {
+                    if registry.is_member(target_name, &e.jobset_id) {
+                        found = Some(e.clone());
+                        break;
+                    }
+                    if let Some(dir) = registry.data_dir() {
+                        if let Ok(store) = crate::state::jobsets::JobsetStore::open_path(&dir) {
+                            if store.is_member(&e.jobset_id, target_name).unwrap_or(false) {
+                                found = Some(e.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+                found
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let client = if let (Some(ref file), Some(ref e)) = (&cred_file, &selected_entry) {
+            let interceptor: Arc<dyn CallInterceptor> =
+                Arc::new(JobsetCredentialInterceptor::from_entry(&file.agent_id, e));
+            let client = self.client_for_jobset(entry, Some(interceptor))?;
+            // Resign hop token with this jobset's secret
+            if !e.secret.is_empty() {
+                let token = crate::core::a2a::ingress::issue_hop_token(
+                    hop,
+                    &message.message_id,
+                    e.secret.as_bytes(),
+                    crate::core::a2a::inbox::now_unix(),
+                );
+                if let Some(ref mut meta) = message.metadata {
+                    meta.insert(META_HOP_TOKEN.to_string(), serde_json::json!(token));
+                }
+            }
+            client
+        } else {
+            self.client_for(entry)?
+        };
+
         let req = SendMessageRequest {
             message,
             configuration: None,
@@ -473,7 +536,6 @@ impl A2aClientCtx {
             tenant: None,
         };
 
-        let client = self.client_for(entry)?;
         let resp = client
             .send_message(&req)
             .await
@@ -650,6 +712,20 @@ impl JobsetCredentialInterceptor {
                 identity: crate::core::jobset::agent_identity_from_env(),
             }),
             _ => None,
+        }
+    }
+
+    /// Build the interceptor for a specific credential entry and agent id.
+    pub fn from_entry(agent_id: &str, entry: &crate::core::jobset::CredentialEntry) -> Self {
+        let identity = if !agent_id.is_empty() && !entry.member_proof.is_empty() {
+            Some((agent_id.to_string(), entry.member_proof.clone()))
+        } else {
+            None
+        };
+        Self {
+            jobset_id: entry.jobset_id.clone(),
+            secret: entry.secret.clone(),
+            identity,
         }
     }
 }
@@ -1618,14 +1694,15 @@ mod tests {
         ctx.static_peer_keys = Arc::new(static_keys);
 
         // Plain-HTTP discovered peer: jobset secret must NOT be attached (N9).
-        let list_http = ctx.interceptors_for(&discovered_http, &discovered_http.url, false);
+        let list_http = ctx.interceptors_for(&discovered_http, &discovered_http.url, false, None);
         assert!(
             list_http.is_empty(),
             "plain-HTTP Service-discovered peer must not receive jobset secret headers"
         );
 
         // HTTPS peer: attached exactly once (never duplicated).
-        let list_https = ctx.interceptors_for(&discovered_https, &discovered_https.url, false);
+        let list_https =
+            ctx.interceptors_for(&discovered_https, &discovered_https.url, false, None);
         assert_eq!(list_https.len(), 1);
         let mut params: ServiceParams = HashMap::new();
         for ic in &list_https {
@@ -1641,7 +1718,7 @@ mod tests {
         );
 
         // Static peer over plain HTTP: attached once.
-        let list_static = ctx.interceptors_for(&static_http, &static_http.url, false);
+        let list_static = ctx.interceptors_for(&static_http, &static_http.url, false, None);
         assert_eq!(list_static.len(), 1);
     }
 

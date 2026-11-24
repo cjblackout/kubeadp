@@ -950,7 +950,9 @@ fn run_session_iteration(
                 sandboxed_cmd.env(k, v);
             }
             session_secret_fd = Some(crate::orchestrate::pty::secret_memfd(
-                &crate::core::jobset::credential_file_json(&session.name, cred),
+                &crate::core::jobset::agent_credential_file_json(&session.name).unwrap_or_else(
+                    || crate::core::jobset::credential_file_json(&session.name, cred),
+                ),
             ));
         }
 
