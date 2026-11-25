@@ -20,7 +20,7 @@ name: build-kubeadp-agent
 #
 # Runner notes (verified live 2026-09-28 against the exact images -- same as
 # build-ai-server.yml and build-agent-run-api.yml):
-# - runs-on: kubeopencode-home (ARC scale set, min 0 / max 5).
+# - runs-on: kubeadp-home (ARC scale set, min 0 / max 5).
 # - Runner pods run on the gVisor (runsc) runtime; standard
 #   bwcloud-preferred affinity (100/50), so they land on bwcloud-worker1,
 #   falling back to home x86 agents (compute3/compute4).
@@ -63,7 +63,7 @@ concurrency:
 
 jobs:
   version:
-    runs-on: kubeopencode-home
+    runs-on: kubeadp-home
     timeout-minutes: 10
     outputs:
       version: ${{ steps.calc.outputs.version }}
@@ -111,7 +111,7 @@ jobs:
 
   build:
     needs: version
-    runs-on: kubeopencode-home
+    runs-on: kubeadp-home
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
