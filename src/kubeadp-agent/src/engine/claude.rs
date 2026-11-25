@@ -1,0 +1,1746 @@
+//! The claude engine (design HL-91 E2).
+//!
+//! [`ClaudeEngine`] implements the E1 [`crate::engine::Engine`] trait for the
+//! claude harness, supporting both transports:
+//!
+//! - **job mode** via headless `claude -p --input-format stream-json
+//!   --output-format stream-json` ([`stream_json`]),
+//! - **session mode** by delegating to the existing supervisor machinery
+//!   ([`session_pty`]) that today runs claude in an interactive PTY with
+//!   `--remote-control`.
+//!
+//! Nothing routes through the trait yet (E1 state): this is the engine-side
+//! implementation that E3/E5 wire the endpoint layer onto.
+
+use crate::core::job::{JobMetadata, JobStatus};
+use crate::engine::capability::CapabilityTable;
+use crate::engine::claude::session_pty::ClaudePtyAdapter;
+use crate::engine::claude::stream_json::{
+    parse_result_session_id, parse_stream_json_line, render_text_request, stream_events,
+    StreamJsonArgs, StreamJsonMode,
+};
+use crate::engine::run::{
+    ContextId, EngineEvent, EngineId, ExitInfo, Run, RunId, RunKind, RunStatus,
+};
+use crate::engine::{
+    Engine, EngineCtx, EngineError, JobSpec, LaunchPlan, ResumeMode, SessionDef, SessionSpec,
+    StdinMode, Transport, TurnInput,
+};
+use async_trait::async_trait;
+use std::collections::{HashMap, VecDeque};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout};
+use std::sync::{Arc, Mutex};
+
+// ---------------------------------------------------------------------------
+// Sub-modules (2018 file+dir layout): transcript parser, headless stream-json
+// driver and the PTY session adapter.
+// ---------------------------------------------------------------------------
+pub mod session_pty;
+pub mod stream_json;
+pub mod transcript;
+
+/// The stable engine identifier.
+pub const ENGINE_ID: &str = "claude";
+
+/// Bounded event buffer size per job (drop-oldest), so an idle engine does not
+/// accumulate an unbounded transcript for a long-lived job.
+const JOB_EVENT_BUFFER_CAP: usize = 10_000;
+
+/// Upper bound on the number of in-memory `JobHandle`s the engine tracks.
+///
+/// A job handle is inserted on `start_job` and never removed by a terminal
+/// `job_status` (the `events` cursor and `resume_job` read the same handle),
+/// so without a bound the map would grow one entry per job ever started. When
+/// a NEW job would exceed the cap, only *terminal* (already-exited) handles
+/// are evicted -- the oldest first -- so a live child is never evicted while
+/// it runs (evicting a live handle would leak its process). Terminal entries
+/// are safe to drop: the durable job row on disk remains the authoritative
+/// state and is re-materialized on demand.
+const MAX_JOBS: usize = 1024;
+
+/// A bounded, ordered in-memory event buffer appended by a job's output reader
+/// thread. Cursor semantics mirror the session path: a cursor is a 0-based
+/// index into the retained events (`after` saturates at the end, so a cursor
+/// past the last event yields an empty tail).
+struct JobEvents {
+    events: Vec<EngineEvent>,
+    cap: usize,
+}
+
+impl JobEvents {
+    fn new(cap: usize) -> Self {
+        Self {
+            events: Vec::new(),
+            cap,
+        }
+    }
+
+    /// Appends `event`, dropping the oldest when the buffer is at capacity.
+    fn push(&mut self, event: EngineEvent) {
+        if self.events.len() >= self.cap {
+            self.events.remove(0);
+        }
+        self.events.push(event);
+    }
+
+    /// The events at and after index `after` (saturating).
+    fn after(&self, after: u64) -> Vec<EngineEvent> {
+        events_after_index(&self.events, after)
+    }
+}
+
+/// Pure cursor helper shared by the job event buffer and [`JobEvents::after`]
+/// so the "index at/after `after`, saturating" contract is unit-testable
+/// without a child process.
+fn events_after_index(events: &[EngineEvent], after: u64) -> Vec<EngineEvent> {
+    let start = (after as usize).min(events.len());
+    events[start..].to_vec()
+}
+
+/// A single live claude job child (stream-json headless mode).
+struct JobHandle {
+    child: Child,
+    /// The child's stdin, kept so further user messages can be delivered over
+    /// the harness's stream-json input (`None` while a resume is spawning).
+    #[allow(dead_code)] // held open on purpose: dropping it would close the child's input
+    stdin: Option<ChildStdin>,
+    /// The harness session id captured from the stream-json output
+    /// (`parse_result_session_id`), shared with the reader thread and used by
+    /// `resume_job` to derive the `--resume` target when the caller passes no
+    /// `context_id`.
+    session_id: Arc<Mutex<Option<ContextId>>>,
+    /// The bounded, ordered event buffer appended by the reader thread.
+    events: Arc<Mutex<JobEvents>>,
+    /// Observed terminal status, `None` while the child is (or may be)
+    /// running or already reaped. `Child::try_wait` only reports an exit once,
+    /// so after a `job_status` reaps the child a later probe answers
+    /// `Ok(None)`; this slot keeps the observed outcome so `resume_job` can
+    /// tell "exited" from "still running".
+    terminal: Option<RunStatus>,
+}
+
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        crate::core::reaper::untrack_child(self.child.id());
+    }
+}
+
+/// The claude engine.
+pub struct ClaudeEngine {
+    /// The claude binary path.
+    binary: std::path::PathBuf,
+    /// Session-mode adapter over the supervisor API state (`None` when the
+    /// engine runs without a supervising process, e.g. the worker role;
+    /// session operations then answer `unsupported`).
+    pty: Option<ClaudePtyAdapter>,
+    /// Live job children keyed by run id.
+    jobs: Mutex<HashMap<RunId, JobHandle>>,
+    /// First-appearance order of the tracked job handles (FIFO eviction of
+    /// terminal handles); see [`MAX_JOBS`].
+    job_order: Mutex<VecDeque<RunId>>,
+    /// The `--mode` value for jobs.
+    mode: StreamJsonMode,
+}
+
+impl ClaudeEngine {
+    /// Builds the engine with a supervisor-adapter (`pty`) and a binary.
+    /// `None` disables session mode (operations answer `unsupported`).
+    pub fn new(binary: std::path::PathBuf, pty: Option<ClaudePtyAdapter>) -> Self {
+        Self {
+            binary,
+            pty,
+            jobs: Mutex::new(HashMap::new()),
+            job_order: Mutex::new(VecDeque::new()),
+            mode: StreamJsonMode::Normal,
+        }
+    }
+
+    /// Evicts terminal handles (oldest first) until the map is under `max`,
+    /// leaving live handles untouched. Called under the `jobs`/`job_order`
+    /// locks before a new handle is inserted.
+    fn evict_terminal_jobs(
+        jobs: &mut HashMap<RunId, JobHandle>,
+        order: &mut VecDeque<RunId>,
+        max: usize,
+    ) {
+        while jobs.len() >= max {
+            // Find the oldest candidate with a terminal (exited) handle.
+            let evicted = order
+                .iter()
+                .position(|run_id| jobs.get(run_id).is_some_and(|h| h.terminal.is_some()));
+            match evicted {
+                Some(idx) => {
+                    let run_id = order.remove(idx).expect("index from position");
+                    jobs.remove(&run_id);
+                }
+                None => {
+                    // Every tracked handle is still live: an engine saturated
+                    // with running jobs evicts nothing (a live child must not
+                    // be dropped and leaked); the newest insert still counts
+                    // toward the cap, so the map is at most
+                    // `max + (live jobs over the cap)` when all are live.
+                    break;
+                }
+            }
+        }
+    }
+
+    fn adapter(&self, endpoint: &'static str) -> Result<&ClaudePtyAdapter, EngineError> {
+        self.pty
+            .as_ref()
+            .ok_or_else(|| EngineError::unsupported(ENGINE_ID, endpoint))
+    }
+}
+
+/// Spawns a claude stream-json child for `run` (fresh job or resume),
+/// configures piped stdio, delivers the first user message and starts a
+/// reader thread that maps output lines to [`EngineEvent`]s in `events`
+/// and records the harness session id into `session_id`. Returns the child
+/// and its stdin handle; the caller owns them (the job map is only
+/// touched by the caller, so a resume can reuse the same `events` /
+/// `session_id` buffers across child spawns).
+///
+/// A free function (not `&self`) so `resume_job` can spawn while it holds a
+/// mutable borrow of the `jobs` map entry it is replacing.
+///
+/// The worktree policy file is written into `run.workdir`'s parent
+/// (mirroring the job launcher's state root) so it can fail closed
+/// alongside the run's other artifacts.
+fn spawn_job(
+    binary: &Path,
+    mode: &StreamJsonMode,
+    run: &Run,
+    resume: Option<&str>,
+    prompt: &str,
+    events: Arc<Mutex<JobEvents>>,
+    session_id: Arc<Mutex<Option<ContextId>>>,
+) -> Result<(Child, ChildStdin), EngineError> {
+    let binary_str = binary.to_string_lossy().to_string();
+    let args = StreamJsonArgs {
+        binary: binary_str.clone(),
+        workdir: run.workdir.clone(),
+        session_id: None,
+        resume: resume.map(|s| s.to_string()),
+        mode: mode.clone(),
+        dangerous: true,
+    };
+    let argv = args.argv();
+
+    let run_id = run.id.clone();
+    let workdir = run.workdir.clone();
+    let state_root = workdir
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .to_path_buf();
+    std::fs::create_dir_all(&state_root)
+        .map_err(|e| EngineError::Internal(format!("failed to create job state root: {e}")))?;
+    let policy_path = state_root.join(format!("{run_id}.claude.policy.json"));
+    let base_policy =
+        crate::sandbox::SandboxPolicy::for_job(&run_id, &workdir, None, Some(binary), None);
+    crate::sandbox::SandboxPolicy::write_policy_file(&base_policy, &policy_path)
+        .map_err(|e| EngineError::Internal(format!("failed to write sandbox policy: {e}")))?;
+
+    let launch = crate::engine::claude::stream_json::launch_argv(binary, &argv[1..], &policy_path);
+    let mut cmd = std::process::Command::new(&launch[0]);
+    cmd.args(&launch[1..]);
+    cmd.current_dir(&workdir);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    crate::core::runner::detached_session(&mut cmd);
+    let mut child =
+        crate::core::spawn::spawn_command_tracked(&mut cmd, "claude job").map_err(|e| {
+            EngineError::Internal(format!("failed to spawn claude job '{run_id}': {e}"))
+        })?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| EngineError::Internal("claude job stdin is not piped".to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| EngineError::Internal("claude job stdout is not piped".to_string()))?;
+
+    // Deliver the first user message (the job's prompt) over stdin.
+    let request_line = render_text_request(prompt);
+    let mut stdin_buf = stdin;
+    stdin_buf
+        .write_all(format!("{request_line}\n").as_bytes())
+        .map_err(|e| EngineError::Internal(format!("failed to write claude job prompt: {e}")))?;
+    stdin_buf
+        .flush()
+        .map_err(|e| EngineError::Internal(format!("failed to flush claude job stdin: {e}")))?;
+
+    let events_reader = Arc::clone(&events);
+    let session_reader = Arc::clone(&session_id);
+    let reader_run = run_id.clone();
+    std::thread::Builder::new()
+        .name(format!("claude-job:{reader_run}"))
+        .spawn(move || read_job_stream(stdout, events_reader, session_reader))
+        .map_err(|e| {
+            EngineError::Internal(format!("failed to spawn claude job reader thread: {e}"))
+        })?;
+
+    Ok((child, stdin_buf))
+}
+
+/// The `--mcp-config` JSON that registers the harness-owned `mcp-a2a` stdio
+/// server (this very binary with the `mcp-a2a` subcommand). The server reads
+/// its credential file and A2A env from the job's own environment. `None` when
+/// the current executable cannot be resolved.
+#[cfg(feature = "a2a")]
+fn a2a_mcp_config() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    Some(
+        serde_json::json!({
+            "mcpServers": {
+                "a2a": {
+                    "command": exe.to_string_lossy(),
+                    "args": ["mcp-a2a"],
+                }
+            }
+        })
+        .to_string(),
+    )
+}
+
+#[async_trait]
+impl Engine for ClaudeEngine {
+    fn id(&self) -> EngineId {
+        ENGINE_ID.to_string()
+    }
+
+    async fn start_job(
+        &self,
+        spec: JobSpec,
+        _ctx: &mut dyn EngineCtx,
+    ) -> Result<RunId, EngineError> {
+        let run_id = run_id_from_workdir(&spec.workdir);
+        let mut run = Run::new(run_id.clone(), RunKind::Job, &spec.workdir);
+        run.engine = ENGINE_ID.to_string();
+        run.transport = Some(Transport::StreamJson);
+        run.context_id = spec.conversation_id.clone();
+
+        // Fast path: a workdir that already has a live job is a conflict, so
+        // no child is spawned at all. The authoritative check happens again
+        // under the same lock at insert time (below) to close the race where
+        // a second `start_job` for the same workdir lands between this probe
+        // and the insert.
+        if self
+            .jobs
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("claude job map poisoned: {e}")))?
+            .contains_key(&run_id)
+        {
+            return Err(EngineError::Conflict(format!(
+                "a claude job for workdir '{}' is already running",
+                spec.workdir.display()
+            )));
+        }
+
+        let events = Arc::new(Mutex::new(JobEvents::new(JOB_EVENT_BUFFER_CAP)));
+        let session_id = Arc::new(Mutex::new(None));
+        let (child, stdin) = spawn_job(
+            &self.binary,
+            &self.mode,
+            &run,
+            None,
+            &spec.prompt,
+            events.clone(),
+            session_id.clone(),
+        )?;
+
+        // Two jobs cannot silently overwrite each other in the `jobs` map: a
+        // run id that already has a live handle is a conflict, not a replace
+        // (the check and the insert share one lock acquisition so a racing
+        // start_job with the same workdir cannot interleave in between).
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("claude job map poisoned: {e}")))?;
+        let mut order = self
+            .job_order
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("claude job order poisoned: {e}")))?;
+        if jobs.contains_key(&run_id) {
+            // The freshly spawned child must not be leaked by replacing the
+            // handle; it is a new process for a workdir that already has a
+            // live job, so it is killed, reaped, and untracked.
+            let mut stray = child;
+            let stray_pid = stray.id();
+            let _ = stray.kill();
+            let _ = stray.wait();
+            crate::core::reaper::untrack_child(stray_pid);
+            return Err(EngineError::Conflict(format!(
+                "a claude job for workdir '{}' is already running",
+                spec.workdir.display()
+            )));
+        }
+        // Keep the map bounded: evict terminal handles (oldest first) before
+        // inserting a new one; live handles are never evicted.
+        Self::evict_terminal_jobs(&mut jobs, &mut order, MAX_JOBS);
+        order.push_back(run_id.clone());
+        jobs.insert(
+            run_id.clone(),
+            JobHandle {
+                child,
+                stdin: Some(stdin),
+                session_id,
+                events,
+                terminal: None,
+            },
+        );
+        Ok(run_id)
+    }
+
+    async fn resume_job(&self, run: &Run, prompt: &str) -> Result<(), EngineError> {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("claude job map poisoned: {e}")))?;
+        let handle = jobs.get_mut(&run.id).ok_or_else(|| EngineError::NotFound {
+            run: run.id.clone(),
+        })?;
+        // A resume is keyed on the harness conversation/session id.
+        let resume_session = if let Some(id) = run.context_id.clone() {
+            id
+        } else {
+            // A caller that lost the resolved id can still resume through the
+            // harness session id the output stream captured.
+            handle
+                .session_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or_default()
+        };
+        if resume_session.is_empty() {
+            return Err(EngineError::Conflict(format!(
+                "job '{}' has no conversation id; cannot resume",
+                run.id
+            )));
+        }
+        // One resume at a time: the previous child must have exited. The
+        // `terminal` slot keeps the observed outcome across `job_status`
+        // probes, because `Child::try_wait` reports an exit only once.
+        let exited = match handle.terminal {
+            Some(RunStatus::Done) | Some(RunStatus::Failed) | Some(RunStatus::Killed) => true,
+            Some(_) => false,
+            None => match handle.child.try_wait() {
+                Ok(Some(status)) => {
+                    crate::core::reaper::untrack_child(handle.child.id());
+                    handle.terminal = Some(if status.success() {
+                        RunStatus::Done
+                    } else {
+                        RunStatus::Failed
+                    });
+                    true
+                }
+                Ok(None) => false,
+                Err(e) => {
+                    return Err(EngineError::Internal(format!(
+                        "failed to probe claude job child: {e}"
+                    )))
+                }
+            },
+        };
+        if !exited {
+            return Err(EngineError::Conflict(format!(
+                "job '{}' is still running; cannot resume",
+                run.id
+            )));
+        }
+        // Reuse the handle's event/session buffers so the resumed turn's
+        // events are contiguous with the previous run's.
+        let run_events = Arc::clone(&handle.events);
+        let run_session = Arc::clone(&handle.session_id);
+        let (child, stdin) = spawn_job(
+            &self.binary,
+            &self.mode,
+            run,
+            Some(&resume_session),
+            prompt,
+            Arc::clone(&run_events),
+            Arc::clone(&run_session),
+        )?;
+        *handle = JobHandle {
+            child,
+            stdin: Some(stdin),
+            session_id: run_session,
+            events: run_events,
+            terminal: None,
+        };
+        Ok(())
+    }
+
+    async fn job_status(&self, run: &Run) -> Result<RunStatus, EngineError> {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|e| EngineError::Internal(format!("claude job map poisoned: {e}")))?;
+        let handle = jobs.get_mut(&run.id).ok_or_else(|| EngineError::NotFound {
+            run: run.id.clone(),
+        })?;
+        if let Some(terminal) = handle.terminal {
+            return Ok(terminal);
+        }
+        match handle.child.try_wait() {
+            Ok(Some(status)) => {
+                crate::core::reaper::untrack_child(handle.child.id());
+                let outcome = if status.success() {
+                    RunStatus::Done
+                } else {
+                    RunStatus::Failed
+                };
+                handle.terminal = Some(outcome);
+                Ok(outcome)
+            }
+            Ok(None) => Ok(RunStatus::Running),
+            Err(e) => Err(EngineError::Internal(format!(
+                "failed to probe claude job child: {e}"
+            ))),
+        }
+    }
+
+    fn is_idle(&self, run: &Run) -> Result<bool, EngineError> {
+        // A finished job is idle (its next turn can be started with the queued
+        // message); a live job child is busy until it exits. A session is idle
+        // when it is RUNNING (between turns: the PTY is idle, so the bracketed
+        // paste of the `idle_turn` can be delivered). Everything else (pending,
+        // stopped, failed, backoff) is not idle.
+        match run.kind {
+            RunKind::Job => {
+                let jobs = self
+                    .jobs
+                    .lock()
+                    .map_err(|e| EngineError::Internal(format!("claude job map poisoned: {e}")))?;
+                let handle = jobs.get(&run.id).ok_or_else(|| EngineError::NotFound {
+                    run: run.id.clone(),
+                })?;
+                Ok(handle.terminal.is_some())
+            }
+            RunKind::Session => {
+                let adapter = self.adapter("a2a.inject.idle_turn")?;
+                let st = adapter
+                    .state
+                    .supervisor_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                Ok(st
+                    .sessions
+                    .get(&run.id)
+                    .is_some_and(|s| s.status == crate::orchestrate::state::SessionStatus::Running))
+            }
+        }
+    }
+
+    async fn idle_turn(&self, run: &Run, joined: &str) -> Result<(), EngineError> {
+        // The `idle_turn` step of §7.14: the queued message starts the run's
+        // NEXT turn. A finished job is resumed with the joined framed text; a
+        // running interactive session gets it as the next user input (the PTY
+        // bracketed paste). Never kills.
+        match run.kind {
+            RunKind::Job => self.resume_job(run, joined).await,
+            RunKind::Session => {
+                let adapter = self.adapter("a2a.inject.idle_turn")?;
+                let run_for = Run::new(run.id.clone(), RunKind::Session, &run.workdir);
+                let outcome = crate::orchestrate::sessions_api::deliver_message(
+                    &adapter.state,
+                    &run.id,
+                    crate::orchestrate::sessions_api::REST_SENDER,
+                    joined,
+                    false,
+                );
+                crate::engine::claude::session_pty::outcome_to_error(outcome, &run_for)
+            }
+        }
+    }
+
+    async fn start_session(
+        &self,
+        spec: SessionSpec,
+        _ctx: &mut dyn EngineCtx,
+    ) -> Result<RunId, EngineError> {
+        let adapter = self.adapter("session.start")?;
+        let name = session_name_from_workdir(&spec.workdir);
+        adapter.start(&name)?;
+        Ok(name)
+    }
+
+    async fn send_message(&self, run: &Run, text: &str) -> Result<(), EngineError> {
+        let adapter = self.adapter("session.message")?;
+        adapter.send_message(&run.id, text)
+    }
+
+    async fn stop_session(&self, run: &Run, restart: bool) -> Result<(), EngineError> {
+        let adapter = self.adapter("session.stop")?;
+        adapter.stop(&run.id, restart)
+    }
+
+    fn job_command(
+        &self,
+        job: &JobMetadata,
+        turn: TurnInput<'_>,
+    ) -> Result<LaunchPlan, EngineError> {
+        let mut args: Vec<String> = vec![
+            "--dangerously-skip-permissions".to_string(),
+            "-p".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+        ];
+
+        if job.mode.eq_ignore_ascii_case("plan") {
+            args.push("--permission-mode".to_string());
+            args.push("plan".to_string());
+        }
+
+        if let Some(m) = &job.model {
+            args.push("--model".to_string());
+            args.push(m.clone());
+        }
+
+        // The harness-owned `mcp-a2a` server is the agent's only way to send
+        // A2A messages (SPEC §8); claude jobs register it explicitly.
+        #[cfg(feature = "a2a")]
+        if let Some(config) = a2a_mcp_config() {
+            args.push("--mcp-config".to_string());
+            args.push(config);
+        }
+
+        let prompt = match turn {
+            TurnInput::Start { prompt, .. } => prompt,
+            TurnInput::Resume {
+                prompt,
+                conversation,
+                ..
+            } => {
+                if let Some(conv_id) = conversation {
+                    args.push("--resume".to_string());
+                    args.push(conv_id.to_string());
+                }
+                prompt
+            }
+        };
+
+        let mut first_line = render_text_request(prompt);
+        if !first_line.ends_with('\n') {
+            first_line.push('\n');
+        }
+
+        Ok(LaunchPlan {
+            program: self.binary.clone(),
+            args,
+            env: Vec::new(),
+            stdin: StdinMode::Pipe {
+                first_line: Some(first_line),
+            },
+            pty: false,
+        })
+    }
+
+    fn session_command(
+        &self,
+        session: &SessionDef,
+        resume: ResumeMode,
+    ) -> Result<LaunchPlan, EngineError> {
+        let is_resume = matches!(resume, ResumeMode::Resume);
+        let mut args: Vec<String> = Vec::new();
+        let mut session_arg_inserted = false;
+
+        for arg in &session.claude_args {
+            args.push(arg.clone());
+            if arg == "--dangerously-skip-permissions" && !session_arg_inserted {
+                if is_resume {
+                    args.push("--resume".to_string());
+                    args.push(session.session_id.clone());
+                } else {
+                    args.push("--session-id".to_string());
+                    args.push(session.session_id.clone());
+                }
+                session_arg_inserted = true;
+            }
+        }
+
+        if !session_arg_inserted {
+            if is_resume {
+                args.push("--resume".to_string());
+                args.push(session.session_id.clone());
+            } else {
+                args.push("--session-id".to_string());
+                args.push(session.session_id.clone());
+            }
+        }
+
+        let mut env: Vec<(String, String)> = session
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        env.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Ok(LaunchPlan {
+            program: session.claude_binary.clone(),
+            args,
+            env,
+            stdin: StdinMode::Null,
+            pty: true,
+        })
+    }
+
+    fn classify_exit(&self, exit: ExitInfo, log_tail: &[u8]) -> JobStatus {
+        let log = String::from_utf8_lossy(log_tail);
+        crate::core::job::determine_status_from_claude(exit.code, &log)
+    }
+
+    fn conversation_id(&self, job: &JobMetadata) -> Option<ContextId> {
+        if let Some(ref conv_id) = job.conversation_id {
+            if !conv_id.trim().is_empty() {
+                return Some(conv_id.clone());
+            }
+        }
+        None
+    }
+
+    async fn events(&self, run: &Run, after: u64) -> Result<Vec<EngineEvent>, EngineError> {
+        match run.kind {
+            RunKind::Job => {
+                let jobs = self
+                    .jobs
+                    .lock()
+                    .map_err(|e| EngineError::Internal(format!("claude job map poisoned: {e}")))?;
+                let handle = jobs.get(&run.id).ok_or_else(|| EngineError::NotFound {
+                    run: run.id.clone(),
+                })?;
+                let buffer = handle.events.lock().map_err(|e| {
+                    EngineError::Internal(format!("claude job events poisoned: {e}"))
+                })?;
+                Ok(buffer.after(after))
+            }
+            // Session structured reads come from the claude transcript.
+            RunKind::Session => {
+                let adapter = self.adapter("session.log")?;
+                adapter.events(run, after)
+            }
+        }
+    }
+
+    fn capabilities(&self) -> CapabilityTable {
+        // The claude job driver (engine-aware runner) provides the full job
+        // lifecycle over the same HTTP/CLI surface as agy (HL-71 S1 engine
+        // parity): start/status/retry/events plus list/kill/result and the
+        // worktree inspection endpoints, which are engine-agnostic (they
+        // operate on the job row / worktree and already parse claude's
+        // stream-json text). Tested end-to-end through the black-box suite
+        // (tests/cli/run-tests.sh, T172+) and the job.rs/result.rs unit
+        // tests.
+        CapabilityTable::builder(ENGINE_ID)
+            .transport(Transport::StreamJson)
+            .native(&[
+                "job.start",
+                "job.status",
+                "job.list",
+                "job.kill",
+                "job.retry",
+                "job.events",
+                "job.result",
+                "workspace.*",
+                "session.start",
+                "session.stop",
+                "session.restart",
+                "session.log",
+                "session.message",
+                // Design HL-113 §7.14: the harness puts queued A2A messages
+                // into the model's context (mcp-a2a tool_result + the session
+                // hooks); the supported channels are in `inject_channels`.
+                "a2a.inject",
+            ])
+            .emulated(&[
+                "interrupt",
+                "pause",
+                "fork",
+                "compact",
+                "revert",
+                "todo",
+                "a2a.send_message",
+            ])
+            .build()
+    }
+
+    fn display_name(&self) -> &str {
+        "claude"
+    }
+
+    fn normalize_prompt(&self, prompt: &str, _job_id: &str, _retry_count: u32) -> String {
+        prompt.to_string()
+    }
+
+    fn configured_program(&self, config: &crate::core::config::Config) -> PathBuf {
+        config.claude_path.clone()
+    }
+
+    fn prepare_session(
+        &self,
+        session: &SessionDef,
+        cfg_path: &std::path::Path,
+        settings_path: &std::path::Path,
+    ) -> Result<(), String> {
+        crate::orchestrate::claude_config::ensure_claude_config(
+            cfg_path,
+            settings_path,
+            &[&session.workdir],
+        )?;
+        crate::orchestrate::claude_config::ensure_a2a_hooks(settings_path)?;
+        Ok(())
+    }
+
+    fn readiness(
+        &self,
+        session: &SessionDef,
+        poll_interval: std::time::Duration,
+        shutdown: &std::sync::atomic::AtomicBool,
+        paused: &std::sync::atomic::AtomicBool,
+    ) -> (bool, String) {
+        crate::orchestrate::readiness::wait_until_ready_with_pause(
+            &session.claude_binary,
+            &session.env,
+            &session.name,
+            poll_interval,
+            shutdown,
+            paused,
+        )
+    }
+
+    fn session_file(
+        &self,
+        supervisor_config: &crate::orchestrate::config::SupervisorConfig,
+        session: &SessionDef,
+    ) -> PathBuf {
+        supervisor_config.resolve_session_file(session)
+    }
+
+    fn has_session_transcript(&self) -> bool {
+        true
+    }
+
+    fn supports_legacy_memory_file(&self) -> bool {
+        true
+    }
+
+    fn frame_pty_message(&self, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(
+            crate::server::sessions::PASTE_START.len()
+                + payload.len()
+                + crate::server::sessions::PASTE_END.len()
+                + 1,
+        );
+        frame.extend_from_slice(crate::server::sessions::PASTE_START);
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(crate::server::sessions::PASTE_END);
+        frame.push(b'\r');
+        frame
+    }
+
+    fn materialize_instructions(
+        &self,
+        home: &std::path::Path,
+        workdir: &std::path::Path,
+        global_text: Option<(PathBuf, String)>,
+        per_session_text: Option<(PathBuf, String)>,
+        log: &mut Vec<String>,
+    ) -> bool {
+        crate::core::instructions::materialize_claude(
+            home,
+            workdir,
+            global_text,
+            per_session_text,
+            log,
+        )
+    }
+}
+
+/// Reads the job's stream-json stdout line by line, records the harness
+/// session id when the harness echoes one and appends the mapped engine
+/// events to the handle's bounded buffer. Runs on a dedicated thread so job
+/// output is captured without blocking `start_job`/`resume_job`.
+fn read_job_stream(
+    stdout: ChildStdout,
+    events: Arc<Mutex<JobEvents>>,
+    session_id: Arc<Mutex<Option<ContextId>>>,
+) {
+    use std::io::BufRead;
+    let reader = std::io::BufReader::new(stdout);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(id) = parse_result_session_id(&line) {
+            if let Ok(mut slot) = session_id.lock() {
+                if slot.is_none() {
+                    *slot = Some(id);
+                }
+            }
+        }
+        // A malformed line is skipped (the reader stays alive for the rest of
+        // the stream), matching the parser's tolerant contract.
+        if let Ok(message) = parse_stream_json_line(&line) {
+            let mapped = stream_events(std::slice::from_ref(&message));
+            if !mapped.is_empty() {
+                if let Ok(mut buffer) = events.lock() {
+                    for event in mapped {
+                        buffer.push(event);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Derives a stable run id from a workdir (jobs have no supervisor-seeded
+/// name; the path's final component is the natural id).
+fn run_id_from_workdir(workdir: &std::path::Path) -> String {
+    workdir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "claude-job".to_string())
+}
+
+/// Session naming mirrors the supervisor config: `SessionConfig.name` is the
+/// canonical handle for `start`/`stop`/`message`. When starting by workdir
+/// alone, the final path component is the natural name.
+fn session_name_from_workdir(workdir: &std::path::Path) -> String {
+    run_id_from_workdir(workdir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::capability::Capability;
+    use std::path::PathBuf;
+
+    /// Writes a fake `claude` shell script into `dir` that behaves like the
+    /// stream-json harness for the (hermetic) job tests: it reads one line
+    /// from stdin (the rendered text request), records its own argv and the
+    /// received line into files in `dir`, then emits a `system` +
+    /// `assistant` + `result` stream-json sequence carrying `session_id`
+    /// `"fake-session-1"`. The script is used through the `test-hooks` sandbox
+    /// passthrough seam ([`crate::sandbox::testhook`]), so no sandbox runtime
+    /// is needed.
+    #[cfg(feature = "test-hooks")]
+    fn write_fake_claude(dir: &std::path::Path) -> std::path::PathBuf {
+        let argv_log = dir.join("argv.log");
+        let stdin_log = dir.join("stdin.log");
+        let script = dir.join("fake-claude.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+echo "$@" > '{argv}'
+if IFS= read -r line; then
+  printf '%s\n' "$line" > '{stdin}'
+fi
+printf '%s\n' '{{"type":"system","subtype":"init"}}'
+printf '%s\n' '{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"hello from fake claude"}}]}},"session_id":"fake-session-1"}}'
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"fake-session-1"}}'
+exit 0
+"#,
+                argv = argv_log.display(),
+                stdin = stdin_log.display(),
+            ),
+        )
+        .unwrap();
+        #[allow(unused_imports)]
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Polls up to `timeout_ms` until `predicate` returns `true` (used to wait
+    /// for the reader thread to drain the job's stream-json output).
+    #[cfg(feature = "test-hooks")]
+    fn wait_until(timeout_ms: u64, mut predicate: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if predicate() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        predicate()
+    }
+
+    /// Builds a `JobSpec` rooted at a temp worktree whose parent is another
+    /// temp dir (the job's policy file and the run's artifacts live there).
+    #[cfg(feature = "test-hooks")]
+    fn job_spec(root: &std::path::Path, prompt: &str) -> JobSpec {
+        let workdir = root.join("proj");
+        std::fs::create_dir_all(&workdir).unwrap();
+        JobSpec {
+            prompt: prompt.to_string(),
+            conversation_id: None,
+            mode: "normal".to_string(),
+            workdir,
+            project: "hl91".to_string(),
+            options: serde_json::Value::Null,
+        }
+    }
+
+    /// Builds a `ClaudeEngine` whose binary is a fake claude script written
+    /// into `tmp`, with the `test-hooks` sandbox passthrough explicitly on so
+    /// the child runs unwrapped.
+    #[cfg(feature = "test-hooks")]
+    fn job_engine_with(tmp: &tempfile::TempDir) -> ClaudeEngine {
+        let fake = write_fake_claude(tmp.path());
+        crate::sandbox::testhook::set_sandbox_passthrough(true);
+        ClaudeEngine::new(fake, None)
+    }
+
+    #[test]
+    fn id_is_stable() {
+        let engine = ClaudeEngine::new(std::path::PathBuf::from("claude"), None);
+        assert_eq!(engine.id(), "claude");
+    }
+
+    #[test]
+    fn run_id_and_session_name_derive_from_workdir() {
+        assert_eq!(
+            run_id_from_workdir(std::path::Path::new("/workspace/proj")),
+            "proj"
+        );
+        assert_eq!(
+            session_name_from_workdir(std::path::Path::new("/workspace/proj")),
+            "proj"
+        );
+        assert_eq!(
+            session_name_from_workdir(std::path::Path::new("/")),
+            "claude-job"
+        );
+    }
+
+    #[test]
+    fn session_ops_without_supervisor_answer_unsupported() {
+        let engine = ClaudeEngine::new(std::path::PathBuf::from("claude"), None);
+        let mut ctx = crate::engine::EmptyEngineCtx;
+        let spec = SessionSpec {
+            workdir: std::path::PathBuf::from("/workspace/proj"),
+            transport: Some(Transport::StreamJson),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(engine.start_session(spec, &mut ctx))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::Unsupported { endpoint, .. } if endpoint == "session.start"
+            ),
+            "expected session.start unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn capabilities_honest_transport_and_keys() {
+        let engine = ClaudeEngine::new(std::path::PathBuf::from("claude"), None);
+        let table = engine.capabilities();
+        assert_eq!(table.engine, "claude");
+        assert_eq!(table.transport, Some(Transport::StreamJson));
+        assert_eq!(table.capability("job.start"), Some(Capability::Native));
+        assert_eq!(table.capability("job.status"), Some(Capability::Native));
+        // job.events / job.retry are native (event buffer + --resume).
+        assert_eq!(table.capability("job.retry"), Some(Capability::Native));
+        assert_eq!(table.capability("job.events"), Some(Capability::Native));
+        // HL-71 S1: the claude job driver reaches the full job lifecycle and
+        // the worktree endpoints over the same surface as agy (list/kill/
+        // result are engine-agnostic; the black-box suite proves them).
+        assert_eq!(table.capability("job.list"), Some(Capability::Native));
+        assert_eq!(table.capability("job.kill"), Some(Capability::Native));
+        assert_eq!(table.capability("job.result"), Some(Capability::Native));
+        assert_eq!(table.capability("workspace.*"), Some(Capability::Native));
+        assert_eq!(table.capability("session.start"), Some(Capability::Native));
+        assert_eq!(table.capability("session.log"), Some(Capability::Native));
+        assert_eq!(
+            table.capability("session.message"),
+            Some(Capability::Native)
+        );
+        // Control endpoints the engine implements via emulation.
+        assert_eq!(table.capability("interrupt"), Some(Capability::Emulated));
+        assert_eq!(table.capability("pause"), Some(Capability::Emulated));
+        assert_eq!(table.capability("fork"), Some(Capability::Emulated));
+        assert_eq!(table.capability("compact"), Some(Capability::Emulated));
+        assert_eq!(table.capability("revert"), Some(Capability::Emulated));
+        assert_eq!(table.capability("todo"), Some(Capability::Emulated));
+        assert_eq!(
+            table.capability("a2a.send_message"),
+            Some(Capability::Emulated)
+        );
+        assert_eq!(
+            table.capability("permissions"),
+            Some(Capability::Unsupported)
+        );
+    }
+
+    #[test]
+    fn unsupported_job_resume_is_honest() {
+        let engine = ClaudeEngine::new(std::path::PathBuf::from("claude"), None);
+        let run = Run::new("nope", RunKind::Job, "/workspace/proj");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let err = rt.block_on(engine.resume_job(&run, "continue"));
+        assert!(matches!(err, Err(EngineError::NotFound { .. })));
+    }
+
+    #[test]
+    fn event_gap_for_unknown_job_is_not_found() {
+        let engine = ClaudeEngine::new(std::path::PathBuf::from("claude"), None);
+        let run = Run::new("missing", RunKind::Job, "/workspace/proj");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let err = rt.block_on(engine.events(&run, 0));
+        assert!(matches!(err, Err(EngineError::NotFound { .. })));
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn start_job_runs_fake_claude_and_captures_status_events_session() {
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = job_engine_with(&tmp);
+        let spec = job_spec(tmp.path(), "say hi");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        let run_id = rt.block_on(async {
+            let mut ctx = crate::engine::EmptyEngineCtx;
+            engine.start_job(spec, &mut ctx).await.expect("start_job")
+        });
+        assert_eq!(run_id, "proj");
+
+        // The delivered prompt must reach the fake claude as exactly one
+        // newline-terminated stream-json user line.
+        assert!(wait_until(5000, || tmp.path().join("stdin.log").exists()));
+        let stdin_log = std::fs::read_to_string(tmp.path().join("stdin.log")).unwrap();
+        let line = stdin_log.trim_end();
+        let value: serde_json::Value = serde_json::from_str(line).expect("stdin line is json");
+        assert_eq!(value["type"], "user");
+        assert_eq!(value["message"]["content"][0]["text"], "say hi");
+        // The fake claude argv carried the stream-json headless flags.
+        let argv_log = std::fs::read_to_string(tmp.path().join("argv.log")).unwrap();
+        assert!(argv_log.contains("--input-format"));
+        assert!(argv_log.contains("stream-json"));
+        assert!(argv_log.contains("--output-format"));
+        // Token set of the recorded argv (the fake records `echo "$@"`,
+        // space-joined). `--verbose` is last on a fresh start, so a
+        // token-boundary match via split, not a substring, is used.
+        let argv_tokens: Vec<&str> = argv_log.split_whitespace().collect();
+        // `--output-format stream-json` with `-p` requires `--verbose` on the
+        // real claude CLI.
+        assert!(
+            argv_tokens.contains(&"--verbose"),
+            "claude job argv must carry --verbose: {argv_log}"
+        );
+        // The agy-only `--mode` flag must never reach the claude harness (the
+        // real CLI rejects it with `error: unknown option '--mode'`). A token
+        // match, so `--permission-mode` does not trip it.
+        assert!(
+            !argv_tokens.contains(&"--mode"),
+            "claude job argv must not carry the agy-only --mode flag: {argv_log}"
+        );
+
+        let run = Run::new(run_id.clone(), RunKind::Job, tmp.path().join("proj"));
+
+        // job_status ends Done (the fake script exits 0). The reader thread
+        // and the child exit asynchronously, so poll until Done.
+        assert!(wait_until(5000, || rt
+            .block_on(engine.job_status(&run))
+            .unwrap_or(RunStatus::Running)
+            == RunStatus::Done));
+
+        // events carry the assistant text and the result/session id is
+        // captured into the handle for resume/context.
+        assert!(wait_until(5000, || {
+            rt.block_on(engine.events(&run, 0))
+                .map(|events| {
+                    events.iter().any(|ev| {
+                        matches!(
+                            ev,
+                            EngineEvent::MessageDelta {
+                                role: crate::engine::run::Role::Assistant,
+                                text,
+                            } if text == "hello from fake claude"
+                        )
+                    })
+                })
+                .unwrap_or(false)
+        }));
+        // Cursor semantics: after the first event, the assistant text is
+        // still present when the cursor is 0; a cursor past the buffer tail
+        // yields an empty list.
+        let after_all = rt.block_on(engine.events(&run, 100)).unwrap();
+        assert!(after_all.is_empty());
+
+        // The harness session id is stored on the handle (used for resume
+        // and for the run's context_id).
+        let jobs = engine.jobs.lock().unwrap();
+        let handle = jobs.get(&run_id).unwrap();
+        assert_eq!(
+            handle.session_id.lock().unwrap().as_deref(),
+            Some("fake-session-1")
+        );
+        drop(jobs);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn resume_job_spawns_with_resume_flag() {
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = job_engine_with(&tmp);
+        let spec = job_spec(tmp.path(), "first prompt");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        let run_id = rt.block_on(async {
+            let mut ctx = crate::engine::EmptyEngineCtx;
+            engine.start_job(spec, &mut ctx).await.expect("start_job")
+        });
+        let workdir = tmp.path().join("proj");
+        let run = Run::new(run_id.clone(), RunKind::Job, &workdir);
+
+        // Wait for the first child to drive its output to EOF (the handle
+        // then reports Done) AND the harness session id to be captured by the
+        // reader thread (resume relies on it when the run has no context_id).
+        assert!(wait_until(5000, || {
+            rt.block_on(engine.job_status(&run))
+                .unwrap_or(RunStatus::Pending)
+                == RunStatus::Done
+                && engine
+                    .jobs
+                    .lock()
+                    .unwrap()
+                    .get(&run_id)
+                    .and_then(|h| h.session_id.lock().unwrap().clone())
+                    .is_some()
+        }));
+
+        // Resuming with the harness context id must spawn a new child whose
+        // argv carries `--resume fake-session-1`.
+        let resumed = rt
+            .block_on(engine.resume_job(&run, "continue please"))
+            .is_ok();
+        assert!(resumed, "resume_job must succeed after the child exited");
+        // The fake claude records its argv right at startup; wait for it to
+        // be overwritten by the resumed spawn before asserting.
+        assert!(wait_until(5000, || {
+            std::fs::read_to_string(tmp.path().join("argv.log"))
+                .map(|log| log.contains("--resume") && log.contains("fake-session-1"))
+                .unwrap_or(false)
+        }));
+        let argv_log = std::fs::read_to_string(tmp.path().join("argv.log")).unwrap();
+        assert!(
+            argv_log.contains("--resume"),
+            "resume must pass --resume to the harness: {argv_log}"
+        );
+        assert!(
+            argv_log.contains("fake-session-1"),
+            "resume must name the harness session id: {argv_log}"
+        );
+
+        // The resumed job is live again and eventually Done.
+        assert!(wait_until(5000, || rt
+            .block_on(engine.job_status(&run))
+            .unwrap_or(RunStatus::Pending)
+            == RunStatus::Done));
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn resume_requires_exited_child() {
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        // A fake claude that never exits: the resume is refused while the
+        // child is still running.
+        let script = tmp.path().join("slow-claude.sh");
+        std::fs::write(&script, "#!/bin/sh\nwhile :; do read -r l || break; done\n").unwrap();
+        #[allow(unused_imports)]
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::sandbox::testhook::set_sandbox_passthrough(true);
+        let engine = ClaudeEngine::new(script, None);
+        let spec = job_spec(tmp.path(), "slow");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let run_id = rt.block_on(async {
+            let mut ctx = crate::engine::EmptyEngineCtx;
+            engine.start_job(spec, &mut ctx).await.expect("start_job")
+        });
+        // Give the child a moment to be live.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut run = Run::new(run_id.clone(), RunKind::Job, "/workspace/proj");
+        run.context_id = Some("fake-session-1".to_string());
+        let err = rt.block_on(engine.resume_job(&run, "go"));
+        assert!(
+            matches!(err, Err(EngineError::Conflict(_))),
+            "resume while running must conflict, got {err:?}"
+        );
+        // Cleanup: kill the never-exiting child so the test does not leak it.
+        let mut jobs = engine.jobs.lock().unwrap();
+        if let Some(handle) = jobs.get_mut(&run_id) {
+            let _ = handle.child.kill();
+        }
+        drop(jobs);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn start_job_same_workdir_conflicts() {
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = job_engine_with(&tmp);
+        let spec = job_spec(tmp.path(), "one");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let run_id = rt.block_on(async {
+            let mut ctx = crate::engine::EmptyEngineCtx;
+            engine
+                .start_job(spec.clone(), &mut ctx)
+                .await
+                .expect("start")
+        });
+        assert_eq!(run_id, "proj");
+        let err = rt.block_on(async {
+            let mut ctx = crate::engine::EmptyEngineCtx;
+            engine.start_job(spec, &mut ctx).await
+        });
+        assert!(
+            matches!(err, Err(EngineError::Conflict(_))),
+            "second start for the same workdir must conflict, got {err:?}"
+        );
+    }
+
+    fn test_job_meta(job_id: &str, wt: &Path) -> JobMetadata {
+        JobMetadata {
+            job_id: job_id.to_string(),
+            project: "homelab".to_string(),
+            prompt: "task prompt".to_string(),
+            resolved_prompt: "task prompt".to_string(),
+            model: None,
+            effort: None,
+            sandbox: false,
+            mode: "normal".to_string(),
+            add_dirs: Vec::new(),
+            print_timeout: None,
+            created_at: chrono::Utc::now(),
+            worktree_path: wt.to_path_buf(),
+            branch: "b".to_string(),
+            base_ref: "HEAD".to_string(),
+            conversation_id: None,
+            retry_count: 0,
+            pid: None,
+            exit_code: None,
+            status: None,
+            hindsight: None,
+            auto_recall: None,
+            auto_retain: None,
+            retry_prompt: None,
+            read_only: false,
+            external_worktree: false,
+            pid_start_time: None,
+            hindsight_bank: None,
+            proxy: None,
+            max_runtime: None,
+            started_at: None,
+            hindsight_query: None,
+            sandbox_info: None,
+            engine: Some("claude".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_claude_job_command_start_normal_pinned() {
+        use std::path::{Path, PathBuf};
+        let engine = ClaudeEngine::new(PathBuf::from("/usr/local/bin/claude"), None);
+        let mut meta = test_job_meta("claude-start-1", Path::new("/tmp/claude-wt"));
+        meta.mode = "normal".to_string();
+        meta.model = Some("claude-3-5-sonnet-20241022".to_string());
+
+        let plan = engine
+            .job_command(
+                &meta,
+                TurnInput::Start {
+                    prompt: "implement feature X",
+                    live: false,
+                },
+            )
+            .expect("plan");
+
+        assert_eq!(plan.program, PathBuf::from("/usr/local/bin/claude"));
+        assert_eq!(
+            plan.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--model",
+                "claude-3-5-sonnet-20241022",
+            ]
+            .into_iter()
+            .map(String::from)
+            .chain(mcp_config_args())
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(plan.env, Vec::<(String, String)>::new());
+        let mut expected_json = render_text_request("implement feature X");
+        expected_json.push('\n');
+        assert_eq!(
+            plan.stdin,
+            StdinMode::Pipe {
+                first_line: Some(expected_json),
+            }
+        );
+        assert!(!plan.pty);
+    }
+
+    /// The `--mcp-config` argument pair the job command adds for the
+    /// harness-owned `mcp-a2a` server (only in the `a2a` build).
+    fn mcp_config_args() -> Vec<String> {
+        #[cfg(feature = "a2a")]
+        {
+            vec![
+                "--mcp-config".to_string(),
+                a2a_mcp_config().expect("current exe"),
+            ]
+        }
+        #[cfg(not(feature = "a2a"))]
+        {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn test_claude_job_command_plan_mode_pinned() {
+        use std::path::{Path, PathBuf};
+        let engine = ClaudeEngine::new(PathBuf::from("/usr/local/bin/claude"), None);
+        let mut meta = test_job_meta("claude-plan-1", Path::new("/tmp/claude-wt"));
+        meta.mode = "plan".to_string();
+
+        let plan = engine
+            .job_command(
+                &meta,
+                TurnInput::Start {
+                    prompt: "investigate issue",
+                    live: false,
+                },
+            )
+            .expect("plan");
+
+        assert_eq!(
+            plan.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--permission-mode",
+                "plan",
+            ]
+            .into_iter()
+            .map(String::from)
+            .chain(mcp_config_args())
+            .collect::<Vec<_>>()
+        );
+        let mut expected_json = render_text_request("investigate issue");
+        expected_json.push('\n');
+        assert_eq!(
+            plan.stdin,
+            StdinMode::Pipe {
+                first_line: Some(expected_json),
+            }
+        );
+    }
+
+    #[test]
+    fn test_claude_job_command_resume_pinned() {
+        use std::path::{Path, PathBuf};
+        let engine = ClaudeEngine::new(PathBuf::from("/usr/local/bin/claude"), None);
+        let meta = test_job_meta("claude-resume-1", Path::new("/tmp/claude-wt"));
+
+        let plan = engine
+            .job_command(
+                &meta,
+                TurnInput::Resume {
+                    prompt: "continue with next step",
+                    conversation: Some("sess-uuid-789"),
+                    live: false,
+                },
+            )
+            .expect("plan");
+
+        assert_eq!(
+            plan.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+            ]
+            .into_iter()
+            .map(String::from)
+            .chain(mcp_config_args())
+            .chain(["--resume", "sess-uuid-789"].into_iter().map(String::from))
+            .collect::<Vec<_>>()
+        );
+        let mut expected_json = render_text_request("continue with next step");
+        expected_json.push('\n');
+        assert_eq!(
+            plan.stdin,
+            StdinMode::Pipe {
+                first_line: Some(expected_json),
+            }
+        );
+    }
+
+    #[test]
+    fn test_claude_classify_exit_and_conversation_id() {
+        use std::path::{Path, PathBuf};
+        let engine = ClaudeEngine::new(PathBuf::from("/usr/local/bin/claude"), None);
+
+        let exit_0 = ExitInfo {
+            code: Some(0),
+            signal: None,
+        };
+        let exit_1 = ExitInfo {
+            code: Some(1),
+            signal: None,
+        };
+        let exit_137 = ExitInfo {
+            code: Some(137),
+            signal: None,
+        };
+
+        assert_eq!(
+            engine.classify_exit(exit_137, b""),
+            JobStatus::SelfTerminated
+        );
+
+        let result_ok = b"{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}\n";
+        assert_eq!(engine.classify_exit(exit_0, result_ok), JobStatus::Done);
+
+        let result_err = b"{\"type\":\"result\",\"subtype\":\"error\",\"error\":\"bad\"}\n";
+        assert_eq!(engine.classify_exit(exit_1, result_err), JobStatus::Failed);
+
+        // Also test error result line with result field (auth fail shape), quota line, etc.
+        let result_authfail = b"{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"result\":\"Failed to authenticate: OAuth session expired\"}\n";
+        assert_eq!(
+            engine.classify_exit(exit_1, result_authfail),
+            JobStatus::Failed
+        );
+
+        let result_quota = b"{\"type\":\"result\",\"subtype\":\"error\",\"error\":\"upstream 429 resource_exhausted: rate limit exceeded\"}\n";
+        assert_eq!(
+            engine.classify_exit(exit_1, result_quota),
+            JobStatus::QuotaExhausted
+        );
+
+        let mut meta = test_job_meta("meta-conv", Path::new("/tmp/wt"));
+        assert_eq!(engine.conversation_id(&meta), None);
+
+        meta.conversation_id = Some("sess-999".to_string());
+        assert_eq!(engine.conversation_id(&meta).as_deref(), Some("sess-999"));
+    }
+
+    #[test]
+    fn test_claude_session_command_start_and_resume() {
+        let engine = ClaudeEngine::new(PathBuf::from("/usr/local/bin/claude"), None);
+
+        let mut env_map = HashMap::new();
+        env_map.insert("ZZZ".to_string(), "last".to_string());
+        env_map.insert("AAA".to_string(), "first".to_string());
+
+        let session = SessionDef {
+            name: "test-sess".to_string(),
+            workdir: PathBuf::from("/workspace/claude-repo"),
+            session_id: "session-uuid-123".to_string(),
+            engine: Some("claude".to_string()),
+            claude_binary: PathBuf::from("/opt/tools/claude"),
+            claude_args: vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--verbose".to_string(),
+            ],
+            agy_binary: PathBuf::from("agy"),
+            env: env_map,
+            session_file: None,
+            transcript_path: None,
+            memory_file: None,
+            instructions_file: None,
+            readiness_poll_secs: 5.0,
+            hang_timeout_secs: 0.0,
+            kill_grace_secs: 5.0,
+            pty_eof_grace_secs: 10.0,
+            kill_wait_secs: 15.0,
+            sandbox: true,
+            grants: None,
+            base_backoff_secs: 2.0,
+            max_backoff_secs: 60.0,
+            healthy_run_secs: 30.0,
+            max_crashes: 5,
+            crash_window_secs: 60.0,
+            prefix_output: false,
+            failed_cooldown_secs: 300.0,
+            backoff_window_secs: 600.0,
+            resume_fail_quarantine_after: 5,
+            resume_fail_uptime_secs: 5.0,
+        };
+
+        // Start mode: injects --session-id after --dangerously-skip-permissions
+        let plan_start = engine
+            .session_command(&session, ResumeMode::Start)
+            .expect("session_command Start");
+        assert_eq!(plan_start.program, PathBuf::from("/opt/tools/claude"));
+        assert_eq!(
+            plan_start.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--session-id",
+                "session-uuid-123",
+                "--verbose",
+            ]
+        );
+        assert!(plan_start.pty);
+        assert_eq!(plan_start.stdin, StdinMode::Null);
+        assert_eq!(
+            plan_start.env,
+            vec![
+                ("AAA".to_string(), "first".to_string()),
+                ("ZZZ".to_string(), "last".to_string())
+            ]
+        );
+
+        // Resume mode: injects --resume after --dangerously-skip-permissions
+        let plan_resume = engine
+            .session_command(&session, ResumeMode::Resume)
+            .expect("session_command Resume");
+        assert_eq!(plan_resume.program, PathBuf::from("/opt/tools/claude"));
+        assert_eq!(
+            plan_resume.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--resume",
+                "session-uuid-123",
+                "--verbose",
+            ]
+        );
+
+        // Test fallback where --dangerously-skip-permissions is not in claude_args
+        let mut session_no_dsp = session.clone();
+        session_no_dsp.claude_args = vec!["--headless".to_string()];
+
+        let plan_no_dsp = engine
+            .session_command(&session_no_dsp, ResumeMode::Start)
+            .expect("session_command Start no dsp");
+        assert_eq!(
+            plan_no_dsp.args,
+            vec!["--headless", "--session-id", "session-uuid-123"]
+        );
+    }
+
+    #[test]
+    fn evict_terminal_jobs_keeps_map_bounded_and_spares_live() {
+        // Directly exercises the map bound with tiny synthetic handles: the
+        // eviction must drop terminal (exited) handles oldest-first while
+        // never dropping a live handle.
+        use std::process::Command as StdCommand;
+
+        // A JobHandle whose child is a real `sleep 30` (live) or a `sleep 0`
+        // that is reaped before the handle is built (terminal, Done).
+        fn make_handle(live: bool) -> JobHandle {
+            let mut child = if live {
+                StdCommand::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .expect("spawn live child")
+            } else {
+                StdCommand::new("sleep")
+                    .arg("0")
+                    .spawn()
+                    .expect("spawn terminal child")
+            };
+            if !live {
+                let _ = child.wait();
+            }
+            JobHandle {
+                child,
+                stdin: None,
+                session_id: Arc::new(Mutex::new(None)),
+                events: Arc::new(Mutex::new(JobEvents::new(8))),
+                terminal: if live { None } else { Some(RunStatus::Done) },
+            }
+        }
+
+        let _proc_lock = crate::core::reaper::lock_proc_child_tests();
+        let mut jobs = HashMap::new();
+        let mut order = VecDeque::new();
+
+        // Oldest first: t1, t2 are terminal; "live" is running.
+        jobs.insert("t1".to_string(), make_handle(false));
+        order.push_back("t1".to_string());
+        jobs.insert("t2".to_string(), make_handle(false));
+        order.push_back("t2".to_string());
+        jobs.insert("live".to_string(), make_handle(true));
+        order.push_back("live".to_string());
+
+        // Cap at 2 before a new insert: evicts the terminal handles oldest
+        // first (down to max-1 = 1 to make room for the pending insert),
+        // leaving the live handle untouched.
+        ClaudeEngine::evict_terminal_jobs(&mut jobs, &mut order, 2);
+        assert!(!jobs.contains_key("t1"), "oldest terminal handle evicted");
+        assert!(
+            !jobs.contains_key("t2"),
+            "terminal handles are evicted down to max-1 to leave room for the insert"
+        );
+        assert!(jobs.contains_key("live"), "live handle must not be evicted");
+        assert!(jobs.len() <= 1);
+
+        // All-live over a small cap: nothing terminal to evict, so live
+        // handles are all kept (the map may exceed the cap rather than leak a
+        // running child).
+        let mut jobs2 = HashMap::new();
+        let mut order2 = VecDeque::new();
+        jobs2.insert("a".to_string(), make_handle(true));
+        order2.push_back("a".to_string());
+        jobs2.insert("b".to_string(), make_handle(true));
+        order2.push_back("b".to_string());
+        ClaudeEngine::evict_terminal_jobs(&mut jobs2, &mut order2, 1);
+        assert_eq!(jobs2.len(), 2, "all-live handles must never be evicted");
+
+        // Cleanup: kill the live children so no test leaks a process group.
+        for handle in jobs.values_mut() {
+            let _ = handle.child.kill();
+        }
+        for handle in jobs2.values_mut() {
+            let _ = handle.child.kill();
+        }
+    }
+}

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# kubeadp-agent - FAKE test stub for the sandbox attack suite.
+#
+# Self-test only. It implements just enough of the v1.3 CLI contract to run the
+# suite WITHOUT the real binary (negative control):
+#   sandbox-probe [--json]          -> runtime "fake", backend "none"
+#   sandbox-exec --policy P -- CMD  -> validated policy then PLAIN-EXEC
+# It accepts NO --runtime and NO --mode flag (contract v1.3 removed them).
+#
+# Positive behaviour the stub still emulates so R5/R8/R10 and the R06
+# own-secret check are meaningful:
+#   - validates the policy JSON (unknown keys are an error, like the real one)
+#   - fails closed with exit 125 on an invalid policy (missing file, malformed
+#     JSON, unreadable file, or an rw path that does not exist and cannot be
+#     created); the command is NEVER run on failure
+#   - creates a per-agent private tmp (sets TMPDIR), writes the fd-3 secret
+#     into $TMPDIR/secret mode 0400 (like the real private tmp positive)
+#   - then PLAIN-EXECs the command
+# It provides NO isolation: this is the point. The leak checks (R1/R2/R3/R4/
+# R6/R7/R11) must FAIL [CONTROL] against it, and R5/R8/R10 must PASS.
+#
+# Not shipped to pods. Meant to sit at tests/sandbox/fake/kubeadp-agent so
+#   run.sh --binary tests/sandbox/fake/kubeadp-agent
+# works from the repo root (and from ./tests/sandbox).
+
+set -u
+
+die() { echo "FATAL: $*" >&2; exit 125; }
+
+variant_valid() {
+  python3 - "$1" <<'PYEOF'
+import json, os, sys
+def fail(m):
+    print("policy invalid: %s" % m, file=sys.stderr)
+    sys.exit(2)
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    fail("json: %s" % e)
+have = set(d)
+want = {"agent_id","jobset_id","rw","ro","shared_rw","hide","tmp","secret","env_allow","net"}
+unknown = have - want
+if unknown:
+    fail("unknown keys: %s" % sorted(unknown))
+must = {"agent_id","jobset_id","rw","ro","tmp","secret"}
+missing = must - have
+if missing:
+    fail("missing keys: %s" % sorted(missing))
+# an rw path that cannot exist and cannot be created must fail closed, like
+# the real launcher (isolation cannot be established -> 125).
+import os as _os
+for rwpath in d.get("rw", []):
+    if not _os.path.exists(rwpath):
+        # can we create it? parent dir must exist and be writable
+        parent = _os.path.dirname(rwpath)
+        if not _os.path.isdir(parent) or not _os.access(parent, _os.W_OK | _os.X_OK):
+            fail("rw path %s does not exist and cannot be created" % rwpath)
+PYEOF
+}
+
+policy_valid() {
+  local f="$1"
+  # io-checks that a non-root holder of the policy path cannot bypass
+  [ -e "$f" ] || { echo "policy: missing file $f" >&2; return 1; }
+  [ -r "$f" ] || { echo "policy: unreadable file $f" >&2; return 1; }
+  if ! variant_valid "$f" 2>"$f.verr"; then
+    cat "$f.verr" >&2 2>/dev/null
+    rm -f "$f.verr"
+    return 1
+  fi
+  rm -f "$f.verr"
+  return 0
+}
+
+case "${1:-}" in
+  sandbox-probe)
+    shift
+    if [ "${1:-}" = "--json" ]; then
+      cat <<'J'
+{"runtime":"fake","backend":"none","kernel":"fake","mechanisms":{"user_namespace":{"ok":false,"reason":"fake stub"},"pid_namespace":{"ok":false,"reason":"fake stub"},"fresh_procfs":{"ok":false,"reason":"fake stub"},"tmpfs":{"ok":false,"reason":"fake stub"},"bind_mount":{"ok":false,"reason":"fake stub"},"landlock":{"ok":false,"reason":"fake stub","abi":0},"subreaper":{"ok":false,"reason":"fake stub"}}}
+J
+      exit 0
+    fi
+    echo "runtime=fake backend=none (fake stub: no isolation)"
+    exit 0
+    ;;
+  sandbox-exec)
+    shift
+    ;;
+  *)
+    cat >&2 <<'E'
+kubeadp-agent (fake stub) - not the real binary. For self-testing the
+sandbox attack suite only. Supports: sandbox-exec --policy P -- CMD and
+sandbox-probe [--json].
+E
+    exit 125
+    ;;
+esac
+
+policy=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --policy) policy="${2:-}"; shift 2 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
+[ -n "$policy" ] || die "--policy required"
+
+if [ "$policy" = "-" ]; then
+  tmp_pol="$(mktemp)"
+  cat > "$tmp_pol"
+  policy_valid "$tmp_pol" || { rm -f "$tmp_pol"; exit 125; }
+  rm -f "$tmp_pol"
+else
+  policy_valid "$policy" || die "policy rejected"
+fi
+
+[ "$#" -gt 0 ] || { echo "no command" >&2; exit 126; }
+
+# Per-agent private tmp emulation: set TMPDIR, write the fd-3 secret 0400.
+# This mirrors the real sandbox's private-tmp positive so R06 own-secret
+# checks are meaningful even with no isolation. When the harness runs, its
+# scratch dir is exported as KUBEADP_TEST_SCRATCH so the private tmp lands
+# inside it and teardown can remove it.
+role="${KUBEADP_TEST_ROLE:-x}"
+privbase="${KUBEADP_TEST_SCRATCH:-${TMPDIR:-/tmp}}"
+priv="$(mktemp -d "$privbase/fake-priv-${role}-XXXXXX")" || die "mktemp"
+if [ -e /dev/fd/3 ]; then
+  dd if=/dev/fd/3 of="$priv/secret" bs=4096 count=1 2>/dev/null
+  chmod 400 "$priv/secret" 2>/dev/null
+fi
+export TMPDIR="$priv"
+
+# plain exec (no isolation)
+exec "$@"
