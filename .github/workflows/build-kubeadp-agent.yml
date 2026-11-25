@@ -2,12 +2,10 @@ name: build-kubeadp-agent
 
 # Builds the kubeadp-agent image (docker/kubeadp-agent/Dockerfile) when the
 # one agent package (src/kubeadp-agent) or its docker dir changes, versions
-# it, pushes it to GHCR, and -- on main -- tags the release and commits the
-# new image tag back to main. This is the image that will replace
-# build-ai-server.yml (orchestrator pod) and build-agent-run-api.yml (worker
-# pod); NOTHING consumes it yet (cut-over is later, test pods first), so the
-# deploy commit only touches the `kubeadp-agent` key in versions/versions.env
-# -- no manifest carries an image line for it yet.
+# it, pushes it to GHCR (ghcr.io/cjblackout/kubeopencode/kubeadp-agent) and, on
+# main, tags the release (kubeadp-agent-<version>). Nothing is committed to any
+# deployment repository: consumers (the homelab cluster) PIN a released version
+# explicitly, so a rollout is a deliberate change on their side.
 #
 # Versioning: YYYY.MM.<X> with prerelease suffix -rc<N>; MajorVersion lives
 # in src/kubeadp-agent/VERSION and appears in rc tags only:
@@ -22,7 +20,7 @@ name: build-kubeadp-agent
 #
 # Runner notes (verified live 2026-09-28 against the exact images -- same as
 # build-ai-server.yml and build-agent-run-api.yml):
-# - runs-on: homelab-home (ARC scale set, min 0 / max 5).
+# - runs-on: kubeopencode-home (ARC scale set, min 0 / max 5).
 # - Runner pods run on the gVisor (runsc) runtime; standard
 #   bwcloud-preferred affinity (100/50), so they land on bwcloud-worker1,
 #   falling back to home x86 agents (compute3/compute4).
@@ -65,7 +63,7 @@ concurrency:
 
 jobs:
   version:
-    runs-on: homelab-home
+    runs-on: kubeopencode-home
     timeout-minutes: 10
     outputs:
       version: ${{ steps.calc.outputs.version }}
@@ -113,7 +111,7 @@ jobs:
 
   build:
     needs: version
-    runs-on: homelab-home
+    runs-on: kubeopencode-home
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -201,7 +199,7 @@ jobs:
           # Cached layers make retries cheap (only the failed network step
           # repeats). A final failure still fails the step (set -e).
           retry() { local n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 3 ]; then return 1; fi; echo "::warning::command failed (attempt $n), retrying in 20s: $*" >&2; sleep 20; done; }
-          IMAGE="ghcr.io/cjblackout/homelab/kubeadp-agent:${VERSION}"
+          IMAGE="ghcr.io/cjblackout/kubeopencode/kubeadp-agent:${VERSION}"
           # --network=host: dockerd runs --bridge=none (no netfilter under gVisor),
           # so build RUN steps must use the sandbox netns for egress.
           # --progress=plain: explicit plain log stream for build diagnostics.
@@ -272,73 +270,3 @@ jobs:
           sudo pkill dockerd 2>/dev/null || pkill dockerd 2>/dev/null || true
           sleep 2
           sudo rm -rf /var/lib/docker/* 2>/dev/null || rm -rf /var/lib/docker/* 2>/dev/null || true
-
-  deploy:
-    if: github.ref == 'refs/heads/main'
-    needs: [version, build]
-    runs-on: homelab-home
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      # Builds take tens of minutes; main may have moved since this run's
-      # checkout. Re-base the working tree on the LATEST main so the deploy
-      # commit applies cleanly.
-      - name: Sync checkout to latest main
-        run: |
-          set -euo pipefail
-          git fetch origin main
-          git reset --hard origin/main
-      - name: Update versions key
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          # The worker Deployment (apps/kubeadp-agent-worker) runs this image since HL-70 phase 3: swap its one
-          # kubeadp-agent image line and the kubeadp-agent key in the same commit, like the other
-          # CI-built images. The test pods (apps/kubeadp-agent-test) take the tag from the key only.
-          apt-get update -qq
-          apt-get install -y -qq python3-yaml >/dev/null
-          python3 - <<'PY'
-          import os, pathlib, re, sys
-          import yaml  # noqa: F401 -- imported to fail fast if PyYAML is missing
-
-          version = os.environ["VERSION"]
-          m = pathlib.Path("apps/kubeadp-agent-worker/manifest.yaml")
-          text = m.read_text()
-          new, n = re.subn(
-              r"(image:\s*ghcr\.io/cjblackout/homelab/kubeadp-agent:)\S+",
-              r"\g<1>" + version,
-              text,
-              count=1,
-          )
-          if n != 1:
-              sys.exit("kubeadp-agent image line not found in apps/kubeadp-agent-worker/manifest.yaml")
-          list(yaml.safe_load_all(new))
-          m.write_text(new)
-          v = pathlib.Path("versions/versions.env")
-          vnew, vn = re.subn(r"(?m)^kubeadp-agent=.*$", "kubeadp-agent=" + version, v.read_text())
-          if vn != 1:
-              sys.exit("kubeadp-agent key not found in versions/versions.env")
-          v.write_text(vnew)
-          PY
-      - name: Commit + push (ArgoCD auto-syncs the worker rollout)
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          if git diff --quiet; then
-            echo "No changes (image tag already current) -- nothing to deploy."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add apps/kubeadp-agent-worker/manifest.yaml versions/versions.env
-          git commit -m "ci: kubeadp-agent image ${VERSION} (source build ${{ github.sha }})"
-          for i in 1 2 3 4 5 6; do
-            if git push origin main; then exit 0; fi
-            echo "::warning::push rejected (attempt $i), rebasing onto origin/main"
-            git fetch origin main
-            if ! git rebase origin/main; then git rebase --abort || true; echo "::error::rebase conflict; aborting"; exit 1; fi
-            sleep $((i * 5))
-          done
-          echo "::error::could not push after 6 attempts"; exit 1

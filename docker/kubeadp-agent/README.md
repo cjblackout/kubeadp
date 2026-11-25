@@ -4,7 +4,7 @@ One container image that replaces the two images built today from the same
 cargo package (`docker/ai-server/Dockerfile` for the orchestrator pod,
 `docker/agent-run-api/Dockerfile` for the worker pod). Built by
 `.github/workflows/build-kubeadp-agent.yml` and pushed to
-`ghcr.io/cjblackout/homelab/kubeadp-agent` (public GHCR, like the other
+`ghcr.io/cjblackout/kubeopencode/kubeadp-agent` (public GHCR, like the other
 own-build images).
 
 > Consumers: both agent Deployments in namespace `opencode` run this image: `kubeadp-agent-worker`
