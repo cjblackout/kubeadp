@@ -1025,7 +1025,7 @@ mod tests {
                     state_file: tmp.path().join("elsewhere").join("state.json"),
                     ..Default::default()
                 };
-                let session = "homelab";
+                let session = "project-a";
                 // The ONE shared root: the sink's `a2a_router` input and the
                 // session launcher's `supervisor_config.a2a_inbox_root()` agree
                 // by construction (both route through inbox_state_root();
@@ -1116,7 +1116,7 @@ mod tests {
     fn interrupt_delivery_that_cannot_be_written_stays_queued() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("state-root");
-        let session = "homelab";
+        let session = "project-a";
         let mut state = SupervisorState::new(100);
         let mut s = SessionState::new(session.to_string());
         s.status = SessionStatus::Running;
@@ -1160,7 +1160,7 @@ mod tests {
     fn interrupt_queued_during_starting_delivers_on_interrupt_channel_when_ready() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("state-root");
-        let session = "homelab";
+        let session = "project-a";
         let mut state = SupervisorState::new(100);
         let mut s = SessionState::new(session.to_string());
         s.status = SessionStatus::Starting;

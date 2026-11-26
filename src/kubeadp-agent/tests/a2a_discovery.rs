@@ -42,7 +42,7 @@ fn svc(name: &str, ns: &str, port: u64, labeled: bool) -> serde_json::Value {
             "name": name,
             "namespace": ns,
             "labels": if labeled {
-                serde_json::json!({ "a2a.homelab/agent": "true" })
+                serde_json::json!({ "a2a.kubeadp/agent": "true" })
             } else {
                 serde_json::json!({})
             }

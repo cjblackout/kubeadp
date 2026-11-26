@@ -2147,7 +2147,7 @@ mod tests {
             hindsight_url: Some("http://hindsight:8888".to_string()),
             hindsight_bank: Some("default-bank".to_string()),
             hindsight_api_key: Some("secret".to_string()),
-            hindsight_profile: Some("homelab".to_string()),
+            hindsight_profile: Some("project-a".to_string()),
         };
         assert_eq!(
             init_body(&args),
@@ -2157,7 +2157,7 @@ mod tests {
                 "hindsight_url": "http://hindsight:8888",
                 "hindsight_bank": "default-bank",
                 "hindsight_api_key": "secret",
-                "hindsight_profile": "homelab",
+                "hindsight_profile": "project-a",
             })
         );
     }

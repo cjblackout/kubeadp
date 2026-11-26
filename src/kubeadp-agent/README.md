@@ -155,7 +155,7 @@ Variables that are read at runtime and have no configuration-file key. Environme
 | `KUBEADP_AGY_HOME` | Conversation recovery / `agy` home | Path override for `Config::agy_home` holding `agy`'s own state (`~/.gemini/antigravity-cli`). Passes into the sandbox via `KUBEADP_*`. |
 | `KUBEADP_SANDBOX_HOME` | Sandbox policy | Path override for `Config::sandbox_home` (default `/home/agent`) granted `shared_rw` in sandboxed worker jobs. |
 | `KUBEADP_INSTRUCTIONS_SESSIONS_DIR` | Both long-lived roles | Sessions base for the per-session / per-project instruction files (`<name>.md` / `<project>.md`, default `/etc/kubeadp-agent/instructions/sessions`); env-only, no config-file key (`SPEC.md` §4.10). |
-| `A2A_NAMESPACES` | A2A discovery (`mcp-a2a`, A2A client) | Comma-separated namespaces to scan for Services labelled `a2a.homelab/agent=true`, in addition to the pod's own namespace. |
+| `A2A_NAMESPACES` | A2A discovery (`mcp-a2a`, A2A client) | Comma-separated namespaces to scan for Services labelled `a2a.kubeadp/agent=true`, in addition to the pod's own namespace. |
 | `A2A_PEERS` | A2A discovery (`mcp-a2a`, A2A client) | Static peer registry, comma-separated `name=url` or `namespace/name=url`; needs no Kubernetes service account, so a sandboxed job without an SA token still reaches configured peers. |
 | `A2A_SELF_NAME` | A2A card and client | Outbound sender identity and the `name` field of the agent card (precedence over `POD_NAME`/`HOSTNAME`). Default: `kubeadp-agent`. |
 | `A2A_SELF_PREFIX` | Worker jobs | Prefix for each job's A2A sender identity; a launched job's `A2A_SELF_NAME` is set to `<A2A_SELF_PREFIX>/<job_id>`. |
@@ -192,12 +192,12 @@ kubeadp-agent
 
 Start a background job via the remote CLI:
 ```bash
-agent-run --remote http://agent-run-api:8002 start homelab "Update documentation"
+agent-run --remote http://agent-run-api:8002 start project-a "Update documentation"
 ```
 
 Select an explicit execution engine:
 ```bash
-agent-run --remote http://agent-run-api:8002 start --engine agy homelab "Run test suite"
+agent-run --remote http://agent-run-api:8002 start --engine agy project-a "Run test suite"
 ```
 
 Monitor job status:

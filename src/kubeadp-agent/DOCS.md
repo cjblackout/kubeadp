@@ -294,8 +294,8 @@ Incoming messages delivered via `POST /message:send` pass through strict ingress
 ### 4.5 Outbound A2A via `mcp-a2a`
 
 The `kubeadp-agent mcp-a2a` stdio server exposes tools for outbound communication:
-- `list_agents`: Queries discovered peers from Kubernetes services labelled `a2a.homelab/agent=true` and static entries configured in `A2A_PEERS`. Takes no arguments and returns `{"agents":[{"name","namespace","url","card"?}]}`; use a returned `name` verbatim as the `agent` (send_message/get_task) or `to` (reply) argument.
-- `send_message`: Sends a text payload to an agent by Service name or `namespace/name`. Sets `a2a.sender` to `A2A_SELF_NAME` and increments `a2a.hop`. Arguments (canonical names; the case variants `text`/`message`/`Message` and `task_id`/`taskId` are accepted as aliases and missing/unknown arguments are named in the error): `agent` (required, e.g. `"peer"` or `"ops/peer"`), `text` (required, at most 7536 bytes), `context_id` (optional), `task_id` (optional: a worker job id such as `"a1b2c3d4"`, or an orchestrator session name such as `"homelab"`), `incoming_hop` (optional integer). The success result is a small fixed shape `{id, contextId, status:{state}, hop, delivered:true, delivery}` — `delivered` is true on every success, so a delivered message is never reported as an error; `delivery` says how it was accepted: `queued` (the peer's durable inbox; injected at the peer's next model-call boundary or, after the `a2a_ack_secs` ack window (default 45 s) with the peer's turn ended, delivered through the `idle_turn` step) or `injected` (the peer's live input channel, a session PTY paste). A send to a killed/unknown target fails with `{"code":"a2a_send_failed","message",...,"delivery":"terminal"}`. A `text` above 7536 bytes (the A2A ingress cap minus framing) is refused with an error that names the limit — it is never silently truncated.
+- `list_agents`: Queries discovered peers from Kubernetes services labelled `a2a.kubeadp/agent=true` and static entries configured in `A2A_PEERS`. Takes no arguments and returns `{"agents":[{"name","namespace","url","card"?}]}`; use a returned `name` verbatim as the `agent` (send_message/get_task) or `to` (reply) argument.
+- `send_message`: Sends a text payload to an agent by Service name or `namespace/name`. Sets `a2a.sender` to `A2A_SELF_NAME` and increments `a2a.hop`. Arguments (canonical names; the case variants `text`/`message`/`Message` and `task_id`/`taskId` are accepted as aliases and missing/unknown arguments are named in the error): `agent` (required, e.g. `"peer"` or `"ops/peer"`), `text` (required, at most 7536 bytes), `context_id` (optional), `task_id` (optional: a worker job id such as `"a1b2c3d4"`, or an orchestrator session name such as `"project-a"`), `incoming_hop` (optional integer). The success result is a small fixed shape `{id, contextId, status:{state}, hop, delivered:true, delivery}` — `delivered` is true on every success, so a delivered message is never reported as an error; `delivery` says how it was accepted: `queued` (the peer's durable inbox; injected at the peer's next model-call boundary or, after the `a2a_ack_secs` ack window (default 45 s) with the peer's turn ended, delivered through the `idle_turn` step) or `injected` (the peer's live input channel, a session PTY paste). A send to a killed/unknown target fails with `{"code":"a2a_send_failed","message",...,"delivery":"terminal"}`. A `text` above 7536 bytes (the A2A ingress cap minus framing) is refused with an error that names the limit — it is never silently truncated.
 - `reply`: Dispatches a response to the sender extracted from the incoming message header (`claimed sender: <name>`, copied verbatim into `to`; the per-job form `<agent>/<task_id>` splits automatically). Same arguments as `send_message` (`to` instead of `agent`) and the same fixed-shape result.
 - `get_task`: Inspects remote task progress and completion state, with a bounded result. Arguments: `agent` (required), `task_id` (optional; may be omitted when `agent` names it as `<name>/<task_id>`), `history_length` (optional integer, 0-50, default 10: how many of the LAST history entries the result keeps). The result stays bounded for any history size: the task state plus at most the last `history_length` entries, every message/artifact/status text truncated to 500 characters with the marker `...[truncated: N characters omitted]`, and `history_truncated: true` plus `history_total` when entries were cut. A valid task is never answered with the response-cap error.
 
@@ -399,7 +399,7 @@ All `/api/v1` endpoints require a bearer token matching `KUBEADP_API_TOKEN_FILE`
   - Request body:
     ```json
     {
-      "project": "homelab",
+      "project": "project-a",
       "prompt": "Fix unit test failure",
       "git_ref": "main",
       "model": "gemini-2.5-pro",
@@ -590,11 +590,11 @@ Configured via `KUBEADP_REPO_SYNC_CONFIG` (default `/etc/kubeadp-agent/repo-sync
 token_env = "GITHUB_TOKEN"
 
 [[repo_sync.repos]]
-name = "homelab"
-url = "https://github.com/example/homelab.git"
+name = "project-a"
+url = "https://github.com/example/project-a.git"
 ref = "main"
-root = "/workspace/.roots/homelab"
-link = "/workspace/homelab"
+root = "/workspace/.roots/project-a"
+link = "/workspace/project-a"
 period_secs = 300
 depth = 1
 ```

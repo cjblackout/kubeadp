@@ -219,7 +219,7 @@ async fn mcp_server_with_inbox(inbox: Inbox) -> A2aMcpServer {
     let list_services = |_base: &str, _token: Option<&str>| {
         let peer = serde_json::json!({
             "metadata": { "name": "peer", "namespace": "testns", "labels": {
-                "a2a.homelab/agent": "true" } },
+                "a2a.kubeadp/agent": "true" } },
             "spec": { "ports": [ { "name": "a2a", "port": 8002 } ] }
         });
         async move { Ok(vec![peer]) }

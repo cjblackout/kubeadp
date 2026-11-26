@@ -1,17 +1,16 @@
 name: build
 
-# Homelab fork pipeline: builds the operator image, the opencode agent image,
+# Fork pipeline: builds the operator image, the opencode agent image,
 # the attach image, the devbox image and the Helm chart, pushes them to GHCR under
 # ghcr.io/cjblackout and tags the commit.
 #
-# Versioning: <upstream-base>-hl.<N>, e.g. v0.1.9-hl.3. The base comes from
+# Versioning: <upstream-base>-fork.<N>, e.g. v0.1.9-fork.3. The base comes from
 # the file VERSION; N is the next free counter among the existing git tags
-# <base>-hl.* (so the pipeline sequences itself, like the homelab builds).
+# <base>-fork.* (so the pipeline sequences itself).
 # Chart.yaml version/appVersion are rewritten in the build workspace only
 # (nothing is committed back).
 #
-# Runs on GitHub-hosted runners: the homelab ARC scale set is registered to
-# cjblackout/homelab only and cannot serve this repository.
+# Runs on GitHub-hosted runners.
 
 on:
   push:
@@ -51,8 +50,8 @@ jobs:
           case "$BASE" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "::error::VERSION must look like v0.1.9"; exit 1 ;; esac
           ESC="${BASE//./\\.}"
           TAGS="$(git ls-remote --tags origin | awk -F'\t' '{t=$2; sub(/^refs\/tags\//,"",t); print t}')"
-          MAX="$(printf '%s\n' "$TAGS" | grep -oE "^${ESC}-hl\.[0-9]+$" | grep -oE '[0-9]+$' | sort -n | tail -1 || true)"
-          V="${BASE}-hl.$(( ${MAX:-0} + 1 ))"
+          MAX="$(printf '%s\n' "$TAGS" | grep -oE "^${ESC}-fork\.[0-9]+$" | grep -oE '[0-9]+$' | sort -n | tail -1 || true)"
+          V="${BASE}-fork.$(( ${MAX:-0} + 1 ))"
           echo "version=${V}" >> "$GITHUB_OUTPUT"
           echo "semver=${V#v}" >> "$GITHUB_OUTPUT"
           echo "opencode=$(grep '^OPENCODE_VERSION' agents/Makefile | head -1 | sed 's/.*?= *//')" >> "$GITHUB_OUTPUT"

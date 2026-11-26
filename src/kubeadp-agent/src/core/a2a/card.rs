@@ -124,7 +124,7 @@ pub fn role_skills(role: &str) -> Vec<AgentSkill> {
             description: "Send a message into an agent session".to_string(),
             tags: Vec::new(),
             examples: Some(vec![
-                "{\"sessionId\":\"homelab\",\"text\":\"hello\"}".to_string()
+                "{\"sessionId\":\"project-a\",\"text\":\"hello\"}".to_string()
             ]),
             input_modes: Some(vec!["text/plain".to_string()]),
             output_modes: Some(vec!["text/plain".to_string()]),

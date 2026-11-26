@@ -338,7 +338,7 @@ mod tests {
         meta.hindsight = Some(true);
         meta.auto_recall = Some(true);
         meta.auto_retain = Some(true);
-        meta.hindsight_bank = Some("homelab".to_string());
+        meta.hindsight_bank = Some("project-a".to_string());
         meta.save(&config.state_root).unwrap();
 
         let out = run(
@@ -350,7 +350,7 @@ mod tests {
         .expect("status should succeed");
         assert!(
             out.stdout_lines
-                .contains(&"Memory:       recall on, retain on, bank homelab".to_string()),
+                .contains(&"Memory:       recall on, retain on, bank project-a".to_string()),
             "got: {:?}",
             out.stdout_lines
         );

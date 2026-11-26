@@ -83,8 +83,8 @@ Creates an isolated Git worktree and launches an `agy` agent in the background.
 | `--max-runtime` | `<MAX_RUNTIME>` | None (unlimited) unless `AGENT_RUN_MAX_RUNTIME` is set | Maximum wall-clock runtime (e.g. `30m`, `2h`) before SIGTERM/SIGKILL. |
 
 Exit status: 0 on success, 1 on error.
-Example: `agent-run start homelab "Fix tests" --model gemini-3.8-flash-medium --max-runtime 1h`
-Example: `agent-run start homelab "Refactor the retry path to resume cleanly" --hindsight-query "retry resume worktree"`
+Example: `agent-run start project-a "Fix tests" --model gemini-3.8-flash-medium --max-runtime 1h`
+Example: `agent-run start project-a "Refactor the retry path to resume cleanly" --hindsight-query "retry resume worktree"`
 
 ## `status`
 
@@ -155,7 +155,7 @@ Lists known jobs with project name, creation age, status, and prompt preview.
 | `--status` | `<STATUS>` | None | Filter by job status (repeatable, comma-separated). |
 
 Exit status: 0 on success, 1 on error.
-Example: `agent-run list --project homelab --status running,failed`
+Example: `agent-run list --project project-a --status running,failed`
 
 ## `projects`
 

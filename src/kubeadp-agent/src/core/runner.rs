@@ -1636,7 +1636,7 @@ mod tests {
     fn test_meta_overrides() -> JobMetadata {
         JobMetadata {
             job_id: "test1234".to_string(),
-            project: "homelab".to_string(),
+            project: "project-a".to_string(),
             prompt: "Test prompt".to_string(),
             resolved_prompt: "Test prompt".to_string(),
             model: None,
@@ -1646,7 +1646,7 @@ mod tests {
             add_dirs: vec![],
             print_timeout: None,
             created_at: Utc::now(),
-            worktree_path: PathBuf::from("/workspace/homelab/.agent-jobs/test1234"),
+            worktree_path: PathBuf::from("/workspace/project-a/.agent-jobs/test1234"),
             branch: "agent-run/test1234".to_string(),
             base_ref: "main".to_string(),
             conversation_id: None,
@@ -1741,7 +1741,7 @@ mod tests {
         assert!(args.contains(&"high".to_string()));
         assert!(args.contains(&"--sandbox".to_string()));
         assert!(args.contains(&"--add-dir".to_string()));
-        assert!(args.contains(&"/workspace/homelab/.agent-jobs/test1234".to_string()));
+        assert!(args.contains(&"/workspace/project-a/.agent-jobs/test1234".to_string()));
         assert!(args.contains(&"/extra/dir".to_string()));
         assert!(args.contains(&"--print-timeout".to_string()));
         assert!(args.contains(&"30s".to_string()));
@@ -1787,7 +1787,7 @@ mod tests {
         assert!(args.contains(&"gemini-pro".to_string()));
         assert!(args.contains(&"--sandbox".to_string()));
         assert!(args.contains(&"--add-dir".to_string()));
-        assert!(args.contains(&"/workspace/homelab/.agent-jobs/test1234".to_string()));
+        assert!(args.contains(&"/workspace/project-a/.agent-jobs/test1234".to_string()));
     }
 
     /// The claude job argv (HL-91 E5) must use the REAL `claude` CLI flags
@@ -2002,7 +2002,7 @@ mod tests {
         // 1. When meta.add_dirs is empty: worktree_path is passed as --add-dir
         let mut meta = test_meta_overrides();
         meta.job_id = "test_add_dir".to_string();
-        meta.worktree_path = PathBuf::from("/workspace/homelab/.agent-jobs/test_add_dir");
+        meta.worktree_path = PathBuf::from("/workspace/project-a/.agent-jobs/test_add_dir");
 
         let mode = InvocationMode::Start {
             resolved_prompt: "Test".to_string(),
@@ -2018,7 +2018,7 @@ mod tests {
         assert_eq!(add_dir_indices.len(), 1);
         assert_eq!(
             args_empty[add_dir_indices[0] + 1],
-            "/workspace/homelab/.agent-jobs/test_add_dir"
+            "/workspace/project-a/.agent-jobs/test_add_dir"
         );
 
         // 2. When meta.add_dirs has items: worktree_path is passed FIRST unconditionally
@@ -2037,7 +2037,7 @@ mod tests {
         assert_eq!(add_dir_indices_multi.len(), 3);
         assert_eq!(
             args_multi[add_dir_indices_multi[0] + 1],
-            "/workspace/homelab/.agent-jobs/test_add_dir"
+            "/workspace/project-a/.agent-jobs/test_add_dir"
         );
         assert_eq!(
             args_multi[add_dir_indices_multi[1] + 1],
@@ -3244,7 +3244,7 @@ mod tests {
             "-p".to_string(),
             "hello".to_string(),
             "--add-dir".to_string(),
-            "/workspace/homelab/.agent-jobs/test1234".to_string(),
+            "/workspace/project-a/.agent-jobs/test1234".to_string(),
         ];
         let policy_path = PathBuf::from("/tmp/state/jobs/test1234.policy.json");
 

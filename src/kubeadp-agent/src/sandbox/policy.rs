@@ -169,7 +169,7 @@ impl Default for SandboxPolicy {
                 PathBuf::from("/sbin"),
                 PathBuf::from("/etc"),
                 PathBuf::from("/opt/tools"),
-                PathBuf::from("/workspace/homelab"),
+                PathBuf::from("/workspace/project-a"),
             ],
             shared_rw: vec![PathBuf::from("/home/agent")],
             hide: vec![PathBuf::from("/workspace/.agent-jobs")],
@@ -645,8 +645,8 @@ mod tests {
         let json = r#"{
             "agent_id": "job-7",
             "jobset_id": "js-1",
-            "rw": ["/workspace/.agent-jobs/homelab/ab12"],
-            "ro": ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/opt/tools", "/workspace/homelab"],
+            "rw": ["/workspace/.agent-jobs/project-a/ab12"],
+            "ro": ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/opt/tools", "/workspace/project-a"],
             "shared_rw": ["/home/agent"],
             "hide": ["/workspace/.agent-jobs"],
             "tmp": "auto",
@@ -660,7 +660,7 @@ mod tests {
         assert_eq!(policy.jobset_id.as_deref(), Some("js-1"));
         assert_eq!(
             policy.rw,
-            vec![PathBuf::from("/workspace/.agent-jobs/homelab/ab12")]
+            vec![PathBuf::from("/workspace/.agent-jobs/project-a/ab12")]
         );
         assert_eq!(policy.shared_rw, vec![PathBuf::from("/home/agent")]);
         assert_eq!(
@@ -684,7 +684,7 @@ mod tests {
         // keep it out of their environment.
         let base = SandboxPolicy::for_job(
             "job-71",
-            Path::new("/workspace/.agent-jobs/homelab/job-71"),
+            Path::new("/workspace/.agent-jobs/project-a/job-71"),
             None,
             None,
             None,
@@ -723,7 +723,7 @@ mod tests {
         // other secret-named variables stay filtered out.
         let policy = SandboxPolicy::for_job(
             "job-71",
-            Path::new("/workspace/.agent-jobs/homelab/job-71"),
+            Path::new("/workspace/.agent-jobs/project-a/job-71"),
             None,
             None,
             None,
@@ -747,7 +747,7 @@ mod tests {
         // Without the allowlist entry the same variable is dropped entirely.
         let denied = SandboxPolicy::for_job(
             "job-71",
-            Path::new("/workspace/.agent-jobs/homelab/job-71"),
+            Path::new("/workspace/.agent-jobs/project-a/job-71"),
             None,
             None,
             None,
@@ -792,7 +792,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let policy = SandboxPolicy::for_job(
             "job-write1",
-            std::path::Path::new("/workspace/.agent-jobs/homelab/job-write1"),
+            std::path::Path::new("/workspace/.agent-jobs/project-a/job-write1"),
             None,
             None,
             None,
@@ -817,7 +817,7 @@ mod tests {
     fn test_hide_calculation_and_preservation() {
         let policy = SandboxPolicy {
             rw: vec![
-                PathBuf::from("/workspace/.agent-jobs/homelab/job1"),
+                PathBuf::from("/workspace/.agent-jobs/project-a/job1"),
                 PathBuf::from("/tmp/other"),
             ],
             hide: vec![PathBuf::from("/workspace/.agent-jobs")],
@@ -834,7 +834,7 @@ mod tests {
         assert_eq!(sub_rws.len(), 1);
         assert_eq!(
             sub_rws[0].strip_prefix(hide_dir).unwrap(),
-            Path::new("homelab/job1")
+            Path::new("project-a/job1")
         );
     }
 
@@ -925,7 +925,7 @@ mod tests {
         // itself is never an env var, so it cannot reach the agent.
         let base = SandboxPolicy::for_job(
             "job-42",
-            Path::new("/workspace/.agent-jobs/homelab/job-42"),
+            Path::new("/workspace/.agent-jobs/project-a/job-42"),
             None,
             None,
             None,
@@ -980,7 +980,7 @@ mod tests {
         // channel and no jobset env vars are added.
         let policy = SandboxPolicy::for_job(
             "job-plain",
-            Path::new("/workspace/.agent-jobs/homelab/job-plain"),
+            Path::new("/workspace/.agent-jobs/project-a/job-plain"),
             None,
             None,
             None,

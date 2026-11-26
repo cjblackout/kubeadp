@@ -2,7 +2,7 @@
 //!
 //! The Kubernetes service-account discovery is implemented here (the real
 //! list callback passed to [`crate::core::a2a::client::build_ctx`]): it lists
-//! Services with the label `a2a.homelab/agent=true` across the pod's own
+//! Services with the label `a2a.kubeadp/agent=true` across the pod's own
 //! namespace plus `A2A_NAMESPACES`. The HTTP call to the Kubernetes API uses
 //! the in-cluster service-account token and CA, or `A2A_KUBE_API` for tests.
 
@@ -10,7 +10,7 @@ use crate::core::a2a::client::{discovery_namespaces, AGENT_LABEL};
 
 /// Label key and value selecting agent Services, derived from [`AGENT_LABEL`]
 /// (`<key>=<value>`).
-const AGENT_LABEL_KEY: &str = "a2a.homelab/agent";
+const AGENT_LABEL_KEY: &str = "a2a.kubeadp/agent";
 const AGENT_LABEL_VALUE: &str = "true";
 
 /// The selector `AGENT_LABEL` used as the Kubernetes API label selector.

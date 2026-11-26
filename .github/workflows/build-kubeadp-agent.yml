@@ -4,7 +4,7 @@ name: build-kubeadp-agent
 # one agent package (src/kubeadp-agent) or its docker dir changes, versions
 # it, pushes it to GHCR (ghcr.io/cjblackout/kubeopencode/kubeadp-agent) and, on
 # main, tags the release (kubeadp-agent-<version>). Nothing is committed to any
-# deployment repository: consumers (the homelab cluster) PIN a released version
+# deployment repository: consumers (such as a cluster deployment) PIN a released version
 # explicitly, so a rollout is a deliberate change on their side.
 #
 # Versioning: YYYY.MM.<X> with prerelease suffix -rc<N>; MajorVersion lives

@@ -600,7 +600,7 @@ mod tests {
     fn test_meta(job_id: &str, worktree: &std::path::Path) -> JobMetadata {
         JobMetadata {
             job_id: job_id.to_string(),
-            project: "homelab".to_string(),
+            project: "project-a".to_string(),
             prompt: "Test prompt".to_string(),
             resolved_prompt: "Test prompt".to_string(),
             model: None,
