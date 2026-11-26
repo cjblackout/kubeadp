@@ -864,6 +864,7 @@ mod tests {
             workspace_root: temp.path().join("ws"),
             agy_path: temp.path().join("fake-agy"),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
         save_job(
@@ -965,6 +966,7 @@ mod tests {
             workspace_root: temp.path().join("ws"),
             agy_path: temp.path().join("fake-agy"),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             agy_home: Some(home.clone()),
             max_parallel: 4,
             ..Default::default()
@@ -1281,6 +1283,7 @@ mod tests {
             workspace_root: temp.path().join("ws"),
             agy_path: temp.path().join("fake-agy"),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
         // A failed job with a conversation ID.
@@ -1380,6 +1383,7 @@ mod tests {
             workspace_root: temp.path().join("ws"),
             agy_path: temp.path().join("fake-agy"),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
         // A failed job with a conversation ID whose row still carries the
@@ -1452,6 +1456,7 @@ mod tests {
             workspace_root: temp.path().join("ws"),
             agy_path: temp.path().join("fake-agy"),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             hindsight_bank: Some("bank-h".to_string()),
             hindsight_auto_recall: true,
             ..Default::default()
@@ -1539,6 +1544,7 @@ mod tests {
             workspace_root: temp.path().join("ws"),
             agy_path: temp.path().join("fake-agy"),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             hindsight_bank: Some("bank-big".to_string()),
             hindsight_auto_recall: true,
             ..Default::default()
@@ -1678,6 +1684,7 @@ mod tests {
             workspace_root: temp.path().join("ws"),
             agy_path: temp.path().join("fake-agy"),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             hindsight_bank: Some(bank.to_string()),
             hindsight_auto_recall: true,
             ..Default::default()

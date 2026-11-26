@@ -12,6 +12,9 @@ pub const DEFAULT_JOBS_DIR_NAME: &str = ".agent-jobs";
 pub const DEFAULT_REPOS_ROOT_TEMPLATE: &str = "{workspace_root}/.agent-repos";
 pub const DEFAULT_AGY_PATH: &str = "/usr/local/libexec/agy";
 pub const DEFAULT_CLAUDE_PATH: &str = "/usr/local/bin/claude";
+/// Default opencode binary path (resolved from `$PATH` at spawn when the
+/// configured value is a bare name).
+pub const DEFAULT_OPENCODE_PATH: &str = "opencode";
 pub const DEFAULT_BASE_BRANCH: &str = "main";
 pub const DEFAULT_STATE_ROOT: &str = "~/.agent-run";
 pub const DEFAULT_GC_MAX_AGE_DAYS: u64 = 14;
@@ -84,6 +87,9 @@ pub struct ConfigFile {
     pub agy_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_path: Option<String>,
+    /// `opencode_path` config key (the opencode engine binary).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opencode_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,6 +197,10 @@ pub struct Config {
     /// orchestrator). Overridable via `AGENT_RUN_CLAUDE_PATH` / the
     /// `claude_path` config key.
     pub claude_path: PathBuf,
+    /// The opencode binary path, used to launch opencode jobs and sessions.
+    /// The union image bakes opencode on `$PATH` on every pod; overridable via
+    /// `AGENT_RUN_OPENCODE_PATH` / the `opencode_path` config key.
+    pub opencode_path: PathBuf,
     pub default_model: Option<String>,
     pub default_effort: Option<String>,
     pub default_base_branch: String,
@@ -303,6 +313,7 @@ impl Default for Config {
             jobs_dir_name: DEFAULT_JOBS_DIR_NAME.to_string(),
             agy_path: PathBuf::from(DEFAULT_AGY_PATH),
             claude_path: PathBuf::from(DEFAULT_CLAUDE_PATH),
+            opencode_path: PathBuf::from(DEFAULT_OPENCODE_PATH),
             default_model: None,
             default_effort: None,
             default_base_branch: DEFAULT_BASE_BRANCH.to_string(),
@@ -419,6 +430,13 @@ impl Config {
             .or_else(|| file_cfg.claude_path.clone())
             .unwrap_or_else(|| DEFAULT_CLAUDE_PATH.to_string());
         let claude_path = expand_path(&claude_path_raw, &workspace_root);
+
+        let opencode_path_raw = env_vars
+            .get("AGENT_RUN_OPENCODE_PATH")
+            .cloned()
+            .or_else(|| file_cfg.opencode_path.clone())
+            .unwrap_or_else(|| DEFAULT_OPENCODE_PATH.to_string());
+        let opencode_path = expand_path(&opencode_path_raw, &workspace_root);
 
         // 6. Resolve model and effort
         let default_model_raw = env_vars
@@ -991,6 +1009,7 @@ impl Config {
             jobs_dir_name,
             agy_path,
             claude_path,
+            opencode_path,
             default_model,
             default_effort,
             default_base_branch,

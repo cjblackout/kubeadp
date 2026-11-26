@@ -1135,6 +1135,7 @@ mod tests {
             repos_root: temp.path().join("ws").join(".agent-repos"),
             agy_path: temp.path().join("fake-agy"),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             a2a_interrupt_min_secs: min_secs,
             ..Default::default()
         };
@@ -1862,6 +1863,7 @@ mod tests {
                 repos_root: temp.path().join("ws").join(".agent-repos"),
                 agy_path: temp.path().join("fake-agy"),
                 claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+                opencode_path: std::path::PathBuf::from("opencode"),
                 a2a_interrupt_min_secs: 0,
                 a2a_live_stdin: true,
                 // A wide ack window (far larger than any test delay) so the

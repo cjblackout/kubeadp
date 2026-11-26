@@ -439,6 +439,7 @@ mod tests {
         Config {
             agy_path: agy.to_path_buf(),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             repos_root: dir.to_path_buf().join(".agent-repos"),
             workspace_root: dir.to_path_buf(),
             ..Default::default()

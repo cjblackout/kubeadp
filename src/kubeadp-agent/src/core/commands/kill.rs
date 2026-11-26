@@ -564,6 +564,7 @@ mod tests {
         let config = Config {
             agy_path: agy.clone(),
             claude_path: claude.clone(),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -631,6 +632,7 @@ mod tests {
         let config = Config {
             agy_path: dir.path().join("agy"),
             claude_path: claude.clone(),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 

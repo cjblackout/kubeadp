@@ -235,6 +235,7 @@ mod tests {
             state_root: state_root.clone(),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -317,6 +318,7 @@ mod tests {
             state_root: state_root.clone(),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -373,6 +375,7 @@ mod tests {
             state_root: state_root.clone(),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
         let job_id = format!("shrd{}", std::process::id());

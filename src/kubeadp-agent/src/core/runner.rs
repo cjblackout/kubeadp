@@ -507,12 +507,13 @@ pub fn validate_executable_paths(config: &Config) -> Result<()> {
 }
 
 /// Validates the configured engine executable path for `engine` (`Some("claude")`
-/// checks `config.claude_path`; all other values check `config.agy_path`).
+/// checks `config.claude_path`, `Some("opencode")` checks `config.opencode_path`;
+/// all other values check `config.agy_path`).
 pub fn validate_engine_executable_path(config: &Config, engine: Option<&str>) -> Result<()> {
-    let (label, path) = if engine == Some("claude") {
-        ("claude", &config.claude_path)
-    } else {
-        ("agy", &config.agy_path)
+    let (label, path) = match engine {
+        Some("claude") => ("claude", &config.claude_path),
+        Some("opencode") => ("opencode", &config.opencode_path),
+        _ => ("agy", &config.agy_path),
     };
     if path.is_absolute() {
         if !path.exists() {
@@ -1707,6 +1708,7 @@ mod tests {
         let config = Config {
             agy_path: PathBuf::from("/usr/local/bin/agy"),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -1757,6 +1759,7 @@ mod tests {
         let config = Config {
             agy_path: PathBuf::from("/usr/local/bin/agy"),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -1801,6 +1804,7 @@ mod tests {
         let config = Config {
             agy_path: PathBuf::from("/usr/local/bin/agy"),
             claude_path: PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -1866,6 +1870,7 @@ mod tests {
         let config = Config {
             agy_path: PathBuf::from("/usr/local/bin/agy"),
             claude_path: PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
         let mut meta = test_meta_overrides();
@@ -2054,6 +2059,7 @@ mod tests {
         let config = Config {
             agy_path: PathBuf::from("/nonexistent/agy-binary"),
             claude_path: std::path::PathBuf::from("claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
         assert!(validate_executable_paths(&config).is_err());
@@ -2062,6 +2068,7 @@ mod tests {
         let rel_config = Config {
             agy_path: PathBuf::from("agy"),
             claude_path: std::path::PathBuf::from("claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
         assert!(validate_executable_paths(&rel_config).is_ok());
@@ -2070,6 +2077,7 @@ mod tests {
         let ok_config = Config {
             agy_path: PathBuf::from("/bin/sh"),
             claude_path: std::path::PathBuf::from("claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
         assert!(validate_executable_paths(&ok_config).is_ok());
@@ -2078,6 +2086,7 @@ mod tests {
         let claude_only_config = Config {
             agy_path: PathBuf::from("/nonexistent/agy-binary"),
             claude_path: PathBuf::from("/bin/sh"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
         assert!(validate_engine_executable_path(&claude_only_config, Some("claude")).is_ok());
@@ -2085,6 +2094,7 @@ mod tests {
         let bad_claude_config = Config {
             agy_path: PathBuf::from("/bin/sh"),
             claude_path: PathBuf::from("/nonexistent/claude-binary"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
         assert!(validate_engine_executable_path(&bad_claude_config, Some("claude")).is_err());
@@ -2116,6 +2126,7 @@ mod tests {
             state_root: state_root.clone(),
             agy_path: agy.clone(),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -2187,6 +2198,7 @@ mod tests {
             state_root: state_root.clone(),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             agy_home: Some(home.clone()),
             ..Default::default()
         };
@@ -2284,6 +2296,7 @@ mod tests {
             state_root: state_root.clone(),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             agy_home: Some(home.clone()),
             ..Default::default()
         };
@@ -2380,6 +2393,7 @@ mod tests {
             state_root: state_root.clone(),
             agy_path: agy.clone(),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -2621,6 +2635,7 @@ mod tests {
             state_root: state_root.clone(),
             agy_path: PathBuf::from("/bin/sh"),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -2712,6 +2727,7 @@ mod tests {
             state_root: state_root.clone(),
             agy_path: agy.clone(),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -2807,6 +2823,7 @@ mod tests {
             state_root: state_root.clone(),
             agy_path: agy.clone(),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -2959,6 +2976,7 @@ mod tests {
             state_root: state_root.clone(),
             agy_path: agy.clone(),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -3126,6 +3144,7 @@ mod tests {
             state_root: state_root.clone(),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -3192,6 +3211,7 @@ mod tests {
             state_root: state_root.clone(),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             launch_timeout_secs: 1,
             ..Default::default()
         };
@@ -3317,6 +3337,7 @@ mod tests {
             state_root,
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             // Point the policy's writable shared path (the agent's home) at a
             // temp dir the sandbox backend can actually create; the production
             // default `/home/agent` is not creatable on this (or a CI) host.
@@ -3405,6 +3426,7 @@ mod tests {
             state_root,
             agy_path: std::path::PathBuf::from("/usr/local/bin/agy"),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             sandbox_home: tmp.path().join("sbx-home"),
             ..Default::default()
         };
@@ -3447,6 +3469,7 @@ mod tests {
         let config = Config {
             agy_path: PathBuf::from("/usr/local/bin/agy"),
             claude_path: PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
         let registry = EngineRegistry::with_builtin(&config);
@@ -3500,6 +3523,7 @@ mod tests {
         let config = Config {
             agy_path: PathBuf::from("/usr/local/bin/agy"),
             claude_path: PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
         let registry = EngineRegistry::with_builtin(&config);
@@ -3562,6 +3586,7 @@ mod tests {
     fn test_claude_job_command_preserves_prompt_with_fake_markers_and_cwd() {
         let config = Config {
             claude_path: PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
         let registry = EngineRegistry::with_builtin(&config);
