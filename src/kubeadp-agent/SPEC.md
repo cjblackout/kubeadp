@@ -62,7 +62,7 @@ The library crate name is `kubeadp_agent`.
 |---|---|
 | agent | one job or one session; the unit that sends and receives messages |
 | agent id | the job id (job) or the session name (session); unique within a deployment (§7.1) |
-| run | the engine-level view of an agent: `{id, engine, kind, transport, status, ...}` (§3.7); run id = agent id |
+| run | the engine-level view of an agent: `{id, engine, kind, transport, status, ...}` (§3.8); run id = agent id |
 | engine | an agent harness behind the `Engine` trait (`agy`, `claude`) |
 | jobset | an authenticated messaging group of agents (§7). The word "mesh" is not used |
 | API bearer | the `/api/v1` control-plane token (`api_token_file`); formerly "operator token". It never authorizes messaging |
@@ -153,7 +153,7 @@ Version 6 is reserved for the stream-3 step C1 `jobset`/`jobset_member`
 tables (a parallel patch); this step appends 7 so both additive migrations can
 land in any order without renumbering.
 
-The planned `jobset`/`jobset_member` tables (§7.2) and `run_meta` (§3.7) are
+The planned `jobset`/`jobset_member` tables (§7.2) and `run_meta` (§3.8) are
 appended as later additive migrations when implemented (§13.1).
 
 Table definitions (normative column sets; types are SQLite affinities):
@@ -196,10 +196,10 @@ The `fake` flag keeps the test suites' in-memory store apart from the real
 per-pod database.
 
 The run registry is not a table: a run is the union view of a `jobs` row or a
-`session_state` row with its optional `run_meta` row (§3.7).
+`session_state` row with its optional `run_meta` row (§3.8).
 
 Not in the database, by design: job log files and session log rings (bulk
-append-only output), Git worktrees and the checkpoint refs of §3.5 (Git data),
+append-only output), Git worktrees and the checkpoint refs of §3.6 (Git data),
 engine-owned files (transcripts, engine conversation databases), configuration
 and secrets.
 
@@ -270,8 +270,9 @@ and secrets.
   structured execution in a worktree) and **session mode** (a long-lived
   supervised conversation). No handler, command or supervisor loop may branch on
   an engine name; engine-specific behaviour lives behind the trait.
-- Every role registers every engine built into the image (`agy`, `claude`). The
-  registry maps ids to engines, each wrapped in the emulation layer (§3.5);
+- Every role registers every engine built into the image (`agy`, `claude`,
+  `opencode`). The
+  registry maps ids to engines, each wrapped in the emulation layer (§3.6);
   `resolve(kind, request, configured)` returns `UnknownEngine` for an unknown id.
 - Selection precedence, per run: explicit request (`--engine` / `engine` in the
   job body; `engine` in the session definition) > configured default
@@ -285,7 +286,7 @@ and secrets.
   `session_state.engine`) and never changes for the life of the run: retry,
   resume and restart use the stored engine.
 - Unknown engine → `400` `{"error", "code":"unknown_engine", "engine":"<name>"}`.
-- **Engine independence**: every endpoint of the capability table (§3.4) must
+- **Engine independence**: every endpoint of the capability table (§3.5) must
   work with every registered engine in every mode the endpoint applies to,
   natively or through emulation. No endpoint may answer `501` because of the
   engine. `EngineError::Unsupported` (`501`, `code:"unsupported"`) stays in the
@@ -334,7 +335,39 @@ and secrets.
   claude.ai) and `stream_json` (headless).
 - Message injection uses the Claude Code hooks of §7.14.
 
-### 3.4 Capabilities
+### 3.4 opencode engine (`"opencode"`)
+- **Job mode** invokes headless `opencode run --format json [--model
+  provider/model] [--session <id>] --auto --dir <worktree> <prompt>`. The
+  prompt is a positional argv element (opencode's CLI contract), a retry
+  resumes the harness conversation via `--session <conversation_id>` (the
+  `sessionID` carried on every JSON event, captured into the job row), and
+  the run directory is `--dir <worktree>` (explicit for opencode, which may
+  be launched with a different cwd by the sandbox wrapper).
+- **Events**: `opencode run --format json` emits one NDJSON event per line:
+  `step_start`, `text`, `tool_use`, `step_finish` and (on failure, before
+  exit 1) `error` (verified live against opencode 1.19.4 in-cluster). The
+  engine parses these into the job's event buffer; status classification
+  (`core::job::determine_status_from_opencode`, §13.2) mirrors the
+  agy/claude taxonomy on the opencode contract: a `step_finish` whose
+  `reason` is `"stop"` is `Done` (a tool-calling turn `"tool-calls"` is not
+  completion), a terminal `error` is `Failed`, a quota/rate-limit signal is
+  `QuotaExhausted`, exit 0 without a terminal stop is `Incomplete`, and a
+  137/143 kill without an error line is `SelfTerminated`.
+- **Session mode** runs `opencode run -i --format json --auto --dir
+  <workdir> <start-message>` inside the supervisor PTY, mirroring the agy
+  live-stream approach: the interactive opencode process reads follow-up
+  turns as user lines typed on the PTY.
+- **Message injection** is the floor of the ladder (§7.14): opencode has no
+  hook mechanism, so its injection channel is `idle_turn` only -- a queued
+  message starts the run's next turn as a follow-up prompt. A RUNNING
+  opencode job has no live channel and answers `Unsupported` for the
+  `idle_turn` step.
+- **Instructions**: `materialize_instructions` writes the global
+  `~/.config/opencode/AGENTS.md` and the per-session `AGENTS.md` in the run's
+  working directory (§4.10), each as a managed block; the workdir `AGENTS.md`
+  is git-excluded (a tracked one is never touched).
+
+### 3.5 Capabilities
 - `Capability` ∈ `native`, `emulated`, `unsupported` (serde lowercase).
 - A static endpoint table defines every capability key with its job/session
   applicability. Per-engine tables (with the engine's `transport` and
@@ -345,43 +378,50 @@ and secrets.
   for `permissions` only, and that endpoint then answers `200` with an empty
   list (a headless engine never asks).
 
-| Key | Job | Session | agy | claude |
-|---|---|---|---|---|
-| `job.start` | Y | — | native | native |
-| `job.status` | Y | — | native | native |
-| `job.list` | Y | — | native | native |
-| `job.kill` | Y | — | native | native |
-| `job.retry` | Y | — | native | native |
-| `job.events` | Y | — | native | native |
-| `job.result` | Y | — | native | native |
-| `session.start` | — | Y | emulated | native |
-| `session.stop` | — | Y | emulated | native |
-| `session.restart` | — | Y | emulated | native |
-| `session.log` | — | Y | emulated | native |
-| `session.message` | — | Y | emulated | native |
-| `interrupt` | Y | Y | emulated | emulated |
-| `pause` | Y | Y | emulated | emulated |
-| `fork` | Y | Y | emulated | emulated |
-| `compact` | Y | Y | emulated | emulated |
-| `revert` | Y | Y | emulated | emulated |
-| `todo` | Y | Y | emulated | emulated |
-| `permissions` | Y | Y | unsupported (empty list) | unsupported (empty list) |
-| `workspace.*` | Y | Y | native | native |
-| `a2a.send_message` | Y | Y | native | native |
-| `a2a.inject` | Y | Y | native: `hook`, `tool_result`, `idle_turn` | native: `hook`, `tool_result`, `idle_turn` |
+| Key | Job | Session | agy | claude | opencode |
+|---|---|---|---|---|---|
+| `job.start` | Y | — | native | native | native |
+| `job.status` | Y | — | native | native | native |
+| `job.list` | Y | — | native | native | native |
+| `job.kill` | Y | — | native | native | native |
+| `job.retry` | Y | — | native | native | native |
+| `job.events` | Y | — | native | native | native |
+| `job.result` | Y | — | native | native | native |
+| `session.start` | — | Y | emulated | native | emulated |
+| `session.stop` | — | Y | emulated | native | emulated |
+| `session.restart` | — | Y | emulated | native | emulated |
+| `session.log` | — | Y | emulated | native | emulated |
+| `session.message` | — | Y | emulated | native | emulated |
+| `interrupt` | Y | Y | emulated | emulated | emulated |
+| `pause` | Y | Y | emulated | emulated | emulated |
+| `fork` | Y | Y | emulated | emulated | emulated |
+| `compact` | Y | Y | emulated | emulated | emulated |
+| `revert` | Y | Y | emulated | emulated | emulated |
+| `todo` | Y | Y | emulated | emulated | emulated |
+| `permissions` | Y | Y | unsupported (empty list) | unsupported (empty list) | unsupported (empty list) |
+| `workspace.*` | Y | Y | native | native | native |
+| `a2a.send_message` | Y | Y | native | native | native |
+| `a2a.inject` | Y | Y | native: `hook`, `tool_result`, `idle_turn` | native: `hook`, `tool_result`, `idle_turn` | native: `idle_turn` only |
 
 `job.*` and `workspace.*` operate on the job row and the worktree and are
 therefore engine-independent: they are `native` for every engine by
 construction. `a2a.send_message` is `native` for every engine because sending
 is done by the harness-owned `mcp-a2a` server (§8), not by the engine.
+`a2a.inject` is `native` for every engine with an engine-specific channel
+ladder (§7.14): agy and claude expose `hook`, `tool_result` and `idle_turn`;
+opencode is the floor of the ladder -- no hook mechanism and no harness-owned
+`mcp-a2a` wired through `opencode.json` (a future change, Open Points), so it
+exposes `idle_turn` only. Session control for opencode is the emulated control surface
+(§3.4), because the interactive opencode process exposes no restart/log/message
+channels.
 
-### 3.5 Emulation layer
+### 3.6 Emulation layer
 Implements, purely in the shared layer, what the inner engine lacks. Every
 emulation touches only the run's own worktree and state rows.
 - **interrupt**: process-group SIGTERM escalated to SIGKILL after the grace;
   the worktree and the conversation are preserved, the run can be continued.
 - **pause**: per-run flag (`run_meta.paused`); text sent to a paused run
-  accumulates in the run's queue (§3.6) and is delivered on continuation.
+  accumulates in the run's queue (§3.7) and is delivered on continuation.
 - **compact**: summarise-then-restart. The summary comes from the run's own Git
   history and worktree via hardened Git (no engine consulted), prefixed
   `[engine compacted context follows; continue the same task from this
@@ -399,7 +439,7 @@ emulation touches only the run's own worktree and state rows.
 - **session.\*** for an engine without a native session process model: the
   session supervisor (§4) drives the engine's live transport in a PTY.
 
-### 3.6 Message queue
+### 3.7 Message queue
 Text for a run that cannot take it now (paused, or mid-turn on an engine whose
 input is turn-bounded) is queued as `inbox` rows with `origin = 'api'` (§2.3),
 ordered by `enqueued_at`, drained at continuation or the next turn boundary as
@@ -407,7 +447,7 @@ ONE continuation prompt, entries joined with `\n`. Exactly one writer drains a
 run's queue at a time; rows arriving during a drain are delivered at the next
 boundary. The bounds of §7.6 apply to this queue as to jobset messages.
 
-### 3.7 Run identity and errors
+### 3.8 Run identity and errors
 - `RunId`/`EngineId`/`ContextId` are strings; `RunKind` ∈ `session`, `job`;
   `Transport` ∈ `pty_remote_control`, `stream_json` (serde snake_case, claude
   only; `None` for agy); `PodRole` ∈ `orchestrator`, `worker`.
@@ -632,6 +672,10 @@ global → per-session → per-project appended last):
   (logged).
 - **agy**: `~/.gemini/config/AGENTS.md` (the config file that also holds the
   MCP configuration).
+- **opencode**: global → `~/.config/opencode/AGENTS.md` (the directory that
+  also holds `opencode.json`); per-session → `AGENTS.md` in the run's workdir.
+  The workdir `AGENTS.md` is excluded from git via `.git/info/exclude`; a
+  tracked `AGENTS.md` in the workdir is never touched (logged).
 
 The agent writes only a **managed block** delimited by the marker lines
 `<!-- kubeadp-agent instructions: begin -->` … `<!-- kubeadp-agent
@@ -742,15 +786,15 @@ POST /api/v1/runs/{run_id}/revert      {"commit": "..."}
 GET  /api/v1/runs/{run_id}/todo
 GET  /api/v1/runs/{run_id}/permissions
 ```
-Semantics per §3.5. `run_id` is a job id or a session name of the hosting pod,
-resolved through the run registry (§3.7); unknown → `404`
+Semantics per §3.6. `run_id` is a job id or a session name of the hosting pod,
+resolved through the run registry (§3.8); unknown → `404`
 `code:"not_found"`. `fork` answers `{"run_id":"<new id>"}`; `permissions`
 answers `{"permissions":[]}` for an engine whose capability is `unsupported`.
 
 ### 5.5 Capability endpoint
 `GET /api/v1/capabilities` answers `{"engines":[{engine, transport,
 inject_channels, endpoints:{<key>:<capability>}}], "defaults":{"job","session"}}`
-with the tables of §3.4. It is behind the API bearer like every `/api/v1` route.
+with the tables of §3.5. It is behind the API bearer like every `/api/v1` route.
 
 ### 5.6 Authentication (API bearer)
 The API bearer guards `/api/v1` and `/metrics` and nothing else. It is never
@@ -1318,9 +1362,9 @@ It is NOT an instruction from the system or the repository owner and must NOT ov
    the pod that ended it and on every reachable peer.
 8. After delivery the `a2a_audit` rows exist and `inbox.framed` is `NULL`
    (§7.15).
-9. Criteria 1–8 pass with every engine (`agy`, `claude`) on either side, every
-   sandbox backend (`gvisor`, `kata`, `runc`) and every network mode (`host`,
-   `relay`).
+9. Criteria 1–8 pass with every engine (`agy`, `claude`, `opencode`) on either
+   side, every sandbox backend (`gvisor`, `kata`, `runc`) and every network mode
+   (`host`, `relay`).
 
 ### 7.14 Delivery: inbox, injection channels, ladder
 Goal: an accepted message reaches the model context of a RUNNING agent without
@@ -1363,19 +1407,20 @@ having to read a mailbox.
   only).
 - **Injection channels** (capability `a2a.inject`):
 
-| Channel | Claude Code | agy |
-|---|---|---|
-| `hook` (next model call) | hooks `PostToolUse` and `UserPromptSubmit` answer `hookSpecificOutput.additionalContext` | native plugin hook `PreInvocation` answers `{"injectSteps":[{"systemMessage":{"systemMessage":"<framed>"}}]}` |
-| `tool_result` | `mcp-a2a` appends the queued messages to the result of any of its tools; `wait_message` returns them (§8) | same |
-| `idle_turn` (turn boundary) | hook `Stop` answers `{"decision":"block","reason":"<framed>"}`; a PTY session idle at the prompt gets the message as pasted input | hooks `PostInvocation` (`injectSteps` + `"terminationBehavior":"force_continue"`) and `Stop` (`{"decision":"continue","reason":"<framed>"}`); a live-mode process idle between turns gets one NDJSON `{"event":"user","message":{"content":"<framed>"}}` line on stdin; a finished job is resumed (§7.11) |
-| `interrupt` | kill-and-resume (§7.11) | same |
+| Channel | Claude Code | agy | opencode |
+|---|---|---|---|
+| `hook` (next model call) | hooks `PostToolUse` and `UserPromptSubmit` answer `hookSpecificOutput.additionalContext` | native plugin hook `PreInvocation` answers `{"injectSteps":[{"systemMessage":{"systemMessage":"<framed>"}}]}` | — (none: no hook mechanism) |
+| `tool_result` | `mcp-a2a` appends the queued messages to the result of any of its tools; `wait_message` returns them (§8) | same | — (none: no harness-owned `mcp-a2a`) |
+| `idle_turn` (turn boundary) | hook `Stop` answers `{"decision":"block","reason":"<framed>"}`; a PTY session idle at the prompt gets the message as pasted input | hooks `PostInvocation` (`injectSteps` + `"terminationBehavior":"force_continue"`) and `Stop` (`{"decision":"continue","reason":"<framed>"}`); a live-mode process idle between turns gets one NDJSON `{"event":"user","message":{"content":"<framed>"}}` line on stdin; a finished job is resumed (§7.11) | a queued message starts the run's next turn as a follow-up prompt (a finished job is resumed as a retry, §3.4); a RUNNING opencode job has no live channel |
+| `interrupt` | kill-and-resume (§7.11) | same | same |
 
-  Both engines support `hook`, `tool_result` and `idle_turn`, so a busy agent of
-  either engine receives a message at its next model call. In addition to the
-  model channel, the Claude Code hooks answer a user-visible echo (a TOP-LEVEL
-  `systemMessage`, one short line per message, §7.14.1); the
-  outgoing `send_message`/`reply` results echo themselves the same way, behind
-  the one `a2a_echo` switch.
+  agy and claude support `hook`, `tool_result` and `idle_turn`, so a busy agent
+  of either engine receives a message at its next model call. opencode is the
+  floor of the ladder: `idle_turn` only (a RUNNING opencode job is unwakeable in
+  flight). In addition to the model channel, the Claude Code hooks answer a
+  user-visible echo (a TOP-LEVEL `systemMessage`, one short line per message,
+  §7.14.1); the outgoing `send_message`/`reply` results echo themselves the
+  same way, behind the one `a2a_echo` switch.
 - **`a2a-hook <event>`** (subcommand, events `PostToolUse`, `UserPromptSubmit`,
   `Stop`, `pre-invocation`, `post-invocation`, `stop`): claims (leases) up to
   16 KiB (`MAX_INJECT_BYTES`) for the event's channel, prints the event's JSON
@@ -1654,6 +1699,7 @@ sections; they are the separate trusted config of §4.2.
 | `jobs_dir_name` | `AGENT_RUN_JOBS_DIR_NAME` | `.agent-jobs` |
 | `agy_path` | `AGENT_RUN_AGY_PATH` | `/usr/local/libexec/agy` |
 | `claude_path` | `AGENT_RUN_CLAUDE_PATH` | `claude`; binary for claude jobs |
+| `opencode_path` | `AGENT_RUN_OPENCODE_PATH` | `opencode`; binary for opencode jobs |
 | `default_model` | `AGENT_RUN_DEFAULT_MODEL` | passed to jobs |
 | `default_effort` | `AGENT_RUN_DEFAULT_EFFORT` | reasoning effort |
 | `default_base_branch` | `AGENT_RUN_DEFAULT_BASE_BRANCH` | `main` |
@@ -1923,7 +1969,7 @@ a2a,test-hooks`.
   `--timeout`, `--max-runtime` → `killed`, no-limit default, list AGE/ACTIVITY +
   `--json` keys, remote-control enable/status/idempotency, real-query
   introspection, `--hindsight-query`, remote-control autostart/supervision/
-  disable, `repair` re-attaching orphaned worktrees, per-run message queue (§3.6)
+  disable, `repair` re-attaching orphaned worktrees, per-run message queue (§3.7)
   contract. Opt-in `real-agy-smoke.sh` against the real `agy`.
 - **`tests/orchestrate/` (~69 tests)**: drives `fake-claude.sh` action scripts.
   start/resume args, config rewrite idempotency, readiness, crash→restart with
@@ -1967,9 +2013,9 @@ claude, node, npm, npx, tini, ttyd, git, curl, gcc, make, pkg-config, agy,
 One suite (`tests/conformance.rs`) runs the SAME endpoint cases against every
 registered engine, in job mode and in session mode, with scripted fake engine
 binaries (`tests/cli/fake-agy.sh`, `tests/orchestrate/fake-claude.sh`):
-- every key of the capability table (§3.4) is exercised through its HTTP
+- every key of the capability table (§3.5) is exercised through its HTTP
   endpoint and must answer its documented success shape;
-- no response is `501`; `GET /api/v1/capabilities` equals §3.4;
+- no response is `501`; `GET /api/v1/capabilities` equals §3.5;
 - the engine is selectable per job and per session, on either role, and the
   stored engine is used by retry and restart;
 - the parity cases of `a2a_inject.rs` are part of the suite.
@@ -1991,16 +2037,16 @@ Implemented: migrations 1–7 (`jobs`, supervisor and session state, heartbeat i
 |---|---|---|
 | trait, registry, capability endpoint, error mapping | implemented | |
 | both engines registered by both roles | implemented | |
-| agy job mode, claude job mode (`stream_json`) | implemented | |
-| claude sessions (`pty_remote_control`), agy sessions (live stream-json) | partial | work on the orchestrator behind the engine trait; claude `stream_json` sessions planned |
+| agy job mode, claude job mode (`stream_json`), opencode job mode (`--format json`) | implemented | |
+| claude sessions (`pty_remote_control`), agy sessions (live stream-json), opencode sessions (interactive `-i`) | partial | work on the orchestrator behind the engine trait; claude `stream_json` sessions planned |
 | engine persisted per run and used by retry/restart | implemented | |
 | built-in default by run kind only | implemented | |
-| capability table of §3.4 | implemented | implemented capability tables match §3.4: `claude` gets native `job.list`/`job.kill`/`job.result`/`workspace.*`, `interrupt`/`pause`/`fork` emulated for both engines; only `permissions` remains `unsupported` |
+| capability table of §3.5 | implemented | implemented capability tables match §3.5: `claude` gets native `job.list`/`job.kill`/`job.result`/`workspace.*`, `interrupt`/`pause`/`fork` emulated for both engines; `opencode` gets the same native job/workspace surface with `idle_turn`-only injection; only `permissions` remains `unsupported` |
 | no `501` because of the engine | implemented | the worker arms the emulation layer for every control endpoint each engine lacks, so no `/api/v1` control route answers `501` because of the engine; run-control route handlers have no hard-coded 501 arm (answers through capability check) |
 | run-control routes resolving real jobs and sessions | implemented | run-control routes resolve real jobs and sessions through `RunRegistry` backed by SQLite and `run_meta` |
 | `fork` creating a run | implemented | the job surface clones the source worktree and returns the new run id |
 | `permissions` route | implemented | `GET /api/v1/runs/{run_id}/permissions` and `GET /api/v1/jobs/{job_id}/permissions` return `{"permissions": []}` for engines whose capability is `unsupported` |
-| queue of §3.6 in the `inbox` table | implemented | queued messages in `a2a_message` table with sender `api` |
+| queue of §3.7 in the `inbox` table | implemented | queued messages in `a2a_message` table with sender `api` |
 | conformance suite (§12.6) | implemented | |
 
 ### 13.3 Jobset messaging (§7, §8)
@@ -2021,3 +2067,7 @@ Implemented: the sandbox (§6.1–§6.9 including the per-agent delivery socket)
   (120 s URL/code, 15 min parked).
 - `repo-sync` `--once`/`--loop` flag interplay with environment overrides in
   edge configurations.
+- opencode injection ladder: wiring the harness-owned `mcp-a2a` through
+  `opencode.json` (opencode already supports MCP config, verified against
+  `opencode mcp list` for 1.19.4) to raise the opencode injection channel above
+  `idle_turn`; deliberately not done in KA-4.

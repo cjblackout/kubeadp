@@ -67,8 +67,8 @@ use tower::ServiceExt;
 // ---------------------------------------------------------------------------
 
 /// The engines the worker role registers in production (`worker/entry.rs`).
-/// The conformance suite mirrors that exact construction: agy plus claude,
-/// both through [`AgyEngine::build_registry`] / [`ClaudeEngine::new`, then
+/// The conformance suite mirrors that exact construction: agy, claude and
+/// opencode, all wrapped the way the worker entry points build them, then
 /// `attach_config` + `enable_all_emulated`.
 fn production_registry() -> EngineRegistry {
     production_registry_with_config(Arc::new(Config::default()))
@@ -84,6 +84,9 @@ fn production_registry_with_config(config: Arc<Config>) -> EngineRegistry {
         PathBuf::from("claude"),
         None,
     )));
+    registry.register(Arc::new(
+        kubeadp_agent::engine::opencode::OpenCodeEngine::new(Arc::clone(&config)),
+    ));
     registry.attach_config(config);
     registry.enable_all_emulated();
     registry
@@ -372,6 +375,26 @@ exit 0
     path
 }
 
+/// Writes an executable fake `opencode` that produces a terminal opencode
+/// event stream: a `step_start`, a `text`, and a `step_finish` reason `stop`,
+/// carrying a stable `sessionID` (the opencode job taxonomy's `Done`).
+fn fake_opencode(dir: &Path) -> PathBuf {
+    let path = dir.join("fake-opencode");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"step_start","sessionID":"fake-session-oc","part":{"type":"step-start"}}'
+printf '%s\n' '{"type":"text","sessionID":"fake-session-oc","part":{"type":"text","text":"conformance done"}}'
+printf '%s\n' '{"type":"step_finish","sessionID":"fake-session-oc","part":{"type":"step-finish","reason":"stop"}}'
+sleep 1
+exit 0
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
 /// A config with temp state/workspace roots and the fake harness binaries.
 /// The `state_root` must have its state store initialised, and the workspace
 /// root holds `<project>` + `.agent-repos`.
@@ -394,7 +417,7 @@ fn hermetic_config(root: TempDir, engine_name: &str) -> HermeticConfig {
         state_root: state_root.clone(),
         agy_path: fake_agy(root.path()),
         claude_path: fake_claude(root.path()),
-        opencode_path: std::path::PathBuf::from("opencode"),
+        opencode_path: fake_opencode(root.path()),
         sandbox_home: workspace_root.join("sandbox-home"),
         ..Default::default()
     };
@@ -418,6 +441,9 @@ fn hermetic_app(cfg: &HermeticConfig) -> Router {
         PathBuf::from("claude"),
         None,
     )));
+    registry.register(Arc::new(
+        kubeadp_agent::engine::opencode::OpenCodeEngine::new(Arc::new(cfg.config.clone())),
+    ));
     registry.attach_config(Arc::new(cfg.config.clone()));
     registry.enable_all_emulated();
     obs::add_observability(
@@ -580,7 +606,7 @@ async fn run_control_capabilities_dispatch() {
 
     // The suite asserts the negative (unknown engine -> 400) through the
     // engine-selection surface below.
-    assert_eq!(registry.len(), 2, "registry has agy+claude");
+    assert_eq!(registry.len(), 3, "registry has agy+claude+opencode");
 }
 
 fn control_request(key: &str, run_id: &str) -> (&'static str, String, &'static str) {
@@ -629,7 +655,7 @@ async fn engine_selection_and_capabilities_listing() {
         "unknown engine must be 4xx, got {status}: {value}"
     );
 
-    // /capabilities lists exactly the two registered engines.
+    // /capabilities lists exactly the registered engines.
     let (status, value) = body_json(
         app.clone()
             .oneshot(get("/api/v1/capabilities"))
@@ -646,7 +672,14 @@ async fn engine_selection_and_capabilities_listing() {
         .map(|c| c["engine"].as_str().unwrap_or("").to_string())
         .collect();
     engines.sort();
-    assert_eq!(engines, vec!["agy".to_string(), "claude".to_string()]);
+    assert_eq!(
+        engines,
+        vec![
+            "agy".to_string(),
+            "claude".to_string(),
+            "opencode".to_string()
+        ]
+    );
 
     // Every endpoint key in the static table is present in each engine's
     // report (an engine's capability() returns Unsupported for anything it
@@ -955,16 +988,137 @@ async fn job_lifecycle_claude_hermetic() {
     teardown_job(&hcfg, &job_id);
 }
 
+/// The opencode job lifecycle: `POST /api/v1/jobs` with `"engine":"opencode"`
+/// runs the opencode `run --format json` harness (the fake opencode writes a
+/// terminal `step_finish` reason `stop`), so the opencode taxonomy classifies
+/// `done`. The job endpoints (status/list/kill/events/result) are
+/// engine-independent: they operate on the job row and the log, so they
+/// answer 200 for opencode too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn job_lifecycle_opencode_hermetic() {
+    let root = TempDir::new().unwrap();
+    let hcfg = hermetic_config(root, "opencode");
+    let app = hermetic_app(&hcfg);
+
+    let (status, value) = body_json(
+        app.clone()
+            .oneshot(post_json(
+                "/api/v1/jobs",
+                r#"{"project":"proj","prompt":"conformance opencode job","sandbox":false,"engine":"opencode"}"#,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "opencode start must be 200: {value}"
+    );
+    let job_id = value["data"]["job_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("start body must carry job_id: {value}"))
+        .to_string();
+
+    assert!(
+        wait_status_done(&app, &job_id, Duration::from_secs(20)).await,
+        "opencode job must reach done"
+    );
+
+    // The conversation id (the harness session id) must have been captured to
+    // the row, since retry's resume key comes from it.
+    let conv = std::time::Instant::now() + Duration::from_secs(5);
+    let mut conversation_id = String::new();
+    while std::time::Instant::now() < conv {
+        if let Ok(meta) = JobMetadata::load(&hcfg.state_root, &job_id) {
+            if let Some(c) = meta.conversation_id.clone() {
+                conversation_id = c;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !conversation_id.is_empty(),
+        "opencode job must capture a conversation id from sessionID lines"
+    );
+
+    // job.status: 200 for opencode (engine-independent).
+    let (s, v) = body_json(
+        app.clone()
+            .oneshot(get(&format!("/api/v1/jobs/{job_id}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "opencode status must be 200");
+    assert_eq!(v["data"]["status"], "done");
+
+    // job.result: 200 for opencode. The response surfaces the last turn's
+    // visible text events.
+    let (s, v) = body_json(
+        app.clone()
+            .oneshot(get(&format!("/api/v1/jobs/{job_id}/result")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "opencode job.result must be 200: {v}");
+    assert!(
+        v["data"]["response"]
+            .as_str()
+            .unwrap_or("")
+            .contains("conformance done"),
+        "opencode result must carry the fake's response: {v}"
+    );
+
+    // job.retry on a done job without --prompt -> 400 (the documented
+    // retry_already_completed error), never 501.
+    let (s, v) = body_json(
+        app.clone()
+            .oneshot(post_json(
+                &format!("/api/v1/jobs/{job_id}/retry"),
+                &format!(r#"{{"prompt":null,"job_id":"{job_id}"}}"#),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "retry on done opencode job: {v}"
+    );
+    assert_eq!(v["code"], "retry_already_completed");
+
+    // job.events: SSE stream resolves to the terminal end event.
+    let (s, bytes) = body_bytes(
+        app.clone()
+            .oneshot(get(&format!("/api/v1/jobs/{job_id}/events")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "opencode events must resolve");
+    let sse = String::from_utf8_lossy(&bytes);
+    assert!(
+        sse.contains("event: end"),
+        "opencode events stream must carry the terminal end event: {sse:?}"
+    );
+
+    teardown_job(&hcfg, &job_id);
+}
+
 /// The job-scoped run-control surface (`/api/v1/jobs/{id}/...`, HL-71 S2) is
 /// the PRODUCTION surface: the run registry resolves no runs in production, so
 /// the job routes are what an operator actually drives. Every control endpoint
 /// resolves the job row on demand and dispatches through the emulation
-/// wrapper, so a finished agy/claude job still answers a usable body (2xx +
-/// a `CommandOutput` with a `.data` payload) -- never a 501 because of the
-/// engine.
+/// wrapper, so a finished agy/claude/opencode job still answers a usable body
+/// (2xx + a `CommandOutput` with a `.data` payload) -- never a 501 because of
+/// the engine.
 ///
-/// Driven for BOTH engines (agy default + explicit claude) after the job
-/// reached `done`:
+/// Driven for ALL engines (agy default + explicit claude + explicit opencode)
+/// after the job reached `done`:
 /// - `todo` (GET) -> 2xx `{data: {todos: [...]}}`;
 /// - `interrupt` (POST) -> 2xx `{data: {interrupted: true}}` (the job is not
 ///   running, so the emulated interrupt records the "not running" note into
@@ -982,13 +1136,15 @@ async fn job_lifecycle_claude_hermetic() {
 ///   work was discarded, so unrevert is a graceful no-op).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn job_control_surface_answers_usable_bodies() {
-    for engine_name in ["agy", "claude"] {
+    for engine_name in ["agy", "claude", "opencode"] {
         let root = TempDir::new().unwrap();
         let hcfg = hermetic_config(root, engine_name);
         let app = hermetic_app(&hcfg);
 
         let engine_field = if engine_name == "claude" {
             r#","engine":"claude""#
+        } else if engine_name == "opencode" {
+            r#","engine":"opencode""#
         } else {
             ""
         };
@@ -1170,8 +1326,10 @@ async fn capabilities_match_documented_tables() {
     // Doc rows from DOCS.md §2.4 (the reported "effective" view).
     let agy = by_engine.get("agy").expect("agy reported");
     let claude = by_engine.get("claude").expect("claude reported");
+    let opencode = by_engine.get("opencode").expect("opencode reported");
     let agy_eps = agy["endpoints"].as_object().unwrap();
     let claude_eps = claude["endpoints"].as_object().unwrap();
+    let opencode_eps = opencode["endpoints"].as_object().unwrap();
 
     // The documented rows (DOCS.md §2.4), the reported "effective" (post-S2)
     // view. `permissions` and `a2a.inject` are also DOCS.md §2.4 rows:
@@ -1225,11 +1383,41 @@ async fn capabilities_match_documented_tables() {
         ("a2a.inject", "native"),
         ("permissions", "unsupported"),
     ];
+    // opencode mirrors the agy job surface (the engine-aware runner provides
+    // the same start/status/retry/events lifecycle over the JSON-event log,
+    // `workspace.*` is engine-independent, and `a2a.send_message` is emulated
+    // -- queued, no live PTY). Injection is the floor of the ladder
+    // (`idle_turn` only), still reported as a native channel.
+    let opencode_doc: Vec<(&str, &str)> = vec![
+        ("job.start", "native"),
+        ("job.status", "native"),
+        ("job.list", "native"),
+        ("job.kill", "native"),
+        ("job.retry", "native"),
+        ("job.events", "native"),
+        ("job.result", "native"),
+        ("session.start", "emulated"),
+        ("session.stop", "emulated"),
+        ("session.restart", "emulated"),
+        ("session.log", "emulated"),
+        ("session.message", "emulated"),
+        ("interrupt", "emulated"),
+        ("pause", "emulated"),
+        ("fork", "emulated"),
+        ("compact", "emulated"),
+        ("revert", "emulated"),
+        ("todo", "emulated"),
+        ("workspace.*", "native"),
+        ("a2a.send_message", "emulated"),
+        ("a2a.inject", "native"),
+        ("permissions", "unsupported"),
+    ];
 
     let mut failures: Vec<String> = Vec::new();
     for (engine, eps, doc) in [
         ("agy", agy_eps, &agy_doc),
         ("claude", claude_eps, &claude_doc),
+        ("opencode", opencode_eps, &opencode_doc),
     ] {
         for (key, expected) in doc {
             let actual = eps[*key]
@@ -1320,12 +1508,12 @@ async fn capabilities_match_documented_tables() {
 #[tokio::test]
 async fn coverage_guard_rejects_undeclared_engine() {
     // The admission rule for the production engine set: exactly agy + claude
-    // (the engines this suite has cases for). A new engine registered in the
-    // worker/orchestrator entry points without a conformance case must break
-    // the gate.
+    // + opencode (the engines this suite has cases for). A new engine
+    // registered in the worker/orchestrator entry points without a
+    // conformance case must break the gate.
     let registry = production_registry();
     let ids = registry.enabled_ids();
-    let known = ["agy", "claude"];
+    let known = ["agy", "claude", "opencode"];
     for id in &ids {
         assert!(
             known.contains(&id.as_str()),
@@ -1334,8 +1522,10 @@ async fn coverage_guard_rejects_undeclared_engine() {
         );
     }
     assert!(
-        ids.iter().any(|e| e == "agy") && ids.iter().any(|e| e == "claude"),
-        "production registry must carry agy + claude: {ids:?}"
+        ids.iter().any(|e| e == "agy")
+            && ids.iter().any(|e| e == "claude")
+            && ids.iter().any(|e| e == "opencode"),
+        "production registry must carry agy + claude + opencode: {ids:?}"
     );
 
     // Negative control: a synthetic engine outside the admission set is still

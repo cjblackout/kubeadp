@@ -45,6 +45,19 @@ pub fn run(config: &Config, args: &ResultArgs) -> Result<CommandOutput> {
     let response = extract_final_response(&log);
     let error_text = final_error_text(&log);
 
+    // opencode has no agy/claude SUCCESS payload: surface the last turn's
+    // visible text as the response and the terminal error event as the error
+    // (KA-4). The engine is read from the row so this stays a pure engine-ism
+    // inside the shared result command -- the HTTP surface is unchanged.
+    let (response, error_text) = if meta.engine.as_deref() == Some("opencode") {
+        (
+            response.or_else(|| crate::core::job::extract_opencode_response(&log)),
+            error_text.or_else(|| crate::core::job::extract_opencode_error(&log)),
+        )
+    } else {
+        (response, error_text)
+    };
+
     // The `data` payload is exactly the object the client pretty-prints for
     // `--json` (the server always runs result in human mode; the remote
     // client re-serializes `data` itself).

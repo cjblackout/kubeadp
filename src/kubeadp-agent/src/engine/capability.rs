@@ -421,6 +421,15 @@ mod tests {
                 "{engine} channels"
             );
         }
+        // opencode is the floor of the injection ladder (KA-4): it has no
+        // hook mechanism and no harness-owned mcp-a2a until a future change,
+        // so it advertises only `idle_turn` (a queued message starts the
+        // run's next turn).
+        assert_eq!(
+            inject_channels("opencode"),
+            &[InjectChannel::IdleTurn],
+            "opencode channels"
+        );
         assert!(inject_channels("other").is_empty());
         // The stable channel names serialize snake_case.
         assert_eq!(InjectChannel::ToolResult.as_str(), "tool_result");
@@ -555,8 +564,8 @@ mod tests {
     }
 
     #[test]
-    fn capability_tables_match_spec_3_4_literal() {
-        // Assert each engine's CapabilityTable equals a literal copy of SPEC §3.4
+    fn capability_tables_match_spec_3_5_literal() {
+        // Assert each engine's CapabilityTable equals a literal copy of SPEC §3.5
         // and that no cell other than permissions is Unsupported.
         use crate::core::config::Config;
         use crate::engine::agy::AgyEngine;
@@ -566,11 +575,13 @@ mod tests {
 
         let agy = AgyEngine::new(Arc::new(Config::default()));
         let claude = ClaudeEngine::new(std::path::PathBuf::from("claude"), None);
+        let opencode = crate::engine::opencode::OpenCodeEngine::new(Arc::new(Config::default()));
 
         let agy_table = agy.capabilities();
         let claude_table = claude.capabilities();
+        let opencode_table = opencode.capabilities();
 
-        // SPEC §3.4 literal expected values:
+        // SPEC §3.5 literal expected values:
         let spec_3_4_agy: &[(&str, Capability)] = &[
             ("job.start", Capability::Native),
             ("job.status", Capability::Native),
@@ -621,11 +632,40 @@ mod tests {
             ("a2a.inject", Capability::Native),
         ];
 
+        // opencode (KA-4): the agy job surface native + `workspace.*`
+        // (engine-independent) + `a2a.inject` (idle_turn-only channel, still a
+        // native channel), the E4 control and session surface emulated, exactly
+        // like the agy fixture (SPEC §3.5).
+        let spec_3_4_opencode: &[(&str, Capability)] = &[
+            ("job.start", Capability::Native),
+            ("job.status", Capability::Native),
+            ("job.list", Capability::Native),
+            ("job.kill", Capability::Native),
+            ("job.retry", Capability::Native),
+            ("job.events", Capability::Native),
+            ("job.result", Capability::Native),
+            ("session.start", Capability::Emulated),
+            ("session.stop", Capability::Emulated),
+            ("session.restart", Capability::Emulated),
+            ("session.log", Capability::Emulated),
+            ("session.message", Capability::Emulated),
+            ("interrupt", Capability::Emulated),
+            ("pause", Capability::Emulated),
+            ("fork", Capability::Emulated),
+            ("compact", Capability::Emulated),
+            ("revert", Capability::Emulated),
+            ("todo", Capability::Emulated),
+            ("permissions", Capability::Unsupported),
+            ("workspace.*", Capability::Native),
+            ("a2a.send_message", Capability::Emulated),
+            ("a2a.inject", Capability::Native),
+        ];
+
         for (key, expected) in spec_3_4_agy {
             assert_eq!(
                 agy_table.capability(key),
                 Some(*expected),
-                "agy capability for '{key}' must match SPEC §3.4"
+                "agy capability for '{key}' must match SPEC §3.5"
             );
             if *key != "permissions" {
                 assert_ne!(
@@ -640,13 +680,28 @@ mod tests {
             assert_eq!(
                 claude_table.capability(key),
                 Some(*expected),
-                "claude capability for '{key}' must match SPEC §3.4"
+                "claude capability for '{key}' must match SPEC §3.5"
             );
             if *key != "permissions" {
                 assert_ne!(
                     claude_table.capability(key),
                     Some(Capability::Unsupported),
                     "no claude cell other than permissions may be Unsupported ('{key}')"
+                );
+            }
+        }
+
+        for (key, expected) in spec_3_4_opencode {
+            assert_eq!(
+                opencode_table.capability(key),
+                Some(*expected),
+                "opencode capability for '{key}' must match SPEC §3.5"
+            );
+            if *key != "permissions" {
+                assert_ne!(
+                    opencode_table.capability(key),
+                    Some(Capability::Unsupported),
+                    "no opencode cell other than permissions may be Unsupported ('{key}')"
                 );
             }
         }

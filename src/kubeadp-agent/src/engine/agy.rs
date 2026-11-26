@@ -657,7 +657,7 @@ mod tests {
     #[test]
     fn capabilities_report_native_job_endpoints() {
         // The agy engine's own capability table: job endpoints native, pause native
-        // (SPEC §3.4), a2a.send_message native, the E4 control surface emulated,
+        // (SPEC §3.5), a2a.send_message native, the E4 control surface emulated,
         // permissions unsupported (never a 501).
         let engine = AgyEngine::new(Arc::new(Config::default()));
         let table = engine.capabilities();

@@ -25,6 +25,9 @@
 //! monitors the process; status classification reads the job store), exactly
 //! like [`crate::engine::agy::AgyEngine`].
 
+/// The NDJSON event parser (2018 file+dir layout).
+pub mod events;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -35,7 +38,7 @@ use crate::core::config::Config;
 use crate::core::job::{compute_status, JobMetadata, JobStatus};
 
 use crate::engine::capability::{Capability, CapabilityTable};
-use crate::engine::run::{ContextId, EngineEvent, ExitInfo, Role, Run, RunId, RunStatus};
+use crate::engine::run::{ContextId, EngineEvent, ExitInfo, Run, RunId, RunStatus};
 use crate::engine::{
     Engine, EngineCtx, EngineError, JobSpec, LaunchPlan, ResumeMode, SessionDef, SessionSpec,
     StdinMode, TurnInput,
@@ -76,70 +79,7 @@ impl OpenCodeEngine {
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let mut events = Vec::new();
         for line in text.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || !trimmed.starts_with('{') {
-                continue;
-            }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-                continue;
-            };
-            match value.get("type").and_then(|t| t.as_str()) {
-                Some("step_start") => events.push(EngineEvent::Status(RunStatus::Running)),
-                Some("text") => {
-                    let text = value
-                        .get("part")
-                        .and_then(|p| p.get("text"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or_default();
-                    if !text.is_empty() {
-                        events.push(EngineEvent::MessageDelta {
-                            role: Role::Assistant,
-                            text: text.to_string(),
-                        });
-                    }
-                }
-                Some("tool_use") => {
-                    let part = value.get("part");
-                    let name = part
-                        .and_then(|p| p.get("tool"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("tool")
-                        .to_string();
-                    let input = part
-                        .and_then(|p| p.get("state"))
-                        .and_then(|s| s.get("input"))
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    events.push(EngineEvent::ToolCall { name, input });
-                }
-                Some("step_finish") => {
-                    // A completed turn (reason "stop") finishes the run.
-                    let reason = value
-                        .get("part")
-                        .and_then(|p| p.get("reason"))
-                        .and_then(|r| r.as_str())
-                        .unwrap_or("");
-                    if reason == "stop" {
-                        events.push(EngineEvent::Done {
-                            status: RunStatus::Done,
-                        });
-                    }
-                }
-                Some("error") => {
-                    let message = value
-                        .get("error")
-                        .and_then(|e| e.get("data"))
-                        .and_then(|d| d.get("message"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("opencode error")
-                        .to_string();
-                    events.push(EngineEvent::Error { message });
-                    events.push(EngineEvent::Done {
-                        status: RunStatus::Failed,
-                    });
-                }
-                _ => {}
-            }
+            events.extend(events::parse_opencode_line(line));
         }
         Ok(events)
     }
@@ -451,7 +391,13 @@ impl Engine for OpenCodeEngine {
         per_session_text: Option<(PathBuf, String)>,
         log: &mut Vec<String>,
     ) -> bool {
-        crate::core::instructions::materialize_opencode(home, workdir, global_text, per_session_text, log)
+        crate::core::instructions::materialize_opencode(
+            home,
+            workdir,
+            global_text,
+            per_session_text,
+            log,
+        )
     }
 }
 

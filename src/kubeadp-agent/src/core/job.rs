@@ -1311,6 +1311,62 @@ fn scan_opencode_error(log: &str) -> bool {
     false
 }
 
+/// Returns the opencode job's final response text: the concatenated `text`
+/// event parts from the LAST attempt whose run data (the last `step_finish`
+/// or `error` event) follows any retry marker, joined by newlines. opencode
+/// has no single SUCCESS payload like agy/claude; the surfaced "response" is
+/// the visible assistant text of the last completed turn.
+pub fn extract_opencode_response(log: &str) -> Option<String> {
+    let current = last_attempt_log(log);
+    let mut texts: Vec<String> = Vec::new();
+    for value in last_attempt_log(current)
+        .lines()
+        .rev()
+        .filter_map(json_object_line)
+    {
+        if value.get("type").and_then(|t| t.as_str()) == Some("text") {
+            let text = value
+                .get("part")
+                .and_then(|p| p.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            if !text.trim().is_empty() {
+                texts.push(text.to_string());
+            }
+        }
+    }
+    if texts.is_empty() {
+        return None;
+    }
+    texts.reverse();
+    Some(texts.join("\n"))
+}
+
+/// Returns the opencode job's error text: the `error.data.message` of the
+/// terminal `error` event (present when opencode exits non-zero, e.g. an
+/// upstream provider rejection).
+pub fn extract_opencode_error(log: &str) -> Option<String> {
+    for line in last_attempt_log(log).lines().rev() {
+        let Some(value) = json_object_line(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) != Some("error") {
+            continue;
+        }
+        let message = value
+            .get("error")
+            .and_then(|e| e.get("data"))
+            .and_then(|d| d.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        if !message.trim().is_empty() {
+            return Some(message.to_string());
+        }
+        return None;
+    }
+    None
+}
+
 /// Strips ANSI escape sequences (CSI codes like `\x1b[32m`, OSC codes, etc.) from `input`.
 pub fn strip_ansi_escapes(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
@@ -4108,5 +4164,166 @@ Conversation ID: 29376801-94e5-48b6-9c02-f7a10b6d32b1
         for h in handles {
             h.join().expect("concurrent open thread panicked");
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // opencode engine classification (KA-4): `compute_status` on an opencode
+    // row goes through `determine_status_from_opencode`, whose rules are
+    // unit-tested here on `run --format json` event shapes (captured live
+    // from opencode 1.19.4). The black-box / conformance suites drive the
+    // same paths end to end.
+    // ---------------------------------------------------------------------
+
+    /// The canonical opencode `run --format json` shapes the fake harness
+    /// emits (see `tests/cli/fake-opencode.sh`): `step_start`/`text`/
+    /// `tool_use`/`step_finish` (reason `stop` or `tool-calls`) and the
+    /// terminal `error` event.
+    const OPENCODE_STEP_START: &str = r#"{"type":"step_start","timestamp":1,"sessionID":"ses_oc","part":{"id":"p1","type":"step-start"}}"#;
+    const OPENCODE_TEXT: &str = r#"{"type":"text","timestamp":2,"sessionID":"ses_oc","part":{"type":"text","text":"OPENCODE-DONE"}}"#;
+    const OPENCODE_TEXT_MID: &str = r#"{"type":"text","timestamp":1,"sessionID":"ses_oc","part":{"type":"text","text":"working"}}"#;
+    const OPENCODE_TOOL_USE: &str = r#"{"type":"tool_use","timestamp":3,"sessionID":"ses_oc","part":{"type":"tool","tool":"bash","state":{"input":{"command":"echo hi"}}}}"#;
+    const OPENCODE_STEP_FINISH_STOP: &str = r#"{"type":"step_finish","timestamp":4,"sessionID":"ses_oc","part":{"type":"step-finish","reason":"stop"}}"#;
+    const OPENCODE_STEP_FINISH_TOOL: &str = r#"{"type":"step_finish","timestamp":3,"sessionID":"ses_oc","part":{"type":"step-finish","reason":"tool-calls"}}"#;
+    const OPENCODE_ERROR: &str = r#"{"type":"error","timestamp":5,"sessionID":"ses_oc","error":{"name":"UnknownError","data":{"message":"model no-such-model is not recognized"}}}"#;
+
+    fn opencode_ok_log() -> String {
+        [
+            OPENCODE_STEP_START,
+            OPENCODE_TEXT_MID,
+            OPENCODE_TOOL_USE,
+            OPENCODE_STEP_FINISH_TOOL,
+            OPENCODE_STEP_START,
+            OPENCODE_TEXT,
+            OPENCODE_STEP_FINISH_STOP,
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn test_determine_status_from_opencode_done() {
+        // A terminal `step_finish` reason "stop" is Done; a tool-calling turn
+        // is not completion.
+        assert_eq!(
+            determine_status_from_opencode(Some(0), &opencode_ok_log()),
+            JobStatus::Done
+        );
+        // Exit 0 with no terminal stop is Incomplete (the harness exited
+        // cleanly but the model never completed a turn).
+        let tool_only = join_oc(&[
+            OPENCODE_STEP_START,
+            OPENCODE_TEXT,
+            OPENCODE_STEP_FINISH_TOOL,
+        ]);
+        assert_eq!(
+            determine_status_from_opencode(Some(0), &tool_only),
+            JobStatus::Incomplete
+        );
+    }
+
+    #[test]
+    fn test_determine_status_from_opencode_error() {
+        // A terminal `error` event is Failed for any exit code.
+        let err_log = join_oc(&[OPENCODE_STEP_START, OPENCODE_ERROR]);
+        assert_eq!(
+            determine_status_from_opencode(Some(1), &err_log),
+            JobStatus::Failed
+        );
+        assert_eq!(
+            determine_status_from_opencode(Some(0), &err_log),
+            JobStatus::Failed
+        );
+    }
+
+    #[test]
+    fn test_determine_status_from_opencode_quota() {
+        // A quota/rate-limit signal anywhere in the log wins.
+        let quota_log = join_oc(&[
+            OPENCODE_STEP_START,
+            OPENCODE_TEXT,
+            r#"{"type":"error","timestamp":9,"sessionID":"s","error":{"name":"Error","data":{"message":"API error 429: quota exceeded (resource_exhausted)"}}}"#,
+        ]);
+        assert_eq!(
+            determine_status_from_opencode(Some(1), &quota_log),
+            JobStatus::QuotaExhausted
+        );
+    }
+
+    #[test]
+    fn test_determine_status_from_opencode_killed() {
+        // A kill (137/143) with no error line is SelfTerminated; with an
+        // error line it is Failed.
+        assert_eq!(
+            determine_status_from_opencode(Some(137), ""),
+            JobStatus::SelfTerminated
+        );
+        let err_log = join_oc(&[OPENCODE_ERROR]);
+        assert_eq!(
+            determine_status_from_opencode(Some(137), &err_log),
+            JobStatus::Failed
+        );
+        // No exit code and no error line is SelfTerminated.
+        assert_eq!(
+            determine_status_from_opencode(None, ""),
+            JobStatus::SelfTerminated
+        );
+    }
+
+    #[test]
+    fn test_determine_status_from_opencode_stale_attempt() {
+        // A terminal stop from a superseded attempt must not classify the
+        // current one (last_attempt scoping).
+        let stale_then_error = format!(
+            "{}\n==================== RETRY AT 2024-01-01T00:00:00Z ====================\n{}",
+            opencode_ok_log(),
+            OPENCODE_ERROR
+        );
+        assert_eq!(
+            determine_status_from_opencode(Some(1), &stale_then_error),
+            JobStatus::Failed
+        );
+        let stale_err_then_ok = format!(
+            "{}\n==================== RETRY AT 2024-01-01T00:00:00Z ====================\n{}",
+            OPENCODE_ERROR,
+            opencode_ok_log()
+        );
+        assert_eq!(
+            determine_status_from_opencode(Some(0), &stale_err_then_ok),
+            JobStatus::Done
+        );
+    }
+
+    #[test]
+    fn test_extract_opencode_response() {
+        // The response is the last turn's visible text (the `text` events),
+        // joined with newlines, in order.
+        let log = join_oc(&[
+            OPENCODE_STEP_START,
+            OPENCODE_TEXT_MID,
+            OPENCODE_TOOL_USE,
+            OPENCODE_STEP_FINISH_TOOL,
+            OPENCODE_STEP_START,
+            OPENCODE_TEXT,
+            OPENCODE_STEP_FINISH_STOP,
+        ]);
+        assert_eq!(
+            extract_opencode_response(&log).as_deref(),
+            Some("working\nOPENCODE-DONE")
+        );
+        // No text events -> None.
+        assert_eq!(extract_opencode_response(""), None);
+    }
+
+    #[test]
+    fn test_extract_opencode_error() {
+        let err_log = join_oc(&[OPENCODE_STEP_START, OPENCODE_ERROR]);
+        assert_eq!(
+            extract_opencode_error(&err_log).as_deref(),
+            Some("model no-such-model is not recognized")
+        );
+        assert_eq!(extract_opencode_error(&opencode_ok_log()), None);
+    }
+
+    fn join_oc(lines: &[&str]) -> String {
+        lines.join("\n")
     }
 }

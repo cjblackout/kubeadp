@@ -374,10 +374,7 @@ pub fn materialize_opencode(
 ) -> bool {
     let mut written = false;
     // Global level -> ~/.config/opencode/AGENTS.md (a managed block).
-    let global_target = home
-        .join(".config")
-        .join("opencode")
-        .join("AGENTS.md");
+    let global_target = home.join(".config").join("opencode").join("AGENTS.md");
     let global_src = global_text.as_ref().map(|(s, _)| s.display().to_string());
     let global_inner = block_content(render_inner(global_text.iter()));
     let global_set = global_inner.is_some();
@@ -641,8 +638,7 @@ fn inject_entry(
         // Never touch a tracked witness file: when one is tracked the file is
         // owned by the repository, so neither the block is injected nor
         // removed (the file is left byte-identical).
-        if git_in_workdir(workdir, &["ls-files", "--error-unmatch", "--", &entry_name])?.is_some()
-        {
+        if git_in_workdir(workdir, &["ls-files", "--error-unmatch", "--", &entry_name])?.is_some() {
             return Ok(InjectOutcome::Tracked);
         }
         // Only maintain the git-exclude entry when we actually write the
