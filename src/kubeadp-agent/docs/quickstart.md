@@ -11,15 +11,15 @@ This document provides a sequential walkthrough of executing an agent task from 
 ### 1. Job Launch
 Submit a task targeting a repository project under the workspace root:
 ```bash
-agent-run start homelab "Update documentation links"
+agent-run start project-a "Update documentation links"
 ```
 Output:
 ```text
-Creating git worktree at /workspace/.agent-jobs/homelab/a1b2c3d4 on branch 'agent-run/a1b2c3d4' (from 'HEAD')...
-Memory: recall on, retain on, bank homelab
+Creating git worktree at /workspace/.agent-jobs/project-a/a1b2c3d4 on branch 'agent-run/a1b2c3d4' (from 'HEAD')...
+Memory: recall on, retain on, bank project-a
 Job 'a1b2c3d4' started in background.
   PID:      1042
-  Worktree: /workspace/.agent-jobs/homelab/a1b2c3d4
+  Worktree: /workspace/.agent-jobs/project-a/a1b2c3d4
   Log:      /home/agent/.agent-run/logs/a1b2c3d4.log
 Run 'agent-run status a1b2c3d4' or 'agent-run tail a1b2c3d4' to monitor.
 ```
@@ -32,17 +32,17 @@ agent-run status a1b2c3d4
 Output:
 ```text
 Job ID:       a1b2c3d4
-Project:      homelab
+Project:      project-a
 Status:       running
 Elapsed:      15s
-Worktree:     /workspace/.agent-jobs/homelab/a1b2c3d4
+Worktree:     /workspace/.agent-jobs/project-a/a1b2c3d4
 Branch:       agent-run/a1b2c3d4
 Base Ref:     <commit-sha>
 PID:          1042
 Model:        <model-id>
 Effort:       <low|medium|high>
 Conversation: <agy-conversation-uuid>
-Memory:       recall on, retain on, bank homelab
+Memory:       recall on, retain on, bank project-a
 Prompt:       <prompt text>
 ```
 `Model`, `Effort` and `Conversation` are printed only when recorded for the job.

@@ -558,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_build_recall_args_with_tag() {
-        let args = build_recall_args("my-bank", "Fix bug in api", Some("project:homelab"));
+        let args = build_recall_args("my-bank", "Fix bug in api", Some("project:project-a"));
         assert_eq!(
             args,
             vec![
@@ -568,7 +568,7 @@ mod tests {
                 "recall",
                 "my-bank",
                 "--tags",
-                "project:homelab",
+                "project:project-a",
                 "--",
                 "Fix bug in api"
             ]
@@ -600,7 +600,7 @@ mod tests {
     #[test]
     fn test_build_recall_args_dash_prefixed_query_after_separator() {
         let query = "--- A2A INCOMING MESSAGE (claimed sender: task-1) ---\nhello";
-        let args = build_recall_args("my-bank", query, Some("project:homelab"));
+        let args = build_recall_args("my-bank", query, Some("project:project-a"));
         let dash_pos = args
             .iter()
             .position(|a| a.starts_with("---"))
@@ -926,7 +926,7 @@ mod tests {
         assert!(validate_hindsight_config(false, &None).is_ok());
 
         // Enabled hindsight with bank succeeds
-        assert!(validate_hindsight_config(true, &Some("homelab".to_string())).is_ok());
+        assert!(validate_hindsight_config(true, &Some("project-a".to_string())).is_ok());
 
         // Enabled hindsight without bank fails
         assert!(validate_hindsight_config(true, &None).is_err());
@@ -936,14 +936,14 @@ mod tests {
     #[test]
     fn test_build_retain_finding_truncation() {
         let short_output = "Finished successfully with 0 errors.";
-        let finding = build_retain_finding("job123", "homelab", short_output);
+        let finding = build_retain_finding("job123", "project-a", short_output);
         assert_eq!(
             finding,
-            "agent-run job job123 on project homelab completed: Finished successfully with 0 errors."
+            "agent-run job job123 on project project-a completed: Finished successfully with 0 errors."
         );
 
         let long_output = "a".repeat(300);
-        let finding_long = build_retain_finding("job456", "homelab", &long_output);
+        let finding_long = build_retain_finding("job456", "project-a", &long_output);
         assert!(finding_long.contains(&"a".repeat(200)));
         assert!(!finding_long.contains(&"a".repeat(201)));
     }
@@ -1070,7 +1070,7 @@ mod tests {
 
     #[test]
     fn test_is_valid_bank_name_accepts_ordinary_names() {
-        assert!(is_valid_bank_name("homelab"));
+        assert!(is_valid_bank_name("project-a"));
         assert!(is_valid_bank_name("nested-operator"));
         assert!(is_valid_bank_name("a.b_c-9"));
         assert!(is_valid_bank_name(&"a".repeat(64)));
@@ -1090,7 +1090,7 @@ mod tests {
 
     #[test]
     fn test_normalize_bank_name_keeps_valid_names_unchanged() {
-        assert_eq!(normalize_bank_name("homelab"), "homelab");
+        assert_eq!(normalize_bank_name("project-a"), "project-a");
         assert_eq!(normalize_bank_name("nested-operator"), "nested-operator");
         assert_eq!(normalize_bank_name("a.b_c-9"), "a.b_c-9");
     }
@@ -1141,8 +1141,8 @@ mod tests {
     #[test]
     fn test_resolve_bank_explicit_valid_passes_unchanged() {
         assert_eq!(
-            resolve_bank(Some("homelab"), "my app", Some("f b")).unwrap(),
-            Some("homelab".to_string())
+            resolve_bank(Some("project-a"), "my app", Some("f b")).unwrap(),
+            Some("project-a".to_string())
         );
         // Explicit beats project and fallback.
         assert_eq!(

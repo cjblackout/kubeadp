@@ -3669,7 +3669,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let workspace_root = temp.path().join("workspace");
         let repos_root = temp.path().join("repos");
-        let roots_proj = workspace_root.join(".roots").join("homelab");
+        let roots_proj = workspace_root.join(".roots").join("project-a");
         let roots_git_wt = roots_proj.join(".git").join("worktrees").join("job123");
         let roots_sha_wt = roots_proj.join(".worktrees").join("deadbeef");
         std::fs::create_dir_all(&roots_git_wt).unwrap();
@@ -3687,14 +3687,14 @@ mod tests {
         )
         .unwrap();
         std::os::unix::fs::symlink(
-            ".roots/homelab/.worktrees/deadbeef",
-            workspace_root.join("homelab"),
+            ".roots/project-a/.worktrees/deadbeef",
+            workspace_root.join("project-a"),
         )
         .unwrap();
 
         let wt = workspace_root
             .join(".agent-jobs")
-            .join("homelab")
+            .join("project-a")
             .join("job123");
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::write(
@@ -3708,7 +3708,7 @@ mod tests {
             repos_root,
             ..Default::default()
         };
-        let allowed = expected_worktree_roots(&config, "homelab");
+        let allowed = expected_worktree_roots(&config, "project-a");
         worktree_gitdir_in_expected_roots(&wt, &allowed).expect(
             "worktree attached to /workspace/.roots/<project>/.git/worktrees/<id> must be accepted",
         );

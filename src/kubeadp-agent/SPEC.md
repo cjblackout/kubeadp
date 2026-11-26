@@ -850,7 +850,7 @@ JSON, snake_case keys, no renames; unknown keys are a hard parse error
 | `agent_id` | optional string | absent | agent/job id |
 | `jobset_id` | optional string | absent | jobset id |
 | `rw` | paths | `[]` | read-write dirs |
-| `ro` | paths | `["/usr","/lib","/lib64","/bin","/sbin","/etc","/opt/tools","/workspace/homelab"]` | read-only dirs |
+| `ro` | paths | `["/usr","/lib","/lib64","/bin","/sbin","/etc","/opt/tools","/workspace/project-a"]` | read-only dirs |
 | `shared_rw` | paths | `["/home/agent"]` | shared read-write dirs |
 | `hide` | paths | `["/workspace/.agent-jobs"]` | paths hidden from the agent |
 | `tmp` | string | `"auto"` | private tmp: `""` off; `"auto"` → `/tmp/agent-sandbox-<agent_id\|agent>`; else verbatim |
@@ -1142,7 +1142,7 @@ A request that names no recipient (`GET /tasks`, `GET /a2a/agents`) needs 1 and
 - Framing delimiters carry a per-message random nonce (16 random bytes, hex).
 
 ### 7.7 Discovery
-1. ServiceAccount agents discover peers by Service label `a2a.homelab/agent=true`
+1. ServiceAccount agents discover peers by Service label `a2a.kubeadp/agent=true`
    in the pod's namespace plus `A2A_NAMESPACES`, via the Kubernetes API
    (in-cluster SA token/CA; base `https://kubernetes.default.svc`,
    `A2A_KUBE_API` test-only behind `test-hooks`), 5 s discovery timeout. URLs
@@ -1536,7 +1536,7 @@ messages and one of its receive channels.
   never sends an unauthenticated or bearer-authenticated request.
 - `list_agents` (read-only, idempotent): takes no arguments; returns the
   discovered peer agents `{agents:[{name, namespace, url, card?}]}` — the
-  Services labelled `a2a.homelab/agent=true` plus the static `A2A_PEERS`
+  Services labelled `a2a.kubeadp/agent=true` plus the static `A2A_PEERS`
   entries (`card` = the best-effort fetched agent card). A jobset-scoped list
   (`GET /a2a/agents`, §7.7) is planned.
 - `send_message` `{agent, text, context_id?, task_id?, incoming_hop?}`:
@@ -1804,7 +1804,7 @@ on the A2A routes).
 ## 11. Deployment Constraints
 
 ### 11.1 One image, two roles
-A single image `ghcr.io/cjblackout/homelab/kubeadp-agent` serves both roles,
+A single image `ghcr.io/cjblackout/kubeopencode/kubeadp-agent` serves both roles,
 built with features `a2a` (plus `cli,server`), containing `kubeadp-agent` and `agent-run` and
 the engine harnesses (`claude`, `agy` at `/usr/local/libexec/agy`, `ttyd`,
 `tini`). `KUBEADP_ROLE` invalid exits 2. Every on-main image build bumps the
@@ -1828,7 +1828,7 @@ builds push an `rc` tag only; candidates are tested in throwaway pods first.
 - CPU modest / memory 4 Gi; probes on `/healthz`;
   `terminationGracePeriodSeconds` 60; `repo-sync` sidecar runs `repo-sync
   --loop` (token via `GH_TOKEN`, read-only).
-- Service: cluster-internal, label `a2a.homelab/agent: "true"`, port 8002 named
+- Service: cluster-internal, label `a2a.kubeadp/agent: "true"`, port 8002 named
   `a2a`. Network policies: ingress from the ai-server pod only (label +
   ServiceAccount match); egress likewise (§10.5). The API layer authenticates
   independently (bearer/jobset identity).
@@ -1837,19 +1837,19 @@ builds push an `rc` tag only; candidates are tested in throwaway pods first.
 - home, `runtimeClassName: kata`, amd64; ServiceAccount `ai-server`,
   `automountServiceAccountToken: false`. Required pod anti-affinity: never
   co-locate with the worker's Kata VM (their guest RAM shares `/dev/shm`).
-- Sessions sandboxed by default (`sandbox-exec`, Landlock on kata). `homelab`
+- Sessions sandboxed by default (`sandbox-exec`, Landlock on kata). `project-a`
   declares grants (read-only ServiceAccount token; the API bearer file
   as a single read-only path, for REST control only and transitional (§6.6); `/workspace` + `/home/agent` read-write; the
   GitHub/Vikunja/info-hub/Hindsight env); `nested-operator` and `kubeopencode`
   declare none. No session uses `"sandbox": false` by default.
 - The API bearer file and the jobset root key are hidden from every
   sandboxed agent by default; a single-file grant can re-expose the token file
-  (as `homelab` does).
+  (as `project-a` does).
 - PVCs (Longhorn): home 50 Gi and workspace 50 Gi; init container clears stale
   git locks and installs the global Claude instructions.
 - `AGENT_ORCHESTRATE_CONFIG` = generated supervisor config;
   `AGENT_ORCHESTRATE_LISTEN=0.0.0.0:8002`; `CLAUDE_DEFAULT_SESSION=0`.
-- Service labelled `a2a.homelab/agent: "true"` (ttyd 8443 + a2a 8002); network
+- Service labelled `a2a.kubeadp/agent: "true"` (ttyd 8443 + a2a 8002); network
   policies for kube-apiserver egress, worker egress/ingress, info-hub egress,
   additive to the namespace-wide default-deny
   `opencode-agent-isolation`.

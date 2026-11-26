@@ -36,13 +36,13 @@ Compiled binaries:
 
 ## Container Image
 
-The server container is defined in `docker/agent-run-api/Dockerfile` and published as `ghcr.io/cjblackout/homelab/agent-run-api:<TAG>`.
+The server container is defined in `docker/agent-run-api/Dockerfile` and published as `ghcr.io/cjblackout/kubeopencode/agent-run-api:<TAG>`.
 
 Contents:
 - Base system: Debian/Ubuntu Linux containing `git`, `curl`, `ca-certificates`, `procps`, `gcc`, and `libc6-dev`.
 - Agent binary: `agy` installed at `/usr/local/libexec/agy`.
 - Server binary: `agent-run-api` placed at `/usr/local/bin/agent-run-api`.
-- Shared tools: Mounted at runtime from `ghcr.io/cjblackout/homelab/modules:<TAG>` into `/opt/tools`.
+- Shared tools: Mounted at runtime from `ghcr.io/cjblackout/kubeopencode/modules:<TAG>` into `/opt/tools`.
 
 ## Kubernetes Deployment
 
@@ -58,7 +58,7 @@ Key manifest specifications:
   - `kubeadp-agent-worker-workspace-bw`: 50Gi RWO PVC mounted at `/workspace`.
   - `tools`: Read-only OCI image volume mounted at `/opt/tools`.
 - **repo-sync sidecar**:
-  - Repositories: `nested-operator`, `kubeopencode`, and `homelab` synced from GitHub into `/workspace/.roots/<project>` with symlinks to `/workspace/<project>`.
+  - Repositories: `nested-operator`, `kubeopencode`, and `project-a` synced from GitHub into `/workspace/.roots/<project>` with symlinks to `/workspace/<project>`.
   - Credentials: `gh-kubeoc-token` secret (read-only token; Git push is prohibited).
 - **Network policy**: `CiliumNetworkPolicy` restricts ingress on port 8002 to the `ai-server` pod (label and ServiceAccount); the worker API is independently authenticated (operator bearer or jobset identity on /api/v1, jobset secret + proof on A2A).
 

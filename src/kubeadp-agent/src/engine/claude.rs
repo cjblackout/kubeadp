@@ -1333,7 +1333,7 @@ exit 0
     fn test_job_meta(job_id: &str, wt: &Path) -> JobMetadata {
         JobMetadata {
             job_id: job_id.to_string(),
-            project: "homelab".to_string(),
+            project: "project-a".to_string(),
             prompt: "task prompt".to_string(),
             resolved_prompt: "task prompt".to_string(),
             model: None,

@@ -443,8 +443,8 @@ mod tests {
 
     #[test]
     fn test_uuid_v5_determinism() {
-        let id1 = generate_workspace_session_id("homelab");
-        let id2 = generate_workspace_session_id("homelab");
+        let id1 = generate_workspace_session_id("project-a");
+        let id2 = generate_workspace_session_id("project-a");
         assert_eq!(id1, id2);
 
         let id_nested = generate_workspace_session_id("nested-operator");
@@ -454,7 +454,7 @@ mod tests {
     #[test]
     fn test_name_validation() {
         // Valid
-        assert!(is_valid_workspace_name("homelab"));
+        assert!(is_valid_workspace_name("project-a"));
         assert!(is_valid_workspace_name("nested-operator"));
         assert!(is_valid_workspace_name("repo.v1"));
         assert!(is_valid_workspace_name("repo_2"));

@@ -1287,18 +1287,18 @@ mod tests {
 
         let now = crate::core::a2a::inbox::now_unix();
         let mut sup = crate::orchestrate::state::SupervisorState::new(1234);
-        let mut sess = crate::orchestrate::state::SessionState::new("homelab".to_string());
+        let mut sess = crate::orchestrate::state::SessionState::new("project-a".to_string());
         sess.status = crate::orchestrate::state::SessionStatus::Running;
         sess.start_time_epoch = Some(now);
-        sup.sessions.insert("homelab".to_string(), sess);
+        sup.sessions.insert("project-a".to_string(), sess);
         crate::orchestrate::state::save_supervisor_state(&root, &sup).unwrap();
 
         let state = InboxHttpState::with_key(key(), &root);
         let app = inbox_http_router(state.clone());
         let token = state
-            .live_run_token("homelab")
+            .live_run_token("project-a")
             .expect("live orchestrator session token");
-        let dir = inbox_dir(&root, "homelab");
+        let dir = inbox_dir(&root, "project-a");
         let inbox = Inbox::new(dir.clone());
 
         let mut expired = msg("m-expired", "too old");

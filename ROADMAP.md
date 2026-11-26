@@ -1,7 +1,7 @@
 # Roadmap
 
 This file tracks changes planned for this fork (`cjblackout/kubeopencode`), which
-is run in the homelab cluster and built by `.github/workflows/build.yaml`.
+is built by `.github/workflows/build.yaml`.
 
 ## 1. Per-task worktrees and per-task memory banks
 
@@ -91,7 +91,7 @@ spec:
     enabled: true
     helperImage: ghcr.io/cjblackout/kubeopencode-worktree-helper:<tag>
     allowedRepositories: ["https://github.com/cjblackout/*"]
-    defaultBankId: homelab        # bank used by Tasks that set no bankId (see 1.7)
+    defaultBankId: default        # bank used by Tasks that set no bankId (see 1.7)
     maxWorktrees: 20
     minFreeBytes: 5Gi             # refuse new worktrees below this free space
     credentialsSecretRef: {name: gh-kubeoc-token}   # read-only token, keys username/password
@@ -193,7 +193,7 @@ Fallback if the plugin's dynamic mode proves unsuitable (to be decided in phase 
 patch the plugin to read the bank from a marker file in the session directory
 (`.hindsight-bank`, written by the helper). The marker approach needs a plugin fork.
 
-### 1.8 Agent and homelab configuration
+### 1.8 Agent and deployment configuration
 
 - Agents that use the feature set `spec.worktrees` (above) and drop the static
   `bankId` from their plugin options in favour of dynamic mode.
@@ -207,9 +207,9 @@ patch the plugin to read the bank from a marker file in the session directory
 ### 1.9 Banks policy (operations)
 
 Hindsight creates a bank on the first write for an unknown bank ID. The set of banks
-is kept small and deliberate (homelab: `nested-operator`, `homelab`, `hlrs`, `kubeopencode`). The controller
+is kept small and deliberate (for example: `project-a`, `project-b`, `nested-operator`, `kubeopencode`). The controller
 rejects `bankId` values that are not in an optional `Agent.spec.worktrees.allowedBankIds`
-list (empty list = no restriction); the homelab sets it to those four.
+list (empty list = no restriction); a deployment can set it to those allowed banks.
 
 ### 1.10 Tests
 
@@ -221,14 +221,14 @@ list (empty list = no restriction); the homelab sets it to those four.
   repeat calls, concurrent calls on one repo, corrupt worktree directory).
 - e2e (kind): one Task with a worktree against an echo agent; assert the directory,
   the attach `--dir`, and removal on delete.
-- Live (homelab): a Qwen Task with `bankId: homelab` and a worktree; check that
+- Live: a Qwen Task with `bankId: project-a` and a worktree; check that
   Hindsight retains into that bank only and that no extra bank appears.
 
 ### 1.11 Rollout
 
 1. Helper binary, image and API with its tests.
 2. CRD fields, validation, controller flow behind `Agent.spec.worktrees.enabled`.
-3. Agent controller sidecar wiring; network policy and homelab values.
+3. Agent controller sidecar wiring; network policy and deployment values.
 4. Live test on one Agent (Qwen), then the others.
 5. Document in `docs/` and `charts/kubeopencode/README.md`.
 
@@ -246,7 +246,7 @@ Estimated effort: 2–3 days implementation plus 1 day for the live test and har
 ## 2. Supervisor deployment and UI page
 
 Status: specified, not started. The supervisor itself (REST API, OAuth flow, removal of
-code-server from the ai-server image, cutover) is specified in the homelab repository,
+code-server from the ai-server image, cutover) is specified in the deployment repository,
 `ROADMAP.md`, section "Supervisor: REST-driven session supervisor". This section covers
 what belongs to this fork: the Helm deployment and the UI page. Estimated effort:
 6-8 working days (chart 3-4, UI and server 3-4).
@@ -265,7 +265,7 @@ New templates under `charts/kubeopencode/templates/supervisor/`, all gated by
 
 - **Workload**: a single-replica StatefulSet (stable volume names, `Recreate`-like
   semantics, no rolling overlap on the RWO volumes), container image
-  `supervisor.image` (the image is built by the homelab repository, the chart only
+  `supervisor.image` (the image is built by a companion or deployment repository, the chart only
   references it by value), `runtimeClassName` configurable (`supervisor.runtimeClassName`),
   `tolerations`, `affinity`, `nodeSelector`, `resources`, `terminationGracePeriodSeconds`
   (sessions are drained gracefully).
@@ -280,11 +280,11 @@ New templates under `charts/kubeopencode/templates/supervisor/`, all gated by
   ```yaml
   supervisor:
     projects:
-      - name: homelab
-        repository: https://github.com/cjblackout/homelab.git
+      - name: project-a
+        repository: https://github.com/example/project.git
         ref: main
         sessionId: 10000000-0000-4000-8000-000000000001
-        remoteControlName: ai-server-homelab
+        remoteControlName: ai-server-project-a
         memory: |                      # content of the project CLAUDE.md, or memoryFrom: {configMapKeyRef: ...}
           ...
         claudeArgs: ["--dangerously-skip-permissions"]
@@ -301,8 +301,8 @@ New templates under `charts/kubeopencode/templates/supervisor/`, all gated by
   policies and extendable through `supervisor.networkPolicy.extraEgress`.
 - **Service**: ClusterIP for the API (default 8090), not exposed through any Ingress.
 - **Probes**: liveness/readiness on `/healthz`.
-- **Homelab overlay**: anything specific to the homelab stays in the homelab repository
-  next to the Argo application (ExternalSecrets for the tokens, Cilium egress rules,
+- **Deployment overlay**: deployment specifics stay in the deployment repository
+  next to the GitOps application (ExternalSecrets for the tokens, Cilium egress rules,
   Kata/`/dev/shm` anti-affinity, git-sync sidecars for the read-only checkouts that
   agent-run and agents consume), applied on top of the chart values.
 - **Tests**: `helm lint`, `helm template` golden files for the default and a full
@@ -317,7 +317,7 @@ New templates under `charts/kubeopencode/templates/supervisor/`, all gated by
   `GET .../projects/{name}/logs` (+ SSE stream passthrough),
   `GET /api/v1/supervisor/auth/status`, `POST .../auth/login`,
   `POST .../auth/login/{id}/code`, `GET .../auth/login/{id}`.
-- Authorization: the existing server middleware stays the gate (in the homelab,
+- Authorization: the existing server middleware stays the gate (for example,
   Authelia admins only at the edge); mutating calls additionally require the server's
   admin role when its own auth is enabled.
 - Streaming: SSE is forwarded without buffering and with the request context so a closed
@@ -330,7 +330,7 @@ New templates under `charts/kubeopencode/templates/supervisor/`, all gated by
 - **Navigation**: a new left-nav item "Supervisor" (route `/supervisor`), shown only when
   the server reports the feature enabled (`GET /api/v1/config`).
 - **Page layout**: a toggle (segmented control / tabs) at the top lists the projects
-  (`homelab`, `nested-operator`, `kubeopencode`, ...) and switches the whole page between
+  (`project-a`, `project-b`, `nested-operator`, `kubeopencode`, ...) and switches the whole page between
   them; the selection is kept in the URL (`?project=`) and local storage.
 - **Panels** for the selected project:
   - status card (status, uptime, restarts, last crash, transcript, readiness) with
@@ -349,17 +349,17 @@ New templates under `charts/kubeopencode/templates/supervisor/`, all gated by
 ### 2.5 Rollout
 
 1. Chart templates and values with a fake supervisor image (kind e2e), behind `supervisor.enabled`.
-2. Server handlers and the UI page against the real supervisor API from the homelab roadmap
+2. Server handlers and the UI page against the real supervisor API from the supervisor roadmap
    (needs its Part A and B).
-3. Homelab: deploy next to the existing `ai-server` pod using adopted volumes only after the
-   cutover steps in the homelab roadmap.
+3. Deployment: deploy next to the existing supervisor pod using adopted volumes only after the
+   cutover steps in the deployment roadmap.
 
 ### 2.6 Open questions
 
 - StatefulSet versus Deployment with `Recreate` for the single-replica supervisor.
 - Whether the per-project memory file (project `CLAUDE.md`) is stored in values, in a
-  ConfigMap per project, or edited through the API and persisted (the homelab keeps them in
-  git today).
+  ConfigMap per project, or edited through the API and persisted (or kept in
+  git).
 - Where the log retention lives if a longer history than the ring buffer is wanted
   (currently: none, by design, because logs can contain sensitive data).
 
@@ -426,7 +426,7 @@ of the Agent's runtime.
 - `template_merge.go`: merge `taskPodSpec.runtimeClassName` like the other scalar pointer
   fields (Agent over template).
 - CRD regeneration (`make manifests`), deepcopy, and the chart CRDs (`charts/kubeopencode/crds`)
-  are part of the change; the homelab `crds` app picks them up through the new tag.
+  are part of the change; deployment manifests pick them up through the new tag.
 
 ### 3.5 Validation and safety
 
@@ -448,19 +448,19 @@ of the Agent's runtime.
 - envtest: a Task overriding the runtime; a Task rejected by `allowedRuntimeClasses`.
 - CRD/openapi check that old manifests without the new fields still validate and render
   identical pods (golden comparison against the current output).
-- Live (homelab): server pod stays on `gvisor` while a Task pod runs with the default
+- Live: server pod stays on `gvisor` while a Task pod runs with the default
   runtime on the same Agent; verify with `kubectl get pod -o jsonpath='{.spec.runtimeClassName}'`.
 
 ### 3.7 Rollout
 
 1. Types, CRDs, resolution helper and builders with tests.
 2. Chart value `controller.allowedRuntimeClasses` and docs.
-3. Build, bump the homelab pins, optionally set `taskPodSpec` for the agents (the homelab
-   currently needs gVisor for the servers; the attach pods could use the default runtime).
+3. Build, bump the deployment pins, optionally set `taskPodSpec` for the agents (a deployment
+   might use gVisor for the servers while attach pods could use the default runtime).
 
 ## 4. Vikunja integration: link, steer, write back
 
-Controller-side parts of the "Vikunja task events reach their assignees" design in the homelab repo's ROADMAP.md (the `vikunja-bridge` service may live here next to the supervisor chart; decision open). Vikunja is the work tracker; KubeOpenCode Tasks are the units of work it drives.
+Controller-side parts of the "Vikunja task events reach their assignees" design (the `vikunja-bridge` service may live here next to the supervisor chart; decision open). Vikunja is the work tracker; KubeOpenCode Tasks are the units of work it drives.
 
 - **Link:** Task annotation `vikunja.rish-home.de/task-id` (and optional `vikunja.rish-home.de/project-id`). The controller keeps no Vikunja state; the bridge resolves task id to Task.
 - **Steer a running Task:** `kubeopencode steer <task> "<text>"` and the controller/bridge call `POST /session/<status.session.id>/prompt_async` on the agent server pod (port 4096). Verified on opencode 1.19.4: a message sent while the session is busy is queued and picked up at the next step; the run is not killed. If the session is idle the message starts a new turn; if the Task is finished, a new Task with the same description plus the update is created.

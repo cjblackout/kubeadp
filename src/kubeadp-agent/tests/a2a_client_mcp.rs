@@ -185,7 +185,7 @@ async fn mcp_server(peer_port: u64) -> A2aMcpServer {
     let list_services = |_base: &str, _token: Option<&str>| {
         let peer = serde_json::json!({
             "metadata": { "name": "peer", "namespace": "testns", "labels": {
-                "a2a.homelab/agent": "true" } },
+                "a2a.kubeadp/agent": "true" } },
             "spec": { "ports": [ { "name": "a2a", "port": peer_port } ] }
         });
         async move { Ok(vec![peer]) }
@@ -638,12 +638,12 @@ async fn mcp_a2a_name_vs_namespace_name_resolution() {
         let peers = vec![
             serde_json::json!({
                 "metadata": { "name": "worker", "namespace": "ns-a", "labels": {
-                    "a2a.homelab/agent": "true" } },
+                    "a2a.kubeadp/agent": "true" } },
                 "spec": { "ports": [ { "name": "a2a", "port": services_a } ] }
             }),
             serde_json::json!({
                 "metadata": { "name": "worker", "namespace": "ns-b", "labels": {
-                    "a2a.homelab/agent": "true" } },
+                    "a2a.kubeadp/agent": "true" } },
                 "spec": { "ports": [ { "name": "a2a", "port": services_b } ] }
             }),
         ];

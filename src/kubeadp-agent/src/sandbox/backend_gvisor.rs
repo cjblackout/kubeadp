@@ -1483,7 +1483,7 @@ mod tests {
         // get an extra writable mount: nothing was remounted read-only over it.
         let policy = SandboxPolicy {
             ro: vec![PathBuf::from("/usr"), PathBuf::from("/opt/tools")],
-            rw: vec![PathBuf::from("/workspace/homelab")],
+            rw: vec![PathBuf::from("/workspace/project-a")],
             ..Default::default()
         };
         let (plan, _) = plan_mounts(&spec(policy));
@@ -1565,7 +1565,7 @@ mod tests {
         let policy = SandboxPolicy {
             rw: vec![
                 // this agent's own worktree, inside the job-dir root
-                PathBuf::from("/workspace/.agent-jobs/homelab/job1"),
+                PathBuf::from("/workspace/.agent-jobs/project-a/job1"),
             ],
             ..Default::default()
         };
@@ -1593,7 +1593,7 @@ mod tests {
         let preserved = hide_preserved(&plan, Path::new("/workspace/.agent-jobs"));
         assert_eq!(
             preserved,
-            vec![PathBuf::from("/workspace/.agent-jobs/homelab/job1")],
+            vec![PathBuf::from("/workspace/.agent-jobs/project-a/job1")],
             "preserved under job root: {preserved:?}"
         );
         // A rw path that is a direct child of a hidden root must also bind back.
@@ -1626,15 +1626,17 @@ mod tests {
     #[test]
     fn test_plan_preserves_shared_rw_under_hide() {
         let policy = SandboxPolicy {
-            rw: vec![PathBuf::from("/workspace/.agent-jobs/homelab/job1")],
-            shared_rw: vec![PathBuf::from("/workspace/.agent-jobs/homelab/job1/shared")],
+            rw: vec![PathBuf::from("/workspace/.agent-jobs/project-a/job1")],
+            shared_rw: vec![PathBuf::from(
+                "/workspace/.agent-jobs/project-a/job1/shared",
+            )],
             ..Default::default()
         };
         let (plan, _) = plan_mounts(&spec(policy));
         let preserved = hide_preserved(&plan, Path::new("/workspace/.agent-jobs"));
         for p in [
-            PathBuf::from("/workspace/.agent-jobs/homelab/job1"),
-            PathBuf::from("/workspace/.agent-jobs/homelab/job1/shared"),
+            PathBuf::from("/workspace/.agent-jobs/project-a/job1"),
+            PathBuf::from("/workspace/.agent-jobs/project-a/job1/shared"),
         ] {
             assert!(
                 preserved.contains(&p),
@@ -1644,7 +1646,9 @@ mod tests {
         // The shared_rw path is NOT in the ro list, so no RemountRo for it.
         let ro = ro_targets(&plan);
         assert!(
-            !ro.contains(&PathBuf::from("/workspace/.agent-jobs/homelab/job1/shared")),
+            !ro.contains(&PathBuf::from(
+                "/workspace/.agent-jobs/project-a/job1/shared"
+            )),
             "shared_rw preserved path must stay writable: {ro:?}"
         );
     }
@@ -1656,7 +1660,7 @@ mod tests {
     fn test_plan_preserves_ro_under_hide_with_remount_ro() {
         let policy = SandboxPolicy {
             ro: vec![PathBuf::from("/workspace/.agent-jobs/tools/docs")],
-            rw: vec![PathBuf::from("/workspace/.agent-jobs/homelab/job1")],
+            rw: vec![PathBuf::from("/workspace/.agent-jobs/project-a/job1")],
             ..Default::default()
         };
         let (plan, _) = plan_mounts(&spec(policy));

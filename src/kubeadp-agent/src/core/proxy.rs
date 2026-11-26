@@ -52,7 +52,7 @@ pub fn redact_proxy_url(raw: &str) -> String {
     }
 }
 
-/// Appends standard homelab/cluster exclusions (`localhost,127.0.0.1,0.0.0.0,.cluster.local,.svc`)
+/// Appends standard cluster exclusions (`localhost,127.0.0.1,0.0.0.0,.cluster.local,.svc`)
 /// to an existing `NO_PROXY` string, deduplicating case-insensitively.
 pub fn build_no_proxy(existing: Option<&str>) -> String {
     let mut entries: Vec<String> = Vec::new();

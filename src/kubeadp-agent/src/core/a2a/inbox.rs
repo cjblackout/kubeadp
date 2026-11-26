@@ -1709,8 +1709,8 @@ mod tests {
                 "the shared inbox root must follow AGENT_RUN_STATE_ROOT exactly"
             );
             assert_eq!(
-                inbox_dir_for(&resolved, "homelab"),
-                root.join("a2a-inbox").join("homelab")
+                inbox_dir_for(&resolved, "project-a"),
+                root.join("a2a-inbox").join("project-a")
             );
         });
     }

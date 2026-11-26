@@ -1900,7 +1900,7 @@ mod tests {
         std::env::remove_var("A2A_SELF_NAME");
 
         let mut cmd = Command::new("claude");
-        crate::core::runner::apply_a2a_self_name(&mut cmd, "homelab");
+        crate::core::runner::apply_a2a_self_name(&mut cmd, "project-a");
 
         let self_name = cmd
             .get_envs()
@@ -1908,7 +1908,7 @@ mod tests {
             .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()));
         assert_eq!(
             self_name.as_deref(),
-            Some("kubeadp-agent-orchestrator-service/homelab")
+            Some("kubeadp-agent-orchestrator-service/project-a")
         );
 
         // Restore env

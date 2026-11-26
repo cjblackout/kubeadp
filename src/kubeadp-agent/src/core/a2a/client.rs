@@ -10,7 +10,7 @@
 //! # Agent registry / discovery
 //!
 //! Peer agents are discovered from Kubernetes Services carrying the label
-//! `a2a.homelab/agent=true`:
+//! `a2a.kubeadp/agent=true`:
 //!
 //! - the pod's own namespace (read from the in-cluster service account, or
 //!   `A2A_NAMESPACE` for tests), plus any namespaces listed in the
@@ -77,7 +77,7 @@ pub use super::ingress::MAX_INGRESS_TEXT_BYTES;
 /// token; the claimed `a2a.hop` is ignored). Re-exported from [`crate::core::a2a::ingress`].
 pub use crate::core::a2a::ingress::META_HOP_TOKEN;
 /// Label selecting agent Services in the Kubernetes discovery.
-pub const AGENT_LABEL: &str = "a2a.homelab/agent=true";
+pub const AGENT_LABEL: &str = "a2a.kubeadp/agent=true";
 /// Env var naming the static A2A peer registry: a comma-separated
 /// `name=url` or `namespace/name=url` list.
 pub const A2A_PEERS_ENV: &str = "A2A_PEERS";
@@ -1559,7 +1559,7 @@ mod tests {
 
     #[test]
     fn label_constants_are_sane() {
-        assert!(AGENT_LABEL.contains("a2a.homelab/agent"));
+        assert!(AGENT_LABEL.contains("a2a.kubeadp/agent"));
         assert_eq!(MAX_HOP, 4);
     }
 

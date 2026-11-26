@@ -1145,8 +1145,8 @@ mod tests {
         );
         assert_eq!(per_session_path(None, "s"), PathBuf::from("/tmp/sess/s.md"));
         assert_eq!(
-            project_instructions_path("homelab"),
-            PathBuf::from("/tmp/sess/homelab.md")
+            project_instructions_path("project-a"),
+            PathBuf::from("/tmp/sess/project-a.md")
         );
     }
 

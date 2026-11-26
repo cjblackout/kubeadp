@@ -1210,7 +1210,7 @@ session_id = "id-b"
         assert!(validate_session_name("0c99f41").is_ok());
         assert!(validate_session_name("0c99f41a0").is_ok());
         assert!(validate_session_name("0C99F41A").is_ok());
-        assert!(validate_session_name("homelab").is_ok());
+        assert!(validate_session_name("project-a").is_ok());
         assert!(validate_session_name("session-1").is_ok());
 
         let s = make_session("0c99f41a");
