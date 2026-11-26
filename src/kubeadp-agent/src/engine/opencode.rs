@@ -352,6 +352,18 @@ impl Engine for OpenCodeEngine {
         "opencode"
     }
 
+    fn classify_status(&self, exit_code: Option<i32>, log: &str) -> JobStatus {
+        crate::core::job::determine_status_from_opencode(exit_code, log)
+    }
+
+    fn extract_response(&self, log: &str) -> Option<String> {
+        crate::core::job::extract_opencode_response(log)
+    }
+
+    fn extract_error(&self, log: &str) -> Option<String> {
+        crate::core::job::extract_opencode_error(log)
+    }
+
     fn configured_program(&self, config: &crate::core::config::Config) -> PathBuf {
         config.opencode_path.clone()
     }

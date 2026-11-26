@@ -506,15 +506,14 @@ pub fn validate_executable_paths(config: &Config) -> Result<()> {
     validate_engine_executable_path(config, None)
 }
 
-/// Validates the configured engine executable path for `engine` (`Some("claude")`
-/// checks `config.claude_path`, `Some("opencode")` checks `config.opencode_path`;
-/// all other values check `config.agy_path`).
+/// Validates the configured engine executable path for `engine`.
+/// Resolves the engine via [`crate::engine::EngineRegistry`] and validates
+/// the program path reported by [`crate::engine::Engine::configured_program`].
 pub fn validate_engine_executable_path(config: &Config, engine: Option<&str>) -> Result<()> {
-    let (label, path) = match engine {
-        Some("claude") => ("claude", &config.claude_path),
-        Some("opencode") => ("opencode", &config.opencode_path),
-        _ => ("agy", &config.agy_path),
-    };
+    let registry = crate::engine::EngineRegistry::with_builtin(config);
+    let resolved = registry.resolve(crate::engine::RunKind::Job, engine, None)?;
+    let label = resolved.display_name();
+    let path = resolved.configured_program(config);
     if path.is_absolute() {
         if !path.exists() {
             bail!(

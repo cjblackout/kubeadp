@@ -42,20 +42,11 @@ pub fn run(config: &Config, args: &ResultArgs) -> Result<CommandOutput> {
         Err(_) => String::new(),
     };
 
-    let response = extract_final_response(&log);
-    let error_text = final_error_text(&log);
-
-    // opencode has no agy/claude SUCCESS payload: surface the last turn's
-    // visible text as the response and the terminal error event as the error
-    // (KA-4). The engine is read from the row so this stays a pure engine-ism
-    // inside the shared result command -- the HTTP surface is unchanged.
-    let (response, error_text) = if meta.engine.as_deref() == Some("opencode") {
-        (
-            response.or_else(|| crate::core::job::extract_opencode_response(&log)),
-            error_text.or_else(|| crate::core::job::extract_opencode_error(&log)),
-        )
+    let registry = crate::engine::EngineRegistry::with_builtin(config);
+    let (response, error_text) = if let Ok(engine) = registry.for_job(&meta) {
+        (engine.extract_response(&log), engine.extract_error(&log))
     } else {
-        (response, error_text)
+        (extract_final_response(&log), final_error_text(&log))
     };
 
     // The `data` payload is exactly the object the client pretty-prints for
@@ -118,13 +109,7 @@ pub fn run(config: &Config, args: &ResultArgs) -> Result<CommandOutput> {
 /// Returns the `error` field of the last recognized structured result
 /// (terminal status: SUCCESS / ERROR / FAILED / FAILURE, case-insensitive),
 /// if that result carries one.
-///
-/// Recognition goes through the shared [`crate::core::job::structured_value`]
-/// helper, so BOTH structured shapes are covered: a legacy single-object
-/// line with a top-level `status`, and the stream-json
-/// `{"event":"result","result":{...}}` line (where `error` lives one level
-/// down, inside the inner `result` object).
-fn final_error_text(log: &str) -> Option<String> {
+pub fn final_error_text(log: &str) -> Option<String> {
     let mut last: Option<Option<String>> = None;
     for line in log.lines() {
         // A claude stream-json terminal line (`result`/`system` with

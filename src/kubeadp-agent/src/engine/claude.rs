@@ -775,6 +775,10 @@ impl Engine for ClaudeEngine {
         "claude"
     }
 
+    fn classify_status(&self, exit_code: Option<i32>, log: &str) -> JobStatus {
+        crate::core::job::determine_status_from_claude(exit_code, log)
+    }
+
     fn normalize_prompt(&self, prompt: &str, _job_id: &str, _retry_count: u32) -> String {
         prompt.to_string()
     }

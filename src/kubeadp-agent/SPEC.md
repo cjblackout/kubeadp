@@ -294,7 +294,9 @@ and secrets.
   engine that produces it.
 - **Engine trait launch methods**: The engine trait exposes `job_command(job, turn) -> Result<LaunchPlan, EngineError>`
   for jobs and `session_command(session, resume) -> Result<LaunchPlan, EngineError>` for sessions, alongside
-  `classify_exit(exit, log_tail) -> JobStatus` and `conversation_id(job) -> Option<ContextId>`.
+  `classify_exit(exit, log_tail) -> JobStatus`, `classify_status(exit_code, log) -> JobStatus`,
+  `extract_response(log) -> Option<String>`, `extract_error(log) -> Option<String>`,
+  `configured_program(config) -> PathBuf` and `conversation_id(job) -> Option<ContextId>`.
   Engines build their exact argv, env, stdin mode and PTY requirements into `LaunchPlan`.
   `ResumeMode` distinguishes fresh starts (`Start`) from resumes (`Resume`).
   No launcher or command outside the engine may branch on an engine name.

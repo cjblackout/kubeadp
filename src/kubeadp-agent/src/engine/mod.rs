@@ -309,6 +309,24 @@ pub trait Engine: Send + Sync {
         "engine"
     }
 
+    /// Classifies terminal status of an exited process from the recorded exit code and captured log.
+    /// Default implementation delegates to [`crate::core::job::determine_status_from_signals`].
+    fn classify_status(&self, exit_code: Option<i32>, log: &str) -> JobStatus {
+        crate::core::job::determine_status_from_signals(exit_code, log)
+    }
+
+    /// Extracts the final response text from the job log.
+    /// Default implementation delegates to [`crate::core::job::extract_final_response`].
+    fn extract_response(&self, log: &str) -> Option<String> {
+        crate::core::job::extract_final_response(log)
+    }
+
+    /// Extracts the final error text from the job log.
+    /// Default implementation delegates to [`crate::core::commands::result::final_error_text`].
+    fn extract_error(&self, log: &str) -> Option<String> {
+        crate::core::commands::result::final_error_text(log)
+    }
+
     /// Normalizes a prompt before execution (e.g. adding reference tags or normalizing retries).
     /// Default: identity.
     fn normalize_prompt(&self, prompt: &str, _job_id: &str, _retry_count: u32) -> String {
@@ -869,5 +887,131 @@ mod tests {
         claude_expected.extend_from_slice(crate::server::sessions::PASTE_END);
         claude_expected.push(b'\r');
         assert_eq!(claude_frame, claude_expected);
+    }
+
+    struct CustomNoopEngine {
+        id: &'static str,
+        capabilities: CapabilityTable,
+        custom_status: JobStatus,
+        custom_response: Option<String>,
+        custom_error: Option<String>,
+    }
+
+    #[async_trait]
+    impl Engine for CustomNoopEngine {
+        fn id(&self) -> EngineId {
+            self.id.to_string()
+        }
+
+        async fn start_job(
+            &self,
+            _spec: JobSpec,
+            _ctx: &mut dyn EngineCtx,
+        ) -> Result<RunId, EngineError> {
+            Ok("custom-job".to_string())
+        }
+
+        async fn resume_job(&self, _run: &Run, _prompt: &str) -> Result<(), EngineError> {
+            Ok(())
+        }
+
+        async fn job_status(&self, run: &Run) -> Result<run::RunStatus, EngineError> {
+            Ok(run.status)
+        }
+
+        async fn start_session(
+            &self,
+            _spec: SessionSpec,
+            _ctx: &mut dyn EngineCtx,
+        ) -> Result<RunId, EngineError> {
+            Ok("custom-session".to_string())
+        }
+
+        async fn send_message(&self, _run: &Run, _text: &str) -> Result<(), EngineError> {
+            Ok(())
+        }
+
+        async fn stop_session(&self, _run: &Run, _restart: bool) -> Result<(), EngineError> {
+            Ok(())
+        }
+
+        fn job_command(
+            &self,
+            job: &JobMetadata,
+            _turn: TurnInput<'_>,
+        ) -> Result<LaunchPlan, EngineError> {
+            Ok(LaunchPlan {
+                program: PathBuf::from("/bin/true"),
+                args: vec![job.job_id.clone()],
+                env: Vec::new(),
+                stdin: StdinMode::Null,
+                pty: false,
+            })
+        }
+
+        fn session_command(
+            &self,
+            session: &SessionDef,
+            _resume: ResumeMode,
+        ) -> Result<LaunchPlan, EngineError> {
+            Ok(LaunchPlan {
+                program: PathBuf::from("/bin/true"),
+                args: vec![session.name.clone()],
+                env: Vec::new(),
+                stdin: StdinMode::Null,
+                pty: true,
+            })
+        }
+
+        fn classify_exit(&self, _exit: ExitInfo, _log_tail: &[u8]) -> JobStatus {
+            self.custom_status
+        }
+
+        fn classify_status(&self, _exit_code: Option<i32>, _log: &str) -> JobStatus {
+            self.custom_status
+        }
+
+        fn extract_response(&self, _log: &str) -> Option<String> {
+            self.custom_response.clone()
+        }
+
+        fn extract_error(&self, _log: &str) -> Option<String> {
+            self.custom_error.clone()
+        }
+
+        fn conversation_id(&self, job: &JobMetadata) -> Option<ContextId> {
+            job.conversation_id.clone()
+        }
+
+        fn capabilities(&self) -> CapabilityTable {
+            self.capabilities.clone()
+        }
+    }
+
+    #[test]
+    fn custom_noop_engine_seam_classification_and_result() {
+        let mut reg = EngineRegistry::new();
+        let custom = Arc::new(CustomNoopEngine {
+            id: "custom",
+            capabilities: CapabilityTable::builder("custom").build(),
+            custom_status: JobStatus::Done,
+            custom_response: Some("custom answer".to_string()),
+            custom_error: Some("custom error text".to_string()),
+        });
+        reg.register(custom);
+
+        let resolved = reg.resolve(RunKind::Job, Some("custom"), None).unwrap();
+        assert_eq!(
+            resolved.classify_status(Some(1), "arbitrary log"),
+            JobStatus::Done
+        );
+        assert_eq!(
+            resolved.extract_response("arbitrary log").as_deref(),
+            Some("custom answer")
+        );
+        assert_eq!(
+            resolved.extract_error("arbitrary log").as_deref(),
+            Some("custom error text")
+        );
     }
 }

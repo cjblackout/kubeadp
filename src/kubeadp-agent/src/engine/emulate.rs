@@ -64,6 +64,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 
+use crate::core::job::JobStatus;
 use crate::engine::capability::{CapEndpointKey, Capability, CapabilityTable};
 use crate::engine::errors::EngineError;
 use crate::engine::run::{EngineEvent, Run, RunId, RunKind, RunStatus, TodoItem};
@@ -811,6 +812,18 @@ impl Engine for EmulatingEngine {
 
     fn display_name(&self) -> &str {
         self.inner.display_name()
+    }
+
+    fn classify_status(&self, exit_code: Option<i32>, log: &str) -> JobStatus {
+        self.inner.classify_status(exit_code, log)
+    }
+
+    fn extract_response(&self, log: &str) -> Option<String> {
+        self.inner.extract_response(log)
+    }
+
+    fn extract_error(&self, log: &str) -> Option<String> {
+        self.inner.extract_error(log)
     }
 
     fn normalize_prompt(&self, prompt: &str, job_id: &str, retry_count: u32) -> String {
