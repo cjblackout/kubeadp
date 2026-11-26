@@ -844,6 +844,7 @@ some non-json noise line
             state_root: state_root.clone(),
             agy_path: agy.clone(),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             agy_home: Some(tmp.path().join("agy-home")),
             ..Default::default()
         }));

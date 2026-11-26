@@ -89,6 +89,13 @@ pub fn build_router(
         registry.register(std::sync::Arc::new(crate::engine::AgyEngine::new(
             std::sync::Arc::new(core_config.clone()),
         )));
+        // The opencode job engine (KA-4): same trait surface as agy/claude,
+        // driven by the engine-aware runner.
+        registry.register(std::sync::Arc::new(
+            crate::engine::opencode::OpenCodeEngine::new(std::sync::Arc::new(
+                core_config.clone(),
+            )),
+        ));
         // Selection precedence level 2 (config): the configured defaults
         // override the per-role fallbacks (agy for jobs, claude for
         // sessions); a request still wins. Empty values keep the fallback.

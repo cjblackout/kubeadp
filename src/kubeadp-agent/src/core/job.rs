@@ -620,6 +620,8 @@ pub fn compute_status(meta: &JobMetadata, state_root: &Path) -> JobStatus {
     //     byte-identical to the pre-E5 behaviour.
     if meta.engine.as_deref() == Some("claude") {
         determine_status_from_claude(meta.exit_code, &log_content)
+    } else if meta.engine.as_deref() == Some("opencode") {
+        determine_status_from_opencode(meta.exit_code, &log_content)
     } else {
         determine_status_from_signals(meta.exit_code, &log_content)
     }
@@ -1208,6 +1210,107 @@ pub fn determine_status_from_claude(exit_code: Option<i32>, log: &str) -> JobSta
     }
 }
 
+/// Status classification for an opencode JSON-event job log (KA-4).
+///
+/// opencode `run --format json` emits one NDJSON event per line: `step_start`,
+/// `text`, `step_finish`, `tool_use` and (on failure, before exit 1)
+/// `error`. Rules, mirroring the agy/claude taxonomy on the opencode contract:
+/// - A complete run ends with a `step_finish` whose `reason` is `"stop"` (an
+///   answered turn); that is `Done` (the opencode analogue of a structured
+///   SUCCESS / terminal `result`). Tool-calling turns (`reason:"tool-calls"`)
+///   are NOT completion: opencode continues the session, so the job only
+///   completes when the model stops.
+/// - A terminal `error` event is `Failed`.
+/// - A quota/rate-limit exhaustion signal anywhere in the log is
+///   `QuotaExhausted` (opencode surfaces the upstream rejection in the `error`
+///   line's message, which the generic marker scan matches).
+/// - Exit 0 with no terminal `step_finish`/`stop` is `Incomplete` (the harness
+///   exited cleanly but the model never completed a turn).
+/// - Non-zero exit with an `error` line is `Failed`; a 137/143 kill without an
+///   error line is `SelfTerminated` (the external-kill taxonomy).
+/// - No exit code with no error line is `SelfTerminated`.
+pub fn determine_status_from_opencode(exit_code: Option<i32>, log: &str) -> JobStatus {
+    let current = last_attempt_log(log);
+    let done = scan_opencode_completed(current);
+
+    // Quota/rate-limit exhaustion wins over every other "didn't finish"
+    // signal (same markers and last-attempt scoping as the other engines).
+    if has_quota_exhaustion_signal(current) {
+        return JobStatus::QuotaExhausted;
+    }
+
+    if done {
+        return JobStatus::Done;
+    }
+
+    // The terminal `error` event (present when opencode exits 1 on a failed
+    // run, e.g. an unknown model or an upstream provider error).
+    let has_error = scan_opencode_error(current);
+
+    match exit_code {
+        Some(0) => {
+            if has_error {
+                JobStatus::Failed
+            } else {
+                JobStatus::Incomplete
+            }
+        }
+        Some(code) => {
+            if (code == 137 || code == 143) && !has_error {
+                JobStatus::SelfTerminated
+            } else {
+                JobStatus::Failed
+            }
+        }
+        None => {
+            if has_error {
+                JobStatus::Failed
+            } else {
+                JobStatus::SelfTerminated
+            }
+        }
+    }
+}
+
+/// True when `log` carries a completed opencode run: a `step_finish` event
+/// whose `part.reason` is `"stop"` (the model answered the turn). Scanning
+/// backwards so the outcome of the LAST attempt wins; a `step_finish` with
+/// `reason:"tool-calls"` does not complete the job (opencode would continue
+/// the session with the tool result).
+fn scan_opencode_completed(log: &str) -> bool {
+    for line in last_attempt_log(log).lines().rev() {
+        let Some(value) = json_object_line(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) != Some("step_finish") {
+            continue;
+        }
+        let reason = value
+            .get("part")
+            .and_then(|p| p.get("reason"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        return reason == "stop";
+    }
+    false
+}
+
+/// True when `log` carries the terminal `error` event opencode emits before
+/// exiting non-zero (`{"type":"error",...,"error":{...}}`). Scanning the last
+/// attempt only, so a stale error from a superseded attempt never misclassifies
+/// a later attempt.
+fn scan_opencode_error(log: &str) -> bool {
+    for line in last_attempt_log(log).lines().rev() {
+        let Some(value) = json_object_line(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) == Some("error") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Strips ANSI escape sequences (CSI codes like `\x1b[32m`, OSC codes, etc.) from `input`.
 pub fn strip_ansi_escapes(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
@@ -1370,6 +1473,26 @@ pub fn extract_conversation_id(log: &str) -> Option<String> {
         // `retry` / resume reuse the same `conversation_id` field.
         if let Some(pos) = line.find("\"session_id\"") {
             let rest = line[pos + "\"session_id\"".len()..].trim_start();
+            if let Some(after_colon) = rest.strip_prefix(':') {
+                let rest = after_colon.trim_start();
+                if let Some(after_quote) = rest.strip_prefix('"') {
+                    if let Some(end) = after_quote.find('"') {
+                        let id = &after_quote[..end];
+                        if !id.is_empty() {
+                            return Some(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pattern 2c: opencode JSON events carry the harness session id on
+        // `"sessionID"` (every event line: step_start/text/tool_use/
+        // step_finish/error). This is the resume key for an opencode job
+        // (`--session <id>`), captured like an agy/claude conversation id so
+        // `retry` / resume reuse the same `conversation_id` field.
+        if let Some(pos) = line.find("\"sessionID\"") {
+            let rest = line[pos + "\"sessionID\"".len()..].trim_start();
             if let Some(after_colon) = rest.strip_prefix(':') {
                 let rest = after_colon.trim_start();
                 if let Some(after_quote) = rest.strip_prefix('"') {

@@ -2844,6 +2844,7 @@ mod tests {
             state_root: tmp.join("state"),
             agy_path: agy.to_path_buf(),
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         })
     }
@@ -3627,6 +3628,7 @@ mod tests {
                 state_root: tmp.path().join("state"),
                 agy_path: tmp.path().join("no-such-agy"),
                 claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+                opencode_path: std::path::PathBuf::from("opencode"),
                 ..Default::default()
             }),
             Arc::new(AuthManager::new()),
@@ -3698,6 +3700,7 @@ mod tests {
                 state_root: tmp.path().join("state"),
                 agy_path: tmp.path().join("no-such-agy"),
                 claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+                opencode_path: std::path::PathBuf::from("opencode"),
                 ..Default::default()
             }),
             Arc::new(AuthManager::new()),
@@ -3741,6 +3744,7 @@ mod tests {
                 state_root: tmp.path().join("state1"),
                 agy_path: tmp.path().join("no-such-agy"),
                 claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+                opencode_path: std::path::PathBuf::from("opencode"),
                 default_engine: Some("claude".to_string()),
                 ..Default::default()
             }),
@@ -3767,6 +3771,7 @@ mod tests {
                 state_root: tmp.path().join("state2"),
                 agy_path: tmp.path().join("no-such-agy"),
                 claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+                opencode_path: std::path::PathBuf::from("opencode"),
                 default_engine: Some("warp".to_string()),
                 ..Default::default()
             }),
@@ -3876,6 +3881,7 @@ mod tests {
                 state_root: tmp.path().join("state"),
                 agy_path: tmp.path().join("no-such-agy"),
                 claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+                opencode_path: std::path::PathBuf::from("opencode"),
                 ..Default::default()
             }),
             Arc::new(AuthManager::new()),

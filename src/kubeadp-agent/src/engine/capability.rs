@@ -67,7 +67,7 @@ impl InjectChannel {
     }
 }
 
-/// The injection channels each engine supports (design HL-113 §7.14). Both
+/// The injection channels each engine supports (design HL-113 §7.14). All
 /// engines support `hook`, `tool_result` and `idle_turn` (the parity
 /// requirement: the agy hook channel is a native agy plugin `PreInvocation`
 /// hook, verified live; the Claude Code hook channel is the
@@ -75,14 +75,21 @@ impl InjectChannel {
 /// the explicit last resort every engine already reaches through the existing
 /// kill-and-resume, never an advertised channel. Unknown engines answer empty
 /// (no injection).
+///
+/// opencode is the floor of the ladder: it has no hook mechanism and no
+/// harness-owned `mcp-a2a` server, so it advertises only `idle_turn` (a queued
+/// message starts the run's next turn with the message as the follow-up
+/// prompt).
 pub fn inject_channels(engine: &str) -> &'static [InjectChannel] {
     const CHANNELS: &[InjectChannel] = &[
         InjectChannel::Hook,
         InjectChannel::ToolResult,
         InjectChannel::IdleTurn,
     ];
+    const IDLE_ONLY: &[InjectChannel] = &[InjectChannel::IdleTurn];
     match engine {
         "claude" | "agy" => CHANNELS,
+        "opencode" => IDLE_ONLY,
         _ => &[],
     }
 }

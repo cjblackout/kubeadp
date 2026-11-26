@@ -52,6 +52,7 @@
 //!   jobs_dir_name           -> AGENT_RUN_JOBS_DIR_NAME
 //!   agy_path                -> AGENT_RUN_AGY_PATH
 //!   claude_path             -> AGENT_RUN_CLAUDE_PATH
+//!   opencode_path           -> AGENT_RUN_OPENCODE_PATH
 //!   default_model           -> AGENT_RUN_DEFAULT_MODEL
 //!   default_effort          -> AGENT_RUN_DEFAULT_EFFORT
 //!   default_base_branch     -> AGENT_RUN_DEFAULT_BASE_BRANCH
@@ -293,6 +294,7 @@ fn var_for_section_key(section: &str, key: &str) -> Option<String> {
         ("worker", "jobs_dir_name") => Some("AGENT_RUN_JOBS_DIR_NAME".to_string()),
         ("worker", "agy_path") => Some("AGENT_RUN_AGY_PATH".to_string()),
         ("worker", "claude_path") => Some("AGENT_RUN_CLAUDE_PATH".to_string()),
+        ("worker", "opencode_path") => Some("AGENT_RUN_OPENCODE_PATH".to_string()),
         ("worker", "default_model") => Some("AGENT_RUN_DEFAULT_MODEL".to_string()),
         ("worker", "default_effort") => Some("AGENT_RUN_DEFAULT_EFFORT".to_string()),
         ("worker", "default_base_branch") => Some("AGENT_RUN_DEFAULT_BASE_BRANCH".to_string()),
@@ -426,6 +428,7 @@ fn section_keys(section: &str) -> Vec<&'static str> {
             "jobs_dir_name",
             "agy_path",
             "claude_path",
+            "opencode_path",
             "default_model",
             "default_effort",
             "default_base_branch",
@@ -912,6 +915,16 @@ a2a_echo = false
         assert_eq!(
             vars.get("AGENT_RUN_CLAUDE_PATH").map(|s| s.as_str()),
             Some("/opt/claude/bin/claude")
+        );
+    }
+
+    #[test]
+    fn test_opencode_path_key_maps_to_env() {
+        // KA-4: the worker's opencode job engine binary path.
+        let vars = parse("[worker]\nopencode_path = \"/opt/opencode/bin/opencode\"\n");
+        assert_eq!(
+            vars.get("AGENT_RUN_OPENCODE_PATH").map(|s| s.as_str()),
+            Some("/opt/opencode/bin/opencode")
         );
     }
 

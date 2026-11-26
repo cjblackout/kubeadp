@@ -8,7 +8,11 @@
 //! - claude reads the global `~/.claude/CLAUDE.md` and the per-session
 //!   `CLAUDE.md` in the run's working directory,
 //! - agy reads the global `<agy-home>/.gemini/config/AGENTS.md` (the config
-//!   file that already holds the MCP configuration).
+//!   file that already holds the MCP configuration),
+//! - opencode reads the global `~/.config/opencode/AGENTS.md` and the
+//!   per-session `AGENTS.md` in the run's working directory (KA-4: opencode
+//!   auto-loads `AGENTS.md` walking up from the working directory, and also
+//!   loads the global user `AGENTS.md`).
 //!
 //! The engine files may also carry *user* content that is not managed by the
 //! agent (the agy `AGENTS.md` doubles as the MCP configuration file, and the
@@ -284,7 +288,7 @@ pub fn materialize_claude(
         .map(|(s, _)| s.display().to_string());
     let per_inner = block_content(render_inner(per_session_text.iter()));
     let per_set = per_inner.is_some();
-    match inject_entry(workdir, &per_target, per_inner) {
+    match inject_entry(workdir, &per_target, &per_inner) {
         Ok(InjectOutcome::Written) => {
             written = true;
             log.push(if per_set {
@@ -351,6 +355,91 @@ pub fn materialize_agy(
             false
         }
     }
+}
+
+/// Materialises the opencode witness files: the global `~/.config/opencode/
+/// AGENTS.md` and the per-session `AGENTS.md` in the run's working directory
+/// (KA-4, SPEC §4.10 targets). opencode auto-loads `AGENTS.md` walking up
+/// from the working directory and also loads the global user `AGENTS.md`, so
+/// the two levels map to the same global -> per-session hierarchy the other
+/// engines use. Each holds a managed block (see [`BLOCK_BEGIN`]) so user
+/// content outside the block is kept; the per-session file is git-excluded
+/// like the claude `CLAUDE.md` (a tracked `AGENTS.md` is never touched).
+pub fn materialize_opencode(
+    home: &Path,
+    workdir: &Path,
+    global_text: Option<(PathBuf, String)>,
+    per_session_text: Option<(PathBuf, String)>,
+    log: &mut Vec<String>,
+) -> bool {
+    let mut written = false;
+    // Global level -> ~/.config/opencode/AGENTS.md (a managed block).
+    let global_target = home
+        .join(".config")
+        .join("opencode")
+        .join("AGENTS.md");
+    let global_src = global_text.as_ref().map(|(s, _)| s.display().to_string());
+    let global_inner = block_content(render_inner(global_text.iter()));
+    let global_set = global_inner.is_some();
+    match write_managed(&global_target, global_inner) {
+        Ok(true) => {
+            written = true;
+            log.push(if global_set {
+                format!(
+                    "instructions: opencode global written: {} -> {}",
+                    global_src.as_deref().unwrap_or_default(),
+                    global_target.display()
+                )
+            } else {
+                format!(
+                    "instructions: opencode global managed block removed: {}",
+                    global_target.display()
+                )
+            });
+        }
+        Ok(false) => {}
+        Err(e) => log.push(format!(
+            "ERROR: instructions: opencode global write failed: {} (continuing without it)",
+            e
+        )),
+    }
+    // Per-session level -> <workdir>/AGENTS.md (managed block, git-excluded; a
+    // tracked AGENTS.md is never touched).
+    let per_target = workdir.join("AGENTS.md");
+    let per_src = per_session_text
+        .as_ref()
+        .map(|(s, _)| s.display().to_string());
+    let per_inner = block_content(render_inner(per_session_text.iter()));
+    let per_set = per_inner.is_some();
+    match inject_entry(workdir, &per_target, &per_inner) {
+        Ok(InjectOutcome::Written) => {
+            written = true;
+            log.push(if per_set {
+                format!(
+                    "instructions: opencode per-session written: {} -> {}",
+                    per_src.as_deref().unwrap_or_default(),
+                    per_target.display()
+                )
+            } else {
+                format!(
+                    "instructions: opencode per-session managed block removed: {}",
+                    per_target.display()
+                )
+            });
+        }
+        Ok(InjectOutcome::Unchanged) => {}
+        Ok(InjectOutcome::Tracked) => {
+            log.push(format!(
+                "ERROR: instructions: per-session AGENTS.md {} is tracked in the repository; not touched",
+                per_target.display()
+            ));
+        }
+        Err(e) => log.push(format!(
+            "ERROR: instructions: opencode per-session write failed: {} (continuing without it)",
+            e
+        )),
+    }
+    written
 }
 
 /// Renders the inner text of the managed block for the given hierarchy levels
@@ -529,32 +618,38 @@ enum InjectOutcome {
     Tracked,
 }
 
-/// Applies the managed block to the workdir `CLAUDE.md`, keeping the git
-/// safety rules (a tracked `CLAUDE.md` is never touched; the injected file is
-/// excluded via `.git/info/exclude`). A non-git `workdir` is written directly.
+/// Applies the managed block to the workdir witness file (the claude
+/// `CLAUDE.md` or the opencode `AGENTS.md`), keeping the git safety rules (a
+/// tracked witness file is never touched; the injected file is excluded via
+/// `.git/info/exclude`). A non-git `workdir` is written directly.
 ///
 /// `inner` is the managed-block content (see [`block_content`]); `None`
 /// removes any existing block. `Err` is returned only for a write failure.
 fn inject_entry(
     workdir: &Path,
     target: &Path,
-    inner: Option<String>,
+    inner: &Option<String>,
 ) -> Result<InjectOutcome, String> {
+    let entry_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "CLAUDE.md".to_string());
     let is_work_tree = git_in_workdir(workdir, &["rev-parse", "--is-inside-work-tree"])?
         .map(|s| s == "true")
         .unwrap_or(false);
     if is_work_tree {
-        // Never touch a tracked CLAUDE.md: when one is tracked the file is
+        // Never touch a tracked witness file: when one is tracked the file is
         // owned by the repository, so neither the block is injected nor
         // removed (the file is left byte-identical).
-        if git_in_workdir(workdir, &["ls-files", "--error-unmatch", "--", "CLAUDE.md"])?.is_some() {
+        if git_in_workdir(workdir, &["ls-files", "--error-unmatch", "--", &entry_name])?.is_some()
+        {
             return Ok(InjectOutcome::Tracked);
         }
         // Only maintain the git-exclude entry when we actually write the
         // block; a removal must not touch the repository's state.
         if inner.is_some() {
             if let Some(exclude) = exclude_file_path(workdir)? {
-                ensure_exclude_entry(&exclude)?;
+                ensure_exclude_entry(&exclude, &entry_name)?;
             }
         }
     }
@@ -600,11 +695,12 @@ fn exclude_file_path(workdir: &Path) -> Result<Option<PathBuf>, String> {
     Ok(Some(resolved))
 }
 
-/// Ensures the line `/CLAUDE.md` is present in the repository's
-/// `info/exclude` file (idempotent, creates parents and the file itself).
-fn ensure_exclude_entry(exclude: &Path) -> Result<(), String> {
+/// Ensures the line `/CLAUDE.md` (or the given witness entry name) is present
+/// in the repository's `info/exclude` file (idempotent, creates parents and
+/// the file itself).
+fn ensure_exclude_entry(exclude: &Path, entry_name: &str) -> Result<(), String> {
     let contents = std::fs::read_to_string(exclude).unwrap_or_default();
-    let has_entry = contents.lines().any(|l| l == "/CLAUDE.md");
+    let has_entry = contents.lines().any(|l| l == format!("/{entry_name}"));
     if has_entry {
         return Ok(());
     }
@@ -622,7 +718,7 @@ fn ensure_exclude_entry(exclude: &Path) -> Result<(), String> {
         .append(true)
         .open(exclude)
         .map_err(|e| format!("failed to open {}: {}", exclude.display(), e))?;
-    file.write_all(format!("{}/CLAUDE.md\n", normalized).as_bytes())
+    file.write_all(format!("{normalized}/{entry_name}\n").as_bytes())
         .map_err(|e| format!("failed to write {}: {}", exclude.display(), e))?;
     Ok(())
 }

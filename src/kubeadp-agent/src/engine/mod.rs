@@ -29,6 +29,10 @@ pub mod run;
 /// and the PTY session adapter over the supervisor machinery.
 pub mod claude;
 
+/// The opencode engine (KA-4): a job driver over the opencode `run` CLI and a
+/// PTY session adapter mirroring the agy live mode.
+pub mod opencode;
+
 mod agnostic;
 
 pub use agnostic::EmptyEngineCtx;
@@ -428,7 +432,7 @@ impl EngineRegistry {
         self.resolve(RunKind::Job, job.engine.as_deref(), None)
     }
 
-    /// Creates an engine registry pre-populated with the builtin engines (agy, claude).
+    /// Creates an engine registry pre-populated with the builtin engines (agy, claude, opencode).
     pub fn with_builtin(config: &crate::core::config::Config) -> Self {
         let mut reg = Self::new();
         reg.register(Arc::new(AgyEngine::new(Arc::new(config.clone()))));
@@ -436,6 +440,9 @@ impl EngineRegistry {
             config.claude_path.clone(),
             None,
         )));
+        reg.register(Arc::new(opencode::OpenCodeEngine::new(Arc::new(
+            config.clone(),
+        ))));
         reg
     }
 
@@ -811,6 +818,7 @@ mod tests {
         let config = crate::core::config::Config {
             agy_path: PathBuf::from("/bin/custom-agy"),
             claude_path: PathBuf::from("/bin/custom-claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
         let agy = AgyEngine::new(std::sync::Arc::new(config.clone()));

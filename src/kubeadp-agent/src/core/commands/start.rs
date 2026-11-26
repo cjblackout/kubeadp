@@ -1069,6 +1069,7 @@ mod tests {
                 state_root: temp_dir.path().join("state"),
                 agy_path: agy,
                 claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+                opencode_path: std::path::PathBuf::from("opencode"),
                 ..Default::default()
             };
 
@@ -1118,6 +1119,7 @@ mod tests {
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -1177,6 +1179,7 @@ mod tests {
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             hindsight_enabled: true,
             hindsight_auto_recall: true,
             hindsight_auto_retain: true,
@@ -1245,6 +1248,7 @@ mod tests {
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             hindsight_enabled: true,
             hindsight_auto_recall: true,
             ..Default::default()
@@ -1369,6 +1373,7 @@ mod tests {
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -1543,6 +1548,7 @@ mod tests {
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -1590,6 +1596,7 @@ mod tests {
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             ..Default::default()
         };
 
@@ -1670,6 +1677,7 @@ mod tests {
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             hindsight_bank: Some("bank-big".to_string()),
             hindsight_path: hindsight,
             hindsight_auto_recall: true,
@@ -1745,6 +1753,7 @@ mod tests {
             state_root: state_root.clone(),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             hindsight_bank: Some("bank-q".to_string()),
             hindsight_path: hindsight,
             hindsight_auto_recall: true,
@@ -1901,6 +1910,7 @@ mod tests {
             state_root: temp_dir.path().join("state"),
             agy_path: agy,
             claude_path: std::path::PathBuf::from("/usr/local/bin/claude"),
+            opencode_path: std::path::PathBuf::from("opencode"),
             hindsight_enabled: false,
             hindsight_auto_recall: true,
             ..Default::default()

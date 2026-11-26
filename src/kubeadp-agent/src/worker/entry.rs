@@ -196,6 +196,13 @@ pub async fn run() -> Result<()> {
             registry.register(std::sync::Arc::new(
                 crate::engine::claude::ClaudeEngine::new(state.claude_path.clone(), None),
             ));
+            // The opencode job engine (KA-4): the same trait surface as the
+            // agy/claude job engines, driven by the engine-aware runner
+            // (`meta.engine == "opencode"`); it reports its capabilities and
+            // resolves via request/config through the registry.
+            registry.register(std::sync::Arc::new(
+                crate::engine::opencode::OpenCodeEngine::new(Arc::clone(&state)),
+            ));
             // The emulation layer drives job-mode control against the real job
             // rows, so the wrappers get the host config (HL-71 S2: the
             // emulated interrupt terminates the job's child process group).

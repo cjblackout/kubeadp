@@ -394,6 +394,7 @@ fn hermetic_config(root: TempDir, engine_name: &str) -> HermeticConfig {
         state_root: state_root.clone(),
         agy_path: fake_agy(root.path()),
         claude_path: fake_claude(root.path()),
+        opencode_path: std::path::PathBuf::from("opencode"),
         sandbox_home: workspace_root.join("sandbox-home"),
         ..Default::default()
     };
