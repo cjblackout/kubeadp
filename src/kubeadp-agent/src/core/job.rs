@@ -611,17 +611,12 @@ pub fn compute_status(meta: &JobMetadata, state_root: &Path) -> JobStatus {
     };
 
     // 3b. Engine-aware classification. The recorded `engine` selects the
-    //     status taxonomy whose stream the log carries: claude runs stream
-    //     NDJSON `{"type":"result",...}` lines (a different shape from agy's
-    //     `{"event":"result",...}` / `status` lines), so the claude job driver
-    //     classifies them with the claude rules. A NULL/absent engine row is
-    //     a historical agy job (agy was the only driver before engine
-    //     selection), so the agy path stays the unconditional default and is
-    //     byte-identical to the pre-E5 behaviour.
-    if meta.engine.as_deref() == Some("claude") {
-        determine_status_from_claude(meta.exit_code, &log_content)
-    } else if meta.engine.as_deref() == Some("opencode") {
-        determine_status_from_opencode(meta.exit_code, &log_content)
+    //     status taxonomy whose stream the log carries, resolved through the
+    //     Engine trait so no engine names are branched on directly.
+    let core_config = crate::core::config::Config::load().unwrap_or_default();
+    let registry = crate::engine::EngineRegistry::with_builtin(&core_config);
+    if let Ok(engine) = registry.for_job(meta) {
+        engine.classify_status(meta.exit_code, &log_content)
     } else {
         determine_status_from_signals(meta.exit_code, &log_content)
     }
