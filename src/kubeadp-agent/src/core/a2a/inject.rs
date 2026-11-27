@@ -12,7 +12,9 @@
 //! `{"decision":"block",...}` (the session continues with the message); agy
 //! `pre-invocation` returns `injectSteps` (or `{}` when empty),
 //! `post-invocation` adds `terminationBehavior: force_continue` (the agy
-//! `idle_turn` channel) and `stop` returns `{"decision":"continue",...}`.
+//! `idle_turn` channel) and `stop` returns `{"decision":"continue",...}`;
+//! opencode `transform` prints the plain joined framed text (the harness
+//! plugin splices it into the outgoing model messages, KA-7).
 //!
 //! User-visible echo (HL-125 3.7): the Claude Code hooks additionally answer
 //! a top-level `systemMessage` -- a short visible line per incoming message
@@ -254,9 +256,9 @@ pub fn hook_json_with_echo(
 
 /// The injection channel a hook event delivers through (the inbox marker's
 /// `channel` field). The mid-turn hooks (PostToolUse, UserPromptSubmit,
-/// agy's PreInvocation) are the `hook` channel; the turn-boundary hooks that
-/// re-enter the loop (Claude Code's Stop, agy's PostInvocation/Stop) are the
-/// `idle_turn` channel.
+/// agy's PreInvocation, opencode's `transform`) are the `hook` channel; the
+/// turn-boundary hooks that re-enter the loop (Claude Code's Stop, agy's
+/// PostInvocation/Stop) are the `idle_turn` channel.
 fn event_channel(event: &str) -> &'static str {
     match event {
         "Stop" | "post-invocation" | "stop" => InjectChannel::IdleTurn.as_str(),
@@ -266,21 +268,36 @@ fn event_channel(event: &str) -> &'static str {
 
 /// Whether an event is an agy native plugin hook: agy expects a JSON object
 /// on stdout for every invocation, so an empty inbox prints `{}` (which
-/// injects nothing) instead of no output.
+/// injects nothing) instead of no output. The opencode `transform` event
+/// behaves the same way: the plugin reads stdout and expects a parseable
+/// token (`{}` for empty) so it never mistakes "no output" for a failure.
 fn is_agy_event(event: &str) -> bool {
-    matches!(event, "pre-invocation" | "post-invocation" | "stop")
+    matches!(
+        event,
+        "pre-invocation" | "post-invocation" | "stop" | "transform"
+    )
+}
+
+/// Whether an event prints the plain joined framed text (opencode's
+/// `transform`) instead of a hook JSON object. The opencode plugin splices
+/// the text directly into the model messages.
+fn is_opencode_transform(event: &str) -> bool {
+    matches!(event, "transform")
 }
 
 /// The `kubeadp-agent a2a-hook <PostToolUse|UserPromptSubmit|Stop|
-/// pre-invocation|post-invocation|stop>` subcommand (the `hook` channel,
-/// design HL-113 §7.14): reads the run's inbox directory (named by
+/// pre-invocation|post-invocation|stop|transform>` subcommand (the `hook`
+/// channel, design HL-113 §7.14): reads the run's inbox directory (named by
 /// `KUBEADP_A2A_INBOX_DIR`), marks the queued messages injected through the
 /// event's channel and prints the hook JSON to stdout.
 ///
 /// Claude Code events print nothing and exit 0 on an empty inbox (a hook
 /// that prints nothing injects nothing). The agy native plugin events print
 /// `{}` on an empty inbox (agy parses the stdout of every invocation; `{}`
-/// injects nothing).
+/// injects nothing). The opencode `transform` event prints the JOINED FRAMED
+/// TEXT on stdout (opencode's `experimental.chat.messages.transform` plugin
+/// reads it and appends it to the model messages; `{}` when empty), never a
+/// hook JSON.
 ///
 /// Every failure (usage error, an unreachable/stuck inbox, a failed write)
 /// is NON-blocking: the clear reason goes to stderr and the hook exits `1`,
@@ -292,13 +309,13 @@ fn is_agy_event(event: &str) -> bool {
 pub fn run_a2a_hook(args: &[String]) -> i32 {
     let Some(event) = args.first() else {
         eprintln!(
-            "usage: kubeadp-agent a2a-hook <PostToolUse|UserPromptSubmit|Stop|pre-invocation|post-invocation|stop>"
+            "usage: kubeadp-agent a2a-hook <PostToolUse|UserPromptSubmit|Stop|pre-invocation|post-invocation|stop|transform>"
         );
         return 1;
     };
     if args.len() > 1 {
         eprintln!(
-            "usage: kubeadp-agent a2a-hook <PostToolUse|UserPromptSubmit|Stop|pre-invocation|post-invocation|stop>"
+            "usage: kubeadp-agent a2a-hook <PostToolUse|UserPromptSubmit|Stop|pre-invocation|post-invocation|stop|transform>"
         );
         return 1;
     }
@@ -306,10 +323,16 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
     // usage error even when nothing is queued.
     if !matches!(
         event.as_str(),
-        "PostToolUse" | "UserPromptSubmit" | "Stop" | "pre-invocation" | "post-invocation" | "stop"
+        "PostToolUse"
+            | "UserPromptSubmit"
+            | "Stop"
+            | "pre-invocation"
+            | "post-invocation"
+            | "stop"
+            | "transform"
     ) {
         eprintln!(
-            "kubeadp-agent (a2a-hook): unknown event '{event}' (expected PostToolUse, UserPromptSubmit, Stop, pre-invocation, post-invocation or stop)"
+            "kubeadp-agent (a2a-hook): unknown event '{event}' (expected PostToolUse, UserPromptSubmit, Stop, pre-invocation, post-invocation, stop or transform)"
         );
         return 1;
     }
@@ -323,8 +346,8 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
     }
     let Some(receive) = crate::core::a2a::receive::ReceiveInbox::from_env() else {
         // No inbox for this run (KUBEADP_A2A_INBOX_DIR unset): nothing to
-        // inject. The agy events still print `{}` (agy parses the stdout of
-        // every hook invocation).
+        // inject. The agy/opencode events still print `{}` (agy parses the
+        // stdout of every hook invocation; the opencode plugin reads a token).
         return if is_agy_event(event) {
             print_agy_empty()
         } else {
@@ -357,7 +380,8 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
         };
     }
     let framed = join_framed(&messages);
-    match hook_output(event, &framed, &messages) {
+    let output = hook_stdout_payload(event, &framed, &messages);
+    match output {
         Ok(json) => {
             let mut out = std::io::stdout();
             match (writeln!(out, "{json}"), out.flush()) {
@@ -412,6 +436,24 @@ pub fn run_a2a_hook(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// The stdio payload for one hook event and the joined framed messages.
+///
+/// - opencode `transform` prints the plain joined framed text (the plugin
+///   splices it into the model messages); `{}` when nothing is queued (the
+///   plugin reads a token). No echo: opencode has no transcript the harness
+///   reaches.
+/// - every other event delegates to [`hook_output`] (the Claude/agy JSON).
+fn hook_stdout_payload(
+    event: &str,
+    framed: &str,
+    messages: &[QueuedMessage],
+) -> Result<String, String> {
+    if is_opencode_transform(event) {
+        return Ok(framed.to_string());
+    }
+    hook_output(event, framed, messages).map(|v| v.to_string())
 }
 
 /// The hook JSON for `event`/`framed` with the user-visible echo included:
@@ -703,20 +745,72 @@ mod tests {
     #[test]
     fn run_a2a_hook_marks_injected_through_the_events_channel() {
         // The mid-turn hooks (PostToolUse, UserPromptSubmit, agy's
-        // pre-invocation) inject through the `hook` channel; the
-        // turn-boundary hooks that re-enter the loop (Claude's Stop, agy's
-        // post-invocation/stop) inject through the `idle_turn` channel.
+        // pre-invocation, opencode's transform) inject through the `hook`
+        // channel; the turn-boundary hooks that re-enter the loop (Claude's
+        // Stop, agy's post-invocation/stop) inject through the `idle_turn`
+        // channel.
         assert_eq!(event_channel("PostToolUse"), "hook");
         assert_eq!(event_channel("UserPromptSubmit"), "hook");
         assert_eq!(event_channel("pre-invocation"), "hook");
+        assert_eq!(event_channel("transform"), "hook");
         assert_eq!(event_channel("Stop"), "idle_turn");
         assert_eq!(event_channel("post-invocation"), "idle_turn");
         assert_eq!(event_channel("stop"), "idle_turn");
         assert!(!is_agy_event("Stop"));
         assert!(!is_agy_event("PostToolUse"));
-        for event in ["pre-invocation", "post-invocation", "stop"] {
+        for event in ["pre-invocation", "post-invocation", "stop", "transform"] {
             assert!(is_agy_event(event), "{event}");
         }
+        assert!(is_opencode_transform("transform"));
+        assert!(!is_opencode_transform("pre-invocation"));
+    }
+
+    #[test]
+    fn run_a2a_hook_transform_prints_plain_framed_text() {
+        let tmp = tempdir().unwrap();
+        let inbox = Inbox::new(tmp.path());
+        inbox.enqueue(msg("t1", "hello transform")).unwrap();
+
+        // The transform event prints the joined framed text (not a JSON hook
+        // object) and marks the messages injected through the `hook` channel.
+        let code = crate::core::a2a::testenv::with_env(
+            &[(
+                crate::core::a2a::inbox::INBOX_ENV,
+                Some(tmp.path().to_str().unwrap()),
+            )],
+            || run_a2a_hook(&["transform".to_string()]),
+        );
+        assert_eq!(code, 0);
+        assert!(inbox.injected("t1"));
+        assert!(inbox.pending().is_empty());
+
+        // On an empty inbox the transform event prints `{}` (the plugin
+        // expects a parseable token), like the agy events.
+        let code = crate::core::a2a::testenv::with_env(
+            &[(
+                crate::core::a2a::inbox::INBOX_ENV,
+                Some(tmp.path().to_str().unwrap()),
+            )],
+            || run_a2a_hook(&["transform".to_string()]),
+        );
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn transform_stdout_payload_is_plain_text() {
+        // Unlike the Claude/agy events (hook JSON), the opencode transform
+        // event delegates to the plain framed text with no echo wrapper.
+        let m = msg("m1", "the message");
+        let payload = hook_stdout_payload("transform", "FRAMED", std::slice::from_ref(&m))
+            .expect("transform payload");
+        assert_eq!(payload, "FRAMED");
+        // Non-transform events still produce the JSON hook output.
+        let payload = hook_stdout_payload("PostToolUse", "FRAMED", std::slice::from_ref(&m))
+            .expect("PostToolUse payload");
+        assert!(
+            payload.contains("\"hookSpecificOutput\""),
+            "PostToolUse keeps the JSON hook format: {payload}"
+        );
     }
 
     /// An UNREACHABLE pod-local inbox must make EVERY hook event fail closed
@@ -755,6 +849,7 @@ mod tests {
             "pre-invocation",
             "post-invocation",
             "stop",
+            "transform",
         ] {
             // Each event fails closed, non-blocking (exit 1).
             let code = testenv::with_env(pairs, || run_a2a_hook(&[event.to_string()]));

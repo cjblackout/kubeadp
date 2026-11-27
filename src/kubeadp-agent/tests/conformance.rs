@@ -1386,8 +1386,8 @@ async fn capabilities_match_documented_tables() {
     // opencode mirrors the agy job surface (the engine-aware runner provides
     // the same start/status/retry/events lifecycle over the JSON-event log,
     // `workspace.*` is engine-independent, and `a2a.send_message` is emulated
-    // -- queued, no live PTY). Injection is the floor of the ladder
-    // (`idle_turn` only), still reported as a native channel.
+    // -- queued, no live PTY). Injection supports hook, tool_result, and
+    // idle_turn, reported as a native channel.
     let opencode_doc: Vec<(&str, &str)> = vec![
         ("job.start", "native"),
         ("job.status", "native"),

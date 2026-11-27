@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use super::{agy_home, agy_plugin, server, supervisor};
+use super::{agy_home, agy_plugin, opencode_config, server, supervisor};
 use crate::core::auth::AuthManager;
 use crate::core::config::Config;
 use crate::core::runner::mark_child_subreaper;
@@ -54,6 +54,21 @@ pub async fn run() -> Result<()> {
             agy_plugin::plugin_dir_for(&config.state_root).display()
         ),
         Err(e) => eprintln!("agent-run-api: warning: a2a agy plugin install: {e}"),
+    }
+
+    // The A2A injection channels for opencode (KA-7): write the harness opencode
+    // plugin (the `hook` channel) and merge the `mcp.a2a` local server (the
+    // `tool_result` channel) into the opencode global config. opencode loads
+    // both from its config at startup, so a single per-pod write covers every
+    // run. Best effort, never fatal (the `tool_result` channel still delivers
+    // through `mcp-a2a` even when the plugin write fails).
+    if let Err(e) = opencode_config::prepare_opencode_home(&home) {
+        eprintln!("agent-run-api: warning: opencode A2A setup: {e}");
+    } else {
+        eprintln!(
+            "agent-run-api: opencode A2A plugin+config written ({}), hook/tool_result channels armed",
+            opencode_config::config_dir_for(&home).display()
+        );
     }
 
     // Process-wide orphan-reparenting target for agy's own `cmd &` children

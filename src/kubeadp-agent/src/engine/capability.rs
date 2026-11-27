@@ -71,25 +71,22 @@ impl InjectChannel {
 /// engines support `hook`, `tool_result` and `idle_turn` (the parity
 /// requirement: the agy hook channel is a native agy plugin `PreInvocation`
 /// hook, verified live; the Claude Code hook channel is the
-/// PostToolUse/UserPromptSubmit/Stop hooks). `Interrupt` is not listed: it is
-/// the explicit last resort every engine already reaches through the existing
-/// kill-and-resume, never an advertised channel. Unknown engines answer empty
-/// (no injection).
+/// PostToolUse/UserPromptSubmit/Stop hooks; the opencode hook channel is the
+/// harness's `experimental.chat.messages.transform` plugin, KA-7, which
+/// splices the queued framed text into the outgoing model messages). Unknown
+/// engines answer empty (no injection).
 ///
-/// opencode is the floor of the ladder: it has no hook mechanism and no
-/// harness-owned `mcp-a2a` server, so it advertises only `idle_turn` (a queued
-/// message starts the run's next turn with the message as the follow-up
-/// prompt).
+/// `Interrupt` is not listed: it is the explicit last resort every engine
+/// already reaches through the existing kill-and-resume, never an advertised
+/// channel.
 pub fn inject_channels(engine: &str) -> &'static [InjectChannel] {
     const CHANNELS: &[InjectChannel] = &[
         InjectChannel::Hook,
         InjectChannel::ToolResult,
         InjectChannel::IdleTurn,
     ];
-    const IDLE_ONLY: &[InjectChannel] = &[InjectChannel::IdleTurn];
     match engine {
-        "claude" | "agy" => CHANNELS,
-        "opencode" => IDLE_ONLY,
+        "claude" | "agy" | "opencode" => CHANNELS,
         _ => &[],
     }
 }
@@ -406,11 +403,12 @@ mod tests {
 
     #[test]
     fn inject_channels_are_declared_per_engine() {
-        // The design parity: both engines support hook + tool_result +
+        // The design parity: every engine supports hook + tool_result +
         // idle_turn (the agy hook channel is the verified native agy plugin
-        // PreInvocation hook). Interrupt is the last resort, never an
-        // advertised channel.
-        for engine in ["claude", "agy"] {
+        // PreInvocation hook; the opencode hook channel is the harness's
+        // messages.transform plugin, KA-7). Interrupt is the last resort,
+        // never an advertised channel.
+        for engine in ["claude", "agy", "opencode"] {
             assert_eq!(
                 inject_channels(engine),
                 &[
@@ -421,15 +419,6 @@ mod tests {
                 "{engine} channels"
             );
         }
-        // opencode is the floor of the injection ladder (KA-4): it has no
-        // hook mechanism and no harness-owned mcp-a2a until a future change,
-        // so it advertises only `idle_turn` (a queued message starts the
-        // run's next turn).
-        assert_eq!(
-            inject_channels("opencode"),
-            &[InjectChannel::IdleTurn],
-            "opencode channels"
-        );
         assert!(inject_channels("other").is_empty());
         // The stable channel names serialize snake_case.
         assert_eq!(InjectChannel::ToolResult.as_str(), "tool_result");

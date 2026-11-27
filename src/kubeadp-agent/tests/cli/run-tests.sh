@@ -5044,6 +5044,9 @@ t_t181() {
   local agy_joblist agy_jobkill agy_jobresult agy_ws claude_interrupt claude_fork
   local claude_pause claude_message claude_compact claude_revert claude_todo
   local agy_pause agy_fork agy_compact agy_revert agy_todo
+  local opencode_joblist opencode_jobkill opencode_jobresult opencode_ws
+  local opencode_interrupt opencode_fork opencode_pause opencode_message
+  local opencode_compact opencode_revert opencode_todo
   body=$(curl -s --max-time 10 "http://127.0.0.1:$PORT/api/v1/capabilities")
   if [ -z "$body" ] || ! printf '%s' "$body" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
     rec T181 FAIL "capabilities endpoint returned no/invalid JSON: $body"
@@ -5054,7 +5057,10 @@ t_t181() {
         agy_pause agy_fork agy_compact agy_revert agy_todo \
         claude_joblist claude_jobkill claude_jobresult claude_ws \
         claude_interrupt claude_fork claude_pause claude_message \
-        claude_compact claude_revert claude_todo <<EOF
+        claude_compact claude_revert claude_todo \
+        opencode_joblist opencode_jobkill opencode_jobresult opencode_ws \
+        opencode_interrupt opencode_fork opencode_pause opencode_message \
+        opencode_compact opencode_revert opencode_todo <<EOF
 $(printf '%s' "$body" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -5067,7 +5073,8 @@ def row(eng, keys):
     return " ".join(cap(eng, k) for k in keys)
 agy = row("agy", ["job.list","job.kill","job.result","workspace.*","pause","fork","compact","revert","todo"])
 claude = row("claude", ["job.list","job.kill","job.result","workspace.*","interrupt","fork","pause","a2a.send_message","compact","revert","todo"])
-print(agy, claude)
+opencode = row("opencode", ["job.list","job.kill","job.result","workspace.*","interrupt","fork","pause","a2a.send_message","compact","revert","todo"])
+print(agy, claude, opencode)
 ')
 EOF
   if [ "$agy_joblist" != "native" ] || [ "$agy_jobkill" != "native" ] \
@@ -5080,8 +5087,13 @@ EOF
     rec T181 FAIL "claude capability table does not declare all proven job endpoints native (list=$claude_joblist kill=$claude_jobkill result=$claude_jobresult ws=$claude_ws): $body"
     return
   fi
-  # HL-71 S2: every control endpoint the emulation layer fronts is declared
-  # emulated for both engines -- never unsupported (owner rule: no endpoint
+  if [ "$opencode_joblist" != "native" ] || [ "$opencode_jobkill" != "native" ] \
+     || [ "$opencode_jobresult" != "native" ] || [ "$opencode_ws" != "native" ]; then
+    rec T181 FAIL "opencode capability table does not declare all proven job endpoints native (list=$opencode_joblist kill=$opencode_jobkill result=$opencode_jobresult ws=$opencode_ws): $body"
+    return
+  fi
+  # HL-71 S2 / KA-7: every control endpoint the emulation layer fronts is declared
+  # emulated for all engines -- never unsupported (owner rule: no endpoint
   # answers 501 because of the engine).
   if [ "$claude_interrupt" != "emulated" ] || [ "$claude_fork" != "emulated" ] \
      || [ "$claude_pause" != "emulated" ] || [ "$claude_message" != "emulated" ] \
@@ -5096,7 +5108,14 @@ EOF
     rec T181 FAIL "agy capability table must declare the emulated job control endpoints emulated (pause=$agy_pause fork=$agy_fork compact=$agy_compact revert=$agy_revert todo=$agy_todo): $body"
     return
   fi
-  rec T181 PASS "capabilities: agy and claude both declare job.list/kill/result/workspace.* native; every emulated job-control endpoint (interrupt/pause/message/fork/compact/revert/todo) declared emulated for both"
+  if [ "$opencode_interrupt" != "emulated" ] || [ "$opencode_fork" != "emulated" ] \
+     || [ "$opencode_pause" != "emulated" ] || [ "$opencode_message" != "emulated" ] \
+     || [ "$opencode_compact" != "emulated" ] || [ "$opencode_revert" != "emulated" ] \
+     || [ "$opencode_todo" != "emulated" ]; then
+    rec T181 FAIL "opencode capability table must declare the emulated job control endpoints emulated (interrupt=$opencode_interrupt fork=$opencode_fork pause=$opencode_pause message=$opencode_message compact=$opencode_compact revert=$opencode_revert todo=$opencode_todo): $body"
+    return
+  fi
+  rec T181 PASS "capabilities: agy, claude, and opencode declare job.list/kill/result/workspace.* native; every emulated job-control endpoint (interrupt/pause/message/fork/compact/revert/todo) declared emulated for all"
 }
 
 # ---- T182+ : emulated job-control surface (HL-71 S2) --------------------------
@@ -5794,13 +5813,15 @@ t_t189() {
 t_t190() {
   local body agy_ws agy_todo agy_perm agy_msg agy_inject agy_ss agy_st agy_sr agy_sl agy_sm
   local claude_ws claude_todo claude_perm claude_msg claude_inject claude_ss claude_st claude_sr claude_sl claude_sm
+  local opencode_ws opencode_todo opencode_perm opencode_msg opencode_inject opencode_ss opencode_st opencode_sr opencode_sl opencode_sm
   body=$(curl -s --max-time 10 "http://127.0.0.1:$PORT/api/v1/capabilities")
   if [ -z "$body" ] || ! printf '%s' "$body" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
     rec T190 FAIL "capabilities endpoint returned no/invalid JSON: $body"
     return
   fi
   read -r agy_ws agy_todo agy_perm agy_msg agy_inject agy_ss agy_st agy_sr agy_sl agy_sm \
-        claude_ws claude_todo claude_perm claude_msg claude_inject claude_ss claude_st claude_sr claude_sl claude_sm <<EOF
+        claude_ws claude_todo claude_perm claude_msg claude_inject claude_ss claude_st claude_sr claude_sl claude_sm \
+        opencode_ws opencode_todo opencode_perm opencode_msg opencode_inject opencode_ss opencode_st opencode_sr opencode_sl opencode_sm <<EOF
 $(printf '%s' "$body" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -5810,7 +5831,7 @@ def cap(eng, key):
     if not t: return "NONE"
     return t.get("endpoints", {}).get(key, "NONE")
 keys = ["workspace.*","todo","permissions","a2a.send_message","a2a.inject","session.start","session.stop","session.restart","session.log","session.message"]
-print(" ".join(row for eng in ("agy","claude") for key in keys for row in [cap(eng, key)]))
+print(" ".join(row for eng in ("agy","claude","opencode") for key in keys for row in [cap(eng, key)]))
 ')
 EOF
   # Complete endpoint presence: every one of the 22 static keys must be in
@@ -5834,26 +5855,26 @@ print(" ".join(bad))
     return
   fi
   # Exact labels for the no-route / control surfaces not covered by T181.
-  if [ "$agy_ws" != "native" ] || [ "$claude_ws" != "native" ]; then
-    rec T190 FAIL "workspace.* must be native for both (agy=$agy_ws claude=$claude_ws)"
+  if [ "$agy_ws" != "native" ] || [ "$claude_ws" != "native" ] || [ "$opencode_ws" != "native" ]; then
+    rec T190 FAIL "workspace.* must be native for all (agy=$agy_ws claude=$claude_ws opencode=$opencode_ws)"
     return
   fi
-  if [ "$agy_todo" != "emulated" ] || [ "$claude_todo" != "emulated" ]; then
-    rec T190 FAIL "todo must be emulated for both (agy=$agy_todo claude=$claude_todo)"
+  if [ "$agy_todo" != "emulated" ] || [ "$claude_todo" != "emulated" ] || [ "$opencode_todo" != "emulated" ]; then
+    rec T190 FAIL "todo must be emulated for all (agy=$agy_todo claude=$claude_todo opencode=$opencode_todo)"
     return
   fi
-  if [ "$agy_msg" != "emulated" ] || [ "$claude_msg" != "emulated" ]; then
-    rec T190 FAIL "a2a.send_message must be emulated for the job surface (agy=$agy_msg claude=$claude_msg)"
+  if [ "$agy_msg" != "emulated" ] || [ "$claude_msg" != "emulated" ] || [ "$opencode_msg" != "emulated" ]; then
+    rec T190 FAIL "a2a.send_message must be emulated for the job surface (agy=$agy_msg claude=$claude_msg opencode=$opencode_msg)"
     return
   fi
-  # a2a.inject is native for both (the harness puts queued A2A messages into
+  # a2a.inject is native for all (the harness puts queued A2A messages into
   # the model context; design HL-113 §7.14).
-  if [ "$agy_inject" != "native" ] || [ "$claude_inject" != "native" ]; then
-    rec T190 FAIL "a2a.inject must be native for both (agy=$agy_inject claude=$claude_inject)"
+  if [ "$agy_inject" != "native" ] || [ "$claude_inject" != "native" ] || [ "$opencode_inject" != "native" ]; then
+    rec T190 FAIL "a2a.inject must be native for all (agy=$agy_inject claude=$claude_inject opencode=$opencode_inject)"
     return
   fi
-  # claude drives sessions natively (PTY adapter); agy has no session mode,
-  # so its session.* keys report emulated (the E4 session surface).
+  # claude drives sessions natively (PTY adapter); agy and opencode have no native
+  # supervisor PTY adapter wired inside the engine, so their session.* keys report emulated (the E4 session surface).
   if [ "$claude_ss" != "native" ] || [ "$claude_st" != "native" ] \
      || [ "$claude_sr" != "native" ] || [ "$claude_sl" != "native" ] \
      || [ "$claude_sm" != "native" ]; then
@@ -5866,13 +5887,19 @@ print(" ".join(bad))
     rec T190 FAIL "agy session.* must be emulated (start=$agy_ss stop=$agy_st restart=$agy_sr log=$agy_sl message=$agy_sm)"
     return
   fi
-  # permissions: unsupported-by-design (headless auto-approve) for both --
-  # never a 501.
-  if [ "$agy_perm" != "unsupported" ] || [ "$claude_perm" != "unsupported" ]; then
-    rec T190 FAIL "permissions must be unsupported for both (agy=$agy_perm claude=$claude_perm)"
+  if [ "$opencode_ss" != "emulated" ] || [ "$opencode_st" != "emulated" ] \
+     || [ "$opencode_sr" != "emulated" ] || [ "$opencode_sl" != "emulated" ] \
+     || [ "$opencode_sm" != "emulated" ]; then
+    rec T190 FAIL "opencode session.* must be emulated (start=$opencode_ss stop=$opencode_st restart=$opencode_sr log=$opencode_sl message=$opencode_sm)"
     return
   fi
-  rec T190 PASS "capabilities: both engines report the full 22-key table; workspace.*/a2a.inject native, todo/a2a.send_message emulated, claude session.* native, agy session.* emulated, permissions unsupported"
+  # permissions: unsupported-by-design (headless auto-approve) for all --
+  # never a 501.
+  if [ "$agy_perm" != "unsupported" ] || [ "$claude_perm" != "unsupported" ] || [ "$opencode_perm" != "unsupported" ]; then
+    rec T190 FAIL "permissions must be unsupported for all (agy=$agy_perm claude=$claude_perm opencode=$opencode_perm)"
+    return
+  fi
+  rec T190 PASS "capabilities: all three engines report the full 22-key table; workspace.*/a2a.inject native, todo/a2a.send_message emulated, claude session.* native, agy/opencode session.* emulated, permissions unsupported"
 }
 
 # T191: an EXPLICIT `--engine agy` selects the agy driver and the row carries

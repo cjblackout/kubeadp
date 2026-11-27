@@ -905,6 +905,7 @@ some non-json noise line
         use crate::engine::capability::CapEndpointKey;
         use crate::engine::capability::Capability;
         use crate::engine::claude::ClaudeEngine;
+        use crate::engine::opencode::OpenCodeEngine;
 
         let config = Arc::new(Config::default());
         let mut registry = AgyEngine::build_registry(Arc::clone(&config));
@@ -912,11 +913,13 @@ some non-json noise line
             std::path::PathBuf::from("claude"),
             None,
         )));
+        registry.register(Arc::new(OpenCodeEngine::new(Arc::clone(&config))));
         registry.attach_config(Arc::clone(&config));
         registry.enable_all_emulated();
 
-        // Job lifecycle endpoints stay native for both (parity with the
-        // black-box suite's T172-T180 proof for claude and T02-T46 for agy).
+        // Job lifecycle endpoints stay native for all engines (parity with the
+        // black-box suite's T172-T180 proof for claude, T02-T46 for agy, and
+        // opencode job lifecycle).
         for key in [
             "job.start",
             "job.status",
@@ -935,9 +938,17 @@ some non-json noise line
                 .emulating("claude")
                 .expect("claude wrapper")
                 .capability(key);
+            let opencode_cap = registry
+                .emulating("opencode")
+                .expect("opencode wrapper")
+                .capability(key);
             assert_eq!(
                 agy_cap, claude_cap,
                 "parity: agy and claude must both report the same effective capability for '{key}' (agy={agy_cap:?} claude={claude_cap:?})"
+            );
+            assert_eq!(
+                agy_cap, opencode_cap,
+                "parity: agy and opencode must both report the same effective capability for '{key}' (agy={agy_cap:?} opencode={opencode_cap:?})"
             );
             assert_eq!(
                 agy_cap,
@@ -947,7 +958,7 @@ some non-json noise line
         }
 
         // The emulated job-control surface: identical, non-unsupported
-        // declarations for both engines.
+        // declarations for all engines.
         let control_keys: &[CapEndpointKey] = &[
             "interrupt",
             "pause",
@@ -966,9 +977,17 @@ some non-json noise line
                 .emulating("claude")
                 .expect("claude wrapper")
                 .capability(key);
+            let opencode_cap = registry
+                .emulating("opencode")
+                .expect("opencode wrapper")
+                .capability(key);
             assert_eq!(
                 agy_cap, claude_cap,
                 "parity: agy and claude must declare '{key}' identically (agy={agy_cap:?} claude={claude_cap:?})"
+            );
+            assert_eq!(
+                agy_cap, opencode_cap,
+                "parity: agy and opencode must declare '{key}' identically (agy={agy_cap:?} opencode={opencode_cap:?})"
             );
             assert_ne!(
                 agy_cap,
@@ -979,6 +998,11 @@ some non-json noise line
                 claude_cap,
                 Capability::Unsupported,
                 "owner rule: job-control endpoint '{key}' must never be unsupported for claude"
+            );
+            assert_ne!(
+                opencode_cap,
+                Capability::Unsupported,
+                "owner rule: job-control endpoint '{key}' must never be unsupported for opencode"
             );
         }
     }

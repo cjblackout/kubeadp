@@ -10,10 +10,11 @@
 //!
 //! The `a2a-hook` subcommand (first argument, feature `a2a`) is the hook
 //! entry of the A2A injection framework (design HL-113 §7.14):
-//! `a2a-hook <PostToolUse|UserPromptSubmit|Stop|pre-invocation|post-invocation|stop>`
+//! `a2a-hook <PostToolUse|UserPromptSubmit|Stop|pre-invocation|post-invocation|stop|transform>`
 //! reads the run's durable A2A inbox (`KUBEADP_A2A_INBOX_DIR`), marks the
 //! queued messages injected and prints the hook JSON that puts them into the
-//! model's context.
+//! model's context (the opencode `transform` event prints the joined framed
+//! text instead).
 //!
 //! The `repo-sync` subcommand (first argument) runs the internal git-sync
 //! replacement ([`kubeadp_agent::core::reposync`]) for all configured
