@@ -40,8 +40,8 @@ func NewTaskSessionHandler(c client.Client, clusterDomain string) *TaskSessionHa
 
 // resolveTaskSessionURL looks up a Task, finds its session info and Agent server URL,
 // and returns the base session URL on the Agent's OpenCode server.
-// Unlike resolveAgentServerURL, this skips the suspended check because session data
-// is read-only and should be accessible even when the Agent is in standby.
+// This skips the suspended check because session data is read-only and should be
+// accessible even when the Agent is in standby.
 func (h *TaskSessionHandler) resolveTaskSessionURL(ctx context.Context, namespace, taskName string) (string, string, string, error) {
 	k8sClient := clientFromContext(ctx, h.defaultClient)
 
@@ -57,9 +57,9 @@ func (h *TaskSessionHandler) resolveTaskSessionURL(ctx context.Context, namespac
 	}
 
 	// Get the Agent's server URL directly from Agent status.
-	// We intentionally skip the suspended check (unlike resolveAgentServerURL)
-	// because session data is immutable/read-only — users should be able to
-	// view conversation history even when the Agent is suspended or in standby.
+	// We intentionally skip the suspended check because session data is
+	// immutable/read-only — users should be able to view conversation history
+	// even when the Agent is suspended or in standby.
 	if task.Status.AgentRef == nil {
 		return "", "", "", fmt.Errorf("task %q has no agent reference", taskName)
 	}

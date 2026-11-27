@@ -3,6 +3,7 @@
 package handlers
 
 import (
+	"net/http"
 	"testing"
 )
 
@@ -107,4 +108,33 @@ func TestValidateServerURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSetUpstreamAuth(t *testing.T) {
+	t.Run("caller credentials are replaced by the worker token", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Authorization", "Bearer browser-session-token")
+		setUpstreamAuth(h, "worker-token\n")
+		if got := h.Get("Authorization"); got != "Bearer worker-token" {
+			t.Errorf("Authorization = %q, want Bearer worker-token (trimmed)", got)
+		}
+		if vals := h.Values("Authorization"); len(vals) != 1 {
+			t.Errorf("exactly one Authorization header expected, got %v", vals)
+		}
+	})
+	t.Run("without a worker token the caller credentials are still dropped", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Authorization", "Bearer browser-session-token")
+		setUpstreamAuth(h, "")
+		if got := h.Get("Authorization"); got != "" {
+			t.Errorf("caller credentials must not reach the worker, got %q", got)
+		}
+	})
+	t.Run("blank token counts as no token", func(t *testing.T) {
+		h := http.Header{}
+		setUpstreamAuth(h, "  \n")
+		if got := h.Get("Authorization"); got != "" {
+			t.Errorf("Authorization = %q, want empty", got)
+		}
+	})
 }

@@ -85,7 +85,7 @@ spec:
 ```
 
 ```bash
-# Attach to a live agent from your terminal
+# Open a shell in the agent's server pod from your terminal
 kubeoc agent attach default -n kubeopencode-system
 ```
 
@@ -99,7 +99,7 @@ For full documentation — including getting started, architecture, features, se
 go install github.com/kubeopencode/kubeopencode/cmd/kubeoc@latest
 
 kubeoc get agents                                    # List agents
-kubeoc agent attach my-agent -n kubeopencode-system  # Attach to an agent
+kubeoc agent attach my-agent -n kubeopencode-system  # Open a shell in the agent's server pod
 ```
 
 ### Community

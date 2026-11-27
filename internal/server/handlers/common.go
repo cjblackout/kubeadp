@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/go-chi/chi/v5"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -53,29 +52,6 @@ func clientsetFromContext(ctx context.Context, defaultClientset kubernetes.Inter
 	return defaultClientset
 }
 
-// resolveAgentServerURL looks up the Agent CR and returns its in-cluster server URL.
-func resolveAgentServerURL(ctx context.Context, k8sClient client.Client, namespace, agentName, clusterDomain string) (string, error) {
-	var agent kubeopenv1alpha1.Agent
-	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: agentName}, &agent); err != nil {
-		return "", fmt.Errorf("agent not found: %w", err)
-	}
-
-	if agent.Status.Suspended {
-		return "", fmt.Errorf("agent %q is suspended", agentName)
-	}
-
-	if agent.Status.URL == "" {
-		return "", fmt.Errorf("agent %q is not ready (no URL in status)", agentName)
-	}
-
-	serverURL := agent.Status.URL
-	if err := validateServerURL(serverURL, clusterDomain); err != nil {
-		return "", fmt.Errorf("agent %q has invalid server URL: %w", agentName, err)
-	}
-
-	return serverURL, nil
-}
-
 // validateServerURL ensures the URL points to an in-cluster Kubernetes service.
 // This prevents SSRF if the Agent status is tampered with (e.g., via direct
 // status patch or a compromised controller).
@@ -95,18 +71,6 @@ func validateServerURL(rawURL string, clusterDomain string) error {
 		return fmt.Errorf("URL must not contain userinfo")
 	}
 	return nil
-}
-
-// normalizeProxyPath extracts and normalizes the wildcard path suffix from a chi route.
-func normalizeProxyPath(r *http.Request) string {
-	path := chi.URLParam(r, "*")
-	if path == "" {
-		return "/"
-	}
-	if path[0] != '/' {
-		return "/" + path
-	}
-	return path
 }
 
 // writeResourceOutput writes a Kubernetes resource as JSON or YAML depending on the output query parameter

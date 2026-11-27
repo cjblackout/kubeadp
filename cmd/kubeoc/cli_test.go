@@ -286,16 +286,6 @@ func TestCountReferencingAgents(t *testing.T) {
 	}
 }
 
-func TestIsPortAvailable(t *testing.T) {
-	// Port 0 should always be available (OS assigns ephemeral port)
-	// We can't reliably test specific ports, but we can test the function doesn't panic
-	// Port 1 is typically privileged and unavailable on non-root
-	if isPortAvailable(1) {
-		// On some CI systems, this might actually be true, so just log
-		t.Log("port 1 is available (running as root?)")
-	}
-}
-
 func TestVersionCmd(t *testing.T) {
 	cmd := newVersionCmd()
 	if cmd.Use != "version" {

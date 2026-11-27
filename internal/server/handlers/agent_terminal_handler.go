@@ -23,7 +23,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	kubeopenv1alpha1 "github.com/kubeopencode/kubeopencode/api/v1alpha1"
 	"github.com/kubeopencode/kubeopencode/internal/controller"
 	authmiddleware "github.com/kubeopencode/kubeopencode/internal/server/middleware"
 )
@@ -97,7 +96,7 @@ func (q *terminalSizeQueue) Next() *remotecommand.TerminalSize {
 }
 
 // ServeTerminal upgrades the HTTP connection to WebSocket and bridges it to
-// a pod exec session running "opencode attach" in the agent's server pod.
+// a pod exec session running an interactive shell in the agent's server pod.
 //
 // Includes automatic retry for transient exec failures (e.g., exit code 137)
 // that occur when the agent's server is not yet fully initialized after resume.
@@ -108,12 +107,14 @@ func (h *AgentTerminalHandler) ServeTerminal(w http.ResponseWriter, r *http.Requ
 	k8sClient := clientFromContext(r.Context(), h.defaultClient)
 
 	// Resolve the agent's server pod
-	podName, containerName, _, err := resolveAgentServerPod(r.Context(), k8sClient, namespace, agentName)
+	ref, err := controller.ResolveAgentServerPod(r.Context(), k8sClient, namespace, agentName)
 	if err != nil {
 		termLog.Error(err, "failed to resolve agent server pod", "agent", agentName, "namespace", namespace)
 		writeError(w, http.StatusBadRequest, "Cannot resolve agent server pod", err.Error())
 		return
 	}
+	podName := ref.Pod
+	containerName := ref.Container
 
 	// Build impersonated rest.Config for exec RBAC enforcement.
 	// This ensures the Kubernetes API server checks the user's pods/exec permission,
@@ -337,48 +338,4 @@ func (w *wsStdoutWriter) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	return len(p), nil
-}
-
-// resolveAgentServerPod finds the running server pod for a Server-mode Agent.
-func resolveAgentServerPod(ctx context.Context, k8sClient client.Client, namespace, agentName string) (podName string, containerName string, port int32, err error) {
-	var agent kubeopenv1alpha1.Agent
-	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: agentName}, &agent); err != nil {
-		return "", "", 0, fmt.Errorf("agent not found: %w", err)
-	}
-
-	if agent.Status.Suspended {
-		return "", "", 0, fmt.Errorf("agent %q is suspended", agentName)
-	}
-	if !agent.Status.Ready {
-		return "", "", 0, fmt.Errorf("agent %q is not ready (deployment may be starting up)", agentName)
-	}
-
-	// Find the server pod using the same labels as server_builder.go
-	podList := &corev1.PodList{}
-	if err := k8sClient.List(ctx, podList,
-		client.InNamespace(namespace),
-		client.MatchingLabels{
-			"app.kubernetes.io/name":      "kubeopencode-server",
-			"app.kubernetes.io/instance":  agentName,
-			"app.kubernetes.io/component": "server",
-		},
-	); err != nil {
-		return "", "", 0, fmt.Errorf("failed to list server pods: %w", err)
-	}
-
-	// Find a Ready pod
-	for i := range podList.Items {
-		pod := &podList.Items[i]
-		if pod.Status.Phase != corev1.PodRunning {
-			continue
-		}
-		for _, cond := range pod.Status.Conditions {
-			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
-				serverPort := controller.GetServerPort(&agent)
-				return pod.Name, controller.ServerContainerName, serverPort, nil
-			}
-		}
-	}
-
-	return "", "", 0, fmt.Errorf("no ready server pod found for agent %q", agentName)
 }
