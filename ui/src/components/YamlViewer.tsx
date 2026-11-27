@@ -207,7 +207,7 @@ function YamlViewer({ queryKey, fetchYaml, onSave, defaultOpen = false, hideTogg
               {onSave && !editing && yaml && (
                 <button
                   onClick={handleEdit}
-                  className="text-[11px] text-sky-400 hover:text-sky-300 transition-colors font-medium"
+                  className="text-[11px] text-red-400 hover:text-red-300 transition-colors font-medium"
                 >
                   Edit
                 </button>
@@ -267,7 +267,7 @@ function YamlViewer({ queryKey, fetchYaml, onSave, defaultOpen = false, hideTogg
                   <button
                     onClick={handleSave}
                     disabled={saving || yamlError != null}
-                    className="px-3 py-1.5 text-xs font-medium text-white bg-sky-600 rounded-lg hover:bg-sky-700 transition-colors disabled:opacity-50"
+                    className="px-3 py-1.5 text-xs font-medium text-white bg-red-600 rounded-lg hover:bg-red-700 transition-colors disabled:opacity-50"
                     title={yamlError ? 'Fix YAML errors before saving' : undefined}
                   >
                     {saving ? 'Saving...' : 'Save'}

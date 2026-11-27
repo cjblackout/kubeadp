@@ -1,6 +1,6 @@
 # Build Dependencies
 
-This document tracks all external dependencies used across the KubeOpenCode project's build pipeline, container images, CI workflows, and development tools.
+This document tracks all external dependencies used across the kubeadp project's build pipeline, container images, CI workflows, and development tools.
 
 ## Container Base Images
 

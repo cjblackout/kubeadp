@@ -275,7 +275,7 @@ function ShareTerminalPage() {
 
       {/* Footer */}
       <div className="px-4 py-1.5 bg-stone-900/50 border-t border-stone-800/40 flex items-center justify-between flex-shrink-0">
-        <span className="text-[10px] text-stone-700">Powered by KubeOpenCode</span>
+        <span className="text-[10px] text-stone-700">Powered by kubeadp</span>
         {shareInfo.profile && (
           <span className="text-[10px] text-stone-600 truncate max-w-xs">{shareInfo.profile}</span>
         )}

@@ -2,7 +2,7 @@
 
 Kubernetes-native agent platform. This repository holds two parts:
 
-- **The KubeOpenCode operator** (Go, `api/`, `cmd/`, `internal/`, `charts/`): a fork of
+- **The kubeadp operator** (Go, `api/`, `cmd/`, `internal/`, `charts/`): a fork of
   [kubeopencode/kubeopencode](https://github.com/kubeopencode/kubeopencode) (MIT), the base of the platform. The
   upstream project description follows below.
 - **kubeadp-agent** (Rust, [`src/kubeadp-agent`](src/kubeadp-agent)): the agent runtime and orchestrator (job
@@ -14,7 +14,7 @@ Kubernetes-native agent platform. This repository holds two parts:
 ---
 
 <p align="center">
-  <img src="docs/images/logo.png" alt="KubeOpenCode Logo" width="500">
+  <img src="docs/images/logo.png" alt="kubeadp Logo" width="500">
 </p>
 
 <p align="center">
@@ -26,12 +26,12 @@ Kubernetes-native agent platform. This repository holds two parts:
   <a href="https://goreportcard.com/report/github.com/kubeopencode/kubeopencode"><img src="https://goreportcard.com/badge/github.com/kubeopencode/kubeopencode" alt="Go Report Card"></a>
 </p>
 
-> **Note**: KubeOpenCode builds on the excellent [OpenCode](https://opencode.ai) AI agent. OpenCode is great for individual developers — KubeOpenCode makes it work for **teams and enterprises** by adding governance, shared agent configurations, scale, and enterprise infrastructure integration. This is an independent project, not affiliated with the OpenCode team.
+> **Note**: kubeadp builds on the excellent [OpenCode](https://opencode.ai) AI agent. OpenCode is great for individual developers — kubeadp makes it work for **teams and enterprises** by adding governance, shared agent configurations, scale, and enterprise infrastructure integration. This is an independent project, not affiliated with the OpenCode team.
 
 <br>
 
 <p align="center">
-  <img src="docs/images/screenshot-shadow.png" alt="KubeOpenCode UI" width="800">
+  <img src="docs/images/screenshot-shadow.png" alt="kubeadp UI" width="800">
 </p>
 
 <br>
@@ -117,4 +117,4 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 ---
 
-Made with love by the KubeOpenCode community
+Made with love by the kubeadp community

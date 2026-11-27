@@ -126,14 +126,14 @@ function DemoSection(): ReactNode {
         <div className={styles.sectionHeader}>
           <Heading as="h2">Demo</Heading>
           <p className={styles.sectionSubtitle}>
-            See KubeOpenCode in action.
+            See kubeadp in action.
           </p>
         </div>
         <div className={styles.demoVideoContainer}>
           <iframe
             className={styles.demoVideo}
             src="https://www.youtube.com/embed/H_m8PMFQppc"
-            title="KubeOpenCode Demo"
+            title="kubeadp Demo"
             allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
             allowFullScreen
           />
@@ -375,25 +375,25 @@ const faqItems: FaqItem[] = [
   {
     question: 'Do I need my own Kubernetes cluster?',
     answer:
-      'Yes. KubeOpenCode runs on any standard Kubernetes cluster (v1.26+). You can use managed services like EKS, GKE, AKS, or a local cluster with Kind or minikube for development.',
+      'Yes. kubeadp runs on any standard Kubernetes cluster (v1.26+). You can use managed services like EKS, GKE, AKS, or a local cluster with Kind or minikube for development.',
   },
   {
     question: 'What AI models and providers are supported?',
     answer: (
       <>
-        KubeOpenCode uses <a href="https://opencode.ai">OpenCode</a> as its AI engine, so it supports every provider and model that OpenCode supports — including Anthropic, OpenAI, Google Gemini, Amazon Bedrock, Azure, Google Vertex, xAI, Mistral, Groq, OpenRouter, GitHub Copilot, and more. You can also use any OpenAI-compatible endpoint. See the <a href="https://opencode.ai/docs/providers">full list of 75+ supported providers</a>.
+        kubeadp uses <a href="https://opencode.ai">OpenCode</a> as its AI engine, so it supports every provider and model that OpenCode supports — including Anthropic, OpenAI, Google Gemini, Amazon Bedrock, Azure, Google Vertex, xAI, Mistral, Groq, OpenRouter, GitHub Copilot, and more. You can also use any OpenAI-compatible endpoint. See the <a href="https://opencode.ai/docs/providers">full list of 75+ supported providers</a>.
       </>
     ),
   },
   {
     question: 'Do I need to pay?',
     answer:
-      'KubeOpenCode itself is free and open-source (Apache 2.0). You pay for your own infrastructure (Kubernetes cluster) and any AI model API keys you choose to use.',
+      'kubeadp itself is free and open-source (Apache 2.0). You pay for your own infrastructure (Kubernetes cluster) and any AI model API keys you choose to use.',
   },
   {
     question: 'Can I use it in production?',
     answer:
-      'KubeOpenCode is currently in early alpha (v0.1.x). The API may change without backward compatibility. We recommend using it for development, testing, and evaluation while we work toward a stable release.',
+      'kubeadp is currently in early alpha (v0.1.x). The API may change without backward compatibility. We recommend using it for development, testing, and evaluation while we work toward a stable release.',
   },
 ];
 

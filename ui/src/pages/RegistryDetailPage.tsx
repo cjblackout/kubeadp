@@ -67,7 +67,7 @@ function ImageGroups({ images }: { images: RegistryImageInfo[] }) {
                   <div className="flex items-center gap-2">
                     <span className="font-medium text-sm text-stone-800">{img.name}</span>
                     {img.metadata?.category && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-600 border border-blue-200 font-medium">
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-50 text-red-600 border border-red-200 font-medium">
                         {img.metadata.category}
                       </span>
                     )}

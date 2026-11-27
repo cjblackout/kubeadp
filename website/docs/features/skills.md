@@ -8,7 +8,7 @@ Skills are semantically different from Contexts:
 
 ## Two Ways to Use Skills
 
-KubeOpenCode supports two complementary approaches for loading skills:
+kubeadp supports two complementary approaches for loading skills:
 
 | Approach | How | Best for |
 |----------|-----|----------|

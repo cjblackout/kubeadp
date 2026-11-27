@@ -1,16 +1,16 @@
 ---
 sidebar_position: 1
 title: Getting Started
-description: Install KubeOpenCode and run your first AI task
+description: Install kubeadp and run your first AI task
 ---
 
 # Getting Started
 
 :::caution Alpha Project
-KubeOpenCode is in **early alpha** (v0.1.x). It is **not recommended for production use**. The API (`v1alpha1`) may introduce breaking changes between releases — backward compatibility is not guaranteed at this stage. We welcome contributions and feedback!
+kubeadp is in **early alpha** (v0.1.x). It is **not recommended for production use**. The API (`v1alpha1`) may introduce breaking changes between releases — backward compatibility is not guaranteed at this stage. We welcome contributions and feedback!
 :::
 
-This guide covers installing KubeOpenCode on a Kubernetes cluster and running your first AI task. The default setup uses the free `opencode/big-pickle` model — **no API key required**.
+This guide covers installing kubeadp on a Kubernetes cluster and running your first AI task. The default setup uses the free `opencode/big-pickle` model — **no API key required**.
 
 > **Looking for local development setup?** If you want to build from source and run on a local Kind cluster, see the [Contributing Guide](https://github.com/kubeopencode/kubeopencode/blob/main/CONTRIBUTING.md#local-development-environment).
 

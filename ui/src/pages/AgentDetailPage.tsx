@@ -80,7 +80,7 @@ function ServerConnectCommands({ namespace, agentName }: { namespace: string; ag
       <div className="space-y-3">
         <div>
           <p className="text-xs text-stone-500 mb-1.5">
-            One-click attach via KubeOpenCode CLI
+            One-click attach via kubeadp CLI
           </p>
           <div className="flex items-center gap-2 bg-stone-900 rounded-lg px-4 py-2.5 border border-stone-700">
             <code className="text-xs text-emerald-400 font-mono flex-1">{kocCmd}</code>
@@ -88,7 +88,7 @@ function ServerConnectCommands({ namespace, agentName }: { namespace: string; ag
           </div>
           <div className="mt-1.5 bg-stone-50 rounded-lg px-3 py-2 border border-stone-100">
             <p className="text-[11px] text-stone-400">
-              Install KubeOpenCode CLI:{' '}
+              Install kubeadp CLI:{' '}
               <code className="bg-stone-100 px-1.5 py-0.5 rounded text-stone-500 font-mono select-all cursor-pointer">{goInstallCmd}</code>
             </p>
           </div>
@@ -918,7 +918,7 @@ function AgentDetailPage() {
                         <span className="font-medium text-sm text-stone-800">
                           {ctx.name || `Context ${idx + 1}`}
                         </span>
-                        <span className="text-[11px] px-2 py-0.5 rounded-md bg-sky-50 text-sky-600 border border-sky-200 font-medium">
+                        <span className="text-[11px] px-2 py-0.5 rounded-md bg-red-50 text-red-600 border border-red-200 font-medium">
                           {ctx.type}
                         </span>
                       </div>

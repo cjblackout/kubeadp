@@ -1,6 +1,6 @@
 # Plugins
 
-OpenCode plugins are TypeScript functions that extend Agent capabilities through 17+ hook points: custom tools, auth providers, message/tool interception, event handling, system prompt transformation, and more. KubeOpenCode supports declaring plugins directly on the Agent spec.
+OpenCode plugins are TypeScript functions that extend Agent capabilities through 17+ hook points: custom tools, auth providers, message/tool interception, event handling, system prompt transformation, and more. kubeadp supports declaring plugins directly on the Agent spec.
 
 The controller creates a **plugin-init** init container that runs `npm install` to download plugins and their dependencies into a shared `/plugins` volume. OpenCode loads them via `file://` paths from `/plugins/node_modules/` — the executor container does not need npm installed.
 
@@ -149,7 +149,7 @@ TUI plugins are loaded when users interact with the Agent via `kubeoc agent atta
 
 ## Community Plugins
 
-OpenCode has 60+ community plugins. Some popular ones for KubeOpenCode:
+OpenCode has 60+ community plugins. Some popular ones for kubeadp:
 
 | Plugin | npm Package | Description |
 |--------|-------------|-------------|

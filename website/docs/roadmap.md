@@ -1,13 +1,13 @@
 ---
 sidebar_position: 8
 title: Roadmap
-description: Future directions for KubeOpenCode
+description: Future directions for kubeadp
 ---
 
 # Roadmap
 
 :::caution Alpha Project
-KubeOpenCode is in **early alpha** (v0.1.x). The API (`v1alpha1`) may introduce breaking changes between releases. We do not guarantee backward compatibility at this stage. See [Getting Started](getting-started.md) for details.
+kubeadp is in **early alpha** (v0.1.x). The API (`v1alpha1`) may introduce breaking changes between releases. We do not guarantee backward compatibility at this stage. See [Getting Started](getting-started.md) for details.
 :::
 
 ## Direction 1: Instant Messaging Integration
@@ -31,7 +31,7 @@ This direction focuses on **usability** — reducing the friction between "I nee
 - **Network security** — NetworkPolicy templates, service mesh integration
 - **Multi-tenancy** — Namespace-level isolation, resource quotas, priority classes
 
-This direction focuses on **stability and security** — making KubeOpenCode ready for production environments.
+This direction focuses on **stability and security** — making kubeadp ready for production environments.
 
 ## Direction 3: Observability (OpenTelemetry)
 
@@ -51,7 +51,7 @@ This direction focuses on **operational insight** — giving platform teams the 
 
 AI agents often need to run E2E tests against Kind clusters, build container images, or operate full development environments. These workloads require nested container runtimes inside the agent pod, which standard Kubernetes does not support out of the box.
 
-KubeOpenCode itself does not need code changes — the Agent `podSpec` already supports `runtimeClassName` passthrough. What's needed is **cluster configuration guidance**: documentation and best practices for administrators to enable DinD capabilities using approaches like Sysbox, Rootless Podman, or Kata Containers, depending on their security and platform requirements.
+kubeadp itself does not need code changes — the Agent `podSpec` already supports `runtimeClassName` passthrough. What's needed is **cluster configuration guidance**: documentation and best practices for administrators to enable DinD capabilities using approaches like Sysbox, Rootless Podman, or Kata Containers, depending on their security and platform requirements.
 
 See [ADR 0029](https://github.com/kubeopencode/kubeopencode/blob/main/docs/adr/0029-sysbox-dind-support.md) for the full evaluation of approaches and phased adoption strategy.
 

@@ -6,7 +6,7 @@ The default devbox executor image already includes the **Docker CLI** (`docker-c
 
 ## How It Works
 
-KubeOpenCode uses a two-container pattern: an init container copies the OpenCode binary to `/tools`, and the worker container runs it. The controller sets the container's `Command` explicitly (e.g., `sh -c "/tools/opencode serve ..."`), which **overrides any Dockerfile `ENTRYPOINT`**.
+kubeadp uses a two-container pattern: an init container copies the OpenCode binary to `/tools`, and the worker container runs it. The controller sets the container's `Command` explicitly (e.g., `sh -c "/tools/opencode serve ..."`), which **overrides any Dockerfile `ENTRYPOINT`**.
 
 This means you cannot simply set `ENTRYPOINT` to a dockerd startup script. Instead, the recommended approach is a **lazy-init wrapper** — a script that replaces the `docker` binary and transparently starts `dockerd` on first use. This works with both Agent Deployments and Task Pods without any controller code changes.
 
@@ -58,7 +58,7 @@ Create `docker-lazy-init.sh`:
 #!/bin/bash
 # Lazy-init wrapper for Docker CLI.
 # Starts dockerd automatically on first docker command.
-# Works with KubeOpenCode's command override pattern since it wraps
+# Works with kubeadp's command override pattern since it wraps
 # the docker binary itself, not the container entrypoint.
 
 DOCKER_REAL="/usr/bin/docker.real"

@@ -338,7 +338,7 @@ function AgentTemplateDetailPage() {
                         <span className="font-medium text-sm text-stone-800">
                           {ctx.name || `Context ${idx + 1}`}
                         </span>
-                        <span className="text-[11px] px-2 py-0.5 rounded-md bg-sky-50 text-sky-600 border border-sky-200 font-medium">
+                        <span className="text-[11px] px-2 py-0.5 rounded-md bg-red-50 text-red-600 border border-red-200 font-medium">
                           {ctx.type}
                         </span>
                       </div>

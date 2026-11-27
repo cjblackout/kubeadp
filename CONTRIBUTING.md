@@ -1,6 +1,6 @@
-# Contributing to KubeOpenCode
+# Contributing to kubeadp
 
-We welcome contributions! This document provides guidelines for contributing to KubeOpenCode.
+We welcome contributions! This document provides guidelines for contributing to kubeadp.
 
 ## Getting Started
 
@@ -158,7 +158,7 @@ This single command performs all of the steps below automatically:
 
 Alternatively, tell your AI agent:
 
-> Set up a local development environment for KubeOpenCode using `make local-dev-setup`.
+> Set up a local development environment for kubeadp using `make local-dev-setup`.
 
 The agent will handle everything automatically. See `AGENTS.md` for guidance on how agents discover local-dev instructions.
 
@@ -388,4 +388,4 @@ When reporting issues:
 
 ## License
 
-By contributing to KubeOpenCode, you agree that your contributions will be licensed under the MIT License.
+By contributing to kubeadp, you agree that your contributions will be licensed under the MIT License.

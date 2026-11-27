@@ -1,6 +1,6 @@
 # Go Version Upgrade SOP
 
-Standard Operating Procedure for upgrading the Go version used by KubeOpenCode.
+Standard Operating Procedure for upgrading the Go version used by kubeadp.
 
 ## Prerequisites
 

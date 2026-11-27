@@ -1,8 +1,8 @@
 # OpenTelemetry Observability
 
-KubeOpenCode integrates with OpenTelemetry to provide observability for AI agent workloads — LLM call traces, token usage, latency, and application-level spans flow automatically to your existing observability infrastructure.
+kubeadp integrates with OpenTelemetry to provide observability for AI agent workloads — LLM call traces, token usage, latency, and application-level spans flow automatically to your existing observability infrastructure.
 
-OpenCode has **built-in OTel support** that is activated by injecting standard OTLP environment variables into agent Pods. KubeOpenCode handles the injection; OpenCode handles the telemetry production. No code changes or custom instrumentation required.
+OpenCode has **built-in OTel support** that is activated by injecting standard OTLP environment variables into agent Pods. kubeadp handles the injection; OpenCode handles the telemetry production. No code changes or custom instrumentation required.
 
 ## How It Works
 
@@ -37,7 +37,7 @@ spec:
     openTelemetry:
       enabled: true
       # OTLP/HTTP endpoint for your Collector. Required when enabled.
-      # KubeOpenCode does NOT deploy or manage Collectors.
+      # kubeadp does NOT deploy or manage Collectors.
       endpoint: "http://otel-collector.observability:4318"
       # Optional headers for collector authentication
       headers:
@@ -119,7 +119,7 @@ Config.get / Agent.state / ...           ← Layer 3 (app-level spans)
 
 This gives you fine-grained LLM observability: which model was called, how many tokens were consumed, how long each call took, and what tools were invoked.
 
-> **Note on attribute namespace**: The Vercel AI SDK currently emits `ai.*` attributes rather than the OpenTelemetry `gen_ai.*` semantic conventions. The data is functionally equivalent for cost attribution, model tracking, and behavior analysis. When the AI SDK adds `gen_ai.*` support in a future version, those attributes will automatically appear without any KubeOpenCode changes.
+> **Note on attribute namespace**: The Vercel AI SDK currently emits `ai.*` attributes rather than the OpenTelemetry `gen_ai.*` semantic conventions. The data is functionally equivalent for cost attribution, model tracking, and behavior analysis. When the AI SDK adds `gen_ai.*` support in a future version, those attributes will automatically appear without any kubeadp changes.
 
 ## Headers & Authentication
 
@@ -187,20 +187,20 @@ This injects `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` per the O
 
 ## Responsibility Boundary
 
-KubeOpenCode produces standardized OTLP data and sends it to the user-configured `endpoint`. Everything beyond that is the user's responsibility:
+kubeadp produces standardized OTLP data and sends it to the user-configured `endpoint`. Everything beyond that is the user's responsibility:
 
-| What KubeOpenCode Does | What the User Does |
+| What kubeadp Does | What the User Does |
 |------------------------|-------------------|
 | Produces OTLP-compliant traces and logs | Deploys and manages OTel Collectors |
 | Injects env vars and config into agent Pods | Configures Collector processors, exporters, and backends |
 | Sets K8s semantic convention resource attributes | Chooses backend (Jaeger, Tempo, Grafana, Datadog, etc.) |
 | Provides the `endpoint` configuration field | Decides Collector topology (DaemonSet, Gateway, Sidecar) |
 
-KubeOpenCode does **not** deploy Collectors, prescribe topology, or bundle vendor-specific exporters.
+kubeadp does **not** deploy Collectors, prescribe topology, or bundle vendor-specific exporters.
 
 ## Recommended Collector Configuration
 
-The following examples help integrate KubeOpenCode with your existing OTel Collector.
+The following examples help integrate kubeadp with your existing OTel Collector.
 
 ### Basic Gateway Collector
 
@@ -313,7 +313,7 @@ Open http://localhost:16686 to query traces. Select the `opencode` service to se
 
 ## Backend Compatibility
 
-KubeOpenCode produces OTLP-compliant data. Any OTLP-capable backend can receive it through your Collector:
+kubeadp produces OTLP-compliant data. Any OTLP-capable backend can receive it through your Collector:
 
 | Backend | Notes |
 |---------|-------|
