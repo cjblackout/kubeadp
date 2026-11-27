@@ -219,6 +219,11 @@ pub fn parse_config_toml(path: &str, content: &str) -> Result<HashMap<String, St
             {
                 // sandbox_ro_paths can be a TOML Array of strings or a scalar string (colon-separated)
                 parse_and_validate_sandbox_ro_paths_toml(path, section, key, value)?
+            } else if (section == "common" && key == "sandbox_env_allow")
+                || (section == "worker" && key == "sandbox_env_allow")
+            {
+                // sandbox_env_allow can be a TOML Array of strings or a scalar string (comma-separated)
+                parse_and_validate_sandbox_env_allow_toml(path, section, key, value)?
             } else {
                 scalar_to_string(value).ok_or_else(|| {
                     format!(
@@ -278,6 +283,9 @@ fn var_for_section_key(section: &str, key: &str) -> Option<String> {
         // orchestrator (sessions) and the worker (jobs) at run start.
         ("common", "instructions_file") => Some("KUBEADP_INSTRUCTIONS_FILE".to_string()),
         ("common", "sandbox_ro_paths") => Some("KUBEADP_SANDBOX_RO_PATHS".to_string()),
+        ("common", "sandbox_env_allow") => Some("KUBEADP_SANDBOX_ENV_ALLOW".to_string()),
+        ("worker", "sandbox_ro_paths") => Some("KUBEADP_SANDBOX_RO_PATHS".to_string()),
+        ("worker", "sandbox_env_allow") => Some("KUBEADP_SANDBOX_ENV_ALLOW".to_string()),
 
         // --- [orchestrator]: the agent-orchestrate session supervisor ---
         ("orchestrator", "listen") => Some("AGENT_ORCHESTRATE_LISTEN".to_string()),
@@ -417,6 +425,7 @@ fn section_keys(section: &str) -> Vec<&'static str> {
             "jobset_root_key_file",
             "instructions_file",
             "sandbox_ro_paths",
+            "sandbox_env_allow",
         ],
         "orchestrator" => vec![
             "listen",
@@ -471,6 +480,8 @@ fn section_keys(section: &str) -> Vec<&'static str> {
             "a2a_live_idle_secs",
             "a2a_mcp_enabled",
             "a2a_echo",
+            "sandbox_ro_paths",
+            "sandbox_env_allow",
         ],
         _ => Vec::new(),
     }
@@ -519,6 +530,50 @@ fn parse_and_validate_sandbox_ro_paths_toml(
         }
     }
     Ok(paths.join(":"))
+}
+
+/// Parses and validates `sandbox_env_allow` from TOML: accepts a list of strings
+/// or a single string (comma-separated). Validates that every pattern matches `[A-Za-z0-9_*]`.
+/// Serializes into comma-separated string for env.
+fn parse_and_validate_sandbox_env_allow_toml(
+    path: &str,
+    section: &str,
+    key: &str,
+    value: &toml::Value,
+) -> Result<String, String> {
+    let mut patterns: Vec<String> = Vec::new();
+    match value {
+        toml::Value::Array(arr) => {
+            for (idx, item) in arr.iter().enumerate() {
+                let s = item.as_str().ok_or_else(|| {
+                    format!(
+                        "Invalid configuration file '{path}': key '{section}.{key}[{idx}]' must be a string pattern"
+                    )
+                })?;
+                let trimmed = s.trim();
+                crate::sandbox::validate_sandbox_env_allow_pattern(trimmed)
+                    .map_err(|e| format!("Invalid configuration file '{path}': {e}"))?;
+                if !patterns.iter().any(|p| p == trimmed) {
+                    patterns.push(trimmed.to_string());
+                }
+            }
+        }
+        toml::Value::String(s) => {
+            let parsed = crate::sandbox::parse_sandbox_env_allow(s)
+                .map_err(|e| format!("Invalid configuration file '{path}': {e}"))?;
+            for p in parsed {
+                if !patterns.iter().any(|existing| existing == &p) {
+                    patterns.push(p);
+                }
+            }
+        }
+        _ => {
+            return Err(format!(
+                "Invalid configuration file '{path}': key '{section}.{key}' must be an array of string patterns or a string"
+            ));
+        }
+    }
+    Ok(patterns.join(","))
 }
 
 /// Converts a TOML scalar to the string the env-based readers parse:

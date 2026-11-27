@@ -826,6 +826,10 @@ impl Engine for EmulatingEngine {
         self.inner.extract_error(log)
     }
 
+    fn extract_usage(&self, log: &str) -> Option<crate::engine::JobUsage> {
+        self.inner.extract_usage(log)
+    }
+
     fn normalize_prompt(&self, prompt: &str, job_id: &str, retry_count: u32) -> String {
         self.inner.normalize_prompt(prompt, job_id, retry_count)
     }

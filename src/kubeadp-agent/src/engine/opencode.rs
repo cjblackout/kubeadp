@@ -461,6 +461,10 @@ impl Engine for OpenCodeEngine {
         crate::core::job::extract_opencode_error(log)
     }
 
+    fn extract_usage(&self, log: &str) -> Option<crate::engine::JobUsage> {
+        crate::core::job::extract_opencode_usage(log)
+    }
+
     fn configured_program(&self, config: &crate::core::config::Config) -> PathBuf {
         config.opencode_path.clone()
     }
