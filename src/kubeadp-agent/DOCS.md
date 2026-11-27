@@ -750,6 +750,8 @@ Both black-box integration test suites (the 90-case `agent-run` CLI suite and th
 bash src/kubeadp-agent/tests/cli/run-all.sh
 ```
 
+For live cluster smoke testing of the `opencode` engine against a mock LLM pod, see [tests/smoke/opencode/README.md](file:///workspace/.agent-jobs/kubeadp/ffdd0d97/src/kubeadp-agent/tests/smoke/opencode/README.md) and execute `src/kubeadp-agent/tests/smoke/opencode/run.sh`.
+
 Environment knobs:
 - `BIN_DIR`: Directory containing prebuilt binaries (`agent-run`, `agent-run-api`, `agent-orchestrate`, `kubeadp-agent`). When set, local cargo rebuilds are skipped and both test suites execute directly against these binaries.
 - `PORT`: Port for the CLI private mock server (default `18002`).
