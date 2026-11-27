@@ -652,28 +652,42 @@ pub fn deliver_message(
             let deadline = Instant::now() + crate::orchestrate::pty::PTY_WRITE_TOTAL_DEADLINE;
             let core_config = crate::core::config::Config::load().unwrap_or_default();
             let registry = crate::engine::EngineRegistry::with_builtin(&core_config);
-            let frame = if let Ok(eng) =
-                registry.resolve(crate::engine::RunKind::Session, Some(&engine), None)
-            {
-                eng.frame_pty_message(&payload)
-            } else {
-                let mut f =
-                    Vec::with_capacity(PASTE_START.len() + payload.len() + PASTE_END.len() + 1);
-                f.extend_from_slice(PASTE_START);
-                f.extend_from_slice(&payload);
-                f.extend_from_slice(PASTE_END);
-                f.push(b'\r');
-                f
+            let resolved = registry.resolve(crate::engine::RunKind::Session, Some(&engine), None);
+            // A server-backed engine (opencode) delivers over its own channel
+            // instead of the PTY; every other engine takes the framed PTY write.
+            let server_backed = match &resolved {
+                Ok(eng) => {
+                    eng.deliver_session_message(&control.config, &String::from_utf8_lossy(&payload))
+                }
+                Err(_) => None,
             };
-            let res = slot.write_all(&frame, deadline);
-            if res.is_err() && frame.starts_with(PASTE_START) {
-                // Best-effort close the bracketed paste if a partial write
-                // opened PASTE_START before timing out, so the terminal is
-                // not left wedged inside paste mode.
-                let close_deadline = Instant::now() + Duration::from_millis(50);
-                let _ = slot.write_all(PASTE_END, close_deadline);
+            if let Some(result) = server_backed {
+                if let Err(e) = &result {
+                    log_event(name, &format!("server-backed message delivery failed: {e}"));
+                }
+                result.is_ok()
+            } else {
+                let frame = if let Ok(eng) = &resolved {
+                    eng.frame_pty_message(&payload)
+                } else {
+                    let mut f =
+                        Vec::with_capacity(PASTE_START.len() + payload.len() + PASTE_END.len() + 1);
+                    f.extend_from_slice(PASTE_START);
+                    f.extend_from_slice(&payload);
+                    f.extend_from_slice(PASTE_END);
+                    f.push(b'\r');
+                    f
+                };
+                let res = slot.write_all(&frame, deadline);
+                if res.is_err() && frame.starts_with(PASTE_START) {
+                    // Best-effort close the bracketed paste if a partial write
+                    // opened PASTE_START before timing out, so the terminal is
+                    // not left wedged inside paste mode.
+                    let close_deadline = Instant::now() + Duration::from_millis(50);
+                    let _ = slot.write_all(PASTE_END, close_deadline);
+                }
+                res.is_ok()
             }
-            res.is_ok()
         }
     };
     let n = payload.len();

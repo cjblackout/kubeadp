@@ -39,7 +39,8 @@ pub use agnostic::EmptyEngineCtx;
 pub use agy::AgyEngine;
 pub use errors::EngineError;
 pub use run::{
-    ContextId, EngineEvent, EngineId, ExitInfo, PodRole, Run, RunId, RunKind, RunStatus, Transport,
+    ContextId, EngineEvent, EngineId, ExitInfo, JobUsage, PodRole, Run, RunId, RunKind, RunStatus,
+    Transport,
 };
 
 use crate::core::job::{JobMetadata, JobStatus};
@@ -327,6 +328,12 @@ pub trait Engine: Send + Sync {
         crate::core::commands::result::final_error_text(log)
     }
 
+    /// Extracts token usage and cost accounting from the job log.
+    /// Returns `None` when usage information is unavailable or unsupported.
+    fn extract_usage(&self, _log: &str) -> Option<JobUsage> {
+        None
+    }
+
     /// Normalizes a prompt before execution (e.g. adding reference tags or normalizing retries).
     /// Default: identity.
     fn normalize_prompt(&self, prompt: &str, _job_id: &str, _retry_count: u32) -> String {
@@ -383,6 +390,19 @@ pub trait Engine: Send + Sync {
     /// Whether this engine supports falling back to the legacy `memory_file` when `instructions_file` is absent.
     fn supports_legacy_memory_file(&self) -> bool {
         false
+    }
+
+    /// Delivers a user message into a running session over the engine's own channel
+    /// instead of the session PTY. `None` (the default) means the supervisor pastes
+    /// the framed message into the PTY; `Some(result)` is the outcome of a
+    /// server-backed delivery (opencode talks to its `serve` process over loopback
+    /// HTTP). The call may block for a few seconds while the server comes up.
+    fn deliver_session_message(
+        &self,
+        _session: &SessionDef,
+        _text: &str,
+    ) -> Option<Result<(), String>> {
+        None
     }
 
     /// Encodes a user message into the byte sequence expected on the session's PTY input channel.

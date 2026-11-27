@@ -218,6 +218,11 @@ fn finish_policy(policy: SandboxPolicy) -> SandboxPolicy {
     let mut policy = policy
         .hide_operator_token_file()
         .hide_jobset_root_key_file();
+    if let Ok(raw) = std::env::var("KUBEADP_SANDBOX_ENV_ALLOW") {
+        if let Ok(extra) = super::policy::parse_sandbox_env_allow(&raw) {
+            policy = policy.with_extra_env_allow(&extra);
+        }
+    }
     policy.filter_missing_ro_paths();
     policy
 }

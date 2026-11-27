@@ -38,9 +38,9 @@ stack. It mirrors the capability tables in `src/engine/agy.rs`,
 
 - **A2A message injection**:
   - `hook` (`experimental.chat.messages.transform` plugin hook) and `tool_result` (`mcp.a2a` config) are materialised into `~/.config/opencode/` by `worker::opencode_config`. These channels are verified by unit tests, but because they have NOT been exercised against a real live opencode binary in this repository's test suite, their status is documented as partial.
-  - `idle_turn`: For interactive sessions, `idle_turn` delivers user lines over the PTY adapter. For running jobs, opencode behaves like claude: a RUNNING job is not idle and has no live stdin channel (`idle_turn` answers `Unsupported`); the `hook` and `tool_result` channels cover the mid-run window, while a finished job is resumed as a retry.
+  - `idle_turn`: For sessions, `idle_turn` delivers the message through the opencode server API (`prompt_async`). For running jobs, opencode behaves like claude: a RUNNING job is not idle and has no live stdin channel (`idle_turn` answers `Unsupported`); the `hook` and `tool_result` channels cover the mid-run window, while a finished job is resumed as a retry.
 - **Session mode**:
-  - Interactive sessions (`run -i`) run inside the supervisor PTY adapter and are proven by black-box orchestrator tests (T74–T78) with fake-opencode.
+  - Sessions supervise `opencode serve` and deliver messages through `prompt_async`. Proven by the orchestrator tests T74–T78 (fake server) and by a live run with the real opencode 1.19.4 and a mock LLM: user message and A2A-framed message reached the model, and the same opencode session continued after stop/restart. Not yet proven: sandboxed sessions and the in-CI black-box run.
 
 `permissions` is deliberately absent (no `Engine` trait method yet): an engine
 without a native permission surface reports it `Unsupported`, it is never

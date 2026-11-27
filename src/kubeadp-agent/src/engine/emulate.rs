@@ -826,6 +826,10 @@ impl Engine for EmulatingEngine {
         self.inner.extract_error(log)
     }
 
+    fn extract_usage(&self, log: &str) -> Option<crate::engine::JobUsage> {
+        self.inner.extract_usage(log)
+    }
+
     fn normalize_prompt(&self, prompt: &str, job_id: &str, retry_count: u32) -> String {
         self.inner.normalize_prompt(prompt, job_id, retry_count)
     }
@@ -872,6 +876,14 @@ impl Engine for EmulatingEngine {
 
     fn frame_pty_message(&self, payload: &[u8]) -> Vec<u8> {
         self.inner.frame_pty_message(payload)
+    }
+
+    fn deliver_session_message(
+        &self,
+        session: &crate::engine::SessionDef,
+        text: &str,
+    ) -> Option<Result<(), String>> {
+        self.inner.deliver_session_message(session, text)
     }
 
     fn materialize_instructions(
