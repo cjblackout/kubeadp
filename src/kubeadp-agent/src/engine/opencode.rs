@@ -13,10 +13,20 @@
 //!   live-stream approach: the interactive opencode process reads follow-up
 //!   turns as user lines typed on the PTY.
 //!
-//! opencode has no `--remote-control` and no hook mechanism, so its A2A
-//! injection ladder is the floor (only `idle_turn`): a queued message resumes
-//! a finished job as the next turn; a RUNNING opencode job has no live
-//! channel and answers `Unsupported` for `idle_turn`.
+//! opencode has no Claude-format hooks, so its A2A injection channels (KA-7,
+//! SPEC §7.14) are carried by the harness's opencode plugin and config
+//! (`worker::opencode_config`, materialised into `~/.config/opencode/`):
+//!
+//! - **`hook`**: the plugin's `experimental.chat.messages.transform` hook
+//!   drains the run's inbox (via `kubeadp-agent a2a-hook transform`) and
+//!   splices the framed text into the outgoing model messages.
+//! - **`tool_result`**: the harness-owned `mcp-a2a` stdio server registered
+//!   as `mcp.a2a` in `opencode.json`.
+//! - **`idle_turn`**: a queued message resumes a FINISHED job as the next
+//!   turn (`retry`); a RUNNING opencode job (`run --format json`) has no live
+//!   stdin channel (it is single-turn and exits after `step_finish`), so it
+//!   answers `Unsupported` for the `idle_turn` step. Sessions carry queued
+//!   messages via the PTY (`frame_pty_message`), engine-agnostic.
 //!
 //! The engine carries only the process-wide [`Config`] (the opencode binary
 //! path plus the state root the job rows live under); per-run state lives in
@@ -38,7 +48,8 @@ use crate::core::config::Config;
 use crate::core::job::{compute_status, JobMetadata, JobStatus};
 
 use crate::engine::capability::{Capability, CapabilityTable};
-use crate::engine::run::{ContextId, EngineEvent, ExitInfo, Run, RunId, RunStatus};
+use crate::engine::claude::session_pty::ClaudePtyAdapter;
+use crate::engine::run::{ContextId, EngineEvent, ExitInfo, Run, RunId, RunKind, RunStatus};
 use crate::engine::{
     Engine, EngineCtx, EngineError, JobSpec, LaunchPlan, ResumeMode, SessionDef, SessionSpec,
     StdinMode, TurnInput,
@@ -47,16 +58,45 @@ use crate::engine::{
 /// The stable opencode engine id.
 pub const OPENCODE_ENGINE_ID: &str = "opencode";
 
+/// Derives a stable run id from a workdir (jobs have no supervisor-seeded
+/// name; the path's final component is the natural id).
+fn run_id_from_workdir(workdir: &std::path::Path) -> String {
+    workdir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "opencode-job".to_string())
+}
+
+/// Session naming mirrors the supervisor config: `SessionConfig.name` is the
+/// canonical handle for `start`/`stop`/`message`. When starting by workdir
+/// alone, the final path component is the natural name.
+fn session_name_from_workdir(workdir: &std::path::Path) -> String {
+    run_id_from_workdir(workdir)
+}
+
 /// The opencode engine: a thin adapter over the opencode `run` CLI driven by
 /// the engine-aware job runner.
 pub struct OpenCodeEngine {
     config: Arc<Config>,
+    pty: Option<ClaudePtyAdapter>,
 }
 
 impl OpenCodeEngine {
     /// Constructs the engine over the process-wide config.
     pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+        Self { config, pty: None }
+    }
+
+    /// Constructs the engine with an optional supervisor-adapter (`pty`) and config.
+    /// `None` disables session mode operations (answering `unsupported`).
+    pub fn with_pty(config: Arc<Config>, pty: Option<ClaudePtyAdapter>) -> Self {
+        Self { config, pty }
+    }
+
+    fn adapter(&self, endpoint: &'static str) -> Result<&ClaudePtyAdapter, EngineError> {
+        self.pty
+            .as_ref()
+            .ok_or_else(|| EngineError::unsupported(OPENCODE_ENGINE_ID, endpoint))
     }
 
     /// The process-wide config this engine runs jobs under.
@@ -135,54 +175,92 @@ impl Engine for OpenCodeEngine {
 
     fn is_idle(&self, run: &Run) -> Result<bool, EngineError> {
         // A finished opencode job is idle (the next turn can be started with
-        // the message); a RUNNING opencode job is never idle -- it has no
-        // live stdin channel, so the `idle_turn` step cannot inject mid-run.
-        let meta = JobMetadata::load(&self.config.state_root, &run.id)
-            .map_err(|e| EngineError::Internal(e.to_string()))?;
-        Ok(compute_status(&meta, &self.config.state_root) != JobStatus::Running)
+        // the message); a RUNNING opencode job is never idle -- its
+        // `run --format json` mode is single-turn with no live stdin channel,
+        // so the `idle_turn` step cannot inject mid-run (the `hook` and
+        // `tool_result` channels cover the mid-run window instead).
+        // A session is idle when it is RUNNING (between turns: the PTY is idle,
+        // so the user line of the `idle_turn` can be delivered). Everything else
+        // (starting, stopped, failed, backoff) is not idle.
+        match run.kind {
+            RunKind::Job => {
+                let meta = JobMetadata::load(&self.config.state_root, &run.id)
+                    .map_err(|e| EngineError::Internal(e.to_string()))?;
+                Ok(compute_status(&meta, &self.config.state_root) != JobStatus::Running)
+            }
+            RunKind::Session => {
+                let adapter = self.adapter("a2a.inject.idle_turn")?;
+                let st = adapter
+                    .state
+                    .supervisor_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                Ok(st
+                    .sessions
+                    .get(&run.id)
+                    .is_some_and(|s| s.status == crate::orchestrate::state::SessionStatus::Running))
+            }
+        }
     }
 
     async fn idle_turn(&self, run: &Run, joined: &str) -> Result<(), EngineError> {
         // The `idle_turn` step of §7.14: the message is started as the run's
-        // NEXT turn. opencode has no live channel, so only a finished job is
-        // injectable: it is resumed with the joined text as the follow-up
-        // turn (same conversation), never killed. A RUNNING opencode job
-        // answers Unsupported (the floor of the injection ladder).
-        let meta = JobMetadata::load(&self.config.state_root, &run.id)
-            .map_err(|e| EngineError::Internal(e.to_string()))?;
-        if compute_status(&meta, &self.config.state_root) == JobStatus::Running {
-            return Err(EngineError::unsupported(self.id(), "a2a.inject.idle_turn"));
+        // NEXT turn. A finished job is resumed with the joined text as the
+        // follow-up turn (same conversation), never killed. A RUNNING opencode
+        // job answers Unsupported (the `hook`/`tool_result` channels deliver
+        // its mid-run messages instead). An interactive session receives the
+        // message delivered as user input over the supervisor PTY adapter.
+        match run.kind {
+            RunKind::Job => {
+                let meta = JobMetadata::load(&self.config.state_root, &run.id)
+                    .map_err(|e| EngineError::Internal(e.to_string()))?;
+                if compute_status(&meta, &self.config.state_root) == JobStatus::Running {
+                    return Err(EngineError::unsupported(self.id(), "a2a.inject.idle_turn"));
+                }
+                let args = crate::core::args::RetryArgs {
+                    job_id: run.id.clone(),
+                    prompt: Some(joined.to_string()),
+                    ..Default::default()
+                };
+                crate::core::commands::retry::run(&self.config, &args).map_err(|e| {
+                    EngineError::Internal(format!("failed to resume job '{}': {e}", run.id))
+                })?;
+                Ok(())
+            }
+            RunKind::Session => {
+                let adapter = self.adapter("a2a.inject.idle_turn")?;
+                let run_for = Run::new(run.id.clone(), RunKind::Session, &run.workdir);
+                let outcome = crate::orchestrate::sessions_api::deliver_message(
+                    &adapter.state,
+                    &run.id,
+                    crate::orchestrate::sessions_api::REST_SENDER,
+                    joined,
+                    false,
+                );
+                crate::engine::claude::session_pty::outcome_to_error(outcome, &run_for)
+            }
         }
-        let args = crate::core::args::RetryArgs {
-            job_id: run.id.clone(),
-            prompt: Some(joined.to_string()),
-            ..Default::default()
-        };
-        crate::core::commands::retry::run(&self.config, &args).map_err(|e| {
-            EngineError::Internal(format!("failed to resume job '{}': {e}", run.id))
-        })?;
-        Ok(())
     }
 
     async fn start_session(
         &self,
-        _spec: SessionSpec,
+        spec: SessionSpec,
         _ctx: &mut dyn EngineCtx,
     ) -> Result<RunId, EngineError> {
-        // opencode sessions run through the supervisor session machinery
-        // (`session_command`); this async seam is unwired like the agy
-        // engine's.
-        Err(EngineError::unsupported(self.id(), "session.start"))
+        let adapter = self.adapter("session.start")?;
+        let name = session_name_from_workdir(&spec.workdir);
+        adapter.start(&name)?;
+        Ok(name)
     }
 
     async fn send_message(&self, run: &Run, text: &str) -> Result<(), EngineError> {
-        let _ = (run, text);
-        Err(EngineError::unsupported(self.id(), "session.message"))
+        let adapter = self.adapter("session.message")?;
+        adapter.send_message(&run.id, text)
     }
 
     async fn stop_session(&self, run: &Run, restart: bool) -> Result<(), EngineError> {
-        let _ = (run, restart);
-        Err(EngineError::unsupported(self.id(), "session.stop"))
+        let adapter = self.adapter("session.stop")?;
+        adapter.stop(&run.id, restart)
     }
 
     fn job_command(
@@ -279,12 +357,29 @@ impl Engine for OpenCodeEngine {
         env.sort_by(|a, b| a.0.cmp(&b.0));
 
         Ok(LaunchPlan {
-            program: session.agy_binary.clone(),
+            program: self.config.opencode_path.clone(),
             args,
             env,
             stdin: StdinMode::Null,
             pty: true,
         })
+    }
+
+    /// opencode sessions run the engine's own binary (the configured
+    /// `opencode_path`), not the per-session agy/claude binaries.
+    fn readiness(
+        &self,
+        session: &SessionDef,
+        poll_interval: std::time::Duration,
+        shutdown: &std::sync::atomic::AtomicBool,
+        _paused: &std::sync::atomic::AtomicBool,
+    ) -> (bool, String) {
+        crate::orchestrate::readiness::binary_ready(
+            &self.config.opencode_path,
+            &session.env,
+            poll_interval,
+            shutdown,
+        )
     }
 
     fn classify_exit(&self, exit: ExitInfo, log_tail: &[u8]) -> JobStatus {
@@ -313,7 +408,9 @@ impl Engine for OpenCodeEngine {
         // lifecycle over the JSON-event log) plus `workspace.*` (operates on
         // the job row / worktree, engine-independent). Session mode mirrors
         // the agy live-stream PTY. `interrupt`/`pause`/`fork`/`compact`/
-        // `revert`/`todo` are emulated by the E4 layer, never 501.
+        // `revert`/`todo` are emulated by the E4 layer, never 501. The A2A
+        // inject channels (KA-7) are `hook`, `tool_result` and `idle_turn`,
+        // carried by the harness plugin + `mcp-a2a` config (SPEC §7.14).
         let native: &[crate::engine::capability::CapEndpointKey] = &[
             "job.start",
             "job.status",
@@ -384,6 +481,24 @@ impl Engine for OpenCodeEngine {
         false
     }
 
+    fn prepare_session(
+        &self,
+        session: &SessionDef,
+        _cfg_path: &std::path::Path,
+        _settings_path: &std::path::Path,
+    ) -> Result<(), String> {
+        // Materialise the opencode plugin and mcp.a2a config into ~/.config/opencode/
+        // for the session environment (KA-7).
+        let home = session
+            .env
+            .iter()
+            .find(|(k, _)| k.as_str() == "HOME")
+            .map(|(_, v)| std::path::PathBuf::from(v))
+            .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
+            .unwrap_or_else(|| std::path::PathBuf::from("/home/coder"));
+        crate::worker::opencode_config::prepare_opencode_home(&home)
+    }
+
     fn frame_pty_message(&self, payload: &[u8]) -> Vec<u8> {
         // opencode reads follow-up turns as user lines typed on the PTY, so a
         // message is a plain text line terminated by Enter (no bracketed
@@ -403,6 +518,18 @@ impl Engine for OpenCodeEngine {
         per_session_text: Option<(PathBuf, String)>,
         log: &mut Vec<String>,
     ) -> bool {
+        // The A2A injection channels (KA-7): write the harness opencode plugin
+        // (the `hook` channel) and merge the `mcp.a2a` local server (the
+        // `tool_result` channel) into the opencode global config
+        // (`~/.config/opencode/opencode.json`), idempotent. Same target as the
+        // AGENTS.md materialisation below; never touches the user's committed
+        // files. Best effort: an error is logged and the `tool_result` channel
+        // still delivers.
+        if let Err(e) = crate::worker::opencode_config::prepare_opencode_home(home) {
+            log.push(format!(
+                "ERROR: opencode A2A plugin/config write failed: {e} (continuing; tool_result channel still delivers)"
+            ));
+        }
         crate::core::instructions::materialize_opencode(
             home,
             workdir,
@@ -419,3 +546,206 @@ impl Engine for OpenCodeEngine {
 /// "await instructions" turn and then idles for real user input on the PTY.
 const OPENCODE_SESSION_START: &str =
     "Start a working session in this workspace. Do nothing yet: wait for the next user message.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::capability::Capability;
+    use crate::orchestrate::session_control::SessionControlRegistry;
+    use crate::orchestrate::session_log::SessionLogs;
+    use crate::orchestrate::sessions_api::SessionsApiState;
+    use crate::orchestrate::state::{SessionState, SessionStatus, SupervisorState};
+    use std::sync::Mutex;
+
+    #[test]
+    fn id_is_stable() {
+        let engine = OpenCodeEngine::new(Arc::new(Config::default()));
+        assert_eq!(engine.id(), "opencode");
+    }
+
+    #[test]
+    fn run_id_and_session_name_derive_from_workdir() {
+        assert_eq!(
+            run_id_from_workdir(std::path::Path::new("/workspace/proj")),
+            "proj"
+        );
+        assert_eq!(
+            session_name_from_workdir(std::path::Path::new("/workspace/proj")),
+            "proj"
+        );
+        assert_eq!(
+            session_name_from_workdir(std::path::Path::new("/")),
+            "opencode-job"
+        );
+    }
+
+    #[test]
+    fn session_ops_without_supervisor_answer_unsupported() {
+        let engine = OpenCodeEngine::new(Arc::new(Config::default()));
+        let mut ctx = crate::engine::EmptyEngineCtx;
+        let spec = SessionSpec {
+            workdir: PathBuf::from("/workspace/proj"),
+            transport: None,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        let err = rt
+            .block_on(engine.start_session(spec, &mut ctx))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::Unsupported { endpoint, .. } if endpoint == "session.start"
+            ),
+            "expected session.start unsupported, got {err:?}"
+        );
+
+        let run = Run::new("sess-1", RunKind::Session, "/workspace/proj");
+        let err = rt.block_on(engine.send_message(&run, "hi")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::Unsupported { endpoint, .. } if endpoint == "session.message"
+            ),
+            "expected session.message unsupported, got {err:?}"
+        );
+
+        let err = rt.block_on(engine.stop_session(&run, false)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::Unsupported { endpoint, .. } if endpoint == "session.stop"
+            ),
+            "expected session.stop unsupported, got {err:?}"
+        );
+
+        let err = engine.is_idle(&run).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::Unsupported { endpoint, .. } if endpoint == "a2a.inject.idle_turn"
+            ),
+            "expected is_idle unsupported, got {err:?}"
+        );
+
+        let err = rt.block_on(engine.idle_turn(&run, "msg")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::Unsupported { endpoint, .. } if endpoint == "a2a.inject.idle_turn"
+            ),
+            "expected idle_turn unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn session_ops_with_supervisor_adapter() {
+        let registry = SessionControlRegistry::new();
+        let state = Arc::new(Mutex::new(SupervisorState::new(1)));
+        {
+            let mut st = state.lock().unwrap();
+            let mut sess = SessionState::new("sess-1".to_string());
+            sess.status = SessionStatus::Running;
+            st.sessions.insert("sess-1".to_string(), sess);
+        }
+        let adapter = ClaudePtyAdapter {
+            state: SessionsApiState::new(state, registry, Arc::new(SessionLogs::new(1024))),
+            claude_dir: PathBuf::from("/home/agent/.opencode"),
+        };
+
+        let engine = OpenCodeEngine::with_pty(Arc::new(Config::default()), Some(adapter));
+        let run = Run::new("sess-1", RunKind::Session, "/workspace/proj");
+
+        // is_idle checks SessionStatus::Running
+        let idle = engine.is_idle(&run).expect("is_idle query");
+        assert!(idle, "running session must be idle between turns");
+
+        let stopped_run = Run::new("sess-missing", RunKind::Session, "/workspace/proj");
+        let idle_missing = engine.is_idle(&stopped_run).expect("is_idle for missing");
+        assert!(!idle_missing, "missing/non-running session is not idle");
+    }
+
+    #[test]
+    fn test_opencode_session_command() {
+        let engine = OpenCodeEngine::new(Arc::new(Config::default()));
+        let mut env_map = std::collections::HashMap::new();
+        env_map.insert("BBB".to_string(), "2".to_string());
+        env_map.insert("AAA".to_string(), "1".to_string());
+
+        let session = SessionDef {
+            name: "test-sess".to_string(),
+            workdir: PathBuf::from("/workspace/test-repo"),
+            session_id: "sess-123".to_string(),
+            engine: Some("opencode".to_string()),
+            claude_binary: PathBuf::from("claude"),
+            claude_args: Vec::new(),
+            agy_binary: PathBuf::from("agy"),
+            env: env_map,
+            session_file: None,
+            transcript_path: None,
+            memory_file: None,
+            instructions_file: None,
+            readiness_poll_secs: 5.0,
+            hang_timeout_secs: 0.0,
+            kill_grace_secs: 5.0,
+            pty_eof_grace_secs: 10.0,
+            kill_wait_secs: 15.0,
+            sandbox: true,
+            grants: None,
+            base_backoff_secs: 2.0,
+            max_backoff_secs: 60.0,
+            healthy_run_secs: 30.0,
+            max_crashes: 5,
+            crash_window_secs: 60.0,
+            prefix_output: false,
+            failed_cooldown_secs: 300.0,
+            backoff_window_secs: 600.0,
+            resume_fail_quarantine_after: 5,
+            resume_fail_uptime_secs: 5.0,
+        };
+
+        let plan = engine
+            .session_command(&session, ResumeMode::Start)
+            .expect("session_command Start");
+        assert_eq!(plan.program, engine.config.opencode_path);
+        assert_eq!(
+            plan.args,
+            vec![
+                "run",
+                "-i",
+                "--format",
+                "json",
+                "--auto",
+                "--dir",
+                "/workspace/test-repo",
+                OPENCODE_SESSION_START,
+            ]
+        );
+        assert!(plan.pty);
+        assert_eq!(plan.stdin, StdinMode::Null);
+        assert_eq!(
+            plan.env,
+            vec![
+                ("AAA".to_string(), "1".to_string()),
+                ("BBB".to_string(), "2".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn capabilities_honest_transport_and_keys() {
+        let engine = OpenCodeEngine::new(Arc::new(Config::default()));
+        let table = engine.capabilities();
+        assert_eq!(table.engine, "opencode");
+        assert_eq!(table.transport, None);
+        assert_eq!(table.capability("job.start"), Some(Capability::Native));
+        assert_eq!(table.capability("job.status"), Some(Capability::Native));
+        assert_eq!(table.capability("a2a.inject"), Some(Capability::Native));
+        assert_eq!(
+            table.capability("session.start"),
+            Some(Capability::Emulated)
+        );
+    }
+}

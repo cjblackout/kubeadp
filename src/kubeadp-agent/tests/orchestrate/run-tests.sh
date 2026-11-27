@@ -56,6 +56,8 @@ rec() {
 TEST_TMP=$(mktemp -d -t agent-orchestrate-tests-XXXXXX)
 FAKE_CLAUDE="${SCRIPT_DIR}/fake-claude.sh"
 chmod +x "$FAKE_CLAUDE"
+FAKE_OPENCODE="${SCRIPT_DIR}/fake-opencode.sh"
+chmod +x "$FAKE_OPENCODE"
 
 ACTIVE_PIDS=()
 
@@ -4964,6 +4966,361 @@ EOF
     rec "T73" "PASS" "missing per-session instruction file tolerated; global witness materialised and session started"
 }
 
+# ==============================================================================
+# T74: opencode session start & readiness
+# ==============================================================================
+test_t74() {
+    local tdir="${TEST_TMP}/t74"
+    mkdir -p "$tdir/home" "$tdir/work" "$tdir/control"
+    local log_file="$tdir/fake-opencode.log"
+    local state_file="$tdir/state.json"
+    local cfg_file="$tdir/config.json"
+    local port=`port_alloc`
+    local listen="127.0.0.1:${port}"
+
+    cat <<EOF > "$cfg_file"
+{
+    "state_file": "$state_file",
+    "heartbeat_interval_secs": 0.1,
+    "sessions": [
+        {
+            "name": "sess74",
+            "workdir": "$tdir/work",
+            "sandbox": false,
+            "engine": "opencode",
+            "session_id": "test-session-074",
+            "readiness_poll_secs": 0.2,
+            "base_backoff_secs": 0.2,
+            "env": {
+                "FAKE_OPENCODE_LOG": "$log_file",
+                "FAKE_OPENCODE_CONTROL_DIR": "$tdir/control"
+            }
+        }
+    ]
+}
+EOF
+
+    HOME="$tdir/home" AGENT_RUN_OPENCODE_PATH="$FAKE_OPENCODE" \
+    AGENT_ORCHESTRATE_LISTEN="$listen" \
+        "$BIN" run --config "$cfg_file" >/dev/null 2>&1 &
+    local spid=$!
+    ACTIVE_PIDS+=("$spid")
+
+    local running=0
+    for _ in $(seq 1 120); do
+        local sbody=$(curl -s "http://${listen}/api/v1/sessions/sess74" 2>/dev/null)
+        if echo "$sbody" | grep -q '"status":"running"'; then
+            running=1
+            break
+        fi
+        sleep 0.05
+    done
+
+    stop_supervisor "$spid"
+
+    if [ "$running" -eq 1 ] && grep -q -- "-i" "$log_file" 2>/dev/null; then
+        rec "T74" "PASS" "opencode session started in interactive mode (-i) and reached running"
+    else
+        rec "T74" "FAIL" "opencode session failed to start or reach running (running=$running)"
+    fi
+}
+
+# ==============================================================================
+# T75: opencode message injection (plain user line + Enter)
+# ==============================================================================
+test_t75() {
+    local tdir="${TEST_TMP}/t75"
+    mkdir -p "$tdir/home" "$tdir/work" "$tdir/control"
+    local log_file="$tdir/fake-opencode.log"
+    local stdin_log="$tdir/stdin.log"
+    local state_file="$tdir/state.json"
+    local cfg_file="$tdir/config.json"
+    local port=`port_alloc`
+    local listen="127.0.0.1:${port}"
+
+    cat <<EOF > "$cfg_file"
+{
+    "state_file": "$state_file",
+    "heartbeat_interval_secs": 0.1,
+    "sessions": [
+        {
+            "name": "sess75",
+            "workdir": "$tdir/work",
+            "sandbox": false,
+            "engine": "opencode",
+            "session_id": "test-session-075",
+            "readiness_poll_secs": 0.2,
+            "env": {
+                "FAKE_OPENCODE_LOG": "$log_file",
+                "FAKE_OPENCODE_STDIN_LOG": "$stdin_log",
+                "FAKE_OPENCODE_CONTROL_DIR": "$tdir/control"
+            }
+        }
+    ]
+}
+EOF
+
+    HOME="$tdir/home" AGENT_RUN_OPENCODE_PATH="$FAKE_OPENCODE" \
+    AGENT_ORCHESTRATE_LISTEN="$listen" \
+        "$BIN" run --config "$cfg_file" >/dev/null 2>&1 &
+    local spid=$!
+    ACTIVE_PIDS+=("$spid")
+
+    local up=0
+    for _ in $(seq 1 160); do
+        if grep -q "fd0-loop started" "$stdin_log" 2>/dev/null; then
+            up=1
+            break
+        fi
+        sleep 0.05
+    done
+
+    local resp=""
+    if [ "$up" -eq 1 ]; then
+        resp=$(curl -s -X POST "http://${listen}/api/v1/sessions/sess75/message" \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"test opencode message"}')
+    fi
+
+    # Wait for delivery to child stdin reader
+    local seen=0
+    for _ in $(seq 1 40); do
+        if grep -q 'test opencode message' "$stdin_log" 2>/dev/null; then
+            seen=1
+            break
+        fi
+        sleep 0.05
+    done
+
+    stop_supervisor "$spid"
+
+    local accepted=0
+    if echo "$resp" | grep -q '"accepted":true'; then
+        accepted=1
+    fi
+
+    if [ "$up" -eq 1 ] && [ "$seen" -eq 1 ] && [ "$accepted" -eq 1 ]; then
+        rec "T75" "PASS" "opencode message reached child over PTY and was accepted"
+    else
+        rec "T75" "FAIL" "opencode message injection failed (up=$up seen=$seen accepted=$accepted resp='$resp')"
+    fi
+}
+
+# ==============================================================================
+# T76: opencode session stop and restart lifecycle
+# ==============================================================================
+test_t76() {
+    local tdir="${TEST_TMP}/t76"
+    mkdir -p "$tdir/home" "$tdir/work" "$tdir/control"
+    local log_file="$tdir/fake-opencode.log"
+    local state_file="$tdir/state.json"
+    local cfg_file="$tdir/config.json"
+    local port=`port_alloc`
+    local listen="127.0.0.1:${port}"
+
+    cat <<EOF > "$cfg_file"
+{
+    "state_file": "$state_file",
+    "heartbeat_interval_secs": 0.05,
+    "sessions": [
+        {
+            "name": "sess76",
+            "workdir": "$tdir/work",
+            "sandbox": false,
+            "engine": "opencode",
+            "session_id": "test-session-076",
+            "kill_grace_secs": 0.2,
+            "kill_wait_secs": 0.4,
+            "readiness_poll_secs": 0.2,
+            "env": {
+                "FAKE_OPENCODE_LOG": "$log_file",
+                "FAKE_OPENCODE_CONTROL_DIR": "$tdir/control"
+            }
+        }
+    ]
+}
+EOF
+
+    HOME="$tdir/home" AGENT_RUN_OPENCODE_PATH="$FAKE_OPENCODE" \
+    AGENT_ORCHESTRATE_LISTEN="$listen" \
+        "$BIN" run --config "$cfg_file" >/dev/null 2>&1 &
+    local spid=$!
+    ACTIVE_PIDS+=("$spid")
+
+    local listed=0
+    for _ in $(seq 1 120); do
+        local sbody=$(curl -s "http://${listen}/api/v1/sessions/sess76" 2>/dev/null)
+        if echo "$sbody" | grep -q '"status":"running"'; then
+            listed=1
+            break
+        fi
+        sleep 0.05
+    done
+
+    local stop_ok=0
+    if [ "$listed" -eq 1 ]; then
+        curl -s -X POST "http://${listen}/api/v1/sessions/sess76/stop" >/dev/null 2>&1
+        for _ in $(seq 1 120); do
+            local sb=$(curl -s "http://${listen}/api/v1/sessions/sess76" 2>/dev/null)
+            if echo "$sb" | grep -q '"paused":true'; then
+                stop_ok=1
+                break
+            fi
+            sleep 0.05
+        done
+    fi
+
+    local restart_ok=0
+    if [ "$stop_ok" -eq 1 ]; then
+        curl -s -X POST "http://${listen}/api/v1/sessions/sess76/restart" >/dev/null 2>&1
+        for _ in $(seq 1 160); do
+            local after=$(curl -s "http://${listen}/api/v1/sessions/sess76" 2>/dev/null)
+            local st=$(echo "$after" | grep -o '"status":"[a-z]*"' | cut -d: -f2 | tr -d '"')
+            local paused=$(echo "$after" | grep -o '"paused":[a-z]*' | head -n1 | cut -d: -f2)
+            if [ "$st" = "running" ] && [ "$paused" = "false" ]; then
+                restart_ok=1
+                break
+            fi
+            sleep 0.05
+        done
+    fi
+
+    stop_supervisor "$spid"
+
+    if [ "$restart_ok" -eq 1 ]; then
+        rec "T76" "PASS" "opencode stop and restart lifecycle succeeded"
+    else
+        rec "T76" "FAIL" "opencode stop/restart failed (listed=$listed stop_ok=$stop_ok restart_ok=$restart_ok)"
+    fi
+}
+
+# ==============================================================================
+# T77: opencode crash and backoff recovery
+# ==============================================================================
+test_t77() {
+    local tdir="${TEST_TMP}/t77"
+    mkdir -p "$tdir/home" "$tdir/work" "$tdir/control"
+    local log_file="$tdir/fake-opencode.log"
+    local state_file="$tdir/state.json"
+    local cfg_file="$tdir/config.json"
+    local port=`port_alloc`
+    local listen="127.0.0.1:${port}"
+
+    cat <<EOF > "$cfg_file"
+{
+    "state_file": "$state_file",
+    "sessions": [
+        {
+            "name": "sess77",
+            "workdir": "$tdir/work",
+            "sandbox": false,
+            "engine": "opencode",
+            "session_id": "test-session-077",
+            "base_backoff_secs": 0.05,
+            "max_backoff_secs": 0.1,
+            "readiness_poll_secs": 0.2,
+            "env": {
+                "FAKE_OPENCODE_LOG": "$log_file",
+                "FAKE_OPENCODE_CONTROL_DIR": "$tdir/control"
+            }
+        }
+    ]
+}
+EOF
+
+    touch "$tdir/control/action_exit1"
+
+    HOME="$tdir/home" AGENT_RUN_OPENCODE_PATH="$FAKE_OPENCODE" \
+    AGENT_ORCHESTRATE_LISTEN="$listen" \
+        "$BIN" run --config "$cfg_file" >/dev/null 2>&1 &
+    local spid=$!
+    ACTIVE_PIDS+=("$spid")
+
+    for _ in $(seq 1 80); do
+        local count=$(grep -c "exit=1" "$log_file" 2>/dev/null || echo 0)
+        if [ "$count" -ge 2 ]; then break; fi
+        sleep 0.05
+    done
+
+    # Remove crash marker so it recovers to running
+    rm -f "$tdir/control/action_exit1"
+
+    local recovered=0
+    for _ in $(seq 1 120); do
+        local sbody=$(curl -s "http://${listen}/api/v1/sessions/sess77" 2>/dev/null)
+        if echo "$sbody" | grep -q '"status":"running"'; then
+            recovered=1
+            break
+        fi
+        sleep 0.05
+    done
+
+    stop_supervisor "$spid"
+
+    if [ "$recovered" -eq 1 ]; then
+        rec "T77" "PASS" "opencode crashed, backed off and recovered to running"
+    else
+        rec "T77" "FAIL" "opencode crash recovery failed (recovered=$recovered)"
+    fi
+}
+
+# ==============================================================================
+# T78: opencode log endpoint tail capture
+# ==============================================================================
+test_t78() {
+    local tdir="${TEST_TMP}/t78"
+    mkdir -p "$tdir/home" "$tdir/work" "$tdir/control"
+    local log_file="$tdir/fake-opencode.log"
+    local state_file="$tdir/state.json"
+    local cfg_file="$tdir/config.json"
+    local port=`port_alloc`
+    local listen="127.0.0.1:${port}"
+
+    cat <<EOF > "$cfg_file"
+{
+    "state_file": "$state_file",
+    "sessions": [
+        {
+            "name": "sess78",
+            "workdir": "$tdir/work",
+            "sandbox": false,
+            "engine": "opencode",
+            "session_id": "test-session-078",
+            "readiness_poll_secs": 0.2,
+            "env": {
+                "FAKE_OPENCODE_LOG": "$log_file",
+                "FAKE_OPENCODE_CONTROL_DIR": "$tdir/control"
+            }
+        }
+    ]
+}
+EOF
+
+    HOME="$tdir/home" AGENT_RUN_OPENCODE_PATH="$FAKE_OPENCODE" \
+    AGENT_ORCHESTRATE_LISTEN="$listen" \
+        "$BIN" run --config "$cfg_file" >/dev/null 2>&1 &
+    local spid=$!
+    ACTIVE_PIDS+=("$spid")
+
+    local log_ok=0
+    for _ in $(seq 1 160); do
+        local body=$(curl -s "http://${listen}/api/v1/sessions/sess78/log?tail=50" 2>/dev/null)
+        if echo "$body" | grep -q '"session":"sess78"'; then
+            log_ok=1
+            break
+        fi
+        sleep 0.05
+    done
+
+    stop_supervisor "$spid"
+
+    if [ "$log_ok" -eq 1 ]; then
+        rec "T78" "PASS" "opencode session log tail returned valid session log frame"
+    else
+        rec "T78" "FAIL" "opencode session log fetch failed"
+    fi
+}
+
 TESTS_TO_RUN=()
 if [ -n "${ONLY:-}" ]; then
     for t in $ONLY; do
@@ -5055,6 +5412,11 @@ else
     test_t71
     test_t72
     test_t73
+    test_t74
+    test_t75
+    test_t76
+    test_t77
+    test_t78
 fi
 
 echo "============================================================"

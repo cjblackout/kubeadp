@@ -4,6 +4,7 @@
 pub mod agy_home;
 pub mod agy_plugin;
 pub mod entry;
+pub mod opencode_config;
 pub mod server;
 pub mod supervisor;
 

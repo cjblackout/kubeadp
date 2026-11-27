@@ -359,11 +359,18 @@ and secrets.
   <workdir> <start-message>` inside the supervisor PTY, mirroring the agy
   live-stream approach: the interactive opencode process reads follow-up
   turns as user lines typed on the PTY.
-- **Message injection** is the floor of the ladder (§7.14): opencode has no
-  hook mechanism, so its injection channel is `idle_turn` only -- a queued
-  message starts the run's next turn as a follow-up prompt. A RUNNING
-  opencode job has no live channel and answers `Unsupported` for the
-  `idle_turn` step.
+- **Message injection** (capability `a2a.inject`, §7.14) carries `hook`,
+  `tool_result`, and `idle_turn`:
+  - `hook`: the harness opencode plugin (`experimental.chat.messages.transform`)
+    drains the run's inbox via `kubeadp-agent a2a-hook transform` and appends
+    the framed message to the model prompt.
+  - `tool_result`: the harness-owned `mcp-a2a` server configured in `opencode.json`
+    (`mcp.a2a`) appends queued messages to tool results.
+  - `idle_turn`: a queued message resumes a finished job as the next turn
+    (`retry`). Interactive sessions receive queued messages over the PTY
+    (`frame_pty_message`). A RUNNING opencode single-turn job (`run --format json`)
+    answers `Unsupported` for the `idle_turn` step because it has no live stdin
+    channel (its in-flight messages are delivered via `hook` and `tool_result`).
 - **Instructions**: `materialize_instructions` writes the global
   `~/.config/opencode/AGENTS.md` and the per-session `AGENTS.md` in the run's
   working directory (§4.10), each as a managed block; the workdir `AGENTS.md`
@@ -403,17 +410,15 @@ and secrets.
 | `permissions` | Y | Y | unsupported (empty list) | unsupported (empty list) | unsupported (empty list) |
 | `workspace.*` | Y | Y | native | native | native |
 | `a2a.send_message` | Y | Y | native | native | native |
-| `a2a.inject` | Y | Y | native: `hook`, `tool_result`, `idle_turn` | native: `hook`, `tool_result`, `idle_turn` | native: `idle_turn` only |
+| `a2a.inject` | Y | Y | native: `hook`, `tool_result`, `idle_turn` | native: `hook`, `tool_result`, `idle_turn` | native: `hook`, `tool_result`, `idle_turn` |
 
 `job.*` and `workspace.*` operate on the job row and the worktree and are
 therefore engine-independent: they are `native` for every engine by
 construction. `a2a.send_message` is `native` for every engine because sending
 is done by the harness-owned `mcp-a2a` server (§8), not by the engine.
 `a2a.inject` is `native` for every engine with an engine-specific channel
-ladder (§7.14): agy and claude expose `hook`, `tool_result` and `idle_turn`;
-opencode is the floor of the ladder -- no hook mechanism and no harness-owned
-`mcp-a2a` wired through `opencode.json` (a future change, Open Points), so it
-exposes `idle_turn` only. Session control for opencode is the emulated control surface
+ladder (§7.14): agy, claude, and opencode all expose `hook`, `tool_result` and
+`idle_turn`. Session control for opencode is the emulated control surface
 (§3.4), because the interactive opencode process exposes no restart/log/message
 channels.
 
@@ -1411,28 +1416,28 @@ having to read a mailbox.
 
 | Channel | Claude Code | agy | opencode |
 |---|---|---|---|
-| `hook` (next model call) | hooks `PostToolUse` and `UserPromptSubmit` answer `hookSpecificOutput.additionalContext` | native plugin hook `PreInvocation` answers `{"injectSteps":[{"systemMessage":{"systemMessage":"<framed>"}}]}` | — (none: no hook mechanism) |
-| `tool_result` | `mcp-a2a` appends the queued messages to the result of any of its tools; `wait_message` returns them (§8) | same | — (none: no harness-owned `mcp-a2a`) |
-| `idle_turn` (turn boundary) | hook `Stop` answers `{"decision":"block","reason":"<framed>"}`; a PTY session idle at the prompt gets the message as pasted input | hooks `PostInvocation` (`injectSteps` + `"terminationBehavior":"force_continue"`) and `Stop` (`{"decision":"continue","reason":"<framed>"}`); a live-mode process idle between turns gets one NDJSON `{"event":"user","message":{"content":"<framed>"}}` line on stdin; a finished job is resumed (§7.11) | a queued message starts the run's next turn as a follow-up prompt (a finished job is resumed as a retry, §3.4); a RUNNING opencode job has no live channel |
+| `hook` (next model call) | hooks `PostToolUse` and `UserPromptSubmit` answer `hookSpecificOutput.additionalContext` | native plugin hook `PreInvocation` answers `{"injectSteps":[{"systemMessage":{"systemMessage":"<framed>"}}]}` | harness plugin `experimental.chat.messages.transform` calling `a2a-hook transform` |
+| `tool_result` | `mcp-a2a` appends the queued messages to the result of any of its tools; `wait_message` returns them (§8) | same | `mcp-a2a` server registered in `opencode.json` (`mcp.a2a`) |
+| `idle_turn` (turn boundary) | hook `Stop` answers `{"decision":"block","reason":"<framed>"}`; a PTY session idle at the prompt gets the message as pasted input | hooks `PostInvocation` (`injectSteps` + `"terminationBehavior":"force_continue"`) and `Stop` (`{"decision":"continue","reason":"<framed>"}`); a live-mode process idle between turns gets one NDJSON `{"event":"user","message":{"content":"<framed>"}}` line on stdin; a finished job is resumed (§7.11) | a queued message starts the run's next turn as a follow-up prompt (a finished job is resumed as a retry, §3.4); a running session gets the message over PTY (`frame_pty_message`) |
 | `interrupt` | kill-and-resume (§7.11) | same | same |
 
-  agy and claude support `hook`, `tool_result` and `idle_turn`, so a busy agent
-  of either engine receives a message at its next model call. opencode is the
-  floor of the ladder: `idle_turn` only (a RUNNING opencode job is unwakeable in
-  flight). In addition to the model channel, the Claude Code hooks answer a
+  agy, claude, and opencode all support `hook`, `tool_result` and `idle_turn`, so
+  a busy agent of any engine receives a message at its next model call or turn
+  boundary. In addition to the model channel, the Claude Code hooks answer a
   user-visible echo (a TOP-LEVEL `systemMessage`, one short line per message,
   §7.14.1); the outgoing `send_message`/`reply` results echo themselves the
   same way, behind the one `a2a_echo` switch.
 - **`a2a-hook <event>`** (subcommand, events `PostToolUse`, `UserPromptSubmit`,
-  `Stop`, `pre-invocation`, `post-invocation`, `stop`): claims (leases) up to
+  `Stop`, `pre-invocation`, `post-invocation`, `stop`, `transform`): claims (leases) up to
   16 KiB (`MAX_INJECT_BYTES`) for the event's channel, prints the event's JSON
-  and acknowledges each claimed message only after the text reached stdout
-  (at-least-once: a crash between claim and ack re-delivers after the lease).
-  With nothing queued it prints `{}` for the agy events and nothing for the
-  Claude Code events and exits `0` (a hook never breaks the engine). Inside a
-  relay-sandboxed run the pod-local inbox API is unreachable: the hook fails
-  closed with the reason on stderr, exit `1`. Whenever the inbox API is
-  unreachable or stuck (not just in relay mode), an UNREACHABLE inbox is never
+  (or plain framed text for `transform`) and acknowledges each claimed message
+  only after the text reached stdout (at-least-once: a crash between claim and ack
+  re-delivers after the lease). With nothing queued it prints `{}` for the agy
+  events and `transform`, and nothing for the Claude Code events, exiting `0` (a hook
+  never breaks the engine). Inside a relay-sandboxed run the pod-local inbox API
+  is unreachable: the hook fails closed with the reason on stderr, exit `1`.
+  Whenever the inbox API is unreachable or stuck (not just in relay mode), an
+  UNREACHABLE inbox is never
   read as empty: the claim (or a later ack) fails closed with the endpoint and
   the deadline on stderr and the hook exits `1`, so a broken delivery is never
   silently invisible; a failed ack after the text already reached stdout keeps
@@ -2043,7 +2048,8 @@ Implemented: migrations 1–7 (`jobs`, supervisor and session state, heartbeat i
 | claude sessions (`pty_remote_control`), agy sessions (live stream-json), opencode sessions (interactive `-i`) | partial | work on the orchestrator behind the engine trait; claude `stream_json` sessions planned |
 | engine persisted per run and used by retry/restart | implemented | |
 | built-in default by run kind only | implemented | |
-| capability table of §3.5 | implemented | implemented capability tables match §3.5: `claude` gets native `job.list`/`job.kill`/`job.result`/`workspace.*`, `interrupt`/`pause`/`fork` emulated for both engines; `opencode` gets the same native job/workspace surface with `idle_turn`-only injection; only `permissions` remains `unsupported` |
+| capability table of §3.5 | implemented | implemented capability tables match §3.5: `claude` gets native `job.list`/`job.kill`/`job.result`/`workspace.*`, `interrupt`/`pause`/`fork` emulated for all engines; `opencode` gets the same native job/workspace surface with `hook`, `tool_result`, `idle_turn` injection; only `permissions` remains `unsupported` |
+| opencode A2A plugin and mcp.a2a config | partial | experimental.chat.messages.transform hook and mcp.a2a local server config are written into ~/.config/opencode/opencode.json and verified by harness/unit tests, but were NOT exercised against a real opencode binary in this repo's tests |
 | no `501` because of the engine | implemented | the worker arms the emulation layer for every control endpoint each engine lacks, so no `/api/v1` control route answers `501` because of the engine; run-control route handlers have no hard-coded 501 arm (answers through capability check) |
 | run-control routes resolving real jobs and sessions | implemented | run-control routes resolve real jobs and sessions through `RunRegistry` backed by SQLite and `run_meta` |
 | `fork` creating a run | implemented | the job surface clones the source worktree and returns the new run id |
@@ -2069,7 +2075,5 @@ Implemented: the sandbox (§6.1–§6.9 including the per-agent delivery socket)
   (120 s URL/code, 15 min parked).
 - `repo-sync` `--once`/`--loop` flag interplay with environment overrides in
   edge configurations.
-- opencode injection ladder: wiring the harness-owned `mcp-a2a` through
-  `opencode.json` (opencode already supports MCP config, verified against
-  `opencode mcp list` for 1.19.4) to raise the opencode injection channel above
-  `idle_turn`; deliberately not done in KA-4.
+- opencode injection ladder: wired the harness-owned `mcp-a2a` and `a2a` plugin
+  through `opencode.json` (KA-7) providing `hook`, `tool_result`, and `idle_turn`.
