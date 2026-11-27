@@ -484,7 +484,7 @@ export const mockAgents: Agent[] = [
   {
     name: 'kubeopencode-agent',
     namespace: 'default',
-    profile: 'KubeOpenCode agent — PR review, refactoring, dependency updates, GitHub and Slack responses, community operations, documentation generation, release management, security scanning, and cross-repository coordination',
+    profile: 'kubeadp agent — PR review, refactoring, dependency updates, GitHub and Slack responses, community operations, documentation generation, release management, security scanning, and cross-repository coordination',
     templateRef: { name: 'standard-base' },
     executorImage: 'ghcr.io/kubeopencode/kubeopencode-agent-devbox:latest',
     kubeadpImage: 'ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.64',

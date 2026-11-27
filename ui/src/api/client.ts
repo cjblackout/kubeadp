@@ -1,4 +1,4 @@
-// API Client for KubeOpenCode
+// API Client for kubeadp
 
 const API_BASE = '/api/v1';
 

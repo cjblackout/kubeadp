@@ -8,16 +8,16 @@ module.exports = {
     extend: {
       colors: {
         primary: {
-          50: '#eef4ff',
-          100: '#dae6fe',
-          200: '#bdd2fe',
-          300: '#90b5fc',
-          400: '#6B9AEF',
-          500: '#4878E0',
-          600: '#3560C8',
-          700: '#2B4EA6',
-          800: '#264288',
-          900: '#213A6E',
+          50: '#fff1f0',
+          100: '#ffe0de',
+          200: '#ffc6c2',
+          300: '#ff9a94',
+          400: '#f6574f',
+          500: '#EA100C',
+          600: '#C80D0A',
+          700: '#A30B09',
+          800: '#850D0B',
+          900: '#6B0F0D',
         },
         surface: {
           50: '#f8fafc',
@@ -28,7 +28,7 @@ module.exports = {
         sidebar: {
           DEFAULT: '#FFFFFF',
           light: '#F8FAFC',
-          hover: '#EFF3FF',
+          hover: '#FFF1F0',
           border: '#E2E8F0',
           muted: '#64748B',
           text: '#1E293B',

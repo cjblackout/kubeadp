@@ -2,7 +2,7 @@
 
 ## Pod Security
 
-KubeOpenCode applies a restricted security context by default to all agent containers, following the Kubernetes Pod Security Standards (Restricted profile).
+kubeadp applies a restricted security context by default to all agent containers, following the Kubernetes Pod Security Standards (Restricted profile).
 
 ### Default Security Context
 
@@ -181,7 +181,7 @@ spec:
 
 ### Per-Container-Type Overrides
 
-`podSpec.systemContainers` provides fine-grained control over specific KubeOpenCode-managed
+`podSpec.systemContainers` provides fine-grained control over specific kubeadp-managed
 containers. Use this when you need different env vars or volume mounts on specific container types.
 
 Available container targets:
@@ -200,7 +200,7 @@ On OpenShift with `restricted-v2` SCC, containers run with random UIDs that have
 directory in `/etc/passwd`. This caused `git-init` containers to crash with
 `"failed to setup authentication: exit status 255"` when trying to write `~/.gitconfig`.
 
-KubeOpenCode v0.1.2+ automatically sets `HOME=/tmp` and `SHELL=/bin/bash` on `git-init` and
+kubeadp v0.1.2+ automatically sets `HOME=/tmp` and `SHELL=/bin/bash` on `git-init` and
 `git-sync` containers (the same fix already applied to the executor container since v0.1.0).
 
 If you are running an older version or a custom system image, you can apply the fix via

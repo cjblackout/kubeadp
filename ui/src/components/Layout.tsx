@@ -49,9 +49,9 @@ function Layout() {
       {/* Logo / Brand */}
       <div className="flex items-center justify-between px-4 h-14 shadow-[0_1px_0_0_rgba(0,0,0,0.06)] flex-shrink-0">
         <NavLink to="/" className="flex items-center gap-2.5 group">
-          <img src={logoImg} alt="KubeOpenCode" className="w-7 h-7 rounded-lg" />
+          <img src={logoImg} alt="kubeadp" className="w-7 h-7 rounded-lg" />
           <span className="font-display font-semibold text-sm text-sidebar-text tracking-tight">
-            KubeOpenCode
+            kubeadp
           </span>
         </NavLink>
         <button
@@ -240,7 +240,7 @@ function Layout() {
           <div className="hidden lg:flex flex-col items-center py-3 gap-2 h-full shadow-[1px_0_0_0_rgba(0,0,0,0.06)]">
             {/* Collapsed sidebar */}
             <NavLink to="/" className="w-9 h-9 rounded-lg flex items-center justify-center mb-2">
-              <img src={logoImg} alt="KubeOpenCode" className="w-7 h-7 rounded-lg" />
+              <img src={logoImg} alt="kubeadp" className="w-7 h-7 rounded-lg" />
             </NavLink>
             <button
               onClick={() => setSidebarOpen(true)}

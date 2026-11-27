@@ -3,7 +3,7 @@ import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
-  title: 'KubeOpenCode',
+  title: 'kubeadp',
   tagline: 'Kubernetes-native Agent Platform for Teams and Enterprise',
   favicon: 'img/logo-s.png',
 
@@ -68,9 +68,9 @@ const config: Config = {
       respectPrefersColorScheme: true,
     },
     navbar: {
-      title: 'KubeOpenCode',
+      title: 'kubeadp',
       logo: {
-        alt: 'KubeOpenCode Logo',
+        alt: 'kubeadp Logo',
         src: 'img/logo-s.png',
       },
       items: [

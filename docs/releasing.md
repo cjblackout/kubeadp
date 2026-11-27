@@ -1,10 +1,10 @@
 # Release SOP (Standard Operating Procedure)
 
-This document describes how to release a new version of KubeOpenCode. It is designed to be followed step-by-step by either a human or an AI agent.
+This document describes how to release a new version of kubeadp. It is designed to be followed step-by-step by either a human or an AI agent.
 
 ## Overview
 
-A KubeOpenCode release produces the following artifacts:
+A kubeadp release produces the following artifacts:
 
 | Artifact | Registry | Example |
 |----------|----------|---------|

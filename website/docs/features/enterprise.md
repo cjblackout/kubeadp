@@ -6,7 +6,7 @@ When accessing private Git servers or internal HTTPS services that use self-sign
 
 ### ConfigMap Example (trust-manager Compatible)
 
-If you use [cert-manager trust-manager](https://cert-manager.io/docs/trust/trust-manager/), it can automatically populate a ConfigMap with your organization's CA bundle. KubeOpenCode's default key (`ca-bundle.crt`) matches trust-manager's convention.
+If you use [cert-manager trust-manager](https://cert-manager.io/docs/trust/trust-manager/), it can automatically populate a ConfigMap with your organization's CA bundle. kubeadp's default key (`ca-bundle.crt`) matches trust-manager's convention.
 
 ```yaml
 apiVersion: kubeopencode.io/v1alpha1
@@ -81,14 +81,14 @@ spec:
         key: ca-bundle.crt
   target:
     configMap:
-      key: ca-bundle.crt           # Matches KubeOpenCode's default key
+      key: ca-bundle.crt           # Matches kubeadp's default key
 ```
 
 > **Note**: `git-init` automatically concatenates the custom CA bundle with the container's system CAs, so public HTTPS (e.g., github.com) continues working even when `caBundle` is configured. You do not need to include public CAs in your bundle unless you want to explicitly control the full trust chain.
 
 ## HTTP/HTTPS Proxy Configuration
 
-Enterprise networks often require all outbound traffic to pass through a corporate proxy server. KubeOpenCode supports proxy configuration at both the Agent level and the cluster level via `KubeOpenCodeConfig`.
+Enterprise networks often require all outbound traffic to pass through a corporate proxy server. kubeadp supports proxy configuration at both the Agent level and the cluster level via `KubeOpenCodeConfig`.
 
 ### Agent-Level Proxy
 

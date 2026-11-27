@@ -109,9 +109,9 @@ function ConfigPage() {
           <div className="flex items-center justify-between">
             <div>
               <h2 className="font-display text-xl font-bold text-stone-900">Cluster Configuration</h2>
-              <p className="text-xs text-stone-400 mt-0.5">System-wide settings for KubeOpenCode</p>
+              <p className="text-xs text-stone-400 mt-0.5">System-wide settings for kubeadp</p>
             </div>
-            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium border bg-sky-50 text-sky-600 border-sky-200">
+            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium border bg-red-50 text-red-600 border-red-200">
               Cluster-scoped
             </span>
           </div>

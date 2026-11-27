@@ -9,12 +9,12 @@ description: Step-by-step guide to configure a production-ready AI agent on Kube
 This guide walks you through configuring a fully functional Agent — from choosing your AI model to enabling persistence, skills, and context. By the end, you'll have a production-ready Agent running on Kubernetes.
 
 :::tip Prerequisites
-Make sure KubeOpenCode is installed on your cluster. See [Getting Started](getting-started.md) for installation instructions.
+Make sure kubeadp is installed on your cluster. See [Getting Started](getting-started.md) for installation instructions.
 :::
 
 ## Overview
 
-An Agent in KubeOpenCode is a persistent, running AI service on Kubernetes. Configuring one involves:
+An Agent in kubeadp is a persistent, running AI service on Kubernetes. Configuring one involves:
 
 1. **Model & Provider** — Which AI model powers the agent (most important)
 2. **Images** — The runtime environment (init container + executor)
@@ -23,7 +23,7 @@ An Agent in KubeOpenCode is a persistent, running AI service on Kubernetes. Conf
 
 ## Step 1: Configure the AI Model
 
-This is the most critical step. KubeOpenCode runs [OpenCode](https://opencode.ai) under the hood, so model configuration follows the OpenCode config format. You provide this via the Agent's `config` field as an inline YAML object.
+This is the most critical step. kubeadp runs [OpenCode](https://opencode.ai) under the hood, so model configuration follows the OpenCode config format. You provide this via the Agent's `config` field as an inline YAML object.
 
 ### Minimal Configuration
 
@@ -113,7 +113,7 @@ For full configuration reference, see the [OpenCode Config documentation](https:
 
 ## Step 2: Choose Your Images
 
-KubeOpenCode uses a **two-container pattern**:
+kubeadp uses a **two-container pattern**:
 
 | Container | Field | Role |
 |-----------|-------|------|
@@ -135,7 +135,7 @@ At pod startup, the init container copies the OpenCode binary from `agentImage` 
 
 ### Default Images
 
-If you don't specify images, KubeOpenCode uses these defaults:
+If you don't specify images, kubeadp uses these defaults:
 
 - **OpenCode init**: `ghcr.io/kubeopencode/kubeopencode-agent-opencode:latest`
 - **Devbox executor**: `ghcr.io/kubeopencode/kubeopencode-agent-devbox:latest`
@@ -296,7 +296,7 @@ spec:
       size: "10Gi"
 ```
 
-See [Persistence & Lifecycle](features/persistence.md) for the full explanation of how Kubernetes storage works with KubeOpenCode.
+See [Persistence & Lifecycle](features/persistence.md) for the full explanation of how Kubernetes storage works with kubeadp.
 
 ### Standby (Auto Suspend/Resume)
 
@@ -323,7 +323,7 @@ See [Persistence & Lifecycle — Suspend/Resume](features/persistence.md#suspend
 
 ### Context
 
-Contexts provide knowledge to the agent — codebases, documentation, configuration. KubeOpenCode supports multiple context types:
+Contexts provide knowledge to the agent — codebases, documentation, configuration. kubeadp supports multiple context types:
 
 ```yaml
 spec:
@@ -391,7 +391,7 @@ spec:
           - skill-creator
 ```
 
-KubeOpenCode automatically clones the skill repos and injects the paths into the OpenCode config. See [Skills](features/skills.md) for private repos and advanced usage.
+kubeadp automatically clones the skill repos and injects the paths into the OpenCode config. See [Skills](features/skills.md) for private repos and advanced usage.
 
 ### Plugins
 
@@ -572,7 +572,7 @@ kubectl get task -n my-team -w
 
 ## Further Reading: Repo-as-Agent Pattern
 
-The KubeOpenCode team's own agent — [kubeopencode-agent](https://github.com/kubeopencode/kubeopencode-agent) — follows the **Repo-as-Agent** pattern: a dedicated Git repository that *is* the agent, containing its identity, cross-repo context, team knowledge, skills, and scheduled workflows. The Agent you configure with KubeOpenCode is designed to work this way.
+The kubeadp team's own agent — [kubeopencode-agent](https://github.com/kubeopencode/kubeopencode-agent) — follows the **Repo-as-Agent** pattern: a dedicated Git repository that *is* the agent, containing its identity, cross-repo context, team knowledge, skills, and scheduled workflows. The Agent you configure with kubeadp is designed to work this way.
 
 Read more about this pattern and how we built it: [Whatever You Want to Build, Build an Agent First](/blog/repo-as-agent).
 

@@ -1,6 +1,6 @@
 # Upgrade SOP (Standard Operating Procedure)
 
-This document describes how to upgrade KubeOpenCode on an existing cluster.
+This document describes how to upgrade kubeadp on an existing cluster.
 
 ## Prerequisites
 

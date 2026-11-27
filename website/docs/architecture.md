@@ -2,7 +2,7 @@
 
 ## System Overview
 
-KubeOpenCode brings Agentic AI capabilities into the Kubernetes ecosystem. By leveraging Kubernetes, it enables AI agents to be deployed as services, run in isolated virtual environments, and integrate with enterprise management and governance frameworks.
+kubeadp brings Agentic AI capabilities into the Kubernetes ecosystem. By leveraging Kubernetes, it enables AI agents to be deployed as services, run in isolated virtual environments, and integrate with enterprise management and governance frameworks.
 
 ### Core Goals
 
@@ -21,7 +21,7 @@ KubeOpenCode brings Agentic AI capabilities into the Kubernetes ecosystem. By le
 
 ### External Integrations
 
-KubeOpenCode focuses on the core Task/Agent abstraction. For advanced features, integrate with external projects:
+kubeadp focuses on the core Task/Agent abstraction. For advanced features, integrate with external projects:
 
 | Feature | Recommended Integration |
 |---------|------------------------|
@@ -29,7 +29,7 @@ KubeOpenCode focuses on the core Task/Agent abstraction. For advanced features, 
 | Event-driven triggers | [Argo Events](https://argoproj.github.io/argo-events/) |
 | Scheduled execution | [CronTask](features/crontask.md) (built-in) |
 
-See the [kubeopencode/dogfooding](https://github.com/kubeopencode/dogfooding) repository for examples of GitHub webhook integration using Argo Events that creates KubeOpenCode Tasks.
+See the [kubeopencode/dogfooding](https://github.com/kubeopencode/dogfooding) repository for examples of GitHub webhook integration using Argo Events that creates kubeadp Tasks.
 
 ---
 
@@ -41,8 +41,8 @@ graph TB
         API["Kubernetes API Server<br/><i>CRDs · RBAC · Events</i>"]
 
         subgraph CP["Control Plane (kubeopencode-system)"]
-            Controller["KubeOpenCode Controller<br/><i>Watch CRs · Reconcile · Manage Pods</i>"]
-            Server["KubeOpenCode Server<br/><i>REST API · Embedded React UI</i>"]
+            Controller["kubeadp Controller<br/><i>Watch CRs · Reconcile · Manage Pods</i>"]
+            Server["kubeadp Server<br/><i>REST API · Embedded React UI</i>"]
         end
 
         subgraph DP["Data Plane"]
@@ -555,7 +555,7 @@ spec:
 
 ## Web UI & REST API
 
-KubeOpenCode includes a web-based UI for managing Tasks, Agents, and CronTasks.
+kubeadp includes a web-based UI for managing Tasks, Agents, and CronTasks.
 
 ```mermaid
 graph LR

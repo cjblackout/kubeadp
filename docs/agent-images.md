@@ -1,10 +1,10 @@
 # Agent Images
 
-KubeOpenCode provides **template agent images** that serve as starting points for building your own customized agents. These templates demonstrate the agent interface pattern and include common development tools, but are designed to be customized based on your specific requirements.
+kubeadp provides **template agent images** that serve as starting points for building your own customized agents. These templates demonstrate the agent interface pattern and include common development tools, but are designed to be customized based on your specific requirements.
 
 ## Container Pattern
 
-KubeOpenCode uses multiple container images:
+kubeadp uses multiple container images:
 
 1. **Kubeadp Init Container** (`kubeadpImage`): Copies `kubeadp-agent` and `agent-run` binaries to `/tools`
 2. **OpenCode Init Container** (`agentImage`): Contains the OpenCode CLI, copies it to a shared `/tools` volume

@@ -1,10 +1,10 @@
 # UI Automated Testing
 
-This document describes the frontend automated testing setup for KubeOpenCode's Web UI, including the technology stack, test architecture, how to run tests, and how to maintain them.
+This document describes the frontend automated testing setup for kubeadp's Web UI, including the technology stack, test architecture, how to run tests, and how to maintain them.
 
 ## Overview
 
-The KubeOpenCode Web UI has a comprehensive automated test suite with **220 tests** across 21 test files, achieving **82.5% line coverage**. Tests run in ~3 seconds with zero external dependencies — no browser, no cluster, no network access required.
+The kubeadp Web UI has a comprehensive automated test suite with **220 tests** across 21 test files, achieving **82.5% line coverage**. Tests run in ~3 seconds with zero external dependencies — no browser, no cluster, no network access required.
 
 ### Test Pyramid
 
@@ -240,7 +240,7 @@ it('shows error state when API fails', async () => {
 
 ### Test Wrapper (`src/test/utils.tsx`)
 
-React components in KubeOpenCode require several context providers (React Query, Toast, Router). The `renderWithProviders` helper wraps components with all required providers:
+React components in kubeadp require several context providers (React Query, Toast, Router). The `renderWithProviders` helper wraps components with all required providers:
 
 ```typescript
 export function renderWithProviders(

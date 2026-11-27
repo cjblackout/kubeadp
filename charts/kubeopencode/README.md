@@ -1,6 +1,6 @@
-# KubeOpenCode Helm Chart
+# kubeadp Helm Chart
 
-This Helm chart deploys KubeOpenCode, a Kubernetes-native system for executing AI-powered tasks.
+This Helm chart deploys kubeadp, a Kubernetes-native system for executing AI-powered tasks.
 
 ## Prerequisites
 
@@ -85,7 +85,7 @@ server:
 
 ## Configuration
 
-The following table lists the configurable parameters of the KubeOpenCode chart and their default values.
+The following table lists the configurable parameters of the kubeadp chart and their default values.
 
 ### Controller Configuration
 
@@ -337,4 +337,4 @@ See the main project [README](../../README.md) for contribution guidelines.
 
 ## License
 
-Copyright Contributors to the KubeOpenCode project. Licensed under the MIT License.
+Copyright Contributors to the kubeadp project. Licensed under the MIT License.

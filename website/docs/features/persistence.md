@@ -13,7 +13,7 @@ Kubernetes storage has three layers:
 |-------|-----------|----------------|
 | **StorageClass** | Defines *how* storage is provisioned (e.g., AWS EBS, GCP Persistent Disk, local-path). | Cluster administrator |
 | **PersistentVolume (PV)** | An actual block of storage in your cluster. | Created automatically by the StorageClass (dynamic provisioning) |
-| **PersistentVolumeClaim (PVC)** | A request for storage — "I need 10Gi of disk". | Created automatically by the KubeOpenCode controller |
+| **PersistentVolumeClaim (PVC)** | A request for storage — "I need 10Gi of disk". | Created automatically by the kubeadp controller |
 
 **You only need to configure `persistence` in your Agent spec.** The controller creates PVCs automatically, and Kubernetes provisions the underlying storage via your cluster's StorageClass.
 :::

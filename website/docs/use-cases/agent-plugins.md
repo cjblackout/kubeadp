@@ -1,6 +1,6 @@
 # Agent Plugins
 
-OpenCode has a rich plugin ecosystem with 60+ community plugins. KubeOpenCode's `spec.plugins` field makes it easy to declaratively load plugins for your Agents — no manual JSON editing required. The controller creates a **plugin-init** init container that runs `npm install` to download plugins into a shared volume; the executor container loads them from `/plugins/node_modules/` without needing npm.
+OpenCode has a rich plugin ecosystem with 60+ community plugins. kubeadp's `spec.plugins` field makes it easy to declaratively load plugins for your Agents — no manual JSON editing required. The controller creates a **plugin-init** init container that runs `npm install` to download plugins into a shared volume; the executor container loads them from `/plugins/node_modules/` without needing npm.
 
 This guide walks through two real-world plugins: a **server plugin** for security guardrails and a **TUI plugin** for interactive session enhancements.
 

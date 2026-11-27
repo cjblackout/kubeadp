@@ -1,6 +1,6 @@
 # Features
 
-KubeOpenCode brings Agentic AI capabilities into the Kubernetes ecosystem. Here's an overview of key features.
+kubeadp brings Agentic AI capabilities into the Kubernetes ecosystem. Here's an overview of key features.
 
 ## Core
 

@@ -1,14 +1,14 @@
-# OpenCode Ecosystem Research — KubeOpenCode Integration Opportunities
+# OpenCode Ecosystem Research — kubeadp Integration Opportunities
 
 > **Date**: 2026-03-26 | **Last verified**: 2026-03-26
 >
-> This document surveys OpenCode's official components, community plugins, and the MCP server ecosystem to identify integration opportunities for KubeOpenCode.
+> This document surveys OpenCode's official components, community plugins, and the MCP server ecosystem to identify integration opportunities for kubeadp.
 
 ## 1. OpenCode Official Components
 
 ### 1.1 Current Utilization
 
-| Component | Description | KubeOpenCode Status |
+| Component | Description | kubeadp Status |
 |-----------|-------------|---------------------|
 | `opencode run` | Non-interactive task execution | **Used** — Pod Mode core |
 | `opencode serve` | Headless HTTP server | **Used** — Server Mode core |
@@ -164,7 +164,7 @@ OpenCode auto-detects file extensions and starts the corresponding LSP server, p
 | Plugin | Function | Notes |
 |--------|----------|-------|
 | **opencode-snip** | Reduce 60-90% token consumption | Need to evaluate output quality impact |
-| **opencode-daytona** | Isolated sandbox | KubeOpenCode already provides Pod isolation |
+| **opencode-daytona** | Isolated sandbox | kubeadp already provides Pod isolation |
 | **micode** | Brainstorm-Plan-Implement workflow | Could be provided as a Skill template |
 
 ---
@@ -177,7 +177,7 @@ OpenCode auto-detects file extensions and starts the corresponding LSP server, p
 |------------|-------|----------|--------------|
 | **containers/kubernetes-mcp-server** | 1.3k | Go | **Best choice** — native Go, OpenShift support, no kubectl dependency |
 | **argoproj-labs/mcp-for-argocd** | 378 | TS | Complements our Argo Events ecosystem; Agent directly manages ArgoCD apps |
-| **kagent-dev/kmcp** | 443 | Go | CRD-based MCP server deployment; aligns with KubeOpenCode philosophy |
+| **kagent-dev/kmcp** | 443 | Go | CRD-based MCP server deployment; aligns with kubeadp philosophy |
 | **Flux159/mcp-server-kubernetes** | 1.4k | TS | Most feature-complete, but requires Node runtime |
 | **strowk/mcp-k8s-go** | 377 | Go | Lightweight K8s MCP server |
 
@@ -212,9 +212,9 @@ OpenCode auto-detects file extensions and starts the corresponding LSP server, p
 
 ## 4. Brainstorm: Integration Opportunities
 
-### A. KubeOpenCode MCP Server — Agent Autonomy
+### A. kubeadp MCP Server — Agent Autonomy
 
-Create a KubeOpenCode-specific MCP server enabling Agents to:
+Create a kubeadp-specific MCP server enabling Agents to:
 
 - View status of other Tasks in the cluster
 - Create sub-Tasks (Agent delegates work to other Agents)
@@ -344,7 +344,7 @@ Combine with `opencode-plugin-otel`:
 | Priority | Integration Item | Effort | Value | Notes |
 |----------|-----------------|--------|-------|-------|
 | **P0** | MCP Sidecar Injection (B) | Medium | Very High | Differentiating feature; declarative tool capabilities |
-| **P0** | KubeOpenCode MCP Server (A) | Medium | Very High | Agent autonomy; Agent-to-Agent orchestration |
+| **P0** | kubeadp MCP Server (A) | Medium | Very High | Agent autonomy; Agent-to-Agent orchestration |
 | **P1** | Structured Task Results (F) | Small | High | Machine-readable output; workflow integration foundation |
 | **P1** | Safety Net Plugin Pre-install | Small | High | Security compliance |
 | **P1** | OTel Observability (G) | Medium | High | Enterprise requirement |
@@ -359,6 +359,6 @@ Combine with `opencode-plugin-otel`:
 
 ## 6. Key Conclusions
 
-KubeOpenCode currently only leverages OpenCode's most basic `opencode run` and `opencode serve` capabilities. OpenCode's five major extension systems — **Plugin System, Custom Tools, MCP, Skills, Custom Agents/Commands** — are entirely untapped.
+kubeadp currently only leverages OpenCode's most basic `opencode run` and `opencode serve` capabilities. OpenCode's five major extension systems — **Plugin System, Custom Tools, MCP, Skills, Custom Agents/Commands** — are entirely untapped.
 
-The biggest opportunities are **MCP Sidecar Injection** (B) and **KubeOpenCode MCP Server** (A) — the former gives Agents declarative tool capabilities, the latter gives Agents cluster autonomy. Together they enable truly **Agentic Kubernetes**.
+The biggest opportunities are **MCP Sidecar Injection** (B) and **kubeadp MCP Server** (A) — the former gives Agents declarative tool capabilities, the latter gives Agents cluster autonomy. Together they enable truly **Agentic Kubernetes**.

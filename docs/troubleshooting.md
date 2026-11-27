@@ -1,6 +1,6 @@
 # Troubleshooting Guide
 
-This guide helps diagnose and resolve common issues with KubeOpenCode.
+This guide helps diagnose and resolve common issues with kubeadp.
 
 ## Controller Issues
 
@@ -262,7 +262,7 @@ Common causes:
 
 ## Debugging Commands
 
-### Get All KubeOpenCode Resources
+### Get All kubeadp Resources
 
 ```bash
 kubectl get tasks,agents,kubeopencodeconfigs --all-namespaces

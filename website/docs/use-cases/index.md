@@ -1,6 +1,6 @@
 # Use Cases
 
-Real-world examples of how to use KubeOpenCode for common development workflows.
+Real-world examples of how to use kubeadp for common development workflows.
 
 - **[Agent Plugins](agent-plugins.md)** - Extend Agents with OpenCode plugins (safety net, OTel, TUI enhancements)
 - **[Docker in Docker](docker-in-docker.md)** - Run Docker inside agent containers (Sysbox, privileged, rootless)

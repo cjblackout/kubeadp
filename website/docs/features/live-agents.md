@@ -1,6 +1,6 @@
 # Live Agents
 
-Every Agent in KubeOpenCode is a persistent, running service on Kubernetes — available for interactive use anytime.
+Every Agent in kubeadp is a persistent, running service on Kubernetes — available for interactive use anytime.
 
 ## Why Live Agents?
 
@@ -64,7 +64,7 @@ The controller automatically creates:
 kubeoc agent attach team-agent -n kubeopencode-system
 ```
 
-**Web Terminal**: Access the agent's OpenCode TUI directly from the KubeOpenCode dashboard at `http://localhost:2746`.
+**Web Terminal**: Access the agent's OpenCode TUI directly from the kubeadp dashboard at `http://localhost:2746`.
 
 **Programmatic Tasks**: Submit Tasks referencing the Agent — they run on the persistent server via `--attach` flag:
 

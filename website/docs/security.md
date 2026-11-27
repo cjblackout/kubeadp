@@ -6,11 +6,11 @@ description: RBAC, credential management, pod security, and best practices
 
 # Security
 
-This document covers security considerations and best practices for KubeOpenCode.
+This document covers security considerations and best practices for kubeadp.
 
 ## RBAC
 
-KubeOpenCode follows the principle of least privilege:
+kubeadp follows the principle of least privilege:
 
 - **Controller**: ClusterRole with minimal permissions for Tasks, Agents, Pods, ConfigMaps, Secrets, and Events
 - **Agent ServiceAccount**: Namespace-scoped Role with read/update access to Tasks and read-only access to related resources
@@ -94,7 +94,7 @@ kind: ClusterRole
 metadata:
   name: kubeoc-user
 rules:
-# View all KubeOpenCode resources
+# View all kubeadp resources
 - apiGroups: ["kubeopencode.io"]
   resources: ["agents", "agenttemplates", "tasks", "crontasks"]
   verbs: ["get", "list"]
@@ -288,7 +288,7 @@ The controller runs with hardened security settings:
 
 ### Default Security Context
 
-KubeOpenCode applies a restricted security context by default to all agent containers (init containers and the worker container). When no custom `securityContext` is specified in `podSpec`, the following defaults are applied:
+kubeadp applies a restricted security context by default to all agent containers (init containers and the worker container). When no custom `securityContext` is specified in `podSpec`, the following defaults are applied:
 
 - `allowPrivilegeEscalation: false` - prevents containers from gaining additional privileges
 - `capabilities: drop: ["ALL"]` - drops all Linux capabilities
@@ -348,7 +348,7 @@ See [Private Registry Authentication](features/enterprise.md#private-registry-au
 
 ## Network Proxy Configuration
 
-Enterprise environments often require outbound traffic to pass through a corporate proxy. KubeOpenCode supports proxy configuration at both the Agent level and the cluster level via `KubeOpenCodeConfig`. Agent-level settings override cluster-level settings.
+Enterprise environments often require outbound traffic to pass through a corporate proxy. kubeadp supports proxy configuration at both the Agent level and the cluster level via `KubeOpenCodeConfig`. Agent-level settings override cluster-level settings.
 
 See [HTTP/HTTPS Proxy Configuration](features/enterprise.md#httphttps-proxy-configuration) for configuration examples.
 

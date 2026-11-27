@@ -4,7 +4,7 @@ This guide walks through common patterns for sharing AI agent terminal access wi
 
 ## Overview
 
-KubeOpenCode's share link feature generates a unique URL that provides direct terminal access to an Agent — no Kubernetes credentials, no admin UI, no login. The consumer opens the URL in a browser and gets a full-screen terminal.
+kubeadp's share link feature generates a unique URL that provides direct terminal access to an Agent — no Kubernetes credentials, no admin UI, no login. The consumer opens the URL in a browser and gets a full-screen terminal.
 
 This is useful when:
 
@@ -121,7 +121,7 @@ kubeoc agent share team-agent -n platform --show
 
 ### Networking
 
-- The share URL must be reachable by the consumer — ensure your Ingress, HTTPRoute, or LoadBalancer exposes the KubeOpenCode server
+- The share URL must be reachable by the consumer — ensure your Ingress, HTTPRoute, or LoadBalancer exposes the kubeadp server
 - The server port is `2746` by default
 - For local testing: `kubectl port-forward -n kubeopencode-system svc/kubeopencode-server 2746:2746`
 

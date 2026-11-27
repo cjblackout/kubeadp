@@ -9,7 +9,7 @@ Tasks and Agents use inline **ContextItem** to provide additional context to AI 
 | **Text** | Inline text content | `text` |
 | **ConfigMap** | Content from a Kubernetes ConfigMap | `configMap.name` |
 | **Git** | Content from a Git repository | `git.repository`, `git.ref`, `mountPath` |
-| **Runtime** | KubeOpenCode platform awareness system prompt | _(none)_ |
+| **Runtime** | kubeadp platform awareness system prompt | _(none)_ |
 | **URL** | Content fetched from a remote HTTP/HTTPS URL | `url.source` |
 
 ## Common Fields
@@ -125,7 +125,7 @@ See [Security - Git Authentication](../security.md#git-authentication-for-privat
 
 ### Runtime Context
 
-Injects KubeOpenCode platform awareness into the agent's context. This automatically provides information about the Task, Agent, and cluster environment:
+Injects kubeadp platform awareness into the agent's context. This automatically provides information about the Task, Agent, and cluster environment:
 
 ```yaml
 contexts:
