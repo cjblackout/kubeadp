@@ -113,18 +113,18 @@ func isTaskTimedOut(task *kubeopenv1alpha1.Task) bool {
 // TaskReconciler reconciles a Task object
 type TaskReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder events.EventRecorder
-	ocClient *OpenCodeClient
+	Scheme        *runtime.Scheme
+	Recorder      events.EventRecorder
+	kubeadpClient *KubeadpClient
 }
 
 // NewTaskReconciler creates a new TaskReconciler with all dependencies.
 func NewTaskReconciler(c client.Client, scheme *runtime.Scheme, recorder events.EventRecorder) *TaskReconciler {
 	return &TaskReconciler{
-		Client:   c,
-		Scheme:   scheme,
-		Recorder: recorder,
-		ocClient: NewOpenCodeClient(),
+		Client:        c,
+		Scheme:        scheme,
+		Recorder:      recorder,
+		kubeadpClient: NewKubeadpClient(),
 	}
 }
 
@@ -637,8 +637,8 @@ func (r *TaskReconciler) updateTaskStatusFromPod(ctx context.Context, task *kube
 		log.Info("task completed", "pod", task.Status.PodName)
 		r.Recorder.Eventf(task, nil, corev1.EventTypeNormal, "Completed", "Completed", "Task completed successfully")
 		r.recordTaskDuration(task)
-		// Resolve session info from Agent's OpenCode server (best-effort)
-		r.resolveSessionInfo(ctx, task)
+		// Resolve session info from the Agent's kubeadp-agent worker (best-effort)
+		r.resolveSessionInfo(ctx, task, pod)
 		return r.Status().Update(ctx, task)
 	case corev1.PodFailed:
 		task.Status.ObservedGeneration = task.Generation
@@ -656,8 +656,8 @@ func (r *TaskReconciler) updateTaskStatusFromPod(ctx context.Context, task *kube
 			r.Recorder.Eventf(task, nil, corev1.EventTypeWarning, "Failed", "Failed", "Task failed")
 		}
 		r.recordTaskDuration(task)
-		// Resolve session info from Agent's OpenCode server (best-effort)
-		r.resolveSessionInfo(ctx, task)
+		// Resolve session info from the Agent's kubeadp-agent worker (best-effort)
+		r.resolveSessionInfo(ctx, task, pod)
 		return r.Status().Update(ctx, task)
 	}
 
@@ -701,11 +701,39 @@ func formatTerminationDetail(containerName string, term *corev1.ContainerStateTe
 	}
 }
 
-// resolveSessionInfo queries the Agent's OpenCode server to find the session
-// associated with this Task and populates task.Status.Session with session ID,
-// URL, and summary (token usage, cost, file changes).
+// taskSubmitContainerName is the name of the Task Pod container that runs
+// `kubeopencode task-submit`; its termination message carries the job ID.
+const taskSubmitContainerName = "agent"
+
+// jobIDFromPod reads the kubeadp-agent job ID that `kubeopencode task-submit`
+// published through the termination message of the agent container
+// ({"jobId":"<id>"}). It returns "" when the container has not terminated or
+// published no ID.
+func jobIDFromPod(pod *corev1.Pod) string {
+	if pod == nil {
+		return ""
+	}
+	for i := range pod.Status.ContainerStatuses {
+		cs := pod.Status.ContainerStatuses[i]
+		if cs.Name != taskSubmitContainerName || cs.State.Terminated == nil || cs.State.Terminated.Message == "" {
+			continue
+		}
+		var msg struct {
+			JobID string `json:"jobId"`
+		}
+		if err := json.Unmarshal([]byte(cs.State.Terminated.Message), &msg); err == nil && msg.JobID != "" {
+			return msg.JobID
+		}
+	}
+	return ""
+}
+
+// resolveSessionInfo resolves the kubeadp-agent job that ran this Task and
+// populates task.Status.Session: the ID is the job ID (published by the Task
+// Pod through its termination message) and the summary carries token usage and
+// cost when the worker reports them in the job result.
 // This is best-effort: failures are logged but do not block Task completion.
-func (r *TaskReconciler) resolveSessionInfo(ctx context.Context, task *kubeopenv1alpha1.Task) {
+func (r *TaskReconciler) resolveSessionInfo(ctx context.Context, task *kubeopenv1alpha1.Task, pod *corev1.Pod) {
 	log := log.FromContext(ctx)
 
 	// Only resolve for agentRef Tasks that have a session title
@@ -716,68 +744,52 @@ func (r *TaskReconciler) resolveSessionInfo(ctx context.Context, task *kubeopenv
 		return
 	}
 
-	// Resolve the Agent's server URL
+	jobID := jobIDFromPod(pod)
+	if jobID == "" {
+		log.V(1).Info("cannot resolve session: the Pod published no job ID", "pod", task.Status.PodName)
+		return
+	}
+	task.Status.Session.ID = jobID
 	agentName := task.Status.AgentRef.Name
+	log.Info("resolved session for task", "jobID", jobID, "agent", agentName)
+
 	agent := &kubeopenv1alpha1.Agent{}
-	agentKey := types.NamespacedName{Name: agentName, Namespace: task.Namespace}
-	if err := r.Get(ctx, agentKey, agent); err != nil {
-		log.V(1).Info("cannot resolve session: agent not found", "agent", agentName, "error", err)
+	if err := r.Get(ctx, types.NamespacedName{Name: agentName, Namespace: task.Namespace}, agent); err != nil {
+		log.V(1).Info("cannot read job usage: agent not found", "agent", agentName, "error", err)
 		return
 	}
-
 	if agent.Status.URL == "" {
-		log.V(1).Info("cannot resolve session: agent has no URL", "agent", agentName)
+		log.V(1).Info("cannot read job usage: agent has no URL", "agent", agentName)
 		return
 	}
 
-	serverURL := agent.Status.URL
-	sessionTitle := task.Status.Session.Title
+	// The API bearer token lives in the Agent's kubeadp Secret. It is read here
+	// only to authenticate the request and is never logged.
+	secret := &corev1.Secret{}
+	secretKey := types.NamespacedName{Name: KubeadpSecretName(agentName), Namespace: task.Namespace}
+	if err := r.Get(ctx, secretKey, secret); err != nil {
+		log.V(1).Info("cannot read job usage: kubeadp secret unavailable", "secret", secretKey.Name, "error", err)
+		return
+	}
+	token := strings.TrimSpace(string(secret.Data[KubeadpAPITokenKey]))
 
-	// Find session by title
-	session, err := r.ocClient.FindSessionByTitle(ctx, serverURL, sessionTitle)
+	result, err := r.kubeadpClient.GetJobResult(ctx, agent.Status.URL, token, jobID)
 	if err != nil {
-		log.V(1).Info("cannot resolve session: search failed", "agent", agentName, "title", sessionTitle, "error", err)
+		log.V(1).Info("cannot read job result", "jobID", jobID, "error", err)
 		return
 	}
-	if session == nil {
-		log.V(1).Info("cannot resolve session: no matching session found", "agent", agentName, "title", sessionTitle)
+	if result.Usage == nil {
 		return
 	}
-
-	// Populate session ID
-	task.Status.Session.ID = session.ID
-	log.Info("resolved session for task", "sessionID", session.ID, "agent", agentName)
-
-	// Aggregate message stats (best-effort). Uses the already-fetched session
-	// for file change summary, only fetches messages for token/cost aggregation.
-	aggregated, messageCount, err := r.ocClient.AggregateMessageStats(ctx, serverURL, session.ID)
-	if err != nil {
-		log.V(1).Info("cannot aggregate session summary", "sessionID", session.ID, "error", err)
-		// Still keep session ID and URL even if summary fails
-		return
+	task.Status.Session.Summary = &kubeopenv1alpha1.SessionSummary{
+		Cost: fmt.Sprintf("%.6f", result.Usage.Cost),
+		TokenUsage: &kubeopenv1alpha1.TokenUsage{
+			Input:     result.Usage.InputTokens,
+			Output:    result.Usage.OutputTokens,
+			Reasoning: result.Usage.ReasoningTokens,
+			Cache:     result.Usage.CacheTokens,
+		},
 	}
-
-	summary := &kubeopenv1alpha1.SessionSummary{
-		MessageCount: messageCount,
-	}
-
-	if aggregated != nil {
-		summary.Cost = fmt.Sprintf("%.6f", aggregated.Cost)
-		summary.TokenUsage = &kubeopenv1alpha1.TokenUsage{
-			Input:     aggregated.Tokens.Input,
-			Output:    aggregated.Tokens.Output,
-			Reasoning: aggregated.Tokens.Reasoning,
-			Cache:     aggregated.Tokens.Cache,
-		}
-	}
-
-	if session.Summary != nil {
-		summary.FilesChanged = session.Summary.Files
-		summary.Additions = session.Summary.Additions
-		summary.Deletions = session.Summary.Deletions
-	}
-
-	task.Status.Session.Summary = summary
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -1324,8 +1336,9 @@ func (r *TaskReconciler) handleStop(ctx context.Context, task *kubeopenv1alpha1.
 		Message: "Task stopped by user via kubeopencode.io/stop annotation",
 	})
 
-	// Resolve session info from Agent's OpenCode server (best-effort)
-	r.resolveSessionInfo(ctx, task)
+	// A stopped Pod is deleted before the kubelet reports its termination
+	// message, so the job ID is not available here; the session stays unresolved.
+	r.resolveSessionInfo(ctx, task, nil)
 
 	r.Recorder.Eventf(task, nil, corev1.EventTypeNormal, "Stopped", "Stopped", "Task stopped by user")
 
@@ -1371,8 +1384,9 @@ func (r *TaskReconciler) handleTimeout(ctx context.Context, task *kubeopenv1alph
 		Message: fmt.Sprintf("Task timed out after %s", timeoutDuration),
 	})
 
-	// Resolve session info from Agent's OpenCode server (best-effort)
-	r.resolveSessionInfo(ctx, task)
+	// A stopped Pod is deleted before the kubelet reports its termination
+	// message, so the job ID is not available here; the session stays unresolved.
+	r.resolveSessionInfo(ctx, task, nil)
 
 	r.Recorder.Eventf(task, nil, corev1.EventTypeNormal, "Timeout", "Timeout",
 		"Task timed out after %s", timeoutDuration)

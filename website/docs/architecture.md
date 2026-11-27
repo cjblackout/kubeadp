@@ -46,9 +46,9 @@ graph TB
         end
 
         subgraph DP["Data Plane"]
-            Agent["Agent Deployment<br/><i>opencode serve (persistent)</i>"]
+            Agent["Agent Deployment<br/><i>kubeadp-agent worker (persistent)</i>"]
             AgentSvc["Agent Service<br/><i>ClusterIP</i>"]
-            TaskPod1["Task Pod (agentRef)<br/><i>opencode run --attach</i>"]
+            TaskPod1["Task Pod (agentRef)<br/><i>kubeopencode task-submit</i>"]
             TaskPod2["Task Pod (templateRef)<br/><i>opencode run (standalone)</i>"]
         end
 
@@ -68,7 +68,7 @@ graph TB
     Controller --> AgentSvc
     Controller --> TaskPod1
     Controller --> TaskPod2
-    TaskPod1 -- "--attach" --> AgentSvc
+    TaskPod1 -- "POST /api/v1/jobs" --> AgentSvc
     AgentSvc --> Agent
     API --> etcd
     Agent --> PVC
@@ -81,31 +81,33 @@ graph TB
 |-----------|----------------|
 | **Controller** | Watches Task/Agent/CronTask CRs, creates Deployments/Pods/Services, manages lifecycle |
 | **Server** | REST API + embedded React UI, proxies to Kubernetes API |
-| **Agent Deployment** | Persistent `opencode serve` instance, handles multiple Tasks |
-| **Task Pod (agentRef)** | Lightweight Pod that connects to Agent server via `--attach` |
+| **Agent Deployment** | Persistent `kubeadp-agent worker` instance, handles multiple Tasks |
+| **Task Pod (agentRef)** | Lightweight Pod that submits tasks to Agent server via `task-submit` |
 | **Task Pod (templateRef)** | Standalone Pod with full environment, runs independently |
 
-### Two-Container Pattern
+### Multi-Init Container Pattern
 
-Agent Deployments use a two-container pattern:
+Agent Deployments use an init-container pattern:
 
-1. **Init Container** (`agentImage`): Copies OpenCode binary to `/tools` shared volume
-2. **Worker Container** (`executorImage`): Runs `opencode serve` using `/tools/opencode`
+1. **Kubeadp Init Container** (`kubeadpImage`): Copies `kubeadp-agent` and `agent-run` binaries to `/tools` shared volume
+2. **OpenCode Init Container** (`agentImage`): Copies OpenCode binary to `/tools` shared volume
+3. **Worker Container** (`executorImage`): Runs `kubeadp-agent worker`
 
 ### Image Resolution
 
 | Field | Container | Default |
 |-------|-----------|---------|
+| `kubeadpImage` | Init Container (kubeadp-agent) | `ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.62` |
 | `agentImage` | Init Container (OpenCode) | `ghcr.io/kubeopencode/kubeopencode-agent-opencode:latest` |
 | `executorImage` | Worker Container (Server) | `ghcr.io/kubeopencode/kubeopencode-agent-devbox:latest` |
-| `attachImage` | Task Pod (agentRef) | `ghcr.io/kubeopencode/kubeopencode-agent-attach:latest` |
+| `attachImage` | Not used for Task Pods any more (deprecated, kept for compatibility) | `ghcr.io/kubeopencode/kubeopencode-agent-attach:latest` |
 
 ### Task Execution Flow
 
 ```mermaid
 flowchart LR
     Created["Task Created"] --> Check{agentRef or<br/>templateRef?}
-    Check -- agentRef --> Attach["Create Pod<br/>opencode run --attach URL"]
+    Check -- agentRef --> Attach["Create Pod<br/>kubeopencode task-submit URL"]
     Check -- templateRef --> Standalone["Create Pod<br/>opencode run"]
     Attach --> Running["Phase: Running"]
     Standalone --> Running
@@ -178,7 +180,7 @@ Agent (running AI agent instance — always creates Deployment + Service)
     ├── profile: string             (brief human-readable summary)
     ├── agentImage: string           (OpenCode init container image)
     ├── executorImage: string        (Main worker container image)
-    ├── attachImage: string          (lightweight image for --attach Pods)
+    ├── attachImage: string          (deprecated, unused for agentRef Task Pods)
     ├── workspaceDir: string         (default: "/workspace")
     ├── command: []string
     ├── port: int32                  (OpenCode server port, default: 4096)

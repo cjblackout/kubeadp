@@ -397,3 +397,13 @@ When adding custom RBAC, ensure the controller has `agents/finalizers` permissio
 - [Features](features/index.md) - Context system, concurrency, and more
 - [Setting Up an Agent](setting-up-agent.md) - Agent configuration, images, and features
 - [Architecture](architecture.md) - System design and API reference
+
+## kubeadp-agent worker credentials
+
+The controller creates one Secret per Agent, `<agent>-kubeadp`, owned by the Agent, with two random keys: `api-token` (the bearer token of the worker's `/api/v1` API) and `jobset-root-key` (the root key of the worker's agent-to-agent messaging). The Secret is generated once and never rotated or overwritten by reconcile.
+
+- The server Pod mounts both keys read-only at `/etc/kubeadp` (`KUBEADP_API_TOKEN_FILE`, `KUBEADP_JOBSET_ROOT_KEY_FILE`).
+- Task Pods mount only the `api-token` key, read-only with mode 0400, at `/etc/kubeadp-client`. The jobset root key never leaves the server Pod.
+- The controller and the KubeOpenCode server read the token from the Secret to query job results and to proxy requests to the worker. The server adds the bearer header itself; the token is never forwarded to the browser, written to logs, events or status.
+- Agents get no Kubernetes API rights, as before.
+- The sandbox of a worker job only passes through environment variables on its allow-list. The controller sets `KUBEADP_SANDBOX_ENV_ALLOW` to `OPENCODE_*` plus the environment variable names of the Agent's env-type credentials (names only, never values).

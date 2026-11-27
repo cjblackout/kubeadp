@@ -66,6 +66,7 @@ type CreateAgentRequest struct {
 
 	// P0: Images (required when no template)
 	AgentImage    string `json:"agentImage,omitempty"`
+	KubeadpImage  string `json:"kubeadpImage,omitempty"`
 	ExecutorImage string `json:"executorImage,omitempty"`
 
 	// P1: Common configuration
@@ -203,6 +204,7 @@ type AgentResponse struct {
 	Profile            string                 `json:"profile,omitempty"`
 	TemplateRef        *AgentReference        `json:"templateRef,omitempty"`
 	ExecutorImage      string                 `json:"executorImage,omitempty"`
+	KubeadpImage       string                 `json:"kubeadpImage,omitempty"`
 	AgentImage         string                 `json:"agentImage,omitempty"`
 	WorkspaceDir       string                 `json:"workspaceDir,omitempty"`
 	ServiceAccountName string                 `json:"serviceAccountName,omitempty"`
@@ -230,6 +232,7 @@ type AgentTemplateResponse struct {
 	Name               string                 `json:"name"`
 	Namespace          string                 `json:"namespace"`
 	AgentImage         string                 `json:"agentImage,omitempty"`
+	KubeadpImage       string                 `json:"kubeadpImage,omitempty"`
 	ExecutorImage      string                 `json:"executorImage,omitempty"`
 	WorkspaceDir       string                 `json:"workspaceDir,omitempty"`
 	ServiceAccountName string                 `json:"serviceAccountName,omitempty"`
@@ -398,6 +401,7 @@ type CreateAgentTemplateRequest struct {
 	WorkspaceDir       string `json:"workspaceDir,omitempty"`
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 	AgentImage         string `json:"agentImage,omitempty"`
+	KubeadpImage       string `json:"kubeadpImage,omitempty"`
 	ExecutorImage      string `json:"executorImage,omitempty"`
 
 	// Assembly: assets selected from a Registry catalog

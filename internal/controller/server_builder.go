@@ -28,8 +28,25 @@ const (
 	DefaultServerPort int32 = 4096
 
 	// ServerHealthPath is the path used for readiness probes.
-	// OpenCode's /session/status endpoint returns 200 if the server is healthy.
-	ServerHealthPath = "/session/status"
+	ServerHealthPath = "/readyz"
+
+	// ServerStartupHealthPath is the path used for startup and liveness probes.
+	ServerStartupHealthPath = "/healthz"
+
+	// KubeadpSecretSuffix is appended to Agent name for the kubeadp auth secret.
+	KubeadpSecretSuffix = "-kubeadp"
+
+	// KubeadpSecretVolumeName is the volume name for mounting the kubeadp secret.
+	KubeadpSecretVolumeName = "kubeadp-secret"
+
+	// KubeadpSecretMountPath is where the kubeadp secret is mounted in the server container.
+	KubeadpSecretMountPath = "/etc/kubeadp"
+
+	// KubeadpAPITokenKey is the key in the secret containing the API Bearer token.
+	KubeadpAPITokenKey = "api-token"
+
+	// KubeadpJobsetRootKeyKey is the key in the secret containing the jobset root key.
+	KubeadpJobsetRootKeyKey = "jobset-root-key"
 
 	// ServerSessionPVCSuffix is appended to Agent name for the session PVC name.
 	ServerSessionPVCSuffix = "-server-sessions"
@@ -89,6 +106,11 @@ func ServerServiceName(agentName string) string {
 // ServerURL returns the in-cluster URL for a Server-mode Agent.
 func ServerURL(agentName, namespace string, port int32, clusterDomain string) string {
 	return fmt.Sprintf("http://%s.%s.svc.%s:%d", agentName, namespace, clusterDomain, port)
+}
+
+// KubeadpSecretName returns the Secret name for an Agent's kubeadp auth token and jobset root key.
+func KubeadpSecretName(agentName string) string {
+	return agentName + KubeadpSecretSuffix
 }
 
 // ServerSessionPVCName returns the PVC name for session persistence.
@@ -208,16 +230,36 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 	// HOME and SHELL are set for SCC (Security Context Constraints) compatibility.
 	// In SCC environments, containers run with random UIDs that have no /etc/passwd entry,
 	// causing HOME=/ (not writable) and SHELL=/sbin/nologin.
+	stateRoot := ServerSessionMountPath
 	envVars := []corev1.EnvVar{
 		{Name: "HOME", Value: DefaultHomeDir},
 		{Name: "SHELL", Value: DefaultShell},
-		// Prepend /tools to PATH so the OpenCode binary (copied by the init container)
-		// is discoverable from interactive terminals (e.g., VS Code in browser).
-		// The symlink approach (ln -sf /tools/opencode /usr/local/bin/) fails silently
-		// when the container runs as non-root (UID 1000) because /usr/local/bin/ is root-owned.
+		// Prepend /tools to PATH so the OpenCode and kubeadp-agent binaries (copied by init containers)
+		// are discoverable from interactive terminals.
 		{Name: "PATH", Value: ToolsMountPath + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
 		{Name: "WORKSPACE_DIR", Value: agentCfg.workspaceDir},
+		// kubeadp-agent configuration
+		{Name: "KUBEADP_API_TOKEN_FILE", Value: KubeadpSecretMountPath + "/" + KubeadpAPITokenKey},
+		{Name: "KUBEADP_JOBSET_ROOT_KEY_FILE", Value: KubeadpSecretMountPath + "/" + KubeadpJobsetRootKeyKey},
+		{Name: "KUBEADP_ROLE", Value: "worker"},
+		{Name: "AGENT_RUN_WORKSPACE_ROOT", Value: agentCfg.workspaceDir},
+		{Name: "AGENT_RUN_STATE_ROOT", Value: stateRoot},
+		{Name: "AGENT_RUN_OPENCODE_PATH", Value: ToolsMountPath + "/opencode"},
+		{Name: "KUBEADP_SANDBOX_HOME", Value: DefaultHomeDir},
+		{Name: "AGENT_RUN_API_LISTEN", Value: fmt.Sprintf("0.0.0.0:%d", port)},
 	}
+
+	// Build sandbox env allow-list: default to OPENCODE_* plus any explicit credential env names.
+	sandboxAllowList := []string{"OPENCODE_*"}
+	for _, cred := range agentCfg.credentials {
+		if cred.Env != nil && *cred.Env != "" {
+			sandboxAllowList = append(sandboxAllowList, *cred.Env)
+		}
+	}
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "KUBEADP_SANDBOX_ENV_ALLOW",
+		Value: strings.Join(sandboxAllowList, ","),
+	})
 
 	// Set OPENCODE_PERMISSION only if the Agent config does not include custom permissions.
 	// When the config has a "permission" field, the user has explicitly configured
@@ -296,14 +338,31 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 		})
 	}
 
+	// Add kubeadp auth secret volume and mount
+	kubeadpSecretVolume := corev1.Volume{
+		Name: KubeadpSecretVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: KubeadpSecretName(agent.Name),
+			},
+		},
+	}
+	volumes = append(volumes, kubeadpSecretVolume)
+	volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		Name:      KubeadpSecretVolumeName,
+		MountPath: KubeadpSecretMountPath,
+		ReadOnly:  true,
+	})
+
 	// Add credentials (secrets as env vars or file mounts)
 	credVols, credMounts, credEnvs, credEnvFroms := buildCredentials(agentCfg.credentials)
 	volumes = append(volumes, credVols...)
 	volumeMounts = append(volumeMounts, credMounts...)
 	envVars = append(envVars, credEnvs...)
 
-	// Track init containers (opencode-init is always first)
+	// Track init containers (kubeadp-init and opencode-init)
 	var initContainers []corev1.Container
+	initContainers = append(initContainers, buildKubeadpInitContainer(agentCfg.kubeadpImage))
 	initContainers = append(initContainers, buildOpenCodeInitContainer(agentCfg.agentImage))
 
 	// Add context init containers and volumes
@@ -556,7 +615,7 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 	// because sidecars are not init containers and are only present in Agent Deployments.
 	applyExtraEnvAndSystemOverrides(initContainers, &envVars, agentCfg)
 
-	// Build the serve command.
+	// Build the worker command running kubeadp-agent worker.
 	// When context-init handles config file writing, we don't need inline heredoc.
 	hasContextInit := len(ctxFileMounts) > 0 || len(ctxDirMounts) > 0
 	var command []string
@@ -564,14 +623,16 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 		// No context-init container — write config inline in the command
 		command = []string{
 			"sh", "-c",
-			fmt.Sprintf("%s; cat > %s << 'KOCEOF'\n%s\nKOCEOF\n/tools/opencode serve --port %d --hostname 0.0.0.0",
-				OpenCodeSymlinkCmd, OpenCodeConfigPath, string(agentCfg.config.Raw), port),
+			fmt.Sprintf("%s; cat > %s << 'KOCEOF'\n%s\nKOCEOF\n%s",
+				OpenCodeSymlinkCmd, OpenCodeConfigPath, string(agentCfg.config.Raw),
+				workspaceInitScript(agentCfg.workspaceDir, "exec /tools/kubeadp-agent worker")),
 		}
 	} else {
 		// Config is written by context-init, or no config at all
 		command = []string{
 			"sh", "-c",
-			fmt.Sprintf("%s; /tools/opencode serve --port %d --hostname 0.0.0.0", OpenCodeSymlinkCmd, port),
+			fmt.Sprintf("%s; %s", OpenCodeSymlinkCmd,
+				workspaceInitScript(agentCfg.workspaceDir, "exec /tools/kubeadp-agent worker")),
 		}
 	}
 
@@ -587,13 +648,11 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 		VolumeMounts:    volumeMounts,
 		Ports:           buildContainerPorts(port, agentCfg.extraPorts),
 		// StartupProbe gates liveness and readiness probes until the server
-		// is fully initialized (e.g., session restore after resume from standby).
-		// Without this, the readiness probe may pass before the server can
-		// handle attach connections, causing "exit code 137" errors.
+		// is fully initialized.
 		StartupProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{
-					Path:   ServerHealthPath,
+					Path:   ServerStartupHealthPath,
 					Port:   intstr.FromInt32(port),
 					Scheme: corev1.URISchemeHTTP,
 				},
@@ -605,8 +664,10 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 		},
 		LivenessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
-				TCPSocket: &corev1.TCPSocketAction{
-					Port: intstr.FromInt32(port),
+				HTTPGet: &corev1.HTTPGetAction{
+					Path:   ServerStartupHealthPath,
+					Port:   intstr.FromInt32(port),
+					Scheme: corev1.URISchemeHTTP,
 				},
 			},
 			PeriodSeconds:    DefaultLivenessPeriodSeconds,

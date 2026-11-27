@@ -73,6 +73,12 @@ spec:
                   The init container runs this image and copies the opencode binary to /tools/opencode.
                   If not specified, defaults to "ghcr.io/cjblackout/kubeopencode-agent-opencode:latest".
                 type: string
+              kubeadpImage:
+                description: |-
+                  KubeadpImage specifies the kubeadp-agent init container image.
+                  This image contains the kubeadp-agent and agent-run binaries that get copied to /tools volume.
+                  If not specified, defaults to "ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.62".
+                type: string
               attachImage:
                 description: |-
                   AttachImage specifies the lightweight image used for --attach Pods.
