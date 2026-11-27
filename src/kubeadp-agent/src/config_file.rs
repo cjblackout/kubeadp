@@ -214,11 +214,18 @@ pub fn parse_config_toml(path: &str, content: &str) -> Result<HashMap<String, St
                     "Invalid configuration file '{path}': duplicate key '{section}.{key}'"
                 ));
             }
-            let value = scalar_to_string(value).ok_or_else(|| {
-                format!(
-                    "Invalid configuration file '{path}': key '{section}.{key}' must be a scalar value"
-                )
-            })?;
+            let value = if (section == "common" && key == "sandbox_ro_paths")
+                || (section == "worker" && key == "sandbox_ro_paths")
+            {
+                // sandbox_ro_paths can be a TOML Array of strings or a scalar string (colon-separated)
+                parse_and_validate_sandbox_ro_paths_toml(path, section, key, value)?
+            } else {
+                scalar_to_string(value).ok_or_else(|| {
+                    format!(
+                        "Invalid configuration file '{path}': key '{section}.{key}' must be a scalar value"
+                    )
+                })?
+            };
             vars.insert(resolved, value);
         }
     }
@@ -270,6 +277,7 @@ fn var_for_section_key(section: &str, key: &str) -> Option<String> {
         // The global instructions file (design 6.2): read by both the
         // orchestrator (sessions) and the worker (jobs) at run start.
         ("common", "instructions_file") => Some("KUBEADP_INSTRUCTIONS_FILE".to_string()),
+        ("common", "sandbox_ro_paths") => Some("KUBEADP_SANDBOX_RO_PATHS".to_string()),
 
         // --- [orchestrator]: the agent-orchestrate session supervisor ---
         ("orchestrator", "listen") => Some("AGENT_ORCHESTRATE_LISTEN".to_string()),
@@ -408,6 +416,7 @@ fn section_keys(section: &str) -> Vec<&'static str> {
             "api_allow_unauthenticated",
             "jobset_root_key_file",
             "instructions_file",
+            "sandbox_ro_paths",
         ],
         "orchestrator" => vec![
             "listen",
@@ -465,6 +474,51 @@ fn section_keys(section: &str) -> Vec<&'static str> {
         ],
         _ => Vec::new(),
     }
+}
+
+/// Parses and validates `sandbox_ro_paths` from TOML: accepts a list of strings
+/// or a single string (colon-separated). Validates that every entry is absolute,
+/// non-empty, and contains no '..'. Serializes into colon-separated string for env.
+fn parse_and_validate_sandbox_ro_paths_toml(
+    path: &str,
+    section: &str,
+    key: &str,
+    value: &toml::Value,
+) -> Result<String, String> {
+    let mut paths: Vec<String> = Vec::new();
+    match value {
+        toml::Value::Array(arr) => {
+            for (idx, item) in arr.iter().enumerate() {
+                let s = item.as_str().ok_or_else(|| {
+                    format!(
+                        "Invalid configuration file '{path}': key '{section}.{key}[{idx}]' must be a string path"
+                    )
+                })?;
+                let trimmed = s.trim();
+                crate::sandbox::validate_sandbox_ro_path(std::path::Path::new(trimmed))
+                    .map_err(|e| format!("Invalid configuration file '{path}': {e}"))?;
+                if !paths.iter().any(|p| p == trimmed) {
+                    paths.push(trimmed.to_string());
+                }
+            }
+        }
+        toml::Value::String(s) => {
+            let parsed = crate::sandbox::parse_sandbox_ro_paths(s)
+                .map_err(|e| format!("Invalid configuration file '{path}': {e}"))?;
+            for p in parsed {
+                let ps = p.to_string_lossy().to_string();
+                if !paths.iter().any(|existing| existing == &ps) {
+                    paths.push(ps);
+                }
+            }
+        }
+        _ => {
+            return Err(format!(
+                "Invalid configuration file '{path}': key '{section}.{key}' must be an array of string paths or a string"
+            ));
+        }
+    }
+    Ok(paths.join(":"))
 }
 
 /// Converts a TOML scalar to the string the env-based readers parse:
@@ -940,5 +994,44 @@ a2a_echo = false
         let (section, key) = section_and_key_for_var("KUBEADP_INSTRUCTIONS_FILE").unwrap();
         assert_eq!(section, "common");
         assert_eq!(key, "instructions_file");
+    }
+
+    #[test]
+    fn test_sandbox_ro_paths_mapping_and_validation() {
+        let vars = parse("[common]\nsandbox_ro_paths = [\"/opt/tools\", \"/data/readonly\"]\n");
+        assert_eq!(
+            vars.get("KUBEADP_SANDBOX_RO_PATHS").map(|s| s.as_str()),
+            Some("/opt/tools:/data/readonly")
+        );
+
+        // Also test string format
+        let vars2 = parse("[common]\nsandbox_ro_paths = \"/opt/tools:/data/readonly\"\n");
+        assert_eq!(
+            vars2.get("KUBEADP_SANDBOX_RO_PATHS").map(|s| s.as_str()),
+            Some("/opt/tools:/data/readonly")
+        );
+
+        // Validation rejects relative path
+        assert!(parse_config_toml(
+            "test.toml",
+            "[common]\nsandbox_ro_paths = [\"relative/path\"]\n"
+        )
+        .unwrap_err()
+        .contains("must be absolute"));
+
+        // Validation rejects empty entry
+        assert!(
+            parse_config_toml("test.toml", "[common]\nsandbox_ro_paths = [\"\"]\n")
+                .unwrap_err()
+                .contains("must not be empty")
+        );
+
+        // Validation rejects traversal '..'
+        assert!(parse_config_toml(
+            "test.toml",
+            "[common]\nsandbox_ro_paths = [\"/usr/../etc\"]\n"
+        )
+        .unwrap_err()
+        .contains("must not contain '..'"));
     }
 }

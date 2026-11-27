@@ -222,6 +222,9 @@ pub struct Config {
     /// Overridable so tests can point it at a creatable temp dir when the
     /// sandbox backend fail-closes on a writable path it cannot create.
     pub sandbox_home: PathBuf,
+    /// Extra read-only paths appended to every sandbox policy built from this config.
+    /// Configured via `sandbox_ro_paths` or `KUBEADP_SANDBOX_RO_PATHS`.
+    pub sandbox_ro_paths: Vec<PathBuf>,
     pub gc_max_age_days: u64,
     pub max_parallel: u32,
     pub shutdown_grace_secs: u64,
@@ -321,6 +324,7 @@ impl Default for Config {
             repos_root: expand_path(DEFAULT_REPOS_ROOT_TEMPLATE, &workspace_root),
             agy_home: None,
             sandbox_home: PathBuf::from(DEFAULT_SANDBOX_HOME),
+            sandbox_ro_paths: Vec::new(),
             gc_max_age_days: DEFAULT_GC_MAX_AGE_DAYS,
             max_parallel: DEFAULT_MAX_PARALLEL,
             shutdown_grace_secs: DEFAULT_SHUTDOWN_GRACE_SECS,
@@ -506,6 +510,14 @@ impl Config {
         let sandbox_home = match env_vars.get("KUBEADP_SANDBOX_HOME").map(|s| s.trim()) {
             Some(raw) if !raw.is_empty() => expand_path(raw, &workspace_root),
             _ => PathBuf::from(DEFAULT_SANDBOX_HOME),
+        };
+
+        // 8e. Resolve sandbox_ro_paths (KUBEADP_SANDBOX_RO_PATHS override or file)
+        let sandbox_ro_paths = match env_vars.get("KUBEADP_SANDBOX_RO_PATHS").map(|s| s.trim()) {
+            Some(raw) if !raw.is_empty() => {
+                crate::sandbox::parse_sandbox_ro_paths(raw).map_err(|e| anyhow::anyhow!("{e}"))?
+            }
+            _ => Vec::new(),
         };
 
         // 9. Resolve gc_max_age_days
@@ -1017,6 +1029,7 @@ impl Config {
             repos_root,
             agy_home,
             sandbox_home,
+            sandbox_ro_paths,
             gc_max_age_days,
             max_parallel,
             shutdown_grace_secs,
@@ -1898,5 +1911,34 @@ no_proxy = "file-no-proxy"
         ]);
         let cfg = Config::load_with_env(&env_blank).unwrap();
         assert_eq!(cfg.sandbox_home, PathBuf::from(DEFAULT_SANDBOX_HOME));
+    }
+
+    #[test]
+    fn test_kubeadp_sandbox_ro_paths_env_knob() {
+        let temp_dir = tempdir().unwrap();
+        let state_root = temp_dir.path().join("state").to_str().unwrap().to_string();
+
+        // 1. Unset by default -> empty
+        let env_unset = env_with(&[("AGENT_RUN_STATE_ROOT", &state_root)]);
+        let cfg = Config::load_with_env(&env_unset).unwrap();
+        assert!(cfg.sandbox_ro_paths.is_empty());
+
+        // 2. Set to colon-separated paths
+        let env_set = env_with(&[
+            ("AGENT_RUN_STATE_ROOT", &state_root),
+            ("KUBEADP_SANDBOX_RO_PATHS", "/opt/tools:/data/readonly"),
+        ]);
+        let cfg = Config::load_with_env(&env_set).unwrap();
+        assert_eq!(
+            cfg.sandbox_ro_paths,
+            vec![PathBuf::from("/opt/tools"), PathBuf::from("/data/readonly")]
+        );
+
+        // 3. Invalid path fails closed
+        let env_invalid = env_with(&[
+            ("AGENT_RUN_STATE_ROOT", &state_root),
+            ("KUBEADP_SANDBOX_RO_PATHS", "relative/path"),
+        ]);
+        assert!(Config::load_with_env(&env_invalid).is_err());
     }
 }

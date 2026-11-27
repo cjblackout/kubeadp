@@ -901,9 +901,9 @@ JSON, snake_case keys, no renames; unknown keys are a hard parse error
 | `agent_id` | optional string | absent | agent/job id |
 | `jobset_id` | optional string | absent | jobset id |
 | `rw` | paths | `[]` | read-write dirs |
-| `ro` | paths | `["/usr","/lib","/lib64","/bin","/sbin","/etc","/opt/tools","/workspace/project-a"]` | read-only dirs |
-| `shared_rw` | paths | `["/home/agent"]` | shared read-write dirs |
-| `hide` | paths | `["/workspace/.agent-jobs"]` | paths hidden from the agent |
+| `ro` | paths | `["/usr","/lib","/lib64","/bin","/sbin","/etc","/opt/tools"]` | read-only dirs |
+| `shared_rw` | paths | `["/home/agent"]` (or `KUBEADP_SANDBOX_HOME` / `Config::sandbox_home`) | shared read-write dirs |
+| `hide` | paths | `["/workspace/.agent-jobs"]` (or `<workspace_root>/<jobs_dir_name>`) | paths hidden from the agent |
 | `tmp` | string | `"auto"` | private tmp: `""` off; `"auto"` → `/tmp/agent-sandbox-<agent_id\|agent>`; else verbatim |
 | `secret` | object | absent | secret channel `{fd, dest}` |
 | `env_allow` | globs | `["PATH","HOME","LANG","TERM","SSL_CERT_FILE","REQUESTS_CA_BUNDLE","NODE_USE_SYSTEM_CA","A2A_*","KUBEADP_*"]` | env filter (only allowlist; anything else dropped); exact or trailing `*` |
@@ -920,7 +920,10 @@ alnum+`_`, trailing `*` prefix glob only. `ensure_writable_dirs`: every
 rw/shared_rw/private-tmp path must be a real directory and a missing grant-rw
 path is created as a directory, or launch fails closed (125); a granted rw
 path that already exists as a regular file is a valid single-file grant and is
-kept as-is.
+kept as-is. Non-existent `ro` paths (from the default list or `sandbox_ro_paths`)
+on the host are skipped with a warning on stderr (`sandbox: ro path <p> does not exist, skipped`)
+instead of failing the setup; missing `rw`, `hide`, and `secret` paths remain
+fail-closed (exit 125).
 
 **Claude OAuth token passthrough**: a claude-engine job's policy adds the env
 NAME `CLAUDE_CODE_OAUTH_TOKEN` to `env_allow` (never a value) so the worker
@@ -1681,6 +1684,7 @@ sections; they are the separate trusted config of §4.2.
 | `api_allow_unauthenticated` | `KUBEADP_API_ALLOW_UNAUTHENTICATED` | boolean; allows tokenless start |
 | `jobset_root_key_file` | `KUBEADP_JOBSET_ROOT_KEY_FILE` | root HMAC key for jobset credentials; mandatory with `a2a` (§7.3) |
 | `instructions_file` | `KUBEADP_INSTRUCTIONS_FILE` | global instruction file, default `/etc/kubeadp-agent/instructions/global.md`; hierarchy in §4.10 |
+| `sandbox_ro_paths` | `KUBEADP_SANDBOX_RO_PATHS` | list of absolute paths appended to the default `ro` list of every policy (§6.4) |
 
 `[orchestrator]`:
 | Key | Env | Default / Notes |
