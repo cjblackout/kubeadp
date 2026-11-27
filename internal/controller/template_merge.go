@@ -68,6 +68,7 @@ func MergeAgentWithTemplate(agent *kubeopenv1alpha1.Agent, tmpl *kubeopenv1alpha
 
 	merged := agentConfig{
 		agentImage:    defaultString(agent.Spec.AgentImage, defaultString(tmpl.Spec.AgentImage, DefaultAgentImage)),
+		kubeadpImage:  defaultString(agent.Spec.KubeadpImage, defaultString(tmpl.Spec.KubeadpImage, DefaultKubeadpImage)),
 		executorImage: defaultString(agent.Spec.ExecutorImage, defaultString(tmpl.Spec.ExecutorImage, DefaultExecutorImage)),
 		attachImage:   defaultString(agent.Spec.AttachImage, defaultString(tmpl.Spec.AttachImage, DefaultAttachImage)),
 

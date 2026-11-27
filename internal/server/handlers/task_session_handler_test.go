@@ -191,7 +191,7 @@ func TestResolveTaskSessionURL(t *testing.T) {
 				Build()
 
 			handler := NewTaskSessionHandler(k8sClient, clusterDomain)
-			_, sessionID, err := handler.resolveTaskSessionURL(context.Background(), tt.namespace, tt.taskName)
+			_, sessionID, _, err := handler.resolveTaskSessionURL(context.Background(), tt.namespace, tt.taskName)
 
 			if tt.wantErr != "" {
 				if err == nil {

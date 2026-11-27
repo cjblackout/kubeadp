@@ -3,452 +3,242 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestStreamEvents_SessionError(t *testing.T) {
-	sessionID := "test-session-123"
+// startEnvelope is the real shape of POST /api/v1/jobs answers.
+const startEnvelope = `{"stdout_lines":["Job ID:       a1b2c3d4","Project:      proj","Status:       running"],"stderr_lines":[],"exit_code":0,"data":{"job":{"job_id":"a1b2c3d4","project":"proj","status":"running"}}}`
 
-	tests := []struct {
-		name       string
-		events     []string
-		wantErrors []string
-	}{
-		{
-			name: "collects session error with message",
-			events: []string{
-				sseEvent("session.error", map[string]interface{}{
-					"sessionID": sessionID,
-					"error": map[string]string{
-						"name":    "ProviderModelNotFoundError",
-						"message": "Model deepseek-v4-flash not found",
-					},
-				}),
-			},
-			wantErrors: []string{"Model deepseek-v4-flash not found"},
-		},
-		{
-			name: "collects session error with name only when message is empty",
-			events: []string{
-				sseEvent("session.error", map[string]interface{}{
-					"sessionID": sessionID,
-					"error": map[string]string{
-						"name":    "ProviderModelNotFoundError",
-						"message": "",
-					},
-				}),
-			},
-			wantErrors: []string{"ProviderModelNotFoundError"},
-		},
-		{
-			name: "collects multiple session errors",
-			events: []string{
-				sseEvent("session.error", map[string]interface{}{
-					"sessionID": sessionID,
-					"error": map[string]string{
-						"name":    "Error1",
-						"message": "First error",
-					},
-				}),
-				sseEvent("session.error", map[string]interface{}{
-					"sessionID": sessionID,
-					"error": map[string]string{
-						"name":    "Error2",
-						"message": "Second error",
-					},
-				}),
-			},
-			wantErrors: []string{"First error", "Second error"},
-		},
-		{
-			name: "ignores error for different session",
-			events: []string{
-				sseEvent("session.error", map[string]interface{}{
-					"sessionID": "other-session",
-					"error": map[string]string{
-						"name":    "SomeError",
-						"message": "Not our session",
-					},
-				}),
-			},
-			wantErrors: nil,
-		},
-		{
-			name: "ignores empty error name and message",
-			events: []string{
-				sseEvent("session.error", map[string]interface{}{
-					"sessionID": sessionID,
-					"error": map[string]string{
-						"name":    "",
-						"message": "",
-					},
-				}),
-			},
-			wantErrors: nil,
-		},
-		{
-			name: "prefers message over name when both present",
-			events: []string{
-				sseEvent("session.error", map[string]interface{}{
-					"sessionID": sessionID,
-					"error": map[string]string{
-						"name":    "ProviderModelNotFoundError",
-						"message": "Model not found",
-					},
-				}),
-			},
-			wantErrors: []string{"Model not found"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "text/event-stream")
-				w.Header().Set("Cache-Control", "no-cache")
-				flusher, ok := w.(http.Flusher)
-				if !ok {
-					t.Fatal("response writer must support flushing")
-				}
-
-				for _, event := range tt.events {
-					writeSSE(w, flusher, event)
-				}
-
-				writeSSE(w, flusher, fmt.Sprintf("data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"%s\",\"status\":{\"type\":\"idle\"}}}\n\n", sessionID))
-			}))
-			defer server.Close()
-
-			done := make(chan struct{})
-			sessionErrors := make(chan string, 16)
-
-			go streamEvents(server.URL, sessionID, done, sessionErrors)
-
-			var gotErrors []string
-			timeout := time.After(5 * time.Second)
-		collect:
-			for {
-				select {
-				case e := <-sessionErrors:
-					gotErrors = append(gotErrors, e)
-				case <-timeout:
-					break collect
-				default:
-					if len(gotErrors) >= len(tt.wantErrors) {
-						break collect
-					}
-				}
-			}
-
-			if len(gotErrors) != len(tt.wantErrors) {
-				t.Fatalf("expected %d errors, got %d: %v", len(tt.wantErrors), len(gotErrors), gotErrors)
-			}
-			for i, want := range tt.wantErrors {
-				if gotErrors[i] != want {
-					t.Errorf("error[%d]: expected %q, got %q", i, want, gotErrors[i])
-				}
-			}
-
-			close(done)
-		})
-	}
+func newTestClient(srv *httptest.Server, token string) *jobClient {
+	return &jobClient{http: srv.Client(), baseURL: srv.URL, token: token}
 }
 
-func TestStreamEvents_DoneChannel(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		flusher := w.(http.Flusher)
-
-		for i := 0; i < 100; i++ {
-			_, _ = io.WriteString(w, "data: {\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"s1\",\"part\":{\"type\":\"text\",\"text\":\"ping\"}}}\n\n")
-			flusher.Flush()
+func TestSubmitSendsBodyAndBearer(t *testing.T) {
+	var gotAuth, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/jobs" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
+		gotAuth = r.Header.Get("Authorization")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = io.WriteString(w, startEnvelope)
 	}))
-	defer server.Close()
+	defer srv.Close()
 
-	done := make(chan struct{})
-	sessionErrors := make(chan string, 16)
-
-	doneCalled := make(chan struct{})
-	go func() {
-		streamEvents(server.URL, "s1", done, sessionErrors)
-		close(doneCalled)
-	}()
-
-	close(done)
-
-	select {
-	case <-doneCalled:
-	case <-time.After(3 * time.Second):
-		t.Fatal("streamEvents did not return after done channel was closed")
-	}
-}
-
-func TestStreamEvents_ConnectionFailure(t *testing.T) {
-	done := make(chan struct{})
-	sessionErrors := make(chan string, 16)
-
-	defer close(done)
-
-	streamEvents("http://127.0.0.1:0/event", "s1", done, sessionErrors)
-
-	select {
-	case e := <-sessionErrors:
-		t.Errorf("expected no errors on connection failure, got: %s", e)
-	default:
-	}
-}
-
-func TestStreamEvents_PermissionAskedEvent(t *testing.T) {
-	sessionID := "test-session"
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		flusher := w.(http.Flusher)
-
-		writeSSE(w, flusher, sseEvent("permission.asked", map[string]interface{}{
-			"sessionID":  sessionID,
-			"permission": "file-write",
-			"patterns":   []string{"/app/main.go"},
-		}))
-
-		writeSSE(w, flusher, fmt.Sprintf("data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"%s\",\"status\":{\"type\":\"idle\"}}}\n\n", sessionID))
-	}))
-	defer server.Close()
-
-	done := make(chan struct{})
-	sessionErrors := make(chan string, 16)
-
-	go streamEvents(server.URL, sessionID, done, sessionErrors)
-
-	select {
-	case <-sessionErrors:
-		t.Error("permission.asked events should not produce errors")
-	case <-time.After(2 * time.Second):
-	}
-
-	close(done)
-}
-
-func TestStreamErrorsChannelFull(t *testing.T) {
-	sessionID := "test-session"
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		flusher := w.(http.Flusher)
-
-		for i := 0; i < 20; i++ {
-			writeSSE(w, flusher, sseEvent("session.error", map[string]interface{}{
-				"sessionID": sessionID,
-				"error": map[string]string{
-					"name":    fmt.Sprintf("Error%d", i),
-					"message": fmt.Sprintf("Error message %d", i),
-				},
-			}))
-		}
-
-		writeSSE(w, flusher, fmt.Sprintf("data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"%s\",\"status\":{\"type\":\"idle\"}}}\n\n", sessionID))
-	}))
-	defer server.Close()
-
-	done := make(chan struct{})
-	sessionErrors := make(chan string, 16)
-
-	go streamEvents(server.URL, sessionID, done, sessionErrors)
-
-	var collected []string
-	timeout := time.After(5 * time.Second)
-	waitMore := time.After(500 * time.Millisecond)
-loop:
-	for {
-		select {
-		case e := <-sessionErrors:
-			collected = append(collected, e)
-		case <-waitMore:
-			break loop
-		case <-timeout:
-			break loop
-		}
-	}
-
-	if len(collected) != 20 {
-		t.Errorf("expected 20 errors, got %d: %v", len(collected), collected)
-	}
-
-	close(done)
-}
-
-func TestStreamEvents_InvalidJSON(t *testing.T) {
-	sessionID := "test-session"
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		flusher := w.(http.Flusher)
-
-		_, _ = io.WriteString(w, "data: {invalid json}\n\n")
-		flusher.Flush()
-
-		writeSSE(w, flusher, sseEvent("session.error", map[string]interface{}{
-			"sessionID": sessionID,
-			"error": map[string]string{
-				"name":    "RealError",
-				"message": "This should still work",
-			},
-		}))
-
-		writeSSE(w, flusher, fmt.Sprintf("data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"%s\",\"status\":{\"type\":\"idle\"}}}\n\n", sessionID))
-	}))
-	defer server.Close()
-
-	done := make(chan struct{})
-	sessionErrors := make(chan string, 16)
-
-	go streamEvents(server.URL, sessionID, done, sessionErrors)
-
-	var gotErrors []string
-	timeout := time.After(5 * time.Second)
-	waitMore := time.After(500 * time.Millisecond)
-loop:
-	for {
-		select {
-		case e := <-sessionErrors:
-			gotErrors = append(gotErrors, e)
-		case <-waitMore:
-			break loop
-		case <-timeout:
-			break loop
-		}
-	}
-
-	if len(gotErrors) != 1 {
-		t.Fatalf("expected exactly 1 error (invalid JSON should be skipped), got %d: %v", len(gotErrors), gotErrors)
-	}
-	if gotErrors[0] != "This should still work" {
-		t.Errorf("expected error message 'This should still work', got %q", gotErrors[0])
-	}
-
-	close(done)
-}
-
-func TestStreamEvents_SessionStatusIdle(t *testing.T) {
-	sessionID := "test-session"
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		flusher := w.(http.Flusher)
-
-		writeSSE(w, flusher, sseEvent("session.error", map[string]interface{}{
-			"sessionID": sessionID,
-			"error": map[string]string{
-				"name":    "TestError",
-				"message": "Error before idle",
-			},
-		}))
-
-		writeSSE(w, flusher, fmt.Sprintf("data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"%s\",\"status\":{\"type\":\"idle\"}}}\n\n", sessionID))
-	}))
-	defer server.Close()
-
-	done := make(chan struct{})
-	sessionErrors := make(chan string, 16)
-
-	streamFinished := make(chan struct{})
-	go func() {
-		streamEvents(server.URL, sessionID, done, sessionErrors)
-		close(streamFinished)
-	}()
-
-	select {
-	case <-streamFinished:
-	case <-time.After(5 * time.Second):
-		t.Fatal("streamEvents did not return after receiving session.status idle")
-	}
-
-	var gotErrors []string
-	select {
-	case e := <-sessionErrors:
-		gotErrors = append(gotErrors, e)
-	default:
-	}
-
-	if len(gotErrors) != 1 || gotErrors[0] != "Error before idle" {
-		t.Errorf("expected 'Error before idle', got %v", gotErrors)
-	}
-
-	close(done)
-}
-
-func TestStreamEvents_NonDataLinesSkipped(t *testing.T) {
-	sessionID := "test-session"
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		flusher := w.(http.Flusher)
-
-		_, _ = io.WriteString(w, ": this is a comment\n")
-		_, _ = io.WriteString(w, "event: custom\n")
-		_, _ = io.WriteString(w, "id: 123\n")
-		_, _ = io.WriteString(w, "retry: 5000\n\n")
-		flusher.Flush()
-
-		writeSSE(w, flusher, sseEvent("session.error", map[string]interface{}{
-			"sessionID": sessionID,
-			"error": map[string]string{
-				"name":    "AfterComments",
-				"message": "Error after non-data lines",
-			},
-		}))
-
-		writeSSE(w, flusher, fmt.Sprintf("data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"%s\",\"status\":{\"type\":\"idle\"}}}\n\n", sessionID))
-	}))
-	defer server.Close()
-
-	done := make(chan struct{})
-	sessionErrors := make(chan string, 16)
-
-	streamFinished := make(chan struct{})
-	go func() {
-		streamEvents(server.URL, sessionID, done, sessionErrors)
-		close(streamFinished)
-	}()
-
-	select {
-	case <-streamFinished:
-	case <-time.After(5 * time.Second):
-		t.Fatal("streamEvents did not return")
-	}
-
-	var gotErrors []string
-	select {
-	case e := <-sessionErrors:
-		gotErrors = append(gotErrors, e)
-	default:
-	}
-
-	if len(gotErrors) != 1 || !strings.Contains(gotErrors[0], "Error after non-data lines") {
-		t.Errorf("expected error after non-data lines, got %v", gotErrors)
-	}
-
-	close(done)
-}
-
-func sseEvent(eventType string, properties interface{}) string {
-	propsJSON, _ := json.Marshal(properties)
-	data, _ := json.Marshal(map[string]interface{}{
-		"type":       eventType,
-		"properties": json.RawMessage(propsJSON),
+	id, err := newTestClient(srv, "s3cret").submit(context.Background(), jobCreateRequest{
+		Project: "proj", Prompt: "do it", Engine: "opencode", Model: "p/m", MaxRuntime: "90s",
 	})
-	return "data: " + string(data)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if id != "a1b2c3d4" {
+		t.Errorf("job id = %q, want a1b2c3d4", id)
+	}
+	if gotAuth != "Bearer s3cret" {
+		t.Errorf("Authorization = %q", gotAuth)
+	}
+	for _, want := range []string{`"project":"proj"`, `"prompt":"do it"`, `"engine":"opencode"`, `"model":"p/m"`, `"max_runtime":"90s"`} {
+		if !strings.Contains(gotBody, want) {
+			t.Errorf("request body %s lacks %s", gotBody, want)
+		}
+	}
 }
 
-func writeSSE(w io.Writer, flusher http.Flusher, data string) {
-	_, _ = io.WriteString(w, data+"\n")
-	flusher.Flush()
+func TestSubmitOmitsEmptyOptionalFields(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = io.WriteString(w, startEnvelope)
+	}))
+	defer srv.Close()
+	if _, err := newTestClient(srv, "").submit(context.Background(), jobCreateRequest{Project: "p", Prompt: "x", Engine: "opencode"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(gotBody, "model") || strings.Contains(gotBody, "max_runtime") {
+		t.Errorf("empty optional fields must be omitted: %s", gotBody)
+	}
+}
+
+func TestSubmitFallsBackToStdoutJobID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"stdout_lines":["Job ID:       deadbeef"],"stderr_lines":[],"exit_code":0,"data":null}`)
+	}))
+	defer srv.Close()
+	id, err := newTestClient(srv, "").submit(context.Background(), jobCreateRequest{Project: "p", Prompt: "x", Engine: "opencode"})
+	if err != nil || id != "deadbeef" {
+		t.Fatalf("id=%q err=%v", id, err)
+	}
+}
+
+func TestSubmitErrorDoesNotLeakToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":"unauthorized","code":"unauthorized"}`)
+	}))
+	defer srv.Close()
+	_, err := newTestClient(srv, "s3cret").submit(context.Background(), jobCreateRequest{Project: "p", Prompt: "x", Engine: "opencode"})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "s3cret") || !strings.Contains(err.Error(), "401") {
+		t.Errorf("error must name the status and never the token: %v", err)
+	}
+}
+
+func TestJobStatusReadsNestedJob(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"stdout_lines":[],"exit_code":0,"data":{"job":{"job_id":"a1b2c3d4","status":"done"}}}`)
+	}))
+	defer srv.Close()
+	st, err := newTestClient(srv, "").jobStatus(context.Background(), "a1b2c3d4")
+	if err != nil || st != "done" {
+		t.Fatalf("status=%q err=%v", st, err)
+	}
+}
+
+func TestResultParsesResponseErrorAndUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"exit_code":0,"data":{"job_id":"a1","status":"done","response":"MOCK-OK","error":null,"usage":{"input_tokens":7,"output_tokens":6,"reasoning_tokens":1,"cache_tokens":2,"cost":0.0125}}}`)
+	}))
+	defer srv.Close()
+	st, resp, errText, usage, err := newTestClient(srv, "").result(context.Background(), "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != "done" || resp != "MOCK-OK" || errText != "" {
+		t.Errorf("status=%q resp=%q err=%q", st, resp, errText)
+	}
+	if usage == nil || usage.InputTokens != 7 || usage.OutputTokens != 6 || usage.ReasoningTokens != 1 || usage.CacheTokens != 2 || usage.Cost != 0.0125 {
+		t.Errorf("usage = %+v", usage)
+	}
+}
+
+func TestResultWithoutUsageIsNil(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"exit_code":0,"data":{"job_id":"a1","status":"failed","response":null,"error":"boom"}}`)
+	}))
+	defer srv.Close()
+	_, _, errText, usage, err := newTestClient(srv, "").result(context.Background(), "a1")
+	if err != nil || errText != "boom" || usage != nil {
+		t.Fatalf("err=%v errText=%q usage=%v", err, errText, usage)
+	}
+}
+
+func TestKillPostsToKillEndpoint(t *testing.T) {
+	var hit atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/jobs/a1/kill" {
+			hit.Store(true)
+		}
+		_, _ = io.WriteString(w, `{"exit_code":0}`)
+	}))
+	defer srv.Close()
+	if err := newTestClient(srv, "t").kill("a1"); err != nil {
+		t.Fatal(err)
+	}
+	if !hit.Load() {
+		t.Error("kill endpoint was not called")
+	}
+}
+
+func TestStreamLogCopiesLogEventsUntilEnd(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: status\ndata: {\"status\":\"running\"}\n\n")
+		_, _ = io.WriteString(w, "event: log\ndata: {\"offset\":5,\"text\":\"hello \"}\n\n")
+		_, _ = io.WriteString(w, ": keepalive\n\n")
+		_, _ = io.WriteString(w, "event: log\ndata: {\"offset\":11,\"text\":\"world\"}\n\n")
+		_, _ = io.WriteString(w, "event: end\ndata: {\"status\":\"done\"}\n\n")
+		_, _ = io.WriteString(w, "event: log\ndata: {\"offset\":99,\"text\":\"AFTER-END\"}\n\n")
+	}))
+	defer srv.Close()
+	var out strings.Builder
+	newTestClient(srv, "").streamLog(context.Background(), "a1", &out)
+	if out.String() != "hello world" {
+		t.Errorf("streamed text = %q", out.String())
+	}
+}
+
+func TestWaitForJobReturnsTerminalStatus(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st := "running"
+		if calls.Add(1) >= 2 {
+			st = "incomplete"
+		}
+		_, _ = io.WriteString(w, `{"exit_code":0,"data":{"job":{"job_id":"a1","status":"`+st+`"}}}`)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	st, err := waitForJob(ctx, newTestClient(srv, ""), "a1")
+	if err != nil || st != "incomplete" {
+		t.Fatalf("status=%q err=%v", st, err)
+	}
+}
+
+func TestWaitForJobStopsOnContextCancel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"exit_code":0,"data":{"job":{"job_id":"a1","status":"running"}}}`)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := waitForJob(ctx, newTestClient(srv, ""), "a1"); err == nil {
+		t.Fatal("expected the cancelled context to end the wait")
+	}
+}
+
+func TestFormatMaxRuntime(t *testing.T) {
+	cases := map[time.Duration]string{
+		0:                      "",
+		-time.Second:           "",
+		500 * time.Millisecond: "1s",
+		90 * time.Second:       "90s",
+		2 * time.Hour:          "7200s",
+	}
+	for in, want := range cases {
+		if got := formatMaxRuntime(in); got != want {
+			t.Errorf("formatMaxRuntime(%v) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestIsTerminalJobStatus(t *testing.T) {
+	for _, s := range []string{"done", "failed", "self-terminated", "incomplete", "quota-exhausted", "killed"} {
+		if !isTerminalJobStatus(s) {
+			t.Errorf("%s must be terminal", s)
+		}
+	}
+	for _, s := range []string{"running", "", "pending"} {
+		if isTerminalJobStatus(s) {
+			t.Errorf("%q must not be terminal", s)
+		}
+	}
+}
+
+func TestWriteTerminationMessage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "termination-log")
+	writeTerminationMessage(path, "a1b2c3d4")
+	b, err := os.ReadFile(path) //nolint:gosec
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != `{"jobId":"a1b2c3d4"}` {
+		t.Errorf("termination message = %s", b)
+	}
+	// An unwritable path and an empty id are silently ignored.
+	writeTerminationMessage(filepath.Join(t.TempDir(), "missing", "x"), "a1")
+	writeTerminationMessage(path, "")
 }

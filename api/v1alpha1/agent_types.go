@@ -213,6 +213,12 @@ type AgentSpec struct {
 	// +optional
 	AgentImage string `json:"agentImage,omitempty"`
 
+	// KubeadpImage specifies the kubeadp-agent init container image.
+	// This image contains the kubeadp-agent and agent-run binaries that get copied to /tools volume.
+	// If not specified, defaults to "ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.64".
+	// +optional
+	KubeadpImage string `json:"kubeadpImage,omitempty"`
+
 	// ExecutorImage specifies the main worker container image for task execution.
 	// This is the development environment where tasks actually run.
 	// The container uses /tools/opencode (provided by agentImage init container) to execute AI tasks.

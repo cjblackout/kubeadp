@@ -116,6 +116,7 @@ export interface CreateAgentTemplateRequest {
   workspaceDir?: string;
   serviceAccountName?: string;
   agentImage?: string;
+  kubeadpImage?: string;
   executorImage?: string;
   skills?: AssemblySkillInput[];
   plugins?: AssemblyPluginInput[];
@@ -129,6 +130,7 @@ export interface CreateAgentRequest {
   serviceAccountName?: string;
   // P0: Images
   agentImage?: string;
+  kubeadpImage?: string;
   executorImage?: string;
   // P1: Common configuration
   maxConcurrentTasks?: number;
@@ -237,6 +239,7 @@ export interface Agent {
   profile?: string;
   templateRef?: AgentReference;
   executorImage?: string;
+  kubeadpImage?: string;
   agentImage?: string;
   workspaceDir?: string;
   serviceAccountName?: string;
@@ -263,6 +266,7 @@ export interface AgentTemplate {
   name: string;
   namespace: string;
   agentImage?: string;
+  kubeadpImage?: string;
   executorImage?: string;
   workspaceDir?: string;
   serviceAccountName?: string;

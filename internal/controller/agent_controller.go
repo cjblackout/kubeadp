@@ -110,6 +110,12 @@ func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
+	// Reconcile kubeadp auth Secret (<agent>-kubeadp)
+	if err := r.reconcileKubeadpSecret(ctx, &agent); err != nil {
+		logger.Error(err, "Failed to reconcile kubeadp secret")
+		return ctrl.Result{}, err
+	}
+
 	// Resolve agent configuration (merge with template if referenced).
 	agentCfg, err := ResolveAgentConfigFromTemplate(ctx, r.Client, &agent)
 	if err != nil {
@@ -805,6 +811,57 @@ func (r *AgentReconciler) findAgentsForTemplate(ctx context.Context, obj client.
 		}
 	}
 	return requests
+}
+
+// reconcileKubeadpSecret ensures the <agent>-kubeadp Secret exists with api-token and jobset-root-key.
+func (r *AgentReconciler) reconcileKubeadpSecret(ctx context.Context, agent *kubeopenv1alpha1.Agent) error {
+	logger := log.FromContext(ctx)
+	secretName := KubeadpSecretName(agent.Name)
+
+	var existing corev1.Secret
+	err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: secretName}, &existing)
+	if err == nil {
+		// Secret already exists, do not overwrite keys
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to get kubeadp Secret: %w", err)
+	}
+
+	apiToken, err := generateShareToken()
+	if err != nil {
+		return fmt.Errorf("failed to generate api token: %w", err)
+	}
+	jobsetRootKey, err := generateShareToken()
+	if err != nil {
+		return fmt.Errorf("failed to generate jobset root key: %w", err)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: agent.Namespace,
+			Labels:    getServerLabels(agent.Name),
+		},
+		Data: map[string][]byte{
+			KubeadpAPITokenKey:      []byte(apiToken),
+			KubeadpJobsetRootKeyKey: []byte(jobsetRootKey),
+		},
+	}
+
+	if err := controllerutil.SetControllerReference(agent, secret, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference on kubeadp Secret: %w", err)
+	}
+
+	logger.Info("Creating kubeadp Secret for Agent", "secret", secretName)
+	if err := r.Create(ctx, secret); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to create kubeadp Secret: %w", err)
+	}
+
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

@@ -2001,12 +2001,15 @@ func TestBuildPod_WithoutContextFile(t *testing.T) {
 	}
 }
 
-func TestBuildPod_AgentRef_WithAttachCommand(t *testing.T) {
+func TestBuildPod_AgentRef_WithTaskSubmitCommand(t *testing.T) {
 	task := &kubeopenv1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-task",
 			Namespace: "default",
 			UID:       types.UID("test-uid"),
+		},
+		Spec: kubeopenv1alpha1.TaskSpec{
+			AgentRef: &kubeopenv1alpha1.AgentReference{Name: "test-agent"},
 		},
 	}
 	task.APIVersion = "kubeopencode.io/v1alpha1"
@@ -2021,50 +2024,29 @@ func TestBuildPod_AgentRef_WithAttachCommand(t *testing.T) {
 	}
 
 	serverURL := "http://test-agent.default.svc.cluster.local:4096"
-	pod := buildPod(task, "test-task-pod", cfg, nil, nil, nil, nil, defaultSystemConfig(), serverURL)
-
-	// Verify pod was created
+	sys := defaultSystemConfig()
+	pod := buildPod(task, "test-task-pod", cfg, nil, nil, nil, nil, sys, serverURL)
 	if pod == nil {
 		t.Fatal("buildPod returned nil")
 	}
-
 	container := pod.Spec.Containers[0]
 
-	// Verify attach image is used for default --attach command (no custom command)
-	if container.Image != "test-attach:v1.0.0" {
-		t.Errorf("Container.Image = %q, want %q (attach image for agentRef with default command)", container.Image, "test-attach:v1.0.0")
+	// The Task Pod only runs the small HTTP client `kubeopencode task-submit`,
+	// shipped in the unified system image (not the opencode-only attach image).
+	if container.Image != sys.systemImage {
+		t.Errorf("Container.Image = %q, want the system image %q", container.Image, sys.systemImage)
 	}
-
-	// Verify command uses --attach flag
-	if len(container.Command) != 3 {
-		t.Fatalf("len(Container.Command) = %d, want 3", len(container.Command))
+	joined := strings.Join(container.Command, " ")
+	if len(container.Command) < 2 || container.Command[0] != "/kubeopencode" || container.Command[1] != "task-submit" {
+		t.Fatalf("Container.Command = %v, want /kubeopencode task-submit ...", container.Command)
 	}
-	if container.Command[0] != "sh" {
-		t.Errorf("Container.Command[0] = %q, want %q", container.Command[0], "sh")
+	for _, want := range []string{"--url " + serverURL, "--task-file /workspace/task.md", "--token-file " + KubeadpClientMountPath + "/" + KubeadpAPITokenKey, "--project " + DefaultTaskProject} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("command should contain %q, got: %s", want, joined)
+		}
 	}
-	if container.Command[1] != "-c" {
-		t.Errorf("Container.Command[1] = %q, want %q", container.Command[1], "-c")
-	}
-
-	// Verify the command includes --attach and serverURL
-	if !strings.Contains(container.Command[2], "--attach") {
-		t.Errorf("Command should contain --attach flag")
-	}
-	if !strings.Contains(container.Command[2], serverURL) {
-		t.Errorf("Command should contain server URL: %s", serverURL)
-	}
-	if !strings.Contains(container.Command[2], "/tools/opencode run") {
-		t.Errorf("Command should use /tools/opencode run")
-	}
-	if !strings.Contains(container.Command[2], "$(cat /workspace/task.md)") {
-		t.Errorf("Command should read task from /workspace/task.md")
-	}
-	// Verify the command includes --title with task name prefix
-	if !strings.Contains(container.Command[2], "--title") {
-		t.Errorf("Command should contain --title flag")
-	}
-	if !strings.Contains(container.Command[2], "kubeopencode/default/test-task") {
-		t.Errorf("Command --title should contain deterministic session title, got: %s", container.Command[2])
+	if strings.Contains(joined, "--attach") || strings.Contains(joined, "opencode run") {
+		t.Errorf("command must not use the opencode server API: %s", joined)
 	}
 }
 

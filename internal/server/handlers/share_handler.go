@@ -221,7 +221,7 @@ func (h *ShareHandler) ServeShareTerminal(w http.ResponseWriter, r *http.Request
 	agent := sc.agent
 
 	// Resolve the agent's server pod (using server's own client, no impersonation)
-	podName, containerName, port, err := resolveAgentServerPod(r.Context(), h.k8sClient, agent.Namespace, agent.Name)
+	podName, containerName, _, err := resolveAgentServerPod(r.Context(), h.k8sClient, agent.Namespace, agent.Name)
 	if err != nil {
 		shareLog.Error(err, "share terminal: failed to resolve agent server pod", "agent", agent.Name)
 		http.Error(w, "Agent server not available", http.StatusServiceUnavailable)
@@ -278,7 +278,6 @@ func (h *ShareHandler) ServeShareTerminal(w http.ResponseWriter, r *http.Request
 	}()
 
 	// Build exec request using server's own ServiceAccount (not impersonated)
-	attachURL := fmt.Sprintf("http://localhost:%d", port)
 
 	// WebSocket reader goroutine
 	inputCh := make(chan []byte, 16)
@@ -336,7 +335,7 @@ func (h *ShareHandler) ServeShareTerminal(w http.ResponseWriter, r *http.Request
 			SubResource("exec").
 			VersionedParams(&corev1.PodExecOptions{
 				Container: containerName,
-				Command:   []string{"/tools/opencode", "attach", attachURL},
+				Command:   []string{"/bin/bash"},
 				Stdin:     true,
 				Stdout:    true,
 				TTY:       true,
