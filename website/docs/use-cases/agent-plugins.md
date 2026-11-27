@@ -76,7 +76,7 @@ spec:
 
 [plugin-gentleman](https://github.com/IrrealV/plugin-gentleman) is a TUI plugin that provides an animated ASCII mascot during busy states for interactive sessions.
 
-TUI plugins are loaded when users interact with the Agent via `kubeoc agent attach` or the web terminal — they have no effect on headless `opencode serve` operation.
+TUI plugins are loaded when users interact with the Agent via an interactive session (`kubeoc agent attach`, which opens a shell in the agent's server pod, or the web terminal) — they have no effect on headless worker operation.
 
 ### Agent Configuration
 

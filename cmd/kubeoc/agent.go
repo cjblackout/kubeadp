@@ -5,33 +5,24 @@ package main
 import (
 	"context"
 	"fmt"
-	"net"
-	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/rest"
+	"k8s.io/client-go/kubernetes"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/remotecommand"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kubeopenv1alpha1 "github.com/kubeopencode/kubeopencode/api/v1alpha1"
 	"github.com/kubeopencode/kubeopencode/internal/controller"
-)
-
-const (
-	// Default kubeopencode server deployment settings
-	defaultServerNamespace = "kubeopencode-system"
-	defaultServerService   = "kubeopencode-server"
-	defaultServerPort      = 2746
 )
 
 func init() {
@@ -334,24 +325,16 @@ func runAgentUnshare(ctx context.Context, namespace, agentName string) error {
 }
 
 func newAgentAttachCmd() *cobra.Command {
-	var (
-		namespace       string
-		localPort       int
-		serverNamespace string
-		serverService   string
-		serverPort      int
-		usePortForward  bool
-	)
+	var namespace string
 
 	cmd := &cobra.Command{
 		Use:   "attach <agent-name>",
-		Short: "Attach to a server-mode agent via OpenCode TUI",
-		Long: `Attach to a server-mode agent with a single command.
+		Short: "Open an interactive shell in an agent's server pod",
+		Long: `Open an interactive shell in the agent's server pod.
 
-By default, connects through the kube-apiserver's built-in service proxy,
-using your kubeconfig credentials for authentication. No port-forward needed.
-
-Use --use-port-forward to fall back to kubectl port-forward (legacy mode).
+The session is a kubectl-exec (SPDY) into the pod that runs the agent's
+kubeadp-agent worker, using your kubeconfig credentials for authentication.
+No port-forward or local proxy is needed.
 
 Kubeconfig resolution (in priority order):
   1. KUBEOPENCODE_KUBECONFIG environment variable
@@ -359,39 +342,22 @@ Kubeconfig resolution (in priority order):
   3. Default ~/.kube/config
 
 Examples:
-  kubeoc agent attach server-agent -n test
-  kubeoc agent attach my-agent -n production --local-port 5000
-  kubeoc agent attach my-agent -n test --use-port-forward`,
+  kubeoc agent attach my-agent -n test
+  kubeoc agent attach server-agent -n production`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if usePortForward {
-				return runAgentAttachPortForward(cmd.Context(), namespace, args[0], localPort)
-			}
-			return runAgentAttachServiceProxy(cmd.Context(), namespace, args[0], localPort, serverNamespace, serverService, serverPort)
+			return runAgentAttach(cmd.Context(), namespace, args[0])
 		},
 	}
 
 	cmd.Flags().StringVarP(&namespace, "namespace", "n", "default", "Agent namespace")
-	cmd.Flags().IntVar(&localPort, "local-port", 0, "Local port (default: same as agent server port)")
-	cmd.Flags().StringVar(&serverNamespace, "server-namespace", defaultServerNamespace,
-		"Namespace where kubeopencode server is deployed")
-	cmd.Flags().StringVar(&serverService, "server-service", defaultServerService,
-		"Name of kubeopencode server Service")
-	cmd.Flags().IntVar(&serverPort, "server-port", defaultServerPort,
-		"Port of kubeopencode server Service")
-	cmd.Flags().BoolVar(&usePortForward, "use-port-forward", false,
-		"Use kubectl port-forward instead of service proxy (legacy mode)")
 
 	return cmd
 }
 
-// runAgentAttachServiceProxy connects to an agent via kube-apiserver's built-in service proxy.
-// Flow: local proxy → kube-apiserver (auth) → kubeopencode server → agent OpenCode server
-func runAgentAttachServiceProxy(ctx context.Context, namespace, agentName string, localPort int, svcNamespace, svcName string, svcPort int) error {
-	if err := checkBinary("opencode"); err != nil {
-		return fmt.Errorf("opencode not found: %w\n  Install: https://opencode.ai", err)
-	}
-
+// runAgentAttach opens an interactive shell in the agent's server pod using a
+// kube-apiserver exec (SPDY) with the user's kubeconfig credentials.
+func runAgentAttach(ctx context.Context, namespace, agentName string) error {
 	fmt.Println("Connecting to cluster...")
 
 	cfg, err := getKubeConfig()
@@ -404,252 +370,152 @@ func runAgentAttachServiceProxy(ctx context.Context, namespace, agentName string
 		return fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
 
-	// Look up the Agent to verify it exists and is ready
+	// Look up the Agent's running server pod and the container to exec into.
 	fmt.Printf("Looking up agent %s/%s...\n", namespace, agentName)
 
-	var agent kubeopenv1alpha1.Agent
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: agentName, Namespace: namespace}, &agent); err != nil {
-		return fmt.Errorf("agent %q not found in namespace %q: %w", agentName, namespace, err)
-	}
-
-	agentPort := controller.GetServerPort(&agent)
-	if localPort == 0 {
-		localPort = int(agentPort)
-	}
-
-	if !agent.Status.Ready {
-		deploymentName := controller.ServerDeploymentName(agentName)
-		return fmt.Errorf("agent %q is not ready\n  Check: kubectl get deployment %s -n %s", agentName, deploymentName, namespace)
-	}
-
-	fmt.Println("Agent ready")
-
-	// Create authenticated transport for kube-apiserver
-	transport, err := rest.TransportFor(cfg)
+	ref, err := controller.ResolveAgentServerPod(ctx, k8sClient, namespace, agentName)
 	if err != nil {
-		return fmt.Errorf("failed to create transport: %w", err)
+		return err
 	}
 
-	// Parse the kube-apiserver URL from kubeconfig.
-	// cfg.Host may be "host:port" without scheme, which url.Parse misparses
-	// (treats "host" as scheme). Ensure scheme is present.
-	apiServerHost := cfg.Host
-	apiServerURL, err := url.Parse(apiServerHost)
-	if err != nil || apiServerURL.Scheme == "" || apiServerURL.Host == "" {
-		apiServerURL, err = url.Parse("https://" + apiServerHost)
+	fmt.Printf("Attaching to %s/%s (container %s)\n\n", ref.Pod, namespace, ref.Container)
+
+	// Cancel the session on SIGINT/SIGTERM so the exec stream and the deferred
+	// terminal restore below run cleanly instead of leaving the terminal raw.
+	sessionCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+
+	stdinFd := int(os.Stdin.Fd())
+	isTTY := term.IsTerminal(stdinFd)
+
+	// Switch to raw mode for an interactive (TTY) session so keystrokes reach
+	// the remote shell unbuffered. Restore the terminal on exit.
+	var state *term.State
+	if isTTY {
+		state, err = term.MakeRaw(stdinFd)
 		if err != nil {
-			return fmt.Errorf("invalid kube-apiserver URL %q: %w", apiServerHost, err)
+			return fmt.Errorf("failed to switch terminal to raw mode: %w", err)
 		}
+		defer func() { _ = term.Restore(stdinFd, state) }()
 	}
 
-	if !isPortAvailable(localPort) {
-		return fmt.Errorf("local port %d is already in use\n  Use --local-port to specify a different port", localPort)
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create kubernetes clientset: %w", err)
 	}
 
-	// Build the service proxy path prefix:
-	// /api/v1/namespaces/{server-ns}/services/{server-svc}:{server-port}/proxy
-	//   /api/v1/namespaces/{agent-ns}/agents/{agent-name}/proxy
-	serviceProxyPrefix := fmt.Sprintf(
-		"/api/v1/namespaces/%s/services/%s:%d/proxy/api/v1/namespaces/%s/agents/%s/proxy",
-		svcNamespace, svcName, svcPort, namespace, agentName,
-	)
+	execReq := clientset.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(ref.Pod).
+		Namespace(namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: ref.Container,
+			Command:   []string{"/bin/bash"},
+			Stdin:     true,
+			Stdout:    true,
+			Stderr:    true,
+			TTY:       isTTY,
+		}, clientgoscheme.ParameterCodec)
 
-	// Create the local reverse proxy
-	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = apiServerURL.Scheme
-			req.URL.Host = apiServerURL.Host
-			// /event → /.../proxy/.../proxy/event
-			req.URL.Path = serviceProxyPrefix + req.URL.Path
-			req.Host = apiServerURL.Host
-		},
-		Transport:     transport,
-		FlushInterval: -1, // Immediate flush for SSE streaming
+	executor, err := remotecommand.NewSPDYExecutor(cfg, "POST", execReq.URL())
+	if err != nil {
+		return fmt.Errorf("failed to create exec connection: %w", err)
 	}
 
-	localServer := &http.Server{ //nolint:gosec // ReadHeaderTimeout intentionally omitted for SSE streaming
-		Addr:         fmt.Sprintf("127.0.0.1:%d", localPort),
-		Handler:      proxy,
-		WriteTimeout: 0, // Disabled for SSE long-lived connections
-	}
-
-	// Start the local proxy server
-	errChan := make(chan error, 1)
-	go func() {
-		if err := localServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errChan <- err
-		}
-	}()
-
-	localURL := fmt.Sprintf("http://localhost:%d", localPort)
-
-	// Wait for the local proxy to be ready, checking for startup errors
-	if err := waitForPort(localPort, 5*time.Second); err != nil {
-		// Check if there's a more specific startup error (e.g., bind permission denied)
-		select {
-		case startErr := <-errChan:
-			return fmt.Errorf("local proxy failed to start: %w", startErr)
-		default:
-			return fmt.Errorf("local proxy failed to start: %w", err)
-		}
-	}
-
-	fmt.Printf("Local proxy ready: %s\n", localURL)
-	fmt.Printf("Launching opencode attach...\n\n")
+	// Forward the terminal size and any subsequent window resize events to the
+	// remote terminal.
+	sizeQueue := newTerminalSizeQueue(stdinFd)
+	defer sizeQueue.Close()
 
 	// Start connection heartbeat to prevent standby auto-suspend
-	heartbeatCancel := startConnectionHeartbeat(ctx, k8sClient, namespace, agentName)
+	heartbeatCancel := startConnectionHeartbeat(sessionCtx, k8sClient, namespace, agentName)
 	defer heartbeatCancel()
 
-	// Launch opencode attach
-	attachCmd := exec.CommandContext(ctx, "opencode", "attach", localURL) //nolint:gosec // args are not user-controlled
-	attachCmd.Stdin = os.Stdin
-	attachCmd.Stdout = os.Stdout
-	attachCmd.Stderr = os.Stderr
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigCh
-		_ = localServer.Close()
-	}()
-
-	err = attachCmd.Run()
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_ = localServer.Shutdown(shutdownCtx)
+	err = executor.StreamWithContext(sessionCtx, remotecommand.StreamOptions{
+		Stdin:             os.Stdin,
+		Stdout:            os.Stdout,
+		Stderr:            os.Stderr,
+		Tty:               isTTY,
+		TerminalSizeQueue: sizeQueue,
+	})
 
 	if err != nil {
-		if ctx.Err() != nil {
+		if sessionCtx.Err() != nil {
 			return nil
 		}
-		return fmt.Errorf("opencode attach exited with error: %w", err)
+		return fmt.Errorf("shell session failed: %w", err)
 	}
 
 	fmt.Println("\nSession ended.")
 	return nil
 }
 
-// runAgentAttachPortForward is the legacy mode using kubectl port-forward.
-func runAgentAttachPortForward(ctx context.Context, namespace, agentName string, localPort int) error {
-	if err := checkBinary("kubectl"); err != nil {
-		return fmt.Errorf("kubectl not found: %w\n  Install: https://kubernetes.io/docs/tasks/tools/", err)
-	}
-	if err := checkBinary("opencode"); err != nil {
-		return fmt.Errorf("opencode not found: %w\n  Install: https://opencode.ai", err)
-	}
+// terminalSizeQueue implements remotecommand.TerminalSizeQueue and forwards
+// local terminal size changes to the remote exec session.
+type terminalSizeQueue struct {
+	ch   chan *remotecommand.TerminalSize
+	sig  chan os.Signal
+	done chan struct{}
+}
 
-	fmt.Println("Connecting to cluster...")
-
-	cfg, err := getKubeConfig()
-	if err != nil {
-		return fmt.Errorf("cannot connect to cluster: %w", err)
-	}
-
-	k8sClient, err := client.New(cfg, client.Options{Scheme: scheme})
-	if err != nil {
-		return fmt.Errorf("failed to create kubernetes client: %w", err)
+func newTerminalSizeQueue(fd int) *terminalSizeQueue {
+	q := &terminalSizeQueue{
+		ch:   make(chan *remotecommand.TerminalSize, 1),
+		sig:  make(chan os.Signal, 1),
+		done: make(chan struct{}),
 	}
 
-	fmt.Printf("Looking up agent %s/%s...\n", namespace, agentName)
-
-	var agent kubeopenv1alpha1.Agent
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: agentName, Namespace: namespace}, &agent); err != nil {
-		return fmt.Errorf("agent %q not found in namespace %q: %w", agentName, namespace, err)
+	// Send the current size so the remote terminal starts at the right dimensions.
+	if width, height, err := term.GetSize(fd); err == nil {
+		q.ch <- &remotecommand.TerminalSize{Width: uint16(width), Height: uint16(height)}
 	}
 
-	serverPort := controller.GetServerPort(&agent)
-	deploymentName := controller.ServerDeploymentName(agentName)
-
-	if localPort == 0 {
-		localPort = int(serverPort)
-	}
-
-	if !agent.Status.Ready {
-		return fmt.Errorf("agent %q is not ready\n  Check: kubectl get deployment %s -n %s", agentName, deploymentName, namespace)
-	}
-
-	fmt.Printf("Agent found: %s (port %d)\n", deploymentName, serverPort)
-
-	if !isPortAvailable(localPort) {
-		return fmt.Errorf("local port %d is already in use\n  Use --local-port to specify a different port", localPort)
-	}
-
-	fmt.Printf("Starting port-forward (localhost:%d -> %s:%d)...\n", localPort, deploymentName, serverPort)
-
-	pfCtx, pfCancel := context.WithCancel(ctx)
-	defer pfCancel()
-
-	pfCmd := exec.CommandContext(pfCtx, "kubectl", "port-forward", //nolint:gosec // args are not user-controlled
-		"-n", namespace,
-		fmt.Sprintf("deployment/%s", deploymentName),
-		fmt.Sprintf("%d:%d", localPort, serverPort),
-	)
-	pfCmd.Stderr = os.Stderr
-
-	if err := pfCmd.Start(); err != nil {
-		return fmt.Errorf("failed to start port-forward: %w", err)
-	}
-
-	localURL := fmt.Sprintf("http://localhost:%d", localPort)
-	if err := waitForPort(localPort, 15*time.Second); err != nil {
-		pfCancel()
-		_ = pfCmd.Wait()
-		return fmt.Errorf("port-forward failed to start: %w", err)
-	}
-
-	fmt.Printf("Port-forward ready: %s\n", localURL)
-	fmt.Printf("Launching opencode attach...\n\n")
-
-	// Start connection heartbeat to prevent standby auto-suspend
-	heartbeatCancel := startConnectionHeartbeat(ctx, k8sClient, namespace, agentName)
-	defer heartbeatCancel()
-
-	attachCmd := exec.CommandContext(ctx, "opencode", "attach", localURL) //nolint:gosec // args are not user-controlled
-	attachCmd.Stdin = os.Stdin
-	attachCmd.Stdout = os.Stdout
-	attachCmd.Stderr = os.Stderr
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(q.sig, syscall.SIGWINCH)
 
 	go func() {
-		<-sigCh
-		pfCancel()
+		for {
+			select {
+			case <-q.sig:
+				width, height, err := term.GetSize(fd)
+				if err != nil {
+					return
+				}
+				select {
+				case q.ch <- &remotecommand.TerminalSize{Width: uint16(width), Height: uint16(height)}:
+				default:
+				}
+			case <-q.done:
+				return
+			}
+		}
 	}()
 
-	err = attachCmd.Run()
+	return q
+}
 
-	pfCancel()
-	_ = pfCmd.Wait()
-
-	if err != nil {
-		if ctx.Err() != nil {
+// Next returns the next terminal size, or nil once the queue is closed.
+func (q *terminalSizeQueue) Next() *remotecommand.TerminalSize {
+	select {
+	case size, ok := <-q.ch:
+		if !ok {
 			return nil
 		}
-		return fmt.Errorf("opencode attach exited with error: %w", err)
+		return size
+	case <-q.done:
+		return nil
 	}
-
-	fmt.Println("\nSession ended. Port-forward cleaned up.")
-	return nil
 }
 
-// checkBinary verifies a binary is available in PATH.
-func checkBinary(name string) error {
-	_, err := exec.LookPath(name)
-	return err
-}
-
-// isPortAvailable checks if a TCP port is available locally.
-func isPortAvailable(port int) bool {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		return false
+// Close stops the resize listener. Safe to call multiple times.
+func (q *terminalSizeQueue) Close() {
+	select {
+	case <-q.done:
+		return
+	default:
 	}
-	_ = ln.Close()
-	return true
+	signal.Stop(q.sig)
+	close(q.done)
 }
 
 // startConnectionHeartbeat starts a background goroutine that periodically updates
@@ -668,18 +534,4 @@ func startConnectionHeartbeat(ctx context.Context, k8sClient client.Client, name
 	})
 
 	return cancel
-}
-
-// waitForPort waits for a TCP port to become available.
-func waitForPort(port int, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", port), 500*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			return nil
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return fmt.Errorf("port %d did not become available within %s", port, timeout)
 }

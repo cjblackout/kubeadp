@@ -137,7 +137,7 @@ plugins:
     target: tui
 ```
 
-TUI plugins are loaded when users interact with the Agent via `kubeoc agent attach` or the web terminal. The controller generates a separate `tui.json` and sets the `OPENCODE_TUI_CONFIG` environment variable.
+TUI plugins are loaded when users interact with the Agent via an interactive session (`kubeoc agent attach`, which opens a shell in the agent's server pod, or the web terminal). The controller generates a separate `tui.json` and sets the `OPENCODE_TUI_CONFIG` environment variable.
 
 ## Field Reference
 

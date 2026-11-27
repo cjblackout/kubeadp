@@ -276,14 +276,6 @@ func (s *Server) setupRoutes() *chi.Mux {
 			r.Post("/{name}/share", agentHandler.UpdateShare)
 			r.Delete("/{name}/share", agentHandler.DeleteShare)
 
-			// Agent proxy - reverse proxy to OpenCode agent servers
-			// Supports HTTP REST and SSE streaming for opencode attach
-			agentProxyHandler := handlers.NewAgentProxyHandler(s.k8sClient, s.clusterDomain)
-			r.Route("/{name}/proxy", func(r chi.Router) {
-				r.HandleFunc("/*", agentProxyHandler.ServeProxy)
-				r.HandleFunc("/", agentProxyHandler.ServeProxy)
-			})
-
 			// Agent terminal - WebSocket terminal to agent server pods
 			agentTerminalHandler := handlers.NewAgentTerminalHandler(s.k8sClient, s.clientset, s.restConfig)
 			r.Get("/{name}/terminal", agentTerminalHandler.ServeTerminal)

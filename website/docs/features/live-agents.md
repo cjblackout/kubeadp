@@ -58,7 +58,7 @@ The controller automatically creates:
 
 ## Interacting with Live Agents
 
-**CLI attach** (connects through kube-apiserver service proxy — no Ingress or port-forward needed):
+**CLI attach** (opens an interactive shell in the agent's server pod via a kube-apiserver exec — no Ingress or port-forward needed):
 
 ```bash
 kubeoc agent attach team-agent -n kubeopencode-system

@@ -221,12 +221,14 @@ func (h *ShareHandler) ServeShareTerminal(w http.ResponseWriter, r *http.Request
 	agent := sc.agent
 
 	// Resolve the agent's server pod (using server's own client, no impersonation)
-	podName, containerName, _, err := resolveAgentServerPod(r.Context(), h.k8sClient, agent.Namespace, agent.Name)
+	ref, err := controller.ResolveAgentServerPod(r.Context(), h.k8sClient, agent.Namespace, agent.Name)
 	if err != nil {
 		shareLog.Error(err, "share terminal: failed to resolve agent server pod", "agent", agent.Name)
 		http.Error(w, "Agent server not available", http.StatusServiceUnavailable)
 		return
 	}
+	podName := ref.Pod
+	containerName := ref.Container
 
 	shareLog.Info("share terminal session starting",
 		"agent", agent.Name, "namespace", agent.Namespace,

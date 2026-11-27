@@ -79,7 +79,7 @@ The `kubeoc` CLI communicates directly with the Kubernetes API using your kubeco
 | `kubeoc get crontasks` | `kubeopencode.io` crontasks | get, list | |
 | `kubeoc get agenttemplates` | `kubeopencode.io` agenttemplates, agents | get, list | Lists agents to count template references |
 | `kubeoc agent attach` | `kubeopencode.io` agents | get, **patch** | `patch` needed for connection heartbeat annotation |
-| `kubeoc agent attach` | `""` services/proxy | get | Service proxy to kubeopencode-server (in `kubeopencode-system` namespace) |
+| `kubeoc agent attach` | `""` pods, pods/exec | get, list, create | Opens a shell in the agent's server pod via exec (needs `pods` to resolve the pod, `pods/exec` to run the shell) |
 | `kubeoc agent suspend/resume` | `kubeopencode.io` agents | get, update | |
 | `kubeoc task stop` | `kubeopencode.io` tasks | get, update | Adds `kubeopencode.io/stop` annotation |
 | `kubeoc task logs` | `kubeopencode.io` tasks, `""` pods, pods/log | get | |
@@ -113,14 +113,14 @@ rules:
 # View pod status and logs
 - apiGroups: [""]
   resources: ["pods", "pods/log"]
-  verbs: ["get"]
-# Service proxy for agent attach (in kubeopencode-system namespace)
+  verbs: ["get", "list"]
+# Open a shell in the agent's server pod via exec (kubeoc agent attach)
 - apiGroups: [""]
-  resources: ["services/proxy"]
-  verbs: ["get"]
+  resources: ["pods/exec"]
+  verbs: ["create"]
 ```
 
-> **Note:** The `kubeoc-user` ClusterRole must be bound with a **ClusterRoleBinding** (not a namespaced RoleBinding) if the user needs to access the `services/proxy` in the `kubeopencode-system` namespace for `kubeoc agent attach`. Alternatively, create separate RoleBindings for the agent namespace and the server namespace.
+> **Note:** `kubeoc agent attach` resolves the agent's server pod and execs into it in the agent's own namespace, using the user's own kubeconfig credentials. The user therefore needs `pods` (get, list) and `pods/exec` (create) in the agent's namespace — the `kubeopencode-web-user` ClusterRole shipped in the chart already grants these, as does the `kubeoc-user` ClusterRole above.
 
 > **Note:** The web-user ClusterRole (`kubeopencode-web-user`) included in the Helm chart already covers all CLI permissions. If a user already has the web-user role, no additional role is needed for `kubeoc`.
 
@@ -387,7 +387,6 @@ The controller ClusterRole includes permissions for:
 
 - Tasks, Agents, AgentTemplates, CronTasks, KubeOpenCodeConfigs: full CRUD
 - Pods, ConfigMaps, Secrets, Services, Deployments: managed by the controller
-- Services/proxy: needed for `kubeoc agent attach`
 
 When adding custom RBAC, ensure the controller has `agents/finalizers` permission to set owner references with `blockOwnerDeletion` (required on OpenShift).
 
