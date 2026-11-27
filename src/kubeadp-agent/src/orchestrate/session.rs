@@ -891,6 +891,7 @@ fn run_session_iteration(
                 .with_workspace_root(&cfg.workspace_root, Some(&cfg.jobs_dir_name))
                 .with_shared_rw(vec![cfg.sandbox_home.clone()])
                 .with_extra_ro_paths(&cfg.sandbox_ro_paths)
+                .with_extra_env_allow(&cfg.sandbox_env_allow)
         } else {
             base_policy
         };

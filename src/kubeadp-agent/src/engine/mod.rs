@@ -39,7 +39,8 @@ pub use agnostic::EmptyEngineCtx;
 pub use agy::AgyEngine;
 pub use errors::EngineError;
 pub use run::{
-    ContextId, EngineEvent, EngineId, ExitInfo, PodRole, Run, RunId, RunKind, RunStatus, Transport,
+    ContextId, EngineEvent, EngineId, ExitInfo, JobUsage, PodRole, Run, RunId, RunKind, RunStatus,
+    Transport,
 };
 
 use crate::core::job::{JobMetadata, JobStatus};
@@ -325,6 +326,12 @@ pub trait Engine: Send + Sync {
     /// Default implementation delegates to [`crate::core::commands::result::final_error_text`].
     fn extract_error(&self, log: &str) -> Option<String> {
         crate::core::commands::result::final_error_text(log)
+    }
+
+    /// Extracts token usage and cost accounting from the job log.
+    /// Returns `None` when usage information is unavailable or unsupported.
+    fn extract_usage(&self, _log: &str) -> Option<JobUsage> {
+        None
     }
 
     /// Normalizes a prompt before execution (e.g. adding reference tags or normalizing retries).

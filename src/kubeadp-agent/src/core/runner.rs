@@ -273,7 +273,8 @@ pub fn sandboxed(
     };
     let policy = policy
         .hide_operator_token_file()
-        .hide_jobset_root_key_file();
+        .hide_jobset_root_key_file()
+        .with_extra_env_allow(&config.sandbox_env_allow);
     let policy = if plan.program.file_name().is_some_and(|f| f == "claude") {
         policy.allow_claude_oauth_env()
     } else {
