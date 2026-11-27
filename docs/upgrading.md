@@ -108,6 +108,7 @@ This section tracks which releases include CRD changes, so operators know when m
 
 | Version | CRD Changes | Description |
 |---------|-------------|-------------|
+| v0.2.0  | Yes         | Added optional `kubeadpImage` field to Agent/AgentTemplate CRDs. Agent server Pods now run `kubeadp-agent worker` and Task Pods submit jobs through its API instead of using the opencode server API; `attachImage` is deprecated and unused. Update the CRDs before upgrading. |
 | v0.1.9  | Yes         | Added optional `annotations` field to `AgentPodSpec` in Agent/AgentTemplate CRDs for pod template annotations (e.g., ConfigMap/Secret checksums to trigger rollouts, annotation-based tooling integration) |
 | v0.0.28 | Yes         | Added `status.session` fields (sessionID, url) to Task CRD for OpenCode session integration |
 | v0.0.27 | Yes         | Added `extraVolumes` and `extraVolumeMounts` fields to `AgentPodSpec` in Agent/AgentTemplate CRDs |

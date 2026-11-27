@@ -10,7 +10,8 @@ TIMEOUT_SECS="${SMOKE_TIMEOUT:-900}" # 15 minutes default
 SMOKE_KEEP="${SMOKE_KEEP:-0}"
 
 # Resolve SMOKE_IMAGE: must be provided, or resolved from newest release tag via git describe/gh.
-# latest is NOT accepted as a default because release tags are calendar versions.
+# latest is NOT accepted as a default because image tags are release versions
+# (vX.Y.Z-fork.N). An operator-only build has no agent image: set SMOKE_IMAGE explicitly then.
 SMOKE_IMAGE="${SMOKE_IMAGE:-}"
 if [ -z "$SMOKE_IMAGE" ]; then
   # Try git describe --tags

@@ -80,14 +80,16 @@ the default, `a2a,test-hooks`, `cli`-only and `server`-only feature sets, and
 the `a2a,test-hooks` test suite), builds the heavy stages one at a time
 (`cli-tools`, `agent-builder`, `tools-builder`) then the final image, runs the
 smoke test (`docker/kubeadp-agent/smoke-test.sh`, mounted read-only) before the
-push, pushes to GHCR, tags `kubeadp-agent-<version>`, and on `main` commits the
+push, pushes to GHCR, tags `<version>`, and on `main` commits the
 new tag to the `kubeadp-agent` key in `versions/versions.env` (no manifest
 consumes the image yet, so that is the only deploy-side change).
 
-Version numbering follows the other own-build images: `YYYY.MM.<X>` with
-`-rc<N>` prereleases; the Major in `src/kubeadp-agent/VERSION` appears in the rc
-tags only. The `kubeadp-agent` key in `versions/versions.env` starts at the
-placeholder `0000.0.0` and is rewritten by the first on-main build.
+Version numbering is the same as the operator and the opencode agent images
+(`build.yaml`): the base is the repository `VERSION` file and every build on `main`
+gets `<VERSION>-fork.<N>`, N being the next free counter among the git tags (one counter
+for all images); pull-request builds are `<VERSION>-rc<N>` images that are never tagged.
+The `kubeadp-agent` key in `versions/versions.env` starts at the placeholder
+`0000.0.0` and is rewritten by the first on-main build.
 
 ## Local build
 
