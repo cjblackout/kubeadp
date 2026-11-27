@@ -130,7 +130,7 @@ At pod startup, the init container copies the OpenCode binary from `agentImage` 
 |-------|------|-------------|
 | `opencode` | Init Container | OpenCode CLI binary |
 | `devbox` | Worker (Executor) | Universal development environment with Go, Node.js, Python, kubectl, helm |
-| `attach` | Task Pod (agentRef) | Lightweight image for `--attach` mode |
+| `attach` | none (deprecated) | Formerly the image of agentRef Task Pods; they now run `kubeopencode task-submit` from the system image |
 | `echo` | Testing | Minimal Alpine image for E2E testing |
 
 ### Default Images
@@ -156,7 +156,7 @@ When configuring an Agent, the controller resolves images as follows:
 
 ### Attach Image
 
-The `attachImage` field specifies the lightweight image used for Task Pods when running tasks via `agentRef` (connecting to a persistent Agent). This image contains only the OpenCode CLI binary and is used for the `opencode run --attach` command:
+The `attachImage` field is deprecated and no longer used: Task Pods that reference an Agent run `kubeopencode task-submit` from the KubeOpenCode system image and submit a job to the Agent's kubeadp-agent worker. The field is still accepted for compatibility:
 
 ```yaml
 spec:

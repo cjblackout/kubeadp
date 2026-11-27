@@ -150,19 +150,20 @@ var _ = Describe("TaskController", func() {
 			}
 			Expect(k8sClient.Create(ctx, task)).Should(Succeed())
 
-			By("Checking Pod uses custom attach image for worker container (agentRef uses --attach)")
+			By("Checking Pod runs task-submit from the system image (the attach image is no longer used)")
 			podName := fmt.Sprintf("%s-pod", taskName)
 			podLookupKey := types.NamespacedName{Name: podName, Namespace: taskNamespace}
 			createdPod := &corev1.Pod{}
-			Eventually(func() string {
+			Eventually(func() []string {
 				if err := k8sClient.Get(ctx, podLookupKey, createdPod); err != nil {
-					return ""
+					return nil
 				}
 				if len(createdPod.Spec.Containers) == 0 {
-					return ""
+					return nil
 				}
-				return createdPod.Spec.Containers[0].Image
-			}, timeout, interval).Should(Equal(customAttachImage))
+				return createdPod.Spec.Containers[0].Command
+			}, timeout, interval).Should(ContainElements("/kubeopencode", "task-submit"))
+			Expect(createdPod.Spec.Containers[0].Image).ShouldNot(Equal(customAttachImage))
 
 			By("Checking Pod uses custom agent image for init container")
 			Expect(createdPod.Spec.InitContainers).ShouldNot(BeEmpty())
@@ -2935,7 +2936,7 @@ var _ = Describe("TaskController", func() {
 	})
 
 	Context("Server-mode Task execution", func() {
-		It("Should create Pod with --attach flag pointing to server URL", func() {
+		It("Should create Pod that submits a job to the server URL", func() {
 			agentName := "test-server-agent-task"
 			taskName := "test-task-server-mode"
 			description := "Test server mode task"
@@ -2988,7 +2989,7 @@ var _ = Describe("TaskController", func() {
 				return createdTask.Status.Phase
 			}, timeout, interval).Should(Equal(kubeopenv1alpha1.TaskPhaseRunning))
 
-			By("Checking Pod command contains --attach flag")
+			By("Checking Pod command runs task-submit against the server URL")
 			podName := fmt.Sprintf("%s-pod", taskName)
 			podLookupKey := types.NamespacedName{Name: podName, Namespace: taskNamespace}
 			createdPod := &corev1.Pod{}
@@ -2996,14 +2997,26 @@ var _ = Describe("TaskController", func() {
 				return k8sClient.Get(ctx, podLookupKey, createdPod) == nil
 			}, timeout, interval).Should(BeTrue())
 
-			// Server mode should use --attach flag in command
 			container := createdPod.Spec.Containers[0]
 			commandStr := fmt.Sprintf("%v", container.Command)
-			Expect(commandStr).Should(ContainSubstring("--attach"))
+			Expect(commandStr).Should(ContainSubstring("task-submit"))
+			Expect(commandStr).ShouldNot(ContainSubstring("--attach"))
 
 			// Should contain server URL
 			expectedURL := ServerURL(agentName, taskNamespace, 4096, "cluster.local")
 			Expect(commandStr).Should(ContainSubstring(expectedURL))
+
+			By("Checking the Pod mounts only the API token of the Agent kubeadp Secret")
+			var tokenVolume *corev1.Volume
+			for i := range createdPod.Spec.Volumes {
+				if createdPod.Spec.Volumes[i].Name == KubeadpClientVolumeName {
+					tokenVolume = &createdPod.Spec.Volumes[i]
+				}
+			}
+			Expect(tokenVolume).ShouldNot(BeNil())
+			Expect(tokenVolume.Secret.SecretName).Should(Equal(KubeadpSecretName(agentName)))
+			Expect(tokenVolume.Secret.Items).Should(HaveLen(1))
+			Expect(tokenVolume.Secret.Items[0].Key).Should(Equal(KubeadpAPITokenKey))
 
 			By("Cleaning up")
 			Expect(k8sClient.Delete(ctx, task)).Should(Succeed())

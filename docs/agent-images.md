@@ -6,9 +6,10 @@ kubeadp provides **template agent images** that serve as starting points for bui
 
 kubeadp uses multiple container images:
 
-1. **Init Container** (`agentImage`): Contains the OpenCode CLI, copies it to a shared `/tools` volume
-2. **Worker Container** (`executorImage`): Your development environment that runs `opencode serve` in Agent Deployments, or `opencode run` in ephemeral template-based Task Pods
-3. **Attach Container** (`attachImage`): Lightweight image (~25MB) used by Task Pods that connect to a running Agent via `opencode run --attach`
+1. **Kubeadp Init Container** (`kubeadpImage`): Copies `kubeadp-agent` and `agent-run` binaries to `/tools`
+2. **OpenCode Init Container** (`agentImage`): Contains the OpenCode CLI, copies it to a shared `/tools` volume
+3. **Worker Container** (`executorImage`): Your development environment that runs `kubeadp-agent worker` in Agent Deployments, or `opencode run` in ephemeral template-based Task Pods
+4. **Attach Container** (`attachImage`): Deprecated and unused. Task Pods that reference an Agent run `kubeopencode task-submit` from the system image
 
 ## Available Images
 

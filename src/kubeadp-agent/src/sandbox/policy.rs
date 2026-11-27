@@ -580,6 +580,16 @@ impl SandboxPolicy {
         self
     }
 
+    /// Appends extra environment allow-list patterns to the policy. Duplicates are ignored.
+    pub fn with_extra_env_allow(mut self, envs: &[String]) -> Self {
+        for e in envs {
+            if !self.env_allow.iter().any(|existing| existing == e) {
+                self.env_allow.push(e.clone());
+            }
+        }
+        self
+    }
+
     /// Updates or replaces the jobs root directory in the policy's `hide` list
     /// with `<workspace_root>/<jobs_dir_name>`.
     ///
@@ -714,6 +724,38 @@ pub fn parse_sandbox_ro_paths(raw: &str) -> Result<Vec<PathBuf>, String> {
         }
     }
     Ok(paths)
+}
+
+/// Validates a single glob pattern for `sandbox_env_allow`.
+/// Non-empty, only characters matching `^[A-Za-z0-9_*]+$`.
+pub fn validate_sandbox_env_allow_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() {
+        return Err("sandbox_env_allow: pattern must not be empty".to_string());
+    }
+    for c in pattern.chars() {
+        if !c.is_ascii_alphanumeric() && c != '_' && c != '*' {
+            return Err(format!(
+                "sandbox_env_allow: invalid pattern '{pattern}': only [A-Za-z0-9_*] allowed"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parses and validates a comma-separated string of patterns from `KUBEADP_SANDBOX_ENV_ALLOW`.
+pub fn parse_sandbox_env_allow(raw: &str) -> Result<Vec<String>, String> {
+    let mut patterns = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        validate_sandbox_env_allow_pattern(trimmed)?;
+        if !patterns.iter().any(|p| p == trimmed) {
+            patterns.push(trimmed.to_string());
+        }
+    }
+    Ok(patterns)
 }
 
 /// Validates that a granted path in a sandbox policy is absolute, not root or forbidden system dirs,

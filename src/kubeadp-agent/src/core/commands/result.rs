@@ -43,21 +43,33 @@ pub fn run(config: &Config, args: &ResultArgs) -> Result<CommandOutput> {
     };
 
     let registry = crate::engine::EngineRegistry::with_builtin(config);
-    let (response, error_text) = if let Ok(engine) = registry.for_job(&meta) {
-        (engine.extract_response(&log), engine.extract_error(&log))
+    let (response, error_text, usage) = if let Ok(engine) = registry.for_job(&meta) {
+        (
+            engine.extract_response(&log),
+            engine.extract_error(&log),
+            engine.extract_usage(&log),
+        )
     } else {
-        (extract_final_response(&log), final_error_text(&log))
+        (extract_final_response(&log), final_error_text(&log), None)
     };
 
     // The `data` payload is exactly the object the client pretty-prints for
     // `--json` (the server always runs result in human mode; the remote
     // client re-serializes `data` itself).
-    let data = json!({
+    let mut data = json!({
         "job_id": meta.job_id,
         "status": status.as_str(),
         "response": response,
         "error": error_text,
     });
+    if let Some(u) = usage {
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert(
+                "usage".to_string(),
+                serde_json::to_value(u).unwrap_or_default(),
+            );
+        }
+    }
 
     let mut output = CommandOutput::new(data);
 

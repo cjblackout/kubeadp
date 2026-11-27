@@ -217,3 +217,15 @@ func conditionsToResponse(conds []metav1.Condition) []types.Condition {
 	}
 	return result
 }
+
+// setUpstreamAuth replaces the Authorization header of a request that is proxied
+// to an Agent's kubeadp-agent worker. The caller's own credentials (the browser
+// session of the KubeOpenCode UI) are never forwarded to the worker; when the
+// Agent has an API token it is set as the bearer token instead. The token is
+// only ever placed in this header, never in a URL, log line or response.
+func setUpstreamAuth(h http.Header, token string) {
+	h.Del("Authorization")
+	if t := strings.TrimSpace(token); t != "" {
+		h.Set("Authorization", "Bearer "+t)
+	}
+}

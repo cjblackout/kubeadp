@@ -51,7 +51,7 @@ Key behaviors:
 
 ### Agent Configuration (Summary)
 
-Key Agent spec fields: `templateRef`, `profile`, `agentImage`, `executorImage`, `attachImage`, `command` (optional, has default), `workspaceDir` (required), `port` (default: 4096), `extraPorts` (additional Service/Deployment ports for DinD, VS Code, etc.), `persistence`, `suspend`, `standby` (automatic suspend/resume lifecycle), `contexts`, `skills` (external SKILL.md sources from Git repos, auto-injects `skills.paths` into OpenCode config), `plugins` (OpenCode plugins installed via npm; controller creates a plugin-init container that runs `npm install` into a shared `/plugins` volume, loads via `file:///plugins/node_modules/<package>` path into OpenCode config's `plugin` array — executor container does not need npm), `config` (inline YAML/JSON object → `/tools/opencode.json`), `credentials`, `caBundle`, `proxy`, `imagePullSecrets`, `podSpec`, `serviceAccountName`, `maxConcurrentTasks`, `quota`, `share` (shareable terminal link).
+Key Agent spec fields: `templateRef`, `profile`, `agentImage`, `kubeadpImage`, `executorImage`, `attachImage` (deprecated, unused), `command` (optional, has default), `workspaceDir` (required), `port` (default: 4096), `extraPorts` (additional Service/Deployment ports for DinD, VS Code, etc.), `persistence`, `suspend`, `standby` (automatic suspend/resume lifecycle), `contexts`, `skills` (external SKILL.md sources from Git repos, auto-injects `skills.paths` into OpenCode config), `plugins` (OpenCode plugins installed via npm; controller creates a plugin-init container that runs `npm install` into a shared `/plugins` volume, loads via `file:///plugins/node_modules/<package>` path into OpenCode config's `plugin` array — executor container does not need npm), `config` (inline YAML/JSON object → `/tools/opencode.json`), `credentials`, `caBundle`, `proxy`, `imagePullSecrets`, `podSpec`, `serviceAccountName`, `maxConcurrentTasks`, `quota`, `share` (shareable terminal link).
 
 > See `website/docs/features.md` for detailed YAML examples of Agent configuration, proxy, credentials, concurrency, quota, persistence, and Git auto-sync.
 
@@ -67,7 +67,7 @@ Reusable blueprint serving two roles: (1) base configuration for Agents via `spe
 
 ### Agent Lifecycle
 
-Agent always creates a Deployment + Service running `opencode serve`. Supports persistence (sessions/workspace PVCs), manual suspend/resume (`suspend`), and standby mode (`standby` auto-suspends after idle, auto-resumes when new task arrives). Standby is connection-aware: active web terminal or CLI attach sessions prevent auto-suspend via annotation heartbeat (`kubeopencode.io/last-connection-active`). See ADR 0028.
+Agent always creates a Deployment + Service running `kubeadp-agent worker`. Supports persistence (sessions/workspace PVCs), manual suspend/resume (`suspend`), and standby mode (`standby` auto-suspends after idle, auto-resumes when new task arrives). Standby is connection-aware: active web terminal or CLI attach sessions prevent auto-suspend via annotation heartbeat (`kubeopencode.io/last-connection-active`). See ADR 0028, ADR 0042.
 
 > See `website/docs/features.md` for Agent setup, persistence, suspend/resume, and comparison table.
 
@@ -382,7 +382,7 @@ Three-tier strategy: unit (`make test`), integration (`make integration-test`, u
 
 ## Project Status
 
-- **Version**: v0.1.9
+- **Version**: v0.2.0
 - **API Stability**: v1alpha1 (subject to change)
 - **License**: MIT License
 

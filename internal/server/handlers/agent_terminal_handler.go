@@ -108,7 +108,7 @@ func (h *AgentTerminalHandler) ServeTerminal(w http.ResponseWriter, r *http.Requ
 	k8sClient := clientFromContext(r.Context(), h.defaultClient)
 
 	// Resolve the agent's server pod
-	podName, containerName, port, err := resolveAgentServerPod(r.Context(), k8sClient, namespace, agentName)
+	podName, containerName, _, err := resolveAgentServerPod(r.Context(), k8sClient, namespace, agentName)
 	if err != nil {
 		termLog.Error(err, "failed to resolve agent server pod", "agent", agentName, "namespace", namespace)
 		writeError(w, http.StatusBadRequest, "Cannot resolve agent server pod", err.Error())
@@ -206,7 +206,6 @@ func (h *AgentTerminalHandler) ServeTerminal(w http.ResponseWriter, r *http.Requ
 	}()
 
 	wsWriter := &wsStdoutWriter{ws: ws, mu: &wsMu}
-	attachURL := fmt.Sprintf("http://localhost:%d", port)
 
 	// Retry loop for transient exec failures (e.g., exit code 137 after agent resume)
 	var lastErr error
@@ -222,7 +221,7 @@ func (h *AgentTerminalHandler) ServeTerminal(w http.ResponseWriter, r *http.Requ
 			SubResource("exec").
 			VersionedParams(&corev1.PodExecOptions{
 				Container: containerName,
-				Command:   []string{"/tools/opencode", "attach", attachURL},
+				Command:   []string{"/bin/bash"},
 				Stdin:     true,
 				Stdout:    true,
 				TTY:       true,

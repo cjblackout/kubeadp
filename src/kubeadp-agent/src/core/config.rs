@@ -225,6 +225,8 @@ pub struct Config {
     /// Extra read-only paths appended to every sandbox policy built from this config.
     /// Configured via `sandbox_ro_paths` or `KUBEADP_SANDBOX_RO_PATHS`.
     pub sandbox_ro_paths: Vec<PathBuf>,
+    /// Configured via `sandbox_env_allow` or `KUBEADP_SANDBOX_ENV_ALLOW`.
+    pub sandbox_env_allow: Vec<String>,
     pub gc_max_age_days: u64,
     pub max_parallel: u32,
     pub shutdown_grace_secs: u64,
@@ -325,6 +327,7 @@ impl Default for Config {
             agy_home: None,
             sandbox_home: PathBuf::from(DEFAULT_SANDBOX_HOME),
             sandbox_ro_paths: Vec::new(),
+            sandbox_env_allow: Vec::new(),
             gc_max_age_days: DEFAULT_GC_MAX_AGE_DAYS,
             max_parallel: DEFAULT_MAX_PARALLEL,
             shutdown_grace_secs: DEFAULT_SHUTDOWN_GRACE_SECS,
@@ -516,6 +519,14 @@ impl Config {
         let sandbox_ro_paths = match env_vars.get("KUBEADP_SANDBOX_RO_PATHS").map(|s| s.trim()) {
             Some(raw) if !raw.is_empty() => {
                 crate::sandbox::parse_sandbox_ro_paths(raw).map_err(|e| anyhow::anyhow!("{e}"))?
+            }
+            _ => Vec::new(),
+        };
+
+        // 8f. Resolve sandbox_env_allow (KUBEADP_SANDBOX_ENV_ALLOW override or file)
+        let sandbox_env_allow = match env_vars.get("KUBEADP_SANDBOX_ENV_ALLOW").map(|s| s.trim()) {
+            Some(raw) if !raw.is_empty() => {
+                crate::sandbox::parse_sandbox_env_allow(raw).map_err(|e| anyhow::anyhow!("{e}"))?
             }
             _ => Vec::new(),
         };
@@ -1030,6 +1041,7 @@ impl Config {
             agy_home,
             sandbox_home,
             sandbox_ro_paths,
+            sandbox_env_allow,
             gc_max_age_days,
             max_parallel,
             shutdown_grace_secs,

@@ -1362,6 +1362,65 @@ pub fn extract_opencode_error(log: &str) -> Option<String> {
     None
 }
 
+/// Extracts token usage and cost accounting from an opencode job log.
+/// Inspects `step_finish` lines from the last attempt, summing tokens and cost.
+/// Returns `None` if no `step_finish` events exist in the last attempt.
+pub fn extract_opencode_usage(log: &str) -> Option<crate::engine::JobUsage> {
+    let mut found_any = false;
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+    let mut reasoning_tokens: Option<u64> = None;
+    let mut cache_tokens: Option<u64> = None;
+    let mut cost: Option<f64> = None;
+
+    for line in last_attempt_log(log).lines() {
+        let Some(value) = json_object_line(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) != Some("step_finish") {
+            continue;
+        }
+        let Some(part) = value.get("part") else {
+            continue;
+        };
+        found_any = true;
+
+        if let Some(tokens) = part.get("tokens") {
+            if let Some(inp) = tokens.get("input").and_then(|v| v.as_u64()) {
+                input_tokens = input_tokens.saturating_add(inp);
+            }
+            if let Some(out) = tokens.get("output").and_then(|v| v.as_u64()) {
+                output_tokens = output_tokens.saturating_add(out);
+            }
+            if let Some(res) = tokens.get("reasoning").and_then(|v| v.as_u64()) {
+                reasoning_tokens = Some(reasoning_tokens.unwrap_or(0).saturating_add(res));
+            }
+            if let Some(cache) = tokens.get("cache") {
+                let read = cache.get("read").and_then(|v| v.as_u64()).unwrap_or(0);
+                let write = cache.get("write").and_then(|v| v.as_u64()).unwrap_or(0);
+                let sum = read.saturating_add(write);
+                cache_tokens = Some(cache_tokens.unwrap_or(0).saturating_add(sum));
+            }
+        }
+
+        if let Some(c) = part.get("cost").and_then(|v| v.as_f64()) {
+            cost = Some(cost.unwrap_or(0.0) + c);
+        }
+    }
+
+    if !found_any {
+        return None;
+    }
+
+    Some(crate::engine::JobUsage {
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cache_tokens,
+        cost,
+    })
+}
+
 /// Strips ANSI escape sequences (CSI codes like `\x1b[32m`, OSC codes, etc.) from `input`.
 pub fn strip_ansi_escapes(input: &str) -> String {
     let mut output = String::with_capacity(input.len());

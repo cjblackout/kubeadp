@@ -38,6 +38,9 @@
 /// The NDJSON event parser (2018 file+dir layout).
 pub mod events;
 
+/// Server-backed sessions: the supervised `opencode serve` and its loopback HTTP client.
+pub mod serve;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -333,20 +336,26 @@ impl Engine for OpenCodeEngine {
         session: &SessionDef,
         _resume: ResumeMode,
     ) -> Result<LaunchPlan, EngineError> {
-        // The supervisor runs an interactive `opencode run -i` inside the PTY:
-        // the process stays alive reading follow-up turns as user lines typed
-        // on the PTY (opencode has no stream-json live loop and no
-        // `--remote-control`). A constant neutral start message is required
-        // (opencode refuses an empty message positional).
+        // The supervised process is the headless `opencode serve`, loopback only
+        // (`opencode run -i` answers its first message and exits, so it cannot be a
+        // long-lived session). The port of this start and the opencode session id
+        // (kept across restarts) live in a per-session state file that the HTTP
+        // delivery path reads (`deliver_session_message`).
+        let port = serve::pick_free_port().map_err(|e| {
+            EngineError::Internal(format!("cannot pick a port for opencode serve: {e}"))
+        })?;
+        let state_file = serve::state_path(&self.config.state_root, &session.name);
+        let session_id = serve::read_state(&state_file).and_then(|s| s.session_id);
+        serve::write_state(&state_file, &serve::ServeState { port, session_id }).map_err(|e| {
+            EngineError::Internal(format!("cannot write {}: {e}", state_file.display()))
+        })?;
+
         let args: Vec<String> = vec![
-            "run".to_string(),
-            "-i".to_string(),
-            "--format".to_string(),
-            "json".to_string(),
-            "--auto".to_string(),
-            "--dir".to_string(),
-            session.workdir.to_string_lossy().to_string(),
-            OPENCODE_SESSION_START.to_string(),
+            "serve".to_string(),
+            "--hostname".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            port.to_string(),
         ];
 
         let mut env: Vec<(String, String)> = session
@@ -461,6 +470,10 @@ impl Engine for OpenCodeEngine {
         crate::core::job::extract_opencode_error(log)
     }
 
+    fn extract_usage(&self, log: &str) -> Option<crate::engine::JobUsage> {
+        crate::core::job::extract_opencode_usage(log)
+    }
+
     fn configured_program(&self, config: &crate::core::config::Config) -> PathBuf {
         config.opencode_path.clone()
     }
@@ -497,6 +510,15 @@ impl Engine for OpenCodeEngine {
             .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
             .unwrap_or_else(|| std::path::PathBuf::from("/home/coder"));
         crate::worker::opencode_config::prepare_opencode_home(&home)
+    }
+
+    fn deliver_session_message(
+        &self,
+        session: &SessionDef,
+        text: &str,
+    ) -> Option<Result<(), String>> {
+        let state_file = serve::state_path(&self.config.state_root, &session.name);
+        Some(serve::deliver(&state_file, text, SESSION_DELIVERY_WAIT))
     }
 
     fn frame_pty_message(&self, payload: &[u8]) -> Vec<u8> {
@@ -540,12 +562,9 @@ impl Engine for OpenCodeEngine {
     }
 }
 
-/// The constant opening message used on session start: opencode's `run`
-/// requires a non-empty message positional (it refuses with "You must provide
-/// a message or a command" otherwise), so the session boots with a neutral
-/// "await instructions" turn and then idles for real user input on the PTY.
-const OPENCODE_SESSION_START: &str =
-    "Start a working session in this workspace. Do nothing yet: wait for the next user message.";
+/// How long a session message waits for the supervised `opencode serve` to
+/// answer (it is started by the supervisor right before the first message).
+const SESSION_DELIVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[cfg(test)]
 mod tests {
@@ -669,7 +688,12 @@ mod tests {
 
     #[test]
     fn test_opencode_session_command() {
-        let engine = OpenCodeEngine::new(Arc::new(Config::default()));
+        let state_dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            state_root: state_dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let engine = OpenCodeEngine::new(Arc::new(cfg));
         let mut env_map = std::collections::HashMap::new();
         env_map.insert("BBB".to_string(), "2".to_string());
         env_map.insert("AAA".to_string(), "1".to_string());
@@ -710,19 +734,17 @@ mod tests {
             .session_command(&session, ResumeMode::Start)
             .expect("session_command Start");
         assert_eq!(plan.program, engine.config.opencode_path);
+        // `opencode serve` on loopback with the port chosen for this start; the
+        // port is recorded in the per-session state file.
         assert_eq!(
-            plan.args,
-            vec![
-                "run",
-                "-i",
-                "--format",
-                "json",
-                "--auto",
-                "--dir",
-                "/workspace/test-repo",
-                OPENCODE_SESSION_START,
-            ]
+            &plan.args[..4],
+            ["serve", "--hostname", "127.0.0.1", "--port"]
         );
+        let port: u16 = plan.args[4].parse().expect("a numeric port");
+        let state = serve::read_state(&serve::state_path(&engine.config.state_root, "test-sess"))
+            .expect("the state file of the session");
+        assert_eq!(state.port, port);
+        assert!(state.session_id.is_none());
         assert!(plan.pty);
         assert_eq!(plan.stdin, StdinMode::Null);
         assert_eq!(
@@ -732,6 +754,23 @@ mod tests {
                 ("BBB".to_string(), "2".to_string())
             ]
         );
+
+        // A restart keeps the opencode session id and takes a fresh port.
+        serve::write_state(
+            &serve::state_path(&engine.config.state_root, "test-sess"),
+            &serve::ServeState {
+                port,
+                session_id: Some("ses_keep".to_string()),
+            },
+        )
+        .unwrap();
+        let again = engine
+            .session_command(&session, ResumeMode::Resume)
+            .unwrap();
+        let state2 =
+            serve::read_state(&serve::state_path(&engine.config.state_root, "test-sess")).unwrap();
+        assert_eq!(state2.session_id.as_deref(), Some("ses_keep"));
+        assert_eq!(again.args[4], state2.port.to_string());
     }
 
     #[test]

@@ -218,6 +218,7 @@ func (h *AgentTemplateHandler) Create(w http.ResponseWriter, r *http.Request) {
 	tmpl.Spec.WorkspaceDir = req.WorkspaceDir
 	tmpl.Spec.ServiceAccountName = req.ServiceAccountName
 	tmpl.Spec.AgentImage = req.AgentImage
+	tmpl.Spec.KubeadpImage = req.KubeadpImage
 	tmpl.Spec.ExecutorImage = req.ExecutorImage
 	if len(req.Skills) > 0 {
 		tmpl.Spec.Skills = req.Skills
@@ -308,6 +309,7 @@ func templateToResponse(tmpl *kubeopenv1alpha1.AgentTemplate) types.AgentTemplat
 		Name:               tmpl.Name,
 		Namespace:          tmpl.Namespace,
 		AgentImage:         tmpl.Spec.AgentImage,
+		KubeadpImage:       tmpl.Spec.KubeadpImage,
 		ExecutorImage:      tmpl.Spec.ExecutorImage,
 		WorkspaceDir:       tmpl.Spec.WorkspaceDir,
 		ServiceAccountName: tmpl.Spec.ServiceAccountName,

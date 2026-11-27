@@ -9,8 +9,11 @@ import (
 	"net/url"
 
 	"github.com/go-chi/chi/v5"
+	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/kubeopencode/kubeopencode/internal/controller"
 )
 
 var proxyLog = ctrl.Log.WithName("agent-proxy")
@@ -56,14 +59,23 @@ func (h *AgentProxyHandler) ServeProxy(w http.ResponseWriter, r *http.Request) {
 
 	proxyPath := normalizeProxyPath(r)
 
+	// Fetch kubeadp secret for auth token
+	var token string
+	var secret corev1.Secret
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: controller.KubeadpSecretName(agentName)}, &secret); err == nil {
+		if tok, ok := secret.Data[controller.KubeadpAPITokenKey]; ok && len(tok) > 0 {
+			token = string(tok)
+		}
+	}
+
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
 			req.URL.Path = proxyPath
 			req.Host = target.Host
-			// Remove Authorization header — internal traffic does not need external auth
-			req.Header.Del("Authorization")
+			// Never forward the caller's credentials; authenticate to the worker instead.
+			setUpstreamAuth(req.Header, token)
 		},
 		// FlushInterval -1 means flush immediately after each write,
 		// which is critical for SSE streaming.

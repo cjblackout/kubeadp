@@ -27,6 +27,20 @@ pub type RunId = String;
 /// body and of `CapabilityTable`.
 pub type EngineId = String;
 
+/// Usage counters captured from a job run.
+/// Fields are numbers; absent/None when unknown (never zeros when unknown).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+}
+
 /// The harness's own context id for a run: the claude session id / agy
 /// conversation id. `None` until the engine has created one.
 pub type ContextId = String;
@@ -294,6 +308,7 @@ mod tests {
             serde_json::to_string(&Transport::StreamJson).unwrap(),
             "\"stream_json\""
         );
+
         assert_eq!(
             serde_json::from_str::<Transport>("\"stream_json\"").unwrap(),
             Transport::StreamJson
