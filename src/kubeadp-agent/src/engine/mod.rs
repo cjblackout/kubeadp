@@ -392,6 +392,19 @@ pub trait Engine: Send + Sync {
         false
     }
 
+    /// Delivers a user message into a running session over the engine's own channel
+    /// instead of the session PTY. `None` (the default) means the supervisor pastes
+    /// the framed message into the PTY; `Some(result)` is the outcome of a
+    /// server-backed delivery (opencode talks to its `serve` process over loopback
+    /// HTTP). The call may block for a few seconds while the server comes up.
+    fn deliver_session_message(
+        &self,
+        _session: &SessionDef,
+        _text: &str,
+    ) -> Option<Result<(), String>> {
+        None
+    }
+
     /// Encodes a user message into the byte sequence expected on the session's PTY input channel.
     fn frame_pty_message(&self, payload: &[u8]) -> Vec<u8> {
         let line = crate::core::a2a_live::frame_user_line(&String::from_utf8_lossy(payload));

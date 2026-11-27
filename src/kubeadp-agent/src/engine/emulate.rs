@@ -878,6 +878,14 @@ impl Engine for EmulatingEngine {
         self.inner.frame_pty_message(payload)
     }
 
+    fn deliver_session_message(
+        &self,
+        session: &crate::engine::SessionDef,
+        text: &str,
+    ) -> Option<Result<(), String>> {
+        self.inner.deliver_session_message(session, text)
+    }
+
     fn materialize_instructions(
         &self,
         home: &std::path::Path,
