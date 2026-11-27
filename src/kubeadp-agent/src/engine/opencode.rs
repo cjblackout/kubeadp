@@ -54,8 +54,8 @@ use crate::engine::capability::{Capability, CapabilityTable};
 use crate::engine::claude::session_pty::ClaudePtyAdapter;
 use crate::engine::run::{ContextId, EngineEvent, ExitInfo, Run, RunId, RunKind, RunStatus};
 use crate::engine::{
-    Engine, EngineCtx, EngineError, JobSpec, LaunchPlan, ResumeMode, SessionDef, SessionSpec,
-    StdinMode, TurnInput,
+    Engine, EngineCtx, EngineError, JobSpec, LaunchPlan, ResumeMode, ServerDelivery, SessionDef,
+    SessionSpec, StdinMode, TurnInput,
 };
 
 /// The stable opencode engine id.
@@ -346,7 +346,15 @@ impl Engine for OpenCodeEngine {
         })?;
         let state_file = serve::state_path(&self.config.state_root, &session.name);
         let session_id = serve::read_state(&state_file).and_then(|s| s.session_id);
-        serve::write_state(&state_file, &serve::ServeState { port, session_id }).map_err(|e| {
+        serve::write_state(
+            &state_file,
+            &serve::ServeState {
+                port,
+                session_id,
+                ready: false,
+            },
+        )
+        .map_err(|e| {
             EngineError::Internal(format!("cannot write {}: {e}", state_file.display()))
         })?;
 
@@ -512,13 +520,57 @@ impl Engine for OpenCodeEngine {
         crate::worker::opencode_config::prepare_opencode_home(&home)
     }
 
-    fn deliver_session_message(
+    fn deliver_session_message(&self, session: &SessionDef, text: &str) -> Option<ServerDelivery> {
+        let state_file = serve::state_path(&self.config.state_root, &session.name);
+        match serve::deliver(&state_file, text, SESSION_DELIVERY_WAIT) {
+            Ok(()) => Some(ServerDelivery::Ok),
+            // A cold server (up but not yet answering) is retryable; a dead
+            // server or any other failure keeps the historical 409 mapping.
+            Err(e) if serve::is_not_ready(&e) => Some(ServerDelivery::NotReady(e)),
+            Err(e) => Some(ServerDelivery::Err(e)),
+        }
+    }
+
+    /// Starts the background warm-up for the just-spawned `opencode serve`: a
+    /// thread tied to this spawn's stop flag that polls readiness with the long
+    /// warm-up deadline and then creates (and persists) the opencode session,
+    /// so the first user message never waits for a cold server.
+    fn after_session_spawn(
         &self,
         session: &SessionDef,
-        text: &str,
-    ) -> Option<Result<(), String>> {
+        stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
         let state_file = serve::state_path(&self.config.state_root, &session.name);
-        Some(serve::deliver(&state_file, text, SESSION_DELIVERY_WAIT))
+        if serve::read_state(&state_file).is_none() {
+            return;
+        }
+        let stop = std::sync::Arc::clone(stop);
+        let session_name = session.name.clone();
+        let result = std::thread::Builder::new()
+            .name(format!("opencode-warmup-{session_name}"))
+            .spawn(move || {
+                serve::warm_up(
+                    &state_file,
+                    &stop,
+                    serve::WARMUP_DEADLINE,
+                    std::time::Duration::from_millis(500),
+                )
+            })
+            .ok()
+            .and_then(|h| h.join().ok());
+        if let Some(Err(e)) = result {
+            crate::orchestrate::logging::log_event(
+                &session_name,
+                &format!("opencode serve warm-up failed: {e}"),
+            );
+        }
+    }
+
+    /// The session's engine is warm once the background warm-up has finished
+    /// (the `ready` flag in the per-session state file).
+    fn engine_ready(&self, session: &SessionDef) -> Option<bool> {
+        let state_file = serve::state_path(&self.config.state_root, &session.name);
+        serve::read_state(&state_file).map(|s| s.ready)
     }
 
     fn frame_pty_message(&self, payload: &[u8]) -> Vec<u8> {
@@ -563,8 +615,11 @@ impl Engine for OpenCodeEngine {
 }
 
 /// How long a session message waits for the supervised `opencode serve` to
-/// answer (it is started by the supervisor right before the first message).
-const SESSION_DELIVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// answer. The background warm-up (see `after_session_spawn`) normally has the
+/// server ready well before the first message; this bounds a delivery that
+/// races a still-cold server and is answered with a retryable `503 not_ready`
+/// when it elapses.
+const SESSION_DELIVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[cfg(test)]
 mod tests {
@@ -761,6 +816,7 @@ mod tests {
             &serve::ServeState {
                 port,
                 session_id: Some("ses_keep".to_string()),
+                ready: true,
             },
         )
         .unwrap();

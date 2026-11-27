@@ -103,21 +103,46 @@ pub fn router(state: Arc<SessionsApiState>) -> Router<()> {
 fn session_state_snapshot(
     state: &SessionsApiState,
     name: &str,
-) -> Option<(crate::orchestrate::state::SessionState, bool, bool)> {
+) -> Option<(
+    crate::orchestrate::state::SessionState,
+    bool,
+    bool,
+    Option<bool>,
+)> {
     let st = state
         .supervisor_state
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let sess = st.sessions.get(name)?;
     let control = state.controls.get(name);
-    let (paused, running) = match control {
+    let (paused, running) = match control.as_ref() {
         Some(c) => (
             c.paused.load(Ordering::SeqCst),
             c.running.load(Ordering::SeqCst),
         ),
         None => (false, false),
     };
-    Some((sess.clone(), paused, running))
+    let engine_ready = engine_ready_of(sess, control.as_ref());
+    Some((sess.clone(), paused, running, engine_ready))
+}
+
+/// Whether the session's engine reports a warm state, for the additive
+/// `engine_ready` field of the session JSON. `None` for engines without a
+/// warm-up (the field is then omitted), `Some(true)` once the engine's
+/// warm-up has finished, `Some(false)` while it is still starting.
+fn engine_ready_of(
+    sess: &crate::orchestrate::state::SessionState,
+    control: Option<&std::sync::Arc<crate::orchestrate::session_control::SessionControl>>,
+) -> Option<bool> {
+    // Legacy (pre-engine-selection) sessions are claude and have no warm-up.
+    let engine = sess.engine.as_deref()?;
+    let control = control?;
+    let core_config = crate::core::config::Config::load().ok()?;
+    let registry = crate::engine::EngineRegistry::with_builtin(&core_config);
+    let eng = registry
+        .resolve(crate::engine::RunKind::Session, Some(engine), None)
+        .ok()?;
+    eng.engine_ready(&control.config)
 }
 
 fn session_json(
@@ -125,8 +150,9 @@ fn session_json(
     sess: &crate::orchestrate::state::SessionState,
     paused: bool,
     running: bool,
+    engine_ready: Option<bool>,
 ) -> Value {
-    json!({
+    let mut value = json!({
         "name": name,
         "status": sess.status.to_string(),
         "pid": sess.pid,
@@ -139,7 +165,12 @@ fn session_json(
         "paused": paused,
         "controlled": running,
         "engine": sess.engine,
-    })
+    });
+    // Additive: only engines with a warm-up (opencode) carry the field.
+    if let Some(ready) = engine_ready {
+        value["engine_ready"] = json!(ready);
+    }
+    value
 }
 
 async fn list_sessions(Extension(state): Extension<Arc<SessionsApiState>>) -> Response {
@@ -152,8 +183,8 @@ async fn list_sessions(Extension(state): Extension<Arc<SessionsApiState>>) -> Re
     };
     let mut sessions: Vec<Value> = Vec::with_capacity(names.len());
     for name in names {
-        if let Some((sess, paused, running)) = session_state_snapshot(&state, &name) {
-            sessions.push(session_json(&name, &sess, paused, running));
+        if let Some((sess, paused, running, engine_ready)) = session_state_snapshot(&state, &name) {
+            sessions.push(session_json(&name, &sess, paused, running, engine_ready));
         }
     }
     Json(json!({ "sessions": sessions })).into_response()
@@ -164,8 +195,8 @@ async fn get_session(
     Extension(state): Extension<Arc<SessionsApiState>>,
 ) -> Response {
     match session_state_snapshot(&state, &name) {
-        Some((sess, paused, running)) => {
-            Json(session_json(&name, &sess, paused, running)).into_response()
+        Some((sess, paused, running, engine_ready)) => {
+            Json(session_json(&name, &sess, paused, running, engine_ready)).into_response()
         }
         None => (
             StatusCode::NOT_FOUND,
@@ -192,8 +223,8 @@ fn find_control(
 
 fn control_response(state: &SessionsApiState, name: &str) -> Response {
     match session_state_snapshot(state, name) {
-        Some((sess, paused, running)) => {
-            Json(session_json(name, &sess, paused, running)).into_response()
+        Some((sess, paused, running, engine_ready)) => {
+            Json(session_json(name, &sess, paused, running, engine_ready)).into_response()
         }
         None => (
             StatusCode::NOT_FOUND,
@@ -502,26 +533,8 @@ pub fn message_hash_prefix(text: &[u8], max_hex: usize) -> String {
     hex.chars().take(max_hex).collect()
 }
 
-/// `POST /api/v1/sessions/{name}/message`: inject one message into a running
-/// session's PTY as a bracketed paste (so newlines never submit early and the
-/// text cannot run as a command) followed by a single Enter. Claude Code
-/// queues text typed during an active turn, so this never kills the session.
-async fn inject_message(
-    Extension(state): Extension<Arc<SessionsApiState>>,
-    ApiPath(name): ApiPath<String>,
-    crate::server::reject::ApiJson(req): crate::server::reject::ApiJson<MessageRequest>,
-) -> Response {
-    let MessageRequest { text } = req;
-    // deliver_message does a (deadline-bounded) blocking PTY write and takes
-    // the pty_input mutex; run it off the tokio worker threads so a stuck
-    // child cannot hold a worker thread (and the mutex) and starve /healthz.
-    let state = Arc::clone(&state);
-    let closure_name = name.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        deliver_message(&state, &closure_name, REST_SENDER, &text, true)
-    })
-    .await
-    .expect("spawn_blocking task panicked or runtime shut down");
+/// Maps a [`DeliverOutcome`] to the sessions API response.
+fn message_response(name: &str, outcome: DeliverOutcome) -> Response {
     match outcome {
         DeliverOutcome::Accepted { bytes } => (
             StatusCode::ACCEPTED,
@@ -555,8 +568,39 @@ async fn inject_message(
             Json(json!({ "code": "rate_limited" })),
         )
             .into_response(),
+        DeliverOutcome::NotReady => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "code": "not_ready",
+                "error": "the session engine is still starting; retry the call"
+            })),
+        )
+            .into_response(),
         DeliverOutcome::NotRunning => (StatusCode::CONFLICT, Json(json!({ "code": "not_running" }))).into_response(),
     }
+}
+
+/// `POST /api/v1/sessions/{name}/message`: inject one message into a running
+/// session's PTY as a bracketed paste (so newlines never submit early and the
+/// text cannot run as a command) followed by a single Enter. Claude Code
+/// queues text typed during an active turn, so this never kills the session.
+async fn inject_message(
+    Extension(state): Extension<Arc<SessionsApiState>>,
+    ApiPath(name): ApiPath<String>,
+    crate::server::reject::ApiJson(req): crate::server::reject::ApiJson<MessageRequest>,
+) -> Response {
+    let MessageRequest { text } = req;
+    // deliver_message does a (deadline-bounded) blocking PTY write and takes
+    // the pty_input mutex; run it off the tokio worker threads so a stuck
+    // child cannot hold a worker thread (and the mutex) and starve /healthz.
+    let state = Arc::clone(&state);
+    let closure_name = name.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        deliver_message(&state, &closure_name, REST_SENDER, &text, true)
+    })
+    .await
+    .expect("spawn_blocking task panicked or runtime shut down");
+    message_response(&name, outcome)
 }
 
 /// Outcome of a [`deliver_message`] attempt, shared by the REST handler and
@@ -573,7 +617,13 @@ pub enum DeliverOutcome {
     TooLarge,
     /// The per-session budget is exhausted.
     RateLimited { retry_after_secs: u64 },
-    /// The session has no live PTY (stopped/paused/stale slot).
+    /// The session's server-backed engine is still warming up (the supervised
+    /// `opencode serve` is up but has not answered yet). The call may be
+    /// retried; the sessions API answers `503 not_ready`.
+    NotReady,
+    /// The session has no live PTY (stopped/paused/stale slot) or its
+    /// server-backed engine is dead/missing. The sessions API answers
+    /// `409 not_running`.
     NotRunning,
 }
 
@@ -608,6 +658,10 @@ pub fn deliver_message(
     // not_running when the session has no live PTY (stopped/paused or a
     // dead thread left a stale slot).
     let payload = sanitize_message_text(text);
+    // Set when the engine's server-backed delivery is still warming up (a
+    // cold server): the caller answers a retryable 503 `not_ready` instead of
+    // the 409 `not_running` a dead/missing server produces.
+    let mut server_not_ready = false;
     // The engine this session runs on (HL-91 E5 cross-use): read from the
     // resolved session state (the supervisor seeded it there when it spawned
     // the thread) and fall back to the config's effective engine. It selects
@@ -654,18 +708,27 @@ pub fn deliver_message(
             let registry = crate::engine::EngineRegistry::with_builtin(&core_config);
             let resolved = registry.resolve(crate::engine::RunKind::Session, Some(&engine), None);
             // A server-backed engine (opencode) delivers over its own channel
-            // instead of the PTY; every other engine takes the framed PTY write.
-            let server_backed = match &resolved {
-                Ok(eng) => {
-                    eng.deliver_session_message(&control.config, &String::from_utf8_lossy(&payload))
+            // instead of the PTY and never falls back to the PTY (`opencode
+            // serve` has no stdin consumer, so the text would be lost). Every
+            // other engine takes the framed PTY write.
+            if let Some(delivery) = resolved.as_ref().ok().and_then(|eng| {
+                eng.deliver_session_message(&control.config, &String::from_utf8_lossy(&payload))
+            }) {
+                match delivery {
+                    crate::engine::ServerDelivery::Ok => true,
+                    crate::engine::ServerDelivery::NotReady(e) => {
+                        log_event(
+                            name,
+                            &format!("server-backed message delivery not ready (retryable): {e}"),
+                        );
+                        server_not_ready = true;
+                        false
+                    }
+                    crate::engine::ServerDelivery::Err(e) => {
+                        log_event(name, &format!("server-backed message delivery failed: {e}"));
+                        false
+                    }
                 }
-                Err(_) => None,
-            };
-            if let Some(result) = server_backed {
-                if let Err(e) = &result {
-                    log_event(name, &format!("server-backed message delivery failed: {e}"));
-                }
-                result.is_ok()
             } else {
                 let frame = if let Ok(eng) = &resolved {
                     eng.frame_pty_message(&payload)
@@ -693,6 +756,11 @@ pub fn deliver_message(
     let n = payload.len();
 
     if !write_ok {
+        // A server-backed engine that is still warming up answers a retryable
+        // 503, distinct from the 409 of a dead/missing server.
+        if server_not_ready {
+            return DeliverOutcome::NotReady;
+        }
         return DeliverOutcome::NotRunning;
     }
 
@@ -1378,6 +1446,23 @@ mod tests {
             ))
             .await
             .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body = body_string(res.into_body()).await;
+        assert!(body.contains("not_running"), "body: {body}");
+    }
+
+    /// A server-backed engine still warming up answers `503 not_ready` (a
+    /// retryable cold-start), distinct from the `409 not_running` a dead server
+    /// produces. Exercised directly on the outcome->response mapping.
+    #[tokio::test]
+    async fn test_not_ready_maps_to_503() {
+        let res = message_response("sess-a", DeliverOutcome::NotReady);
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_string(res.into_body()).await;
+        assert!(body.contains("not_ready"), "body: {body}");
+        assert!(body.contains("retry"), "body: {body}");
+
+        let res = message_response("sess-a", DeliverOutcome::NotRunning);
         assert_eq!(res.status(), StatusCode::CONFLICT);
         let body = body_string(res.into_body()).await;
         assert!(body.contains("not_running"), "body: {body}");

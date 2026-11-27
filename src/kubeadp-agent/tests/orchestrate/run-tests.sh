@@ -5279,6 +5279,112 @@ EOF
     fi
 }
 
+# ==============================================================================
+# T79: opencode cold start (slow_start) -> 503 not_ready, then accepted once
+# warm, and the opencode session id survives a stop/restart.
+# ==============================================================================
+test_t79() {
+    local tdir="${TEST_TMP}/t79"
+    mkdir -p "$tdir/home" "$tdir/work" "$tdir/control"
+    local log_file="$tdir/fake-opencode.log"
+    local cfg_file="$tdir/config.json"
+    local port=`port_alloc`
+    local listen="127.0.0.1:${port}"
+    opencode_session_cfg sess79 "$tdir" "$cfg_file"
+
+    # Cold start: the fake server answers NO request until 40s after it binds
+    # (modeling the real `opencode serve` first-start install). 40s is past the
+    # 30s message delivery wait, so a message sent while cold must fail with a
+    # retryable 503 not_ready; the background warm-up (600s deadline) then
+    # brings the server up and warms it.
+    echo 40 > "$tdir/control/slow_start"
+
+    HOME="$tdir/home" AGENT_RUN_OPENCODE_PATH="$FAKE_OPENCODE" \
+    AGENT_ORCHESTRATE_LISTEN="$listen" \
+        "$BIN" run --config "$cfg_file" >/dev/null 2>&1 &
+    local spid=$!
+    ACTIVE_PIDS+=("$spid")
+
+    # The supervised `opencode serve` is listening (bound) but still cold.
+    local up=0
+    opencode_wait_log "listening port=" 160 "$log_file" && up=1
+
+    # (a) The first message sent during the slow start gets 503 not_ready.
+    local first_code="" first_body=""
+    if [ "$up" -eq 1 ]; then
+        first_code=$(curl -s -o /tmp/opencode_t79_a.json -w '%{http_code}' \
+            -X POST "http://${listen}/api/v1/sessions/sess79/message" \
+            -H 'Content-Type: application/json' -d '{"text":"cold start message"}')
+        first_body=$(cat /tmp/opencode_t79_a.json)
+    fi
+    local first_not_ready=0
+    if [ "$first_code" = "503" ] && echo "$first_body" | grep -q '"code":"not_ready"'; then
+        first_not_ready=1
+    fi
+
+    # (b) Once the background warm-up has brought the server up (engine_ready
+    # turns true), the same message is accepted and its PROMPT line appears.
+    local engine_warm=0
+    for _ in $(seq 1 1200); do
+        local er=$(curl -s "http://${listen}/api/v1/sessions/sess79" 2>/dev/null | grep -o '"engine_ready":true')
+        if [ -n "$er" ]; then engine_warm=1; break; fi
+        sleep 0.05
+    done
+    local second_code="" second_body=""
+    if [ "$engine_warm" -eq 1 ]; then
+        second_code=$(curl -s -o /tmp/opencode_t79_b.json -w '%{http_code}' \
+            -X POST "http://${listen}/api/v1/sessions/sess79/message" \
+            -H 'Content-Type: application/json' -d '{"text":"cold start message"}')
+        second_body=$(cat /tmp/opencode_t79_b.json)
+    fi
+    local second_accepted=0
+    if [ "$second_code" = "202" ] && echo "$second_body" | grep -q '"accepted":true'; then
+        second_accepted=1
+    fi
+    local seen=0
+    opencode_wait_log "PROMPT cold start message" 120 "$log_file" && seen=1
+    local id_before=""
+    if [ "$seen" -eq 1 ]; then
+        id_before=$(grep -o 'ses_fake[0-9]*' "$tdir/control/sessions.json" 2>/dev/null | sort -u | head -1)
+    fi
+
+    # (c) After stop/restart the opencode session id is unchanged.
+    local stop_ok=0 restart_ok=0 id_after=""
+    if [ -n "$id_before" ]; then
+        # Lift the cold start so the restarted server is not slow again.
+        rm -f "$tdir/control/slow_start"
+        curl -s -X POST "http://${listen}/api/v1/sessions/sess79/stop" >/dev/null 2>&1
+        for _ in $(seq 1 120); do
+            local sb=$(curl -s "http://${listen}/api/v1/sessions/sess79" 2>/dev/null)
+            if echo "$sb" | grep -q '"paused":true'; then stop_ok=1; break; fi
+            sleep 0.05
+        done
+    fi
+    if [ "$stop_ok" -eq 1 ]; then
+        curl -s -X POST "http://${listen}/api/v1/sessions/sess79/restart" >/dev/null 2>&1
+        opencode_wait_log "listening port=" 160 "$log_file" 2
+        for _ in $(seq 1 400); do
+            local st=$(curl -s "http://${listen}/api/v1/sessions/sess79" 2>/dev/null | grep -o '"status":"[a-z]*"' | cut -d: -f2 | tr -d '"')
+            if [ "$st" = "running" ]; then restart_ok=1; break; fi
+            sleep 0.05
+        done
+    fi
+    # The restarted engine reuses the persisted id; sessions.json still holds it
+    # (the fake only adds a new id if it had to create a fresh session).
+    id_after=$(grep -o 'ses_fake[0-9]*' "$tdir/control/sessions.json" 2>/dev/null | sort -u | head -1)
+    local id_same=0
+    if [ -n "$id_before" ] && [ "$id_before" = "$id_after" ]; then id_same=1; fi
+
+    stop_supervisor "$spid"
+    rm -f /tmp/opencode_t79_a.json /tmp/opencode_t79_b.json
+
+    if [ "$first_not_ready" -eq 1 ] && [ "$second_accepted" -eq 1 ] && [ "$seen" -eq 1 ] && [ "$id_same" -eq 1 ]; then
+        rec "T79" "PASS" "cold start: first message 503 not_ready, accepted when warm, session id survives restart (id=$id_before)"
+    else
+        rec "T79" "FAIL" "cold start failed (up=$up first_not_ready=$first_not_ready[$first_code] second_accepted=$second_accepted[$second_code] seen=$seen id_before=$id_before id_after=$id_after stop_ok=$stop_ok restart_ok=$restart_ok)"
+    fi
+}
+
 TESTS_TO_RUN=()
 if [ -n "${ONLY:-}" ]; then
     for t in $ONLY; do
@@ -5375,6 +5481,7 @@ else
     test_t76
     test_t77
     test_t78
+    test_t79
 fi
 
 echo "============================================================"

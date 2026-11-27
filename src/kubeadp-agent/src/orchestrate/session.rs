@@ -1140,6 +1140,15 @@ fn run_session_iteration(
     };
     let _ = save_supervisor_state(state_root, &state_snapshot);
 
+    // 6b. Post-spawn hook: a server-backed engine (opencode) starts a
+    // background warm-up here. The per-spawn `spawn_stop` flag is set when this
+    // iteration's PTY loop exits (stop, restart, crash, or supervisor shutdown
+    // all end the loop), so the warm-up thread is always tied to this spawn's
+    // lifecycle and never leaks across restarts. The hook is engine-agnostic:
+    // it is a no-op for every engine without a warm-up.
+    let spawn_stop = Arc::new(AtomicBool::new(false));
+    eng.after_session_spawn(session, &spawn_stop);
+
     // 7. PTY Output forwarder & hang detection loop
     let mut tail_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut line_buf: Vec<u8> = Vec::new();
@@ -1239,6 +1248,10 @@ fn run_session_iteration(
             }
         }
     }
+
+    // The spawn's iteration ended (stop, restart, crash, or shutdown): end the
+    // background warm-up that was tied to this spawn so it never outlives it.
+    spawn_stop.store(true, Ordering::SeqCst);
 
     // Flush any remaining partial line in prefix mode
     if session.prefix_output && !line_buf.is_empty() {

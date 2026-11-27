@@ -175,6 +175,19 @@ pub enum ResumeMode {
     Resume,
 }
 
+/// The outcome of a server-backed session message delivery (the
+/// [`Engine::deliver_session_message`] `Some(..)` branch).
+pub enum ServerDelivery {
+    /// The message was queued by the engine's server.
+    Ok,
+    /// The engine's server is up but still warming up: the delivery may be
+    /// retried (mapped to a `503 not_ready` by the sessions API).
+    NotReady(String),
+    /// The engine's server is dead or the delivery failed (mapped to a
+    /// `409 not_running`, the pre-warm-up behaviour).
+    Err(String),
+}
+
 /// The engine trait (design HL-91 2.2). Object-safe, async where needed,
 /// `Send + Sync`. Methods without an explicit default return an
 /// `Unsupported` error via [`agnostic`] so a partial engine implementation
@@ -401,7 +414,31 @@ pub trait Engine: Send + Sync {
         &self,
         _session: &SessionDef,
         _text: &str,
-    ) -> Option<Result<(), String>> {
+    ) -> Option<ServerDelivery> {
+        None
+    }
+
+    /// Called by the supervisor right after the session process is spawned. A
+    /// server-backed engine (opencode) uses it to start a background warm-up
+    /// that brings the supervised server up and creates the session before any
+    /// user message arrives (a cold `opencode serve` answers its first request
+    /// only after a long first-start install). `stop` is set by the supervisor
+    /// when this spawn's iteration ends (stop, restart, or supervisor shutdown
+    /// all leave the iteration) and must make the warm-up exit; the thread must
+    /// not outlive the spawn. Default: no-op.
+    fn after_session_spawn(
+        &self,
+        _session: &SessionDef,
+        _stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+    }
+
+    /// Whether the session's engine is warm (its server is up and its session
+    /// is ready to take a message). `None` for engines without a warm-up
+    /// (the field is then omitted from the session JSON). `Some(true)` once
+    /// the warm-up has succeeded, `Some(false)` while the engine is still
+    /// starting.
+    fn engine_ready(&self, _session: &SessionDef) -> Option<bool> {
         None
     }
 
