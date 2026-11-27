@@ -97,7 +97,7 @@ Agent Deployments use an init-container pattern:
 
 | Field | Container | Default |
 |-------|-----------|---------|
-| `kubeadpImage` | Init Container (kubeadp-agent) | `ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.62` |
+| `kubeadpImage` | Init Container (kubeadp-agent) | `ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.64` |
 | `agentImage` | Init Container (OpenCode) | `ghcr.io/kubeopencode/kubeopencode-agent-opencode:latest` |
 | `executorImage` | Worker Container (Server) | `ghcr.io/kubeopencode/kubeopencode-agent-devbox:latest` |
 | `attachImage` | Not used for Task Pods any more (deprecated, kept for compatibility) | `ghcr.io/kubeopencode/kubeopencode-agent-attach:latest` |

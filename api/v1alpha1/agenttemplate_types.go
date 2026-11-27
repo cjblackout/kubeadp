@@ -49,7 +49,7 @@ type AgentTemplateSpec struct {
 
 	// KubeadpImage specifies the kubeadp-agent init container image.
 	// This image contains the kubeadp-agent and agent-run binaries that get copied to /tools volume.
-	// If not specified, defaults to "ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.62".
+	// If not specified, defaults to "ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.64".
 	// +optional
 	KubeadpImage string `json:"kubeadpImage,omitempty"`
 

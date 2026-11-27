@@ -255,7 +255,7 @@ const (
 
 	// DefaultKubeadpImage is the default kubeadp-agent init container image.
 	// This image copies the kubeadp-agent and agent-run binaries to /tools volume.
-	DefaultKubeadpImage = "ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.62"
+	DefaultKubeadpImage = "ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.64"
 
 	// DefaultExecutorImage is the default worker container image for task execution.
 	// This is the development environment where tasks actually run.
