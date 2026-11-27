@@ -214,14 +214,10 @@ pub fn parse_config_toml(path: &str, content: &str) -> Result<HashMap<String, St
                     "Invalid configuration file '{path}': duplicate key '{section}.{key}'"
                 ));
             }
-            let value = if (section == "common" && key == "sandbox_ro_paths")
-                || (section == "worker" && key == "sandbox_ro_paths")
-            {
+            let value = if section == "common" && key == "sandbox_ro_paths" {
                 // sandbox_ro_paths can be a TOML Array of strings or a scalar string (colon-separated)
                 parse_and_validate_sandbox_ro_paths_toml(path, section, key, value)?
-            } else if (section == "common" && key == "sandbox_env_allow")
-                || (section == "worker" && key == "sandbox_env_allow")
-            {
+            } else if section == "common" && key == "sandbox_env_allow" {
                 // sandbox_env_allow can be a TOML Array of strings or a scalar string (comma-separated)
                 parse_and_validate_sandbox_env_allow_toml(path, section, key, value)?
             } else {
@@ -284,8 +280,6 @@ fn var_for_section_key(section: &str, key: &str) -> Option<String> {
         ("common", "instructions_file") => Some("KUBEADP_INSTRUCTIONS_FILE".to_string()),
         ("common", "sandbox_ro_paths") => Some("KUBEADP_SANDBOX_RO_PATHS".to_string()),
         ("common", "sandbox_env_allow") => Some("KUBEADP_SANDBOX_ENV_ALLOW".to_string()),
-        ("worker", "sandbox_ro_paths") => Some("KUBEADP_SANDBOX_RO_PATHS".to_string()),
-        ("worker", "sandbox_env_allow") => Some("KUBEADP_SANDBOX_ENV_ALLOW".to_string()),
 
         // --- [orchestrator]: the agent-orchestrate session supervisor ---
         ("orchestrator", "listen") => Some("AGENT_ORCHESTRATE_LISTEN".to_string()),
@@ -480,8 +474,6 @@ fn section_keys(section: &str) -> Vec<&'static str> {
             "a2a_live_idle_secs",
             "a2a_mcp_enabled",
             "a2a_echo",
-            "sandbox_ro_paths",
-            "sandbox_env_allow",
         ],
         _ => Vec::new(),
     }
