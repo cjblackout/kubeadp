@@ -1483,7 +1483,7 @@ mod tests {
         // get an extra writable mount: nothing was remounted read-only over it.
         let policy = SandboxPolicy {
             ro: vec![PathBuf::from("/usr"), PathBuf::from("/opt/tools")],
-            rw: vec![PathBuf::from("/workspace/project-a")],
+            rw: vec![PathBuf::from("/workspace/some-project")],
             ..Default::default()
         };
         let (plan, _) = plan_mounts(&spec(policy));

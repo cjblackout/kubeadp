@@ -886,6 +886,14 @@ fn run_session_iteration(
             &session.workdir,
             grants_cfg,
         );
+        let base_policy = if let Ok(cfg) = crate::core::config::Config::load() {
+            base_policy
+                .with_workspace_root(&cfg.workspace_root, Some(&cfg.jobs_dir_name))
+                .with_shared_rw(vec![cfg.sandbox_home.clone()])
+                .with_extra_ro_paths(&cfg.sandbox_ro_paths)
+        } else {
+            base_policy
+        };
         // Jobset wiring (same as the job launcher): if this session is a jobset
         // member (registered in the process-wide registry), its secret rides the
         // sandbox `secret` channel and only the jobset id + the secret file PATH

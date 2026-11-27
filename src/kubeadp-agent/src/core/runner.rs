@@ -255,7 +255,9 @@ pub fn sandboxed(
         None,
         Some(&plan.program),
         Some(vec![config.sandbox_home.clone()]),
-    );
+    )
+    .with_workspace_root(&config.workspace_root, Some(&config.jobs_dir_name))
+    .with_extra_ro_paths(&config.sandbox_ro_paths);
     // A job worktree is a linked worktree of the project's private bare repo,
     // which the sandbox hides with every other repo under `repos_root`: without
     // this grant git inside the job fails ("not a git repository"). Only the

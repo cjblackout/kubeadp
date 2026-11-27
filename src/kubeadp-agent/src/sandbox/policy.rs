@@ -141,6 +141,56 @@ fn default_net() -> String {
     "host".to_string()
 }
 
+/// The environment variable naming the workspace root for worker jobs.
+const AGENT_RUN_WORKSPACE_ROOT_ENV: &str = "AGENT_RUN_WORKSPACE_ROOT";
+
+/// The environment variable naming the workspace root for sessions.
+const CLAUDE_WORKSPACE_ROOT_ENV: &str = "CLAUDE_WORKSPACE_ROOT";
+
+/// The environment variable naming the jobs directory within workspace root.
+const AGENT_RUN_JOBS_DIR_NAME_ENV: &str = "AGENT_RUN_JOBS_DIR_NAME";
+
+/// The environment variable naming the sandbox home directory.
+const SANDBOX_HOME_ENV: &str = "KUBEADP_SANDBOX_HOME";
+
+/// Resolves the default workspace root from the environment, falling back to `/workspace`.
+pub fn default_workspace_root() -> PathBuf {
+    std::env::var(AGENT_RUN_WORKSPACE_ROOT_ENV)
+        .or_else(|_| std::env::var(CLAUDE_WORKSPACE_ROOT_ENV))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/workspace"))
+}
+
+/// Resolves the default jobs subdirectory name within workspace root, falling back to `.agent-jobs`.
+pub fn default_jobs_dir_name() -> String {
+    std::env::var(AGENT_RUN_JOBS_DIR_NAME_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ".agent-jobs".to_string())
+}
+
+/// Resolves the default shared_rw directory for sandbox policies.
+/// Honours `KUBEADP_SANDBOX_HOME` if set and non-empty, falling back to `/home/agent`.
+pub fn default_shared_rw() -> Vec<PathBuf> {
+    let home = std::env::var(SANDBOX_HOME_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/home/agent"));
+    vec![home]
+}
+
+/// Resolves the default hide directories for sandbox policies.
+/// Hides `<workspace_root>/<jobs_dir_name>` derived from configured workspace root and jobs dir.
+pub fn default_hide() -> Vec<PathBuf> {
+    vec![default_workspace_root().join(default_jobs_dir_name())]
+}
+
 /// Validates the policy `net` value. Unknown values are an error so a policy
 /// that was never parsed cannot silently select a weaker (or unknown) mode.
 fn validate_net(net: &str) -> Result<(), String> {
@@ -169,10 +219,9 @@ impl Default for SandboxPolicy {
                 PathBuf::from("/sbin"),
                 PathBuf::from("/etc"),
                 PathBuf::from("/opt/tools"),
-                PathBuf::from("/workspace/project-a"),
             ],
-            shared_rw: vec![PathBuf::from("/home/agent")],
-            hide: vec![PathBuf::from("/workspace/.agent-jobs")],
+            shared_rw: default_shared_rw(),
+            hide: default_hide(),
             tmp: default_tmp(),
             secret: None,
             env_allow: default_env_allow(),
@@ -520,6 +569,68 @@ impl SandboxPolicy {
         }
         self
     }
+
+    /// Appends extra read-only paths to the policy. Duplicates are ignored.
+    pub fn with_extra_ro_paths(mut self, paths: &[PathBuf]) -> Self {
+        for p in paths {
+            if !self.ro.iter().any(|existing| existing == p) {
+                self.ro.push(p.clone());
+            }
+        }
+        self
+    }
+
+    /// Updates or replaces the jobs root directory in the policy's `hide` list
+    /// with `<workspace_root>/<jobs_dir_name>`.
+    ///
+    /// If an existing hide entry matches either `<workspace_root>/<jobs_dir_name>`
+    /// or the default `<default_workspace_root()>/<default_jobs_dir_name()>`, it is replaced.
+    /// Otherwise, the new path is appended.
+    pub fn with_workspace_root(
+        mut self,
+        workspace_root: &Path,
+        jobs_dir_name: Option<&str>,
+    ) -> Self {
+        let dir_name = jobs_dir_name
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(".agent-jobs");
+        let target = workspace_root.join(dir_name);
+        let default_target = default_workspace_root().join(default_jobs_dir_name());
+
+        let mut replaced = false;
+        for entry in self.hide.iter_mut() {
+            if *entry == default_target || *entry == target {
+                *entry = target.clone();
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced && !self.hide.iter().any(|h| h == &target) {
+            self.hide.push(target);
+        }
+        self
+    }
+
+    /// Sets or replaces the `shared_rw` paths for the policy.
+    pub fn with_shared_rw(mut self, shared_rw: Vec<PathBuf>) -> Self {
+        self.shared_rw = shared_rw;
+        self
+    }
+
+    /// Skips non-existent `ro` paths with a warning on stderr.
+    /// Missing `ro` paths (default or from `sandbox_ro_paths`) do not abort setup,
+    /// while missing `rw`, `hide`, or `secret` paths remain fail-closed.
+    pub fn filter_missing_ro_paths(&mut self) {
+        self.ro.retain(|p| {
+            if !p.exists() {
+                eprintln!("sandbox: ro path {} does not exist, skipped", p.display());
+                false
+            } else {
+                true
+            }
+        });
+    }
 }
 
 /// Environment variable naming the operator token file (config key
@@ -563,6 +674,46 @@ pub fn jobset_root_key_file_path() -> Option<PathBuf> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
+}
+
+/// Validates a single path intended for `sandbox_ro_paths` or extra read-only mounts.
+/// Path must be non-empty, absolute, and contain no '..' components.
+pub fn validate_sandbox_ro_path(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("sandbox_ro_paths: path entry must not be empty".to_string());
+    }
+    if !path.is_absolute() {
+        return Err(format!(
+            "sandbox_ro_paths: path '{}' must be absolute",
+            path.display()
+        ));
+    }
+    for comp in path.components() {
+        if let std::path::Component::ParentDir = comp {
+            return Err(format!(
+                "sandbox_ro_paths: path '{}' must not contain '..'",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parses and validates a colon-separated string of paths from `KUBEADP_SANDBOX_RO_PATHS`.
+pub fn parse_sandbox_ro_paths(raw: &str) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    for part in raw.split(':') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let p = PathBuf::from(trimmed);
+        validate_sandbox_ro_path(&p)?;
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    Ok(paths)
 }
 
 /// Validates that a granted path in a sandbox policy is absolute, not root or forbidden system dirs,
@@ -645,8 +796,8 @@ mod tests {
         let json = r#"{
             "agent_id": "job-7",
             "jobset_id": "js-1",
-            "rw": ["/workspace/.agent-jobs/project-a/ab12"],
-            "ro": ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/opt/tools", "/workspace/project-a"],
+            "rw": ["/workspace/.agent-jobs/sample/ab12"],
+            "ro": ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/opt/tools"],
             "shared_rw": ["/home/agent"],
             "hide": ["/workspace/.agent-jobs"],
             "tmp": "auto",
@@ -660,7 +811,19 @@ mod tests {
         assert_eq!(policy.jobset_id.as_deref(), Some("js-1"));
         assert_eq!(
             policy.rw,
-            vec![PathBuf::from("/workspace/.agent-jobs/project-a/ab12")]
+            vec![PathBuf::from("/workspace/.agent-jobs/sample/ab12")]
+        );
+        assert_eq!(
+            policy.ro,
+            vec![
+                PathBuf::from("/usr"),
+                PathBuf::from("/lib"),
+                PathBuf::from("/lib64"),
+                PathBuf::from("/bin"),
+                PathBuf::from("/sbin"),
+                PathBuf::from("/etc"),
+                PathBuf::from("/opt/tools"),
+            ]
         );
         assert_eq!(policy.shared_rw, vec![PathBuf::from("/home/agent")]);
         assert_eq!(
@@ -1225,5 +1388,110 @@ mod tests {
             "a single-file grant of the token file must validate"
         );
         assert!(explicit.hide_operator_token_file().validate().is_ok());
+    }
+
+    #[test]
+    fn test_default_ro_paths_have_no_workspace() {
+        let policy = SandboxPolicy::default();
+        let ro_strings: Vec<String> = policy
+            .ro
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !ro_strings.iter().any(|s| s.starts_with("/workspace")),
+            "default ro must not contain any /workspace path: {ro_strings:?}"
+        );
+        let expected = vec![
+            "/usr",
+            "/lib",
+            "/lib64",
+            "/bin",
+            "/sbin",
+            "/etc",
+            "/opt/tools",
+        ];
+        assert_eq!(ro_strings, expected);
+    }
+
+    #[test]
+    fn test_validate_and_parse_sandbox_ro_paths() {
+        assert!(validate_sandbox_ro_path(Path::new("/valid/abs/path")).is_ok());
+        assert!(validate_sandbox_ro_path(Path::new("relative/path")).is_err());
+        assert!(validate_sandbox_ro_path(Path::new("")).is_err());
+        assert!(validate_sandbox_ro_path(Path::new("/bad/../path")).is_err());
+
+        let raw = "/opt/tools:/data/shared:/opt/tools";
+        let parsed = parse_sandbox_ro_paths(raw).expect("parse must succeed");
+        assert_eq!(
+            parsed,
+            vec![PathBuf::from("/opt/tools"), PathBuf::from("/data/shared")]
+        );
+
+        let invalid_raw = "/opt/tools:relative/path";
+        assert!(parse_sandbox_ro_paths(invalid_raw).is_err());
+    }
+
+    #[test]
+    fn test_filter_missing_ro_paths_skips_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("exists");
+        std::fs::create_dir_all(&existing).unwrap();
+        let missing = dir.path().join("does-not-exist");
+
+        let mut policy = SandboxPolicy {
+            ro: vec![existing.clone(), missing.clone()],
+            ..Default::default()
+        };
+        policy.filter_missing_ro_paths();
+        assert_eq!(policy.ro, vec![existing]);
+    }
+
+    #[test]
+    fn test_with_extra_ro_paths_appends() {
+        let policy = SandboxPolicy::default();
+        let extra = vec![PathBuf::from("/custom/ro1"), PathBuf::from("/usr")];
+        let updated = policy.with_extra_ro_paths(&extra);
+        assert!(updated.ro.contains(&PathBuf::from("/custom/ro1")));
+        // /usr was already present in default ro, must not be duplicated
+        let usr_path = Path::new("/usr");
+        assert_eq!(
+            updated
+                .ro
+                .iter()
+                .filter(|p| p.as_path() == usr_path)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_with_workspace_root_derives_hide_no_workspace() {
+        let policy = SandboxPolicy::default().with_workspace_root(Path::new("/srv/ws"), None);
+        assert_eq!(policy.hide, vec![PathBuf::from("/srv/ws/.agent-jobs")]);
+        let hide_strings: Vec<String> = policy
+            .hide
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !hide_strings.iter().any(|s| s.contains("/workspace")),
+            "hide list must contain no /workspace string when workspace_root is /srv/ws: {hide_strings:?}"
+        );
+
+        // Custom jobs_dir_name
+        let policy_custom = SandboxPolicy::default()
+            .with_workspace_root(Path::new("/srv/ws"), Some(".custom-jobs"));
+        assert_eq!(
+            policy_custom.hide,
+            vec![PathBuf::from("/srv/ws/.custom-jobs")]
+        );
+    }
+
+    #[test]
+    fn test_shared_rw_follows_sandbox_home() {
+        let policy =
+            SandboxPolicy::default().with_shared_rw(vec![PathBuf::from("/srv/agent-home")]);
+        assert_eq!(policy.shared_rw, vec![PathBuf::from("/srv/agent-home")]);
     }
 }

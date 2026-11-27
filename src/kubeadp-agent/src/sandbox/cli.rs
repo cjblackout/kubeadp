@@ -212,10 +212,14 @@ fn refusal_for_runtime(runtime: SandboxRuntime) -> Option<&'static str> {
 /// sandbox cannot read either credential. Both builder methods are no-ops when
 /// the corresponding env path (`KUBEADP_API_TOKEN_FILE` /
 /// `KUBEADP_JOBSET_ROOT_KEY_FILE`) is not configured, so nothing else changes.
+/// Finally, non-existent `ro` paths are skipped with a warning on stderr so that
+/// missing `ro` entries do not cause setup failure.
 fn finish_policy(policy: SandboxPolicy) -> SandboxPolicy {
-    policy
+    let mut policy = policy
         .hide_operator_token_file()
-        .hide_jobset_root_key_file()
+        .hide_jobset_root_key_file();
+    policy.filter_missing_ro_paths();
+    policy
 }
 
 /// Validates whether the chosen backend's required mechanisms passed probe.
@@ -368,9 +372,8 @@ mod tests {
 
         // The finished policy must equal the base policy with the two
         // configured credential paths appended (each once, deduplicated by
-        // `with_hidden_path`, in token-then-key order) and nothing else
-        // changed. Build the expected vector exactly the way the builder
-        // methods do and compare.
+        // `with_hidden_path`, in token-then-key order), non-existent ro paths
+        // skipped, and nothing else changed. Build the expected vectors and compare.
         let mut expected = base.hide.clone();
         if let Some(t) = &token {
             if !expected.iter().any(|h| h == t) {
@@ -387,11 +390,14 @@ mod tests {
             "finish_policy must add each configured credential path exactly once"
         );
 
+        let mut expected_ro = base.ro.clone();
+        expected_ro.retain(|p| p.exists());
+
         // No other field may change.
         assert_eq!(finished.role, base.role);
         assert_eq!(finished.agent_id, base.agent_id);
         assert_eq!(finished.rw, base.rw);
-        assert_eq!(finished.ro, base.ro);
+        assert_eq!(finished.ro, expected_ro);
         assert_eq!(finished.shared_rw, base.shared_rw);
         assert_eq!(finished.tmp, base.tmp);
         assert_eq!(finished.secret, base.secret);
