@@ -355,10 +355,13 @@ and secrets.
   completion), a terminal `error` is `Failed`, a quota/rate-limit signal is
   `QuotaExhausted`, exit 0 without a terminal stop is `Incomplete`, and a
   137/143 kill without an error line is `SelfTerminated`.
-- **Session mode** runs `opencode run -i --format json --auto --dir
-  <workdir> <start-message>` inside the supervisor PTY, mirroring the agy
-  live-stream approach: the interactive opencode process reads follow-up
-  turns as user lines typed on the PTY.
+- **Session mode** supervises `opencode serve --hostname 127.0.0.1 --port
+  <free port>` (the port is recorded in a state file next to the run state).
+  Messages are delivered through the server API: the engine creates or reuses
+  one opencode session (id persisted, so it survives restarts; a lost session
+  is recreated) and posts the text to `POST /session/{id}/prompt_async`
+  (204 = accepted). `opencode run -i` is not used: it exits after its first
+  message.
 - **Message injection** (capability `a2a.inject`, §7.14) carries `hook`,
   `tool_result`, and `idle_turn`:
   - `hook`: the harness opencode plugin (`experimental.chat.messages.transform`)
@@ -367,8 +370,8 @@ and secrets.
   - `tool_result`: the harness-owned `mcp-a2a` server configured in `opencode.json`
     (`mcp.a2a`) appends queued messages to tool results.
   - `idle_turn`: a queued message resumes a finished job as the next turn
-    (`retry`). Interactive sessions receive queued messages over the PTY
-    (`frame_pty_message`). A RUNNING opencode single-turn job (`run --format json`)
+    (`retry`). Sessions receive queued messages through the server API
+    (`prompt_async`, see Session mode). A RUNNING opencode single-turn job (`run --format json`)
     answers `Unsupported` for the `idle_turn` step because it has no live stdin
     channel (its in-flight messages are delivered via `hook` and `tool_result`).
 - **Instructions**: `materialize_instructions` writes the global
@@ -419,8 +422,7 @@ is done by the harness-owned `mcp-a2a` server (§8), not by the engine.
 `a2a.inject` is `native` for every engine with an engine-specific channel
 ladder (§7.14): agy, claude, and opencode all expose `hook`, `tool_result` and
 `idle_turn`. Session control for opencode is the emulated control surface
-(§3.4), because the interactive opencode process exposes no restart/log/message
-channels.
+(§3.4); message delivery is native through the opencode server API.
 
 ### 3.6 Emulation layer
 Implements, purely in the shared layer, what the inner engine lacks. Every
@@ -2049,7 +2051,7 @@ Implemented: migrations 1–7 (`jobs`, supervisor and session state, heartbeat i
 | trait, registry, capability endpoint, error mapping | implemented | |
 | both engines registered by both roles | implemented | |
 | agy job mode, claude job mode (`stream_json`), opencode job mode (`--format json`) | implemented | |
-| claude sessions (`pty_remote_control`), agy sessions (live stream-json), opencode sessions (interactive `-i`) | partial | work on the orchestrator behind the engine trait; claude `stream_json` sessions planned |
+| claude sessions (`pty_remote_control`), agy sessions (live stream-json), opencode sessions (`opencode serve` + `prompt_async`) | partial | work on the orchestrator behind the engine trait; claude `stream_json` sessions planned |
 | engine persisted per run and used by retry/restart | implemented | |
 | built-in default by run kind only | implemented | |
 | capability table of §3.5 | implemented | implemented capability tables match §3.5: `claude` gets native `job.list`/`job.kill`/`job.result`/`workspace.*`, `interrupt`/`pause`/`fork` emulated for all engines; `opencode` gets the same native job/workspace surface with `hook`, `tool_result`, `idle_turn` injection; only `permissions` remains `unsupported` |
