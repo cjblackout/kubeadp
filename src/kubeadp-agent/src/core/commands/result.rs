@@ -64,7 +64,10 @@ pub fn run(config: &Config, args: &ResultArgs) -> Result<CommandOutput> {
     });
     if let Some(u) = usage {
         if let Some(obj) = data.as_object_mut() {
-            obj.insert("usage".to_string(), serde_json::to_value(u).unwrap_or_default());
+            obj.insert(
+                "usage".to_string(),
+                serde_json::to_value(u).unwrap_or_default(),
+            );
         }
     }
 

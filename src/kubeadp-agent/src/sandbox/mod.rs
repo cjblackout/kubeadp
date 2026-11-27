@@ -30,7 +30,8 @@ pub mod testhook;
 
 pub use detect::{detect_runtime, probe_environment, EnvironmentProbe, SandboxRuntime};
 pub use policy::{
-    parse_sandbox_ro_paths, validate_sandbox_ro_path, parse_sandbox_env_allow, validate_sandbox_env_allow_pattern, SandboxPolicy, CLAUDE_OAUTH_TOKEN_ENV,
+    parse_sandbox_env_allow, parse_sandbox_ro_paths, validate_sandbox_env_allow_pattern,
+    validate_sandbox_ro_path, SandboxPolicy, CLAUDE_OAUTH_TOKEN_ENV,
 };
 
 use serde::{Deserialize, Serialize};

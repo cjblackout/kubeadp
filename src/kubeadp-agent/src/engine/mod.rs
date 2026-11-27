@@ -39,7 +39,8 @@ pub use agnostic::EmptyEngineCtx;
 pub use agy::AgyEngine;
 pub use errors::EngineError;
 pub use run::{
-    ContextId, EngineEvent, EngineId, ExitInfo, JobUsage, PodRole, Run, RunId, RunKind, RunStatus, Transport,
+    ContextId, EngineEvent, EngineId, ExitInfo, JobUsage, PodRole, Run, RunId, RunKind, RunStatus,
+    Transport,
 };
 
 use crate::core::job::{JobMetadata, JobStatus};
