@@ -362,6 +362,19 @@ and secrets.
   is recreated) and posts the text to `POST /session/{id}/prompt_async`
   (204 = accepted). `opencode run -i` is not used: it exits after its first
   message.
+  - **Cold start / warm-up**: a first `opencode serve` can take minutes to
+    answer its first request (a first-start install into
+    `~/.config/opencode/node_modules` and similar). When the supervisor spawns
+    the session process it starts a background warm-up (a thread tied to that
+    spawn's stop flag, so it stops on stop/restart/shutdown and never leaks
+    across restarts) that polls readiness with a long deadline (600 s) and then
+    creates and persists the opencode session id, so the first user message
+    never waits for a cold server. The warm-up runs against the same per-request
+    HTTP timeout (a hung first request is retried, not fatal).
+  - **`engine_ready`**: once the warm-up has finished (`wait_ready` +
+    `ensure_session` succeeded) the session JSON carries `engine_ready: true`;
+    while it is still starting it is `false`. The field is additive and absent
+    for engines without a warm-up.
 - **Message injection** (capability `a2a.inject`, §7.14) carries `hook`,
   `tool_result`, and `idle_turn`:
   - `hook`: the harness opencode plugin (`experimental.chat.messages.transform`)
@@ -587,8 +600,10 @@ GET  /api/v1/sessions/{name}/log?tail=<n>
 POST /api/v1/sessions/{name}/message
 ```
 Session state JSON: `{name,status,pid,start_time,start_time_epoch,uptime_secs,
-restart_count,last_exit_reason,last_health_result,paused,controlled}`. Unknown
-session → `404 {"error":"no session named '<name>'","code":"session_not_found"}`.
+restart_count,last_exit_reason,last_health_result,paused,controlled,engine}`;
+`engine_ready` (a boolean) is additionally present for engines with a warm-up
+(opencode) and absent otherwise. Unknown session →
+`404 {"error":"no session named '<name>'","code":"session_not_found"}`.
 
 - `stop`: marks paused; status reports `stopped` (unless already `failed`).
 - `start`: unpauses a live thread or respawns a dead one. `restart`: restarts the
@@ -600,7 +615,10 @@ session → `404 {"error":"no session named '<name>'","code":"session_not_found"
   PASTE `ESC[200~ payload ESC[201~` + one `\r`; sanitize (embedded `ESC[201~`
   removed wholesale, controls stripped, `\r`→`\n`); per-(session,sender) budget
   `MESSAGE_RATE_MAX` (30)/60 s; writes under a total deadline; audit logs only the
-  FNV-1a prefix hash, never the text.
+  FNV-1a prefix hash, never the text. A server-backed engine (opencode) delivers
+  over its own server API instead of the PTY (never a PTY fall-through: the
+  supervised `opencode serve` has no stdin consumer), and answers `503
+  not_ready` (retryable) while its warm-up is in progress; see §3.4.
 
 | Outcome | HTTP | code |
 |---|---|---|
@@ -608,7 +626,8 @@ session → `404 {"error":"no session named '<name>'","code":"session_not_found"
 | not json / no text / empty | 400 | `invalid_body` |
 | text > 8192 | 413 | `too_large` |
 | unknown session | 404 | `session_not_found` |
-| stopped/paused or no live PTY | 409 | `not_running` |
+| stopped/paused or no live PTY (or a server-backed engine dead/missing) | 409 | `not_running` |
+| server-backed engine still warming up (cold start) | 503 | `not_ready` (retryable) |
 | >30/min per (session,sender) | 429 + Retry-After | `rate_limited` |
 
 ### 4.6 PTY protocol (claude remote control)

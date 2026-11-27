@@ -41,6 +41,12 @@ const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// How long readiness waits for `opencode serve` to answer.
 pub const READY_DEADLINE: Duration = Duration::from_secs(90);
 
+/// How long the background warm-up waits for the supervised `opencode serve` to
+/// answer. A cold `opencode serve` (a first start installs into
+/// `~/.config/opencode/node_modules`) can take minutes before its first request
+/// is served, so the warm-up allows far longer than a single request may.
+pub const WARMUP_DEADLINE: Duration = Duration::from_secs(600);
+
 /// The persisted per-session serve state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServeState {
@@ -49,6 +55,17 @@ pub struct ServeState {
     /// The opencode session id (`ses_...`), kept across restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Whether the background warm-up has finished (`wait_ready` +
+    /// `ensure_session`) for the current start. Reset by the supervisor on a
+    /// fresh start and set by the warm-up thread on success, so the sessions
+    /// API can report `engine_ready` and message delivery can tell a cold
+    /// server (retryable) from a dead one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ready: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 /// The allow-all permission ruleset a headless session needs (the shape opencode
@@ -283,6 +300,39 @@ pub fn ensure_session(port: u16, existing: Option<&str>) -> Result<String, Strin
         .ok_or_else(|| "create session: no session id in the answer".to_string())
 }
 
+/// Warms up the supervised `opencode serve` recorded in `state_file`: polls
+/// readiness with the long warm-up deadline and then creates (or reuses) the
+/// opencode session, persisting its id, so the first user message never has to
+/// wait for a cold server. `stop` aborts the warm-up when the session stops,
+/// restarts, or the supervisor shuts down. Returns `Ok(true)` when the server
+/// is warm and the session is persisted, `Ok(false)` when `stop` fired, and
+/// `Err` when the deadline passed (the server stayed cold).
+pub fn warm_up(
+    state_file: &Path,
+    stop: &AtomicBool,
+    deadline: Duration,
+    poll_interval: Duration,
+) -> Result<bool, String> {
+    let state = read_state(state_file).ok_or_else(|| {
+        "opencode serve state is missing: the session was not started".to_string()
+    })?;
+    wait_ready(state.port, poll_interval, stop, deadline)?;
+    let id = ensure_session(state.port, state.session_id.as_deref())?;
+    let mut current = read_state(state_file).unwrap_or(state);
+    current.session_id = Some(id);
+    current.ready = true;
+    write_state(state_file, &current)
+        .map_err(|e| format!("cannot persist the warmed-up session: {e}"))?;
+    Ok(true)
+}
+
+/// Whether the supervised `opencode serve` answered but has not finished its
+/// warm-up yet (cold server, still starting): the delivery may be retried. A
+/// truly dead server (nothing listening) is not `not_ready`.
+pub fn is_not_ready(err: &str) -> bool {
+    err.starts_with("opencode serve not ready")
+}
+
 /// Delivers `text` to the session recorded in `state_file`: waits for the
 /// server of the current start, creates (or reuses) the opencode session and
 /// queues the text as its next user message. The session id is persisted so a
@@ -444,6 +494,7 @@ mod tests {
             &ServeState {
                 port: 4242,
                 session_id: Some("ses_abc".into()),
+                ready: false,
             },
         )
         .unwrap();
@@ -451,7 +502,8 @@ mod tests {
             read_state(&path),
             Some(ServeState {
                 port: 4242,
-                session_id: Some("ses_abc".into())
+                session_id: Some("ses_abc".into()),
+                ready: false
             })
         );
         write_state(
@@ -459,6 +511,7 @@ mod tests {
             &ServeState {
                 port: 4243,
                 session_id: None,
+                ready: false,
             },
         )
         .unwrap();
@@ -620,6 +673,7 @@ mod tests {
             &ServeState {
                 port: srv.port,
                 session_id: None,
+                ready: false,
             },
         )
         .unwrap();
@@ -647,6 +701,7 @@ mod tests {
             &ServeState {
                 port: pick_free_port().unwrap(),
                 session_id: None,
+                ready: false,
             },
         )
         .unwrap();
@@ -660,5 +715,138 @@ mod tests {
         let srv = canned_server(vec![ok_json(r#"{"ses_a":{"type":"busy"}}"#), ok_json("{}")]);
         assert!(session_busy(srv.port, "ses_a").unwrap());
         assert!(!session_busy(srv.port, "ses_a").unwrap());
+    }
+
+    /// A canned-answer server that sleeps `first_delay` before it answers its
+    /// FIRST request and answers every later request immediately: the
+    /// cold-start shape of a real `opencode serve` (one slow first request,
+    /// instant after).
+    fn late_canned_server(first_delay: Duration, answers: Vec<String>) -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut answers = answers.into_iter();
+            let mut first = true;
+            for answer in &mut answers {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                reader.read_exact(&mut body).unwrap();
+                if first {
+                    first = false;
+                    std::thread::sleep(first_delay);
+                }
+                let mut s = stream;
+                s.write_all(answer.as_bytes()).unwrap();
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn warm_up_waits_for_a_late_server_and_persists_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = state_path(dir.path(), "warm");
+        let port = late_canned_server(
+            Duration::from_millis(1200),
+            vec![ok_json("{}"), ok_json(r#"{"id":"ses_late"}"#)],
+        );
+        write_state(
+            &state_file,
+            &ServeState {
+                port,
+                session_id: None,
+                ready: false,
+            },
+        )
+        .unwrap();
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        let warmed = warm_up(
+            &state_file,
+            &stop,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        assert!(warmed, "warm-up must complete once the server answers");
+        assert!(
+            started.elapsed() >= Duration::from_millis(1100),
+            "warm-up must wait out the cold first request"
+        );
+        let state = read_state(&state_file).unwrap();
+        assert!(state.ready, "the ready flag must be set by the warm-up");
+        assert!(
+            state.session_id.as_deref() == Some("ses_late"),
+            "the opencode session id must be persisted by the warm-up"
+        );
+    }
+
+    #[test]
+    fn warm_up_aborts_on_stop_before_warming() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = state_path(dir.path(), "warm-stop");
+        let port = pick_free_port().unwrap(); // nothing listens
+        write_state(
+            &state_file,
+            &ServeState {
+                port,
+                session_id: None,
+                ready: false,
+            },
+        )
+        .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let signaller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            stop2.store(true, Ordering::SeqCst);
+        });
+        let res = warm_up(
+            &state_file,
+            &stop,
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+        );
+        let err = res.unwrap_err();
+        assert!(err.contains("shutdown"), "{err}");
+        signaller.join().unwrap();
+        // A deadline pass (server never answers and no stop) is a plain error.
+        let stop3 = AtomicBool::new(false);
+        let err = warm_up(
+            &state_file,
+            &stop3,
+            Duration::from_millis(250),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(err.contains("not ready"), "{err}");
+        assert!(is_not_ready(&err));
+    }
+
+    #[test]
+    fn is_not_ready_classifies_only_a_cold_server() {
+        assert!(is_not_ready(
+            "opencode serve not ready within 30s: read response: Resource temporarily unavailable"
+        ));
+        assert!(!is_not_ready("connect 127.0.0.1:1: Connection refused"));
+        assert!(!is_not_ready(
+            "opencode serve state is missing: the session was not started"
+        ));
     }
 }

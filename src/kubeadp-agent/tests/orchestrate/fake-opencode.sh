@@ -13,6 +13,12 @@
 # Every start logs `argv=<args>` and `listening port=<p>`, every exit `exit=<rc>`, to $FAKE_OPENCODE_LOG.
 # Control: FAKE_OPENCODE_ACTION (exit0|exit1|crash) at start, or marker files
 # action_exit0 / action_exit1 / action_crash in $FAKE_OPENCODE_CONTROL_DIR at any time.
+# slow_start: a file in $FAKE_OPENCODE_CONTROL_DIR holding an integer N (default 0).
+#   When N > 0 the server answers NO request until N seconds after it started
+#   (a cold-start model: the real `opencode serve` runs a first-start install on
+#   its first request), then answers everything immediately.
+# Sessions persist to $FAKE_OPENCODE_CONTROL_DIR/sessions.json so a restarted
+# server (stop/restart) keeps the same session ids, like the real server.
 set -euo pipefail
 
 log() { [ -n "${FAKE_OPENCODE_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_OPENCODE_LOG" || true; }
@@ -43,13 +49,40 @@ import http.server, json, os, re, sys, threading, time
 port = int(sys.argv[1])
 log_file = os.environ.get("FAKE_OPENCODE_LOG")
 ctrl = os.environ.get("FAKE_OPENCODE_CONTROL_DIR")
-sessions = {}
 lock = threading.Lock()
 
 def log(line):
     if log_file:
         with open(log_file, "a") as f:
             f.write(line + "\n")
+
+# Session persistence: the real `opencode serve` keeps its sessions across a
+# restart, so the supervised session id survives stop/restart. A restarted fake
+# reloads the ids it (or a previous fake) created from the control dir.
+sessions = set()
+if ctrl:
+    try:
+        with open(os.path.join(ctrl, "sessions.json")) as f:
+            sessions = set(json.load(f))
+    except Exception:
+        sessions = set()
+
+def save_sessions():
+    if ctrl:
+        with open(os.path.join(ctrl, "sessions.json"), "w") as f:
+            json.dump(sorted(sessions), f)
+
+start_time = time.time()
+
+def slow_start_remaining():
+    path = os.path.join(ctrl, "slow_start") if ctrl else None
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        n = float(open(path).read().strip() or 0)
+    except Exception:
+        return 0
+    return max(0.0, n - (time.time() - start_time))
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -65,6 +98,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_GET(self):
+        if slow_start_remaining() > 0:
+            return
         if self.path == "/session/status":
             return self._send(200, b"{}")
         m = re.fullmatch(r"/session/(ses_[A-Za-z0-9_]+)", self.path)
@@ -77,6 +112,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
+        if slow_start_remaining() > 0:
+            return
         try:
             body = json.loads(raw or b"{}")
         except ValueError:
@@ -86,7 +123,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(400, b'{"_tag":"BadRequest"}')
             with lock:
                 sid = "ses_fake%d" % (len(sessions) + 1)
-                sessions[sid] = []
+                sessions.add(sid)
+            save_sessions()
             return self._send(200, json.dumps({"id": sid}).encode())
         m = re.fullmatch(r"/session/(ses_[A-Za-z0-9_]+)/prompt_async", self.path)
         if m:

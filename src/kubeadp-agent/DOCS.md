@@ -445,7 +445,7 @@ Job statuses: `running`, `done`, `failed`, `self-terminated`, `killed`, `incompl
 ### 5.4 Session Management Endpoints (Orchestrator)
 
 - `GET /api/v1/sessions`: Lists all supervised sessions and their current process state.
-- `GET /api/v1/sessions/{name}`: Returns state and configuration for a specific session.
+- `GET /api/v1/sessions/{name}`: Returns state and configuration for a specific session. The response additionally carries `engine_ready` (a boolean) for engines with a warm-up (opencode) and omits it otherwise.
 - `POST /api/v1/sessions/{name}/start`: Starts a stopped session.
 - `POST /api/v1/sessions/{name}/stop`: Halts a running session.
 - `POST /api/v1/sessions/{name}/restart`: Restarts a session process group.
@@ -458,7 +458,8 @@ Job statuses: `running`, `done`, `failed`, `self-terminated`, `killed`, `incompl
 | Body not JSON / no `text` / empty after trim | `400` | `invalid_body` |
 | Trimmed text exceeds `8192` bytes | `413` | `too_large` |
 | Unknown session | `404` | — |
-| Session stopped/paused or no live PTY | `409` | `not_running` |
+| Session stopped/paused or no live PTY (or a server-backed engine dead/missing) | `409` | `not_running` |
+| Server-backed engine still warming up (cold start) | `503` | `not_ready` (retryable) |
 | More than `30` messages per minute for the (session, sender) pair | `429` (`Retry-After`) | `rate_limited` |
 
 The message is delivered per the session's engine (HL-91 E5): a claude

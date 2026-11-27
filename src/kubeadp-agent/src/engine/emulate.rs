@@ -882,8 +882,20 @@ impl Engine for EmulatingEngine {
         &self,
         session: &crate::engine::SessionDef,
         text: &str,
-    ) -> Option<Result<(), String>> {
+    ) -> Option<crate::engine::ServerDelivery> {
         self.inner.deliver_session_message(session, text)
+    }
+
+    fn after_session_spawn(
+        &self,
+        session: &crate::engine::SessionDef,
+        stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.inner.after_session_spawn(session, stop)
+    }
+
+    fn engine_ready(&self, session: &crate::engine::SessionDef) -> Option<bool> {
+        self.inner.engine_ready(session)
     }
 
     fn materialize_instructions(

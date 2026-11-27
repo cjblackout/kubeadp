@@ -38,6 +38,9 @@ pub fn outcome_to_error(outcome: DeliverOutcome, run: &Run) -> Result<(), Engine
         DeliverOutcome::RateLimited { retry_after_secs } => Err(EngineError::Conflict(format!(
             "message rate limit reached; retry after {retry_after_secs}s"
         ))),
+        DeliverOutcome::NotReady => Err(EngineError::Conflict(
+            "the session engine is still starting; retry the call".to_string(),
+        )),
         DeliverOutcome::NotRunning => Err(EngineError::Internal(
             "session has no live PTY (stopped or paused)".to_string(),
         )),
