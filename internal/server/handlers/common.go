@@ -52,6 +52,11 @@ func clientsetFromContext(ctx context.Context, defaultClientset kubernetes.Inter
 	return defaultClientset
 }
 
+// allowLoopbackWorkers lets validateServerURL accept loopback hosts. It is false
+// in production and is switched on only by the handler tests, which run the
+// worker as a local fake.
+var allowLoopbackWorkers bool
+
 // validateServerURL ensures the URL points to an in-cluster Kubernetes service.
 // This prevents SSRF if the Agent status is tampered with (e.g., via direct
 // status patch or a compromised controller).
@@ -64,7 +69,7 @@ func validateServerURL(rawURL string, clusterDomain string) error {
 		return fmt.Errorf("URL scheme must be http, got %q", u.Scheme)
 	}
 	host := u.Hostname()
-	if host == "127.0.0.1" || host == "localhost" {
+	if allowLoopbackWorkers && (host == "127.0.0.1" || host == "localhost") {
 		return nil
 	}
 	if !strings.HasSuffix(host, ".svc."+clusterDomain) {
