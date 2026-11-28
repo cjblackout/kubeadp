@@ -15,10 +15,13 @@ function AgentTemplateCreatePage() {
 
   const [name, setName] = useState('');
   const [selectedNamespace, setSelectedNamespace] = useState('');
+  const [engine, setEngine] = useState<'opencode' | 'agy' | 'claude' | ''>('');
   const [workspaceDir, setWorkspaceDir] = useState('');
   const [serviceAccountName, setServiceAccountName] = useState('');
-  const [agentImage, setAgentImage] = useState('');
+  const [kubeadpImage, setKubeadpImage] = useState('');
   const [executorImage, setExecutorImage] = useState('');
+  const [defaultModel, setDefaultModel] = useState('');
+  const [maxParallel, setMaxParallel] = useState('');
 
   const { data: namespacesData } = useQuery({
     queryKey: ['namespaces'],
@@ -47,10 +50,17 @@ function AgentTemplateCreatePage() {
     e.preventDefault();
 
     const data: CreateAgentTemplateRequest = { name };
+    if (engine) data.engine = engine;
     if (workspaceDir) data.workspaceDir = workspaceDir;
     if (serviceAccountName) data.serviceAccountName = serviceAccountName;
-    if (agentImage) data.agentImage = agentImage;
+    if (kubeadpImage) data.kubeadpImage = kubeadpImage;
     if (executorImage) data.executorImage = executorImage;
+    if (defaultModel || maxParallel) {
+      data.worker = {
+        defaultModel: defaultModel || undefined,
+        maxParallel: maxParallel ? parseInt(maxParallel, 10) : undefined,
+      };
+    }
 
     createMutation.mutate(data);
   };
@@ -92,24 +102,42 @@ function AgentTemplateCreatePage() {
             </div>
           )}
 
-          {/* Name */}
-          <div>
-            <label htmlFor="name" className={labelClass}>Name</label>
-            <input
-              type="text"
-              id="name"
-              value={name}
-              onChange={(e) => {
-                const sanitized = e.target.value
-                  .toLowerCase()
-                  .replace(/\s+/g, '-')
-                  .replace(/[^a-z0-9\-.]/g, '');
-                setName(sanitized);
-              }}
-              required
-              placeholder="my-template"
-              className={inputClass}
-            />
+          {/* Name & Engine */}
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="name" className={labelClass}>Name</label>
+              <input
+                type="text"
+                id="name"
+                value={name}
+                onChange={(e) => {
+                  const sanitized = e.target.value
+                    .toLowerCase()
+                    .replace(/\s+/g, '-')
+                    .replace(/[^a-z0-9\-.]/g, '');
+                  setName(sanitized);
+                }}
+                required
+                placeholder="my-template"
+                className={inputClass}
+              />
+            </div>
+            <div>
+              <label htmlFor="engine" className={labelClass}>
+                Default AI Engine <span className="normal-case tracking-normal text-stone-300">(optional)</span>
+              </label>
+              <select
+                id="engine"
+                value={engine}
+                onChange={(e) => setEngine(e.target.value as any)}
+                className={inputClass}
+              >
+                <option value="">Default (opencode)</option>
+                <option value="opencode">OpenCode</option>
+                <option value="agy">Antigravity (agy)</option>
+                <option value="claude">Claude Code</option>
+              </select>
+            </div>
           </div>
 
           {/* Workspace & ServiceAccount */}
@@ -147,15 +175,15 @@ function AgentTemplateCreatePage() {
           {/* Images */}
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label htmlFor="agentImage" className={labelClass}>
-                Agent Image
-                <span className="normal-case tracking-normal text-stone-300"> (init container, optional)</span>
+              <label htmlFor="kubeadpImage" className={labelClass}>
+                KubeADP Image
+                <span className="normal-case tracking-normal text-stone-300"> (worker daemon & tool bundle, optional)</span>
               </label>
               <input
                 type="text"
-                id="agentImage"
-                value={agentImage}
-                onChange={(e) => setAgentImage(e.target.value)}
+                id="kubeadpImage"
+                value={kubeadpImage}
+                onChange={(e) => setKubeadpImage(e.target.value)}
                 placeholder="ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.64"
                 className={monoInputClass}
               />
@@ -172,6 +200,39 @@ function AgentTemplateCreatePage() {
                 onChange={(e) => setExecutorImage(e.target.value)}
                 placeholder="ghcr.io/kubeopencode/kubeopencode-agent-devbox:latest"
                 className={monoInputClass}
+              />
+            </div>
+          </div>
+
+          {/* Worker Defaults */}
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="defaultModel" className={labelClass}>
+                Default Model
+                <span className="normal-case tracking-normal text-stone-300"> (optional)</span>
+              </label>
+              <input
+                type="text"
+                id="defaultModel"
+                value={defaultModel}
+                onChange={(e) => setDefaultModel(e.target.value)}
+                placeholder="claude-3-5-sonnet-20241022"
+                className={monoInputClass}
+              />
+            </div>
+            <div>
+              <label htmlFor="maxParallel" className={labelClass}>
+                Max Parallel Jobs
+                <span className="normal-case tracking-normal text-stone-300"> (optional)</span>
+              </label>
+              <input
+                type="number"
+                id="maxParallel"
+                value={maxParallel}
+                onChange={(e) => setMaxParallel(e.target.value)}
+                min="1"
+                placeholder="4"
+                className={inputClass}
               />
             </div>
           </div>

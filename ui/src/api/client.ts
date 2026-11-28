@@ -159,6 +159,8 @@ export interface AssemblyPluginInput {
 
 export interface CreateAgentTemplateRequest {
   name: string;
+  engine?: 'opencode' | 'agy' | 'claude';
+  worker?: WorkerConfigInput;
   workspaceDir?: string;
   serviceAccountName?: string;
   agentImage?: string;
@@ -168,9 +170,90 @@ export interface CreateAgentTemplateRequest {
   plugins?: AssemblyPluginInput[];
 }
 
+export interface WorkerCapacityStatus {
+  maxParallel?: number;
+  running?: number;
+}
+
+export interface WorkerDiskStatus {
+  totalBytes?: number;
+  freeBytes?: number;
+}
+
+export interface WorkerEngineAuthState {
+  engine: string;
+  state: string;
+}
+
+export interface WorkerAuthStatus {
+  state?: string;
+  engines?: WorkerEngineAuthState[];
+}
+
+export interface WorkerCapability {
+  engine: string;
+  transport?: string;
+  endpoints?: Record<string, string>;
+}
+
+export interface WorkerQuotaStatus {
+  group: string;
+  window?: string;
+  remainingPercent?: number;
+  resetsAt?: string;
+}
+
+export interface WorkerProjectStatus {
+  name: string;
+  branch?: string;
+  head?: string;
+  lastSync?: string;
+  jobs?: number;
+}
+
+export interface WorkerRemoteControlStatus {
+  enabled?: boolean;
+  state?: string;
+}
+
+export interface WorkerStatus {
+  version?: string;
+  ready?: boolean;
+  lastSyncTime?: string;
+  capacity?: WorkerCapacityStatus;
+  disk?: WorkerDiskStatus;
+  auth?: WorkerAuthStatus;
+  capabilities?: WorkerCapability[];
+  models?: string[];
+  quota?: WorkerQuotaStatus[];
+  projects?: WorkerProjectStatus[];
+  remoteControl?: WorkerRemoteControlStatus;
+}
+
+export interface WorkerConfigInput {
+  maxParallel?: number;
+  gcMaxAgeDays?: number;
+  stallMinutes?: number;
+  launchTimeoutSecs?: number;
+  shutdownGraceSecs?: number;
+  defaultModel?: string;
+  defaultEffort?: string;
+  defaultBaseBranch?: string;
+  defaultEngine?: 'opencode' | 'agy' | 'claude';
+  maxRuntime?: string;
+  jobsDirName?: string;
+  reposRoot?: string;
+  sandbox?: {
+    roPaths?: string[];
+    envAllow?: string[];
+  };
+}
+
 export interface CreateAgentRequest {
   name: string;
   profile?: string;
+  engine?: 'opencode' | 'agy' | 'claude';
+  worker?: WorkerConfigInput;
   templateRef?: AgentReference;
   workspaceDir?: string;
   serviceAccountName?: string;
@@ -338,6 +421,8 @@ export interface Agent {
   name: string;
   namespace: string;
   profile?: string;
+  engine?: 'opencode' | 'agy' | 'claude';
+  worker?: WorkerConfigInput;
   templateRef?: AgentReference;
   executorImage?: string;
   kubeadpImage?: string;
@@ -361,11 +446,14 @@ export interface Agent {
   share?: ShareStatusInfo;
   conditions?: Condition[];
   serverStatus?: ServerStatusInfo;
+  workerStatus?: WorkerStatus;
 }
 
 export interface AgentTemplate {
   name: string;
   namespace: string;
+  engine?: 'opencode' | 'agy' | 'claude';
+  worker?: WorkerConfigInput;
   agentImage?: string;
   kubeadpImage?: string;
   executorImage?: string;

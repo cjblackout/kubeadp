@@ -16,6 +16,7 @@ function AgentCreatePage() {
 
   // Basic fields
   const [name, setName] = useState('');
+  const [engine, setEngine] = useState<'opencode' | 'agy' | 'claude' | ''>('');
   const [profile, setProfile] = useState('');
   const [workspaceDir, setWorkspaceDir] = useState('');
   const [serviceAccountName, setServiceAccountName] = useState('');
@@ -23,8 +24,19 @@ function AgentCreatePage() {
   const [selectedTemplate, setSelectedTemplate] = useState('');
 
   // P0: Images
-  const [agentImage, setAgentImage] = useState('');
+  const [kubeadpImage, setKubeadpImage] = useState('');
   const [executorImage, setExecutorImage] = useState('');
+
+  // Worker Config
+  const [maxParallel, setMaxParallel] = useState('');
+  const [gcMaxAgeDays, setGcMaxAgeDays] = useState('');
+  const [stallMinutes, setStallMinutes] = useState('');
+  const [defaultModel, setDefaultModel] = useState('');
+  const [defaultEffort, setDefaultEffort] = useState('');
+  const [defaultBaseBranch, setDefaultBaseBranch] = useState('');
+  const [maxRuntime, setMaxRuntime] = useState('');
+  const [sandboxROPaths, setSandboxROPaths] = useState('');
+  const [sandboxEnvAllow, setSandboxEnvAllow] = useState('');
 
   // P1: Common configuration
   const [maxConcurrentTasks, setMaxConcurrentTasks] = useState('');
@@ -81,7 +93,7 @@ function AgentCreatePage() {
   useEffect(() => {
     setWorkspaceDir('');
     setServiceAccountName('');
-    setAgentImage('');
+    setKubeadpImage('');
     setExecutorImage('');
   }, [selectedTemplate]);
 
@@ -101,6 +113,7 @@ function AgentCreatePage() {
 
     const agent: CreateAgentRequest = { name };
 
+    if (engine) agent.engine = engine;
     if (profile) agent.profile = profile;
 
     if (selectedTemplate) {
@@ -113,8 +126,27 @@ function AgentCreatePage() {
     // Only send fields if user explicitly set them (override)
     if (workspaceDir) agent.workspaceDir = workspaceDir;
     if (serviceAccountName) agent.serviceAccountName = serviceAccountName;
-    if (agentImage) agent.agentImage = agentImage;
+    if (kubeadpImage) agent.kubeadpImage = kubeadpImage;
     if (executorImage) agent.executorImage = executorImage;
+
+    // Worker config
+    const workerConfig: any = {};
+    if (maxParallel) workerConfig.maxParallel = parseInt(maxParallel, 10);
+    if (gcMaxAgeDays) workerConfig.gcMaxAgeDays = parseInt(gcMaxAgeDays, 10);
+    if (stallMinutes) workerConfig.stallMinutes = parseInt(stallMinutes, 10);
+    if (defaultModel) workerConfig.defaultModel = defaultModel;
+    if (defaultEffort) workerConfig.defaultEffort = defaultEffort;
+    if (defaultBaseBranch) workerConfig.defaultBaseBranch = defaultBaseBranch;
+    if (maxRuntime) workerConfig.maxRuntime = maxRuntime;
+    if (sandboxROPaths || sandboxEnvAllow) {
+      workerConfig.sandbox = {
+        roPaths: sandboxROPaths ? sandboxROPaths.split('\n').map(s => s.trim()).filter(Boolean) : undefined,
+        envAllow: sandboxEnvAllow ? sandboxEnvAllow.split('\n').map(s => s.trim()).filter(Boolean) : undefined,
+      };
+    }
+    if (Object.keys(workerConfig).length > 0) {
+      agent.worker = workerConfig;
+    }
 
     // P1
     if (maxConcurrentTasks) {
@@ -203,24 +235,42 @@ function AgentCreatePage() {
             </p>
           </div>
 
-          {/* Name */}
-          <div>
-            <label htmlFor="name" className={labelClass}>Name</label>
-            <input
-              type="text"
-              id="name"
-              value={name}
-              onChange={(e) => {
-                const sanitized = e.target.value
-                  .toLowerCase()
-                  .replace(/\s+/g, '-')
-                  .replace(/[^a-z0-9\-.]/g, '');
-                setName(sanitized);
-              }}
-              required
-              placeholder="my-agent"
-              className={inputClass}
-            />
+          {/* Name & Engine */}
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="name" className={labelClass}>Name</label>
+              <input
+                type="text"
+                id="name"
+                value={name}
+                onChange={(e) => {
+                  const sanitized = e.target.value
+                    .toLowerCase()
+                    .replace(/\s+/g, '-')
+                    .replace(/[^a-z0-9\-.]/g, '');
+                  setName(sanitized);
+                }}
+                required
+                placeholder="my-agent"
+                className={inputClass}
+              />
+            </div>
+            <div>
+              <label htmlFor="engine" className={labelClass}>
+                AI Engine <span className="normal-case tracking-normal text-stone-300">(default: opencode)</span>
+              </label>
+              <select
+                id="engine"
+                value={engine}
+                onChange={(e) => setEngine(e.target.value as any)}
+                className={inputClass}
+              >
+                <option value="">Default (opencode)</option>
+                <option value="opencode">OpenCode</option>
+                <option value="agy">Antigravity (agy)</option>
+                <option value="claude">Claude Code</option>
+              </select>
+            </div>
           </div>
 
           {/* Workspace & ServiceAccount */}
@@ -258,23 +308,23 @@ function AgentCreatePage() {
           {/* P0: Images */}
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label htmlFor="agentImage" className={labelClass}>
-                Agent Image{inheritedHint}
-                <span className="normal-case tracking-normal text-stone-300"> (init container)</span>
+              <label htmlFor="kubeadpImage" className={labelClass}>
+                KubeADP Image{inheritedHint}
+                <span className="normal-case tracking-normal text-stone-300"> (worker daemon & tool bundle)</span>
               </label>
               <input
                 type="text"
-                id="agentImage"
-                value={agentImage}
-                onChange={(e) => setAgentImage(e.target.value)}
-                placeholder={hasTemplate && templateDetail?.agentImage ? templateDetail.agentImage : 'ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.64'}
+                id="kubeadpImage"
+                value={kubeadpImage}
+                onChange={(e) => setKubeadpImage(e.target.value)}
+                placeholder={hasTemplate && (templateDetail?.kubeadpImage || templateDetail?.agentImage) ? (templateDetail.kubeadpImage || templateDetail.agentImage) : 'ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.64'}
                 className={monoInputClass}
               />
             </div>
             <div>
               <label htmlFor="executorImage" className={labelClass}>
                 Executor Image{inheritedHint}
-                <span className="normal-case tracking-normal text-stone-300"> (worker container)</span>
+                <span className="normal-case tracking-normal text-stone-300"> (custom tools / runtime)</span>
               </label>
               <input
                 type="text"
@@ -336,6 +386,114 @@ function AgentCreatePage() {
                   className={monoInputClass}
                 />
                 <p className="mt-1 text-xs text-stone-400">Auto-suspend after idle, auto-resume on new task</p>
+              </div>
+            </div>
+
+            {/* Worker Defaults & Sandbox */}
+            <div className="mt-4 border-t border-stone-100 pt-4">
+              <h4 className="text-[11px] font-display font-medium text-stone-500 uppercase tracking-wider mb-3">
+                Worker Daemon Configuration
+              </h4>
+              <div className="grid grid-cols-3 gap-4 mb-3">
+                <div>
+                  <label htmlFor="maxParallel" className={labelClass}>Max Parallel Jobs</label>
+                  <input
+                    type="number"
+                    id="maxParallel"
+                    value={maxParallel}
+                    onChange={(e) => setMaxParallel(e.target.value)}
+                    min="1"
+                    placeholder="4"
+                    className={inputClass}
+                  />
+                </div>
+                <div>
+                  <label htmlFor="gcMaxAgeDays" className={labelClass}>GC Max Age (Days)</label>
+                  <input
+                    type="number"
+                    id="gcMaxAgeDays"
+                    value={gcMaxAgeDays}
+                    onChange={(e) => setGcMaxAgeDays(e.target.value)}
+                    min="1"
+                    placeholder="7"
+                    className={inputClass}
+                  />
+                </div>
+                <div>
+                  <label htmlFor="stallMinutes" className={labelClass}>Stall Minutes</label>
+                  <input
+                    type="number"
+                    id="stallMinutes"
+                    value={stallMinutes}
+                    onChange={(e) => setStallMinutes(e.target.value)}
+                    min="1"
+                    placeholder="15"
+                    className={inputClass}
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-4 mb-3">
+                <div>
+                  <label htmlFor="defaultModel" className={labelClass}>Default Model</label>
+                  <input
+                    type="text"
+                    id="defaultModel"
+                    value={defaultModel}
+                    onChange={(e) => setDefaultModel(e.target.value)}
+                    placeholder="e.g. claude-3-5-sonnet-20241022"
+                    className={monoInputClass}
+                  />
+                </div>
+                <div>
+                  <label htmlFor="defaultEffort" className={labelClass}>Default Effort</label>
+                  <input
+                    type="text"
+                    id="defaultEffort"
+                    value={defaultEffort}
+                    onChange={(e) => setDefaultEffort(e.target.value)}
+                    placeholder="low, medium, high"
+                    className={monoInputClass}
+                  />
+                </div>
+                <div>
+                  <label htmlFor="maxRuntime" className={labelClass}>Max Runtime</label>
+                  <input
+                    type="text"
+                    id="maxRuntime"
+                    value={maxRuntime}
+                    onChange={(e) => setMaxRuntime(e.target.value)}
+                    placeholder="e.g. 2h, 45m"
+                    className={monoInputClass}
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label htmlFor="sandboxROPaths" className={labelClass}>
+                    Sandbox Read-Only Paths <span className="normal-case tracking-normal text-stone-300">(one per line)</span>
+                  </label>
+                  <textarea
+                    id="sandboxROPaths"
+                    value={sandboxROPaths}
+                    onChange={(e) => setSandboxROPaths(e.target.value)}
+                    rows={2}
+                    placeholder="/opt/tools&#10;/etc/ssl"
+                    className={monoInputClass}
+                  />
+                </div>
+                <div>
+                  <label htmlFor="sandboxEnvAllow" className={labelClass}>
+                    Sandbox Allowed Env <span className="normal-case tracking-normal text-stone-300">(one per line)</span>
+                  </label>
+                  <textarea
+                    id="sandboxEnvAllow"
+                    value={sandboxEnvAllow}
+                    onChange={(e) => setSandboxEnvAllow(e.target.value)}
+                    rows={2}
+                    placeholder="PATH&#10;HOME"
+                    className={monoInputClass}
+                  />
+                </div>
               </div>
             </div>
 
