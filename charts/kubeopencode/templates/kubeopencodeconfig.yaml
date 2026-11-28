@@ -11,9 +11,7 @@ spec:
   {{- end }}
   {{- if .Values.kubeopencodeConfig.systemImage }}
   systemImage:
-    {{- if .Values.kubeopencodeConfig.systemImage.image }}
-    image: {{ .Values.kubeopencodeConfig.systemImage.image | quote }}
-    {{- end }}
+    image: {{ .Values.kubeopencodeConfig.systemImage.image | default (include "kubeopencode.controller.image" .) | quote }}
     {{- if .Values.kubeopencodeConfig.systemImage.imagePullPolicy }}
     imagePullPolicy: {{ .Values.kubeopencodeConfig.systemImage.imagePullPolicy }}
     {{- end }}
