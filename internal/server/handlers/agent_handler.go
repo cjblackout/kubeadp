@@ -280,6 +280,9 @@ func agentToResponse(agent *kubeopenv1alpha1.Agent) types.AgentResponse {
 	resp.PluginsCount = len(agent.Spec.Plugins)
 	resp.Plugins = pluginsToInfo(agent.Spec.Plugins)
 	resp.Config = rawExtensionToMap(agent.Spec.Config)
+	resp.Engine = agent.Spec.Engine
+	resp.Worker = agent.Spec.Worker
+	resp.WorkerStatus = agent.Status.Worker
 
 	return resp
 }
@@ -416,6 +419,13 @@ func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Plugins) > 0 {
 		agent.Spec.Plugins = req.Plugins
+	}
+
+	if req.Engine != nil {
+		agent.Spec.Engine = req.Engine
+	}
+	if req.Worker != nil {
+		agent.Spec.Worker = req.Worker
 	}
 
 	if err := k8sClient.Create(ctx, agent); err != nil {

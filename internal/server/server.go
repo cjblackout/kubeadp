@@ -326,6 +326,53 @@ func (s *Server) setupRoutes() *chi.Mux {
 			// Agent terminal - WebSocket terminal to agent server pods
 			agentTerminalHandler := handlers.NewAgentTerminalHandler(s.k8sClient, s.clientset, s.restConfig)
 			r.Get("/{name}/terminal", agentTerminalHandler.ServeTerminal)
+
+			// Agent Worker endpoints (M6)
+			agentWorkerHandler := handlers.NewAgentWorkerHandler(s.k8sClient, s.clusterDomain)
+			r.Route("/{name}/worker", func(wr chi.Router) {
+				// Read worker info (SAR get agents)
+				wr.Group(func(gr chi.Router) {
+					gr.Use(func(next http.Handler) http.Handler {
+						return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							ns := chi.URLParam(r, "namespace")
+							if !RequireSubjectAccess(w, r, s.clientset, ns, "agents", "get", "") {
+								return
+							}
+							next.ServeHTTP(w, r)
+						})
+					})
+					gr.Get("/info", agentWorkerHandler.Info)
+					gr.Get("/capabilities", agentWorkerHandler.Capabilities)
+					gr.Get("/models", agentWorkerHandler.Models)
+					gr.Get("/quota", agentWorkerHandler.Quota)
+					gr.Get("/projects", agentWorkerHandler.Projects)
+					gr.Get("/jobs", agentWorkerHandler.Jobs)
+					gr.Get("/auth/status", agentWorkerHandler.AuthStatus)
+					gr.Get("/remote-control/status", agentWorkerHandler.RemoteControlStatus)
+				})
+
+				// Mutation worker operations (SAR patch agents)
+				wr.Group(func(pr chi.Router) {
+					pr.Use(func(next http.Handler) http.Handler {
+						return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							ns := chi.URLParam(r, "namespace")
+							if !RequireSubjectAccess(w, r, s.clientset, ns, "agents", "patch", "") {
+								return
+							}
+							next.ServeHTTP(w, r)
+						})
+					})
+					pr.Post("/auth/start", agentWorkerHandler.AuthStart)
+					pr.Post("/auth/code", agentWorkerHandler.AuthCode)
+					pr.Post("/auth/cancel", agentWorkerHandler.AuthCancel)
+					pr.Post("/remote-control/enable", agentWorkerHandler.RemoteControlEnable)
+					pr.Post("/remote-control/disable", agentWorkerHandler.RemoteControlDisable)
+					pr.Post("/gc", agentWorkerHandler.GC)
+					pr.Post("/init", agentWorkerHandler.Init)
+					pr.Post("/jobs/repair", agentWorkerHandler.RepairJobs)
+					pr.Post("/jobsets/{id}/end", agentWorkerHandler.JobsetEnd)
+				})
+			})
 		})
 
 	})

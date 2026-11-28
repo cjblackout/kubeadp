@@ -226,6 +226,12 @@ func (h *AgentTemplateHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if len(req.Plugins) > 0 {
 		tmpl.Spec.Plugins = req.Plugins
 	}
+	if req.Engine != nil {
+		tmpl.Spec.Engine = req.Engine
+	}
+	if req.Worker != nil {
+		tmpl.Spec.Worker = req.Worker
+	}
 
 	if err := k8sClient.Create(ctx, tmpl); err != nil {
 		if apierrors.IsAlreadyExists(err) {
@@ -325,6 +331,8 @@ func templateToResponse(tmpl *kubeopenv1alpha1.AgentTemplate) types.AgentTemplat
 		Credentials:        credentialsToInfo(tmpl.Spec.Credentials),
 		Contexts:           contextsToItems(tmpl.Spec.Contexts),
 		Skills:             skillsToInfo(tmpl.Spec.Skills),
+		Engine:             tmpl.Spec.Engine,
+		Worker:             tmpl.Spec.Worker,
 	}
 }
 
