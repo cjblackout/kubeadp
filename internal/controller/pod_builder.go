@@ -47,6 +47,8 @@ type agentConfig struct {
 	serverReady           bool                                       // Whether Agent server is ready (from status)
 	extraEnv              []corev1.EnvVar                            // Extra env vars injected into ALL containers
 	systemContainers      *kubeopenv1alpha1.SystemContainerOverrides // Per-container-type env/mount overrides
+	engine                *kubeopenv1alpha1.AgentEngine              // Execution engine (opencode, agy, claude)
+	worker                *kubeopenv1alpha1.WorkerConfig             // Typed worker config
 }
 
 // ResolveAgentConfig extracts configuration from the Agent spec.
@@ -73,6 +75,8 @@ func ResolveAgentConfig(agent *kubeopenv1alpha1.Agent) agentConfig {
 		persistence:        agent.Spec.Persistence,
 		suspend:            agent.Spec.Suspend,
 		serverReady:        agent.Status.Ready,
+		engine:             agent.Spec.Engine,
+		worker:             agent.Spec.Worker,
 	}
 	if agent.Spec.ExecutorImage != "" {
 		cfg.executorImage = agent.Spec.ExecutorImage

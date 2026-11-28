@@ -93,6 +93,8 @@ func MergeAgentWithTemplate(agent *kubeopenv1alpha1.Agent, tmpl *kubeopenv1alpha
 		persistence:      agent.Spec.Persistence,
 		suspend:          agent.Spec.Suspend,
 		serverReady:      agent.Status.Ready,
+		engine:           firstNonNilPtr(agent.Spec.Engine, tmpl.Spec.Engine),
+		worker:           func() *kubeopenv1alpha1.WorkerConfig { m := MergeWorkerConfigs(agent.Spec.Worker, tmpl.Spec.Worker, nil); return &m }(),
 	}
 
 	// Populate extraEnv and systemContainers from the merged podSpec.
