@@ -248,7 +248,7 @@ func TestBuildPod_BasicTask(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -372,7 +372,7 @@ func TestBuildPod_WithCredentials(t *testing.T) {
 	mountPath := "/home/agent/.ssh/id_rsa"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -456,7 +456,7 @@ func TestBuildPod_WithEntireSecretCredential(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -503,7 +503,7 @@ func TestBuildPod_WithMixedCredentials(t *testing.T) {
 	envName := "GITHUB_TOKEN"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -576,7 +576,7 @@ func TestBuildPod_WithEntireSecretAsDirectory(t *testing.T) {
 	var fileMode int32 = 0400
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -660,7 +660,7 @@ func TestBuildPod_WithPodScheduling(t *testing.T) {
 
 	runtimeClass := "gvisor"
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -729,7 +729,7 @@ func TestBuildPod_WithPodSpecAnnotations(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -773,7 +773,7 @@ func TestBuildPod_WithoutPodSpecAnnotations(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -798,7 +798,7 @@ func TestBuildPod_WithContextConfigMap(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -899,7 +899,7 @@ func TestBuildPod_WithDirMounts(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -992,7 +992,7 @@ func TestBuildPod_WithGitMounts(t *testing.T) {
 	}
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -1012,15 +1012,15 @@ func TestBuildPod_WithGitMounts(t *testing.T) {
 
 	pod := buildPod(task, "test-task-pod", cfg, nil, nil, nil, gitMounts, defaultSystemConfig(), "")
 
-	// Verify init containers exist (opencode-init first, then git-init-0)
+	// Verify init containers exist (kubeadp-init first, then git-init-0)
 	if len(pod.Spec.InitContainers) != 2 {
-		t.Fatalf("Expected 2 init containers (opencode-init + git-init), got %d", len(pod.Spec.InitContainers))
+		t.Fatalf("Expected 2 init containers (kubeadp-init + git-init), got %d", len(pod.Spec.InitContainers))
 	}
 
-	// First init container should be opencode-init
+	// First init container should be kubeadp-init
 	openCodeInit := pod.Spec.InitContainers[0]
-	if openCodeInit.Name != "opencode-init" {
-		t.Errorf("First init container name = %q, want %q", openCodeInit.Name, "opencode-init")
+	if openCodeInit.Name != "kubeadp-init" {
+		t.Errorf("First init container name = %q, want %q", openCodeInit.Name, "kubeadp-init")
 	}
 
 	// Second init container should be git-init-0
@@ -1113,7 +1113,7 @@ func TestBuildPod_WithGitMountsAndAuth(t *testing.T) {
 	}
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -1133,7 +1133,7 @@ func TestBuildPod_WithGitMountsAndAuth(t *testing.T) {
 
 	pod := buildPod(task, "test-task-pod", cfg, nil, nil, nil, gitMounts, defaultSystemConfig(), "")
 
-	// Verify we have 2 init containers (opencode-init + git-init)
+	// Verify we have 2 init containers (kubeadp-init + git-init)
 	if len(pod.Spec.InitContainers) != 2 {
 		t.Fatalf("Expected 2 init containers, got %d", len(pod.Spec.InitContainers))
 	}
@@ -1453,7 +1453,7 @@ func TestBuildPod_WithExternalFileMounts(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -1629,7 +1629,7 @@ func TestBuildPod_WithOpenCodeConfig(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -1708,7 +1708,7 @@ func TestBuildPod_WithoutOpenCodeConfig(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -1780,7 +1780,7 @@ func TestBuildPod_SkillsOnly_MountsToolsVolume(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -1833,7 +1833,7 @@ func TestBuildPod_ServerPluginsOnly_MountsToolsVolume(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -1881,7 +1881,7 @@ func TestBuildPod_TUIPluginsOnly_NoToolsMount(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -1925,7 +1925,7 @@ func TestBuildPod_WithContextFile(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -1979,7 +1979,7 @@ func TestBuildPod_WithoutContextFile(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -2016,7 +2016,7 @@ func TestBuildPod_AgentRef_WithTaskSubmitCommand(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		attachImage:        "test-attach:v1.0.0",
 		workspaceDir:       "/workspace",
@@ -2062,7 +2062,7 @@ func TestBuildPod_AgentRef_WithCustomCommand_KeepsExecutorImage(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		attachImage:        "test-attach:v1.0.0",
 		command:            []string{"sh", "-c", "echo hello"},
@@ -2103,7 +2103,7 @@ func TestBuildPod_TemplateRef_WithoutAttachCommand(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -2156,7 +2156,7 @@ func TestBuildPod_SkipsOPENCODE_PERMISSIONWhenConfigHasPermission(t *testing.T) 
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -2187,7 +2187,7 @@ func TestBuildPod_SetsOPENCODE_PERMISSIONWhenConfigHasNoPermission(t *testing.T)
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -2225,7 +2225,7 @@ func TestBuildPod_SessionTitleDeterministic(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -2252,7 +2252,7 @@ func TestBuildPod_SessionTitleNotSetForCustomCommand(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -2433,7 +2433,7 @@ func TestBuildPod_WithCABundleConfigMap(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -2522,7 +2522,7 @@ func TestBuildPod_WithCABundleSecret(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -2614,7 +2614,7 @@ func TestBuildPod_WithCABundleAndGitMounts(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -2732,7 +2732,7 @@ func TestBuildPod_WithoutCABundle(t *testing.T) {
 	task.Kind = "Task"
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -3081,7 +3081,7 @@ func TestBuildPodWithProxy(t *testing.T) {
 			task.Kind = "Task"
 
 			cfg := agentConfig{
-				agentImage:         "test-opencode:v1.0.0",
+				kubeadpImage:         "test-opencode:v1.0.0",
 				executorImage:      "test-executor:v1.0.0",
 				workspaceDir:       "/workspace",
 				serviceAccountName: "test-sa",
@@ -3157,7 +3157,7 @@ func TestBuildPodWithImagePullSecrets(t *testing.T) {
 			task.Kind = "Task"
 
 			cfg := agentConfig{
-				agentImage:         "test-opencode:v1.0.0",
+				kubeadpImage:         "test-opencode:v1.0.0",
 				executorImage:      "test-executor:v1.0.0",
 				workspaceDir:       "/workspace",
 				serviceAccountName: "test-sa",
@@ -3228,7 +3228,7 @@ func TestBuildPodSecurityContext(t *testing.T) {
 		task.Kind = "Task"
 
 		cfg := agentConfig{
-			agentImage:         "test-opencode:v1.0.0",
+			kubeadpImage:         "test-opencode:v1.0.0",
 			executorImage:      "test-executor:v1.0.0",
 			workspaceDir:       "/workspace",
 			serviceAccountName: "test-sa",
@@ -3261,7 +3261,7 @@ func TestBuildPodSecurityContext(t *testing.T) {
 
 		runAsNonRoot := true
 		cfg := agentConfig{
-			agentImage:         "test-opencode:v1.0.0",
+			kubeadpImage:         "test-opencode:v1.0.0",
 			executorImage:      "test-executor:v1.0.0",
 			workspaceDir:       "/workspace",
 			serviceAccountName: "test-sa",
@@ -3299,7 +3299,7 @@ func TestBuildPodSecurityContext(t *testing.T) {
 		task.Kind = "Task"
 
 		cfg := agentConfig{
-			agentImage:         "test-opencode:v1.0.0",
+			kubeadpImage:         "test-opencode:v1.0.0",
 			executorImage:      "test-executor:v1.0.0",
 			workspaceDir:       "/workspace",
 			serviceAccountName: "test-sa",
@@ -3330,7 +3330,7 @@ func TestBuildPodSecurityContext(t *testing.T) {
 		task.Kind = "Task"
 
 		cfg := agentConfig{
-			agentImage:         "test-opencode:v1.0.0",
+			kubeadpImage:         "test-opencode:v1.0.0",
 			executorImage:      "test-executor:v1.0.0",
 			workspaceDir:       "/workspace",
 			serviceAccountName: "test-sa",
@@ -3371,7 +3371,7 @@ func TestBuildPodSecurityContext(t *testing.T) {
 		task.Kind = "Task"
 
 		cfg := agentConfig{
-			agentImage:         "test-opencode:v1.0.0",
+			kubeadpImage:         "test-opencode:v1.0.0",
 			executorImage:      "test-executor:v1.0.0",
 			workspaceDir:       "/workspace",
 			serviceAccountName: "test-sa",
@@ -3399,7 +3399,7 @@ func TestBuildPodSecurityContext(t *testing.T) {
 		var runAsUser int64 = 1000
 		var fsGroup int64 = 1000
 		cfg := agentConfig{
-			agentImage:         "test-opencode:v1.0.0",
+			kubeadpImage:         "test-opencode:v1.0.0",
 			executorImage:      "test-executor:v1.0.0",
 			workspaceDir:       "/workspace",
 			serviceAccountName: "test-sa",
@@ -3438,7 +3438,7 @@ func TestBuildPod_WithExtraVolumesAndMounts(t *testing.T) {
 
 	t.Run("extra volumes and mounts are applied", func(t *testing.T) {
 		cfg := agentConfig{
-			agentImage:         "test-opencode:v1.0.0",
+			kubeadpImage:         "test-opencode:v1.0.0",
 			executorImage:      "test-executor:v1.0.0",
 			workspaceDir:       "/workspace",
 			serviceAccountName: "test-sa",
@@ -3525,7 +3525,7 @@ func TestBuildPod_WithExtraVolumesAndMounts(t *testing.T) {
 
 	t.Run("no extra volumes when podSpec is nil", func(t *testing.T) {
 		cfg := agentConfig{
-			agentImage:         "test-opencode:v1.0.0",
+			kubeadpImage:         "test-opencode:v1.0.0",
 			executorImage:      "test-executor:v1.0.0",
 			workspaceDir:       "/workspace",
 			serviceAccountName: "test-sa",
@@ -3599,7 +3599,7 @@ func TestBuildPod_WithPlugins(t *testing.T) {
 	}
 
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -3668,7 +3668,7 @@ func TestBuildPod_WithTUIPlugins(t *testing.T) {
 
 	t.Run("TUI plugin sets OPENCODE_TUI_CONFIG", func(t *testing.T) {
 		cfg := agentConfig{
-			agentImage:         "test-opencode:v1.0.0",
+			kubeadpImage:         "test-opencode:v1.0.0",
 			executorImage:      "test-executor:v1.0.0",
 			workspaceDir:       "/workspace",
 			serviceAccountName: "test-sa",
@@ -3694,7 +3694,7 @@ func TestBuildPod_WithTUIPlugins(t *testing.T) {
 
 	t.Run("server-only plugins do not set OPENCODE_TUI_CONFIG", func(t *testing.T) {
 		cfg := agentConfig{
-			agentImage:         "test-opencode:v1.0.0",
+			kubeadpImage:         "test-opencode:v1.0.0",
 			executorImage:      "test-executor:v1.0.0",
 			workspaceDir:       "/workspace",
 			serviceAccountName: "test-sa",
@@ -3726,7 +3726,7 @@ func TestBuildPod_WithGitWorkspaceRoot(t *testing.T) {
 
 	t.Run("git context at workspace root uses GIT_WORKSPACE_DIR", func(t *testing.T) {
 		cfg := agentConfig{
-			agentImage:         "test-opencode:v1.0.0",
+			kubeadpImage:         "test-opencode:v1.0.0",
 			executorImage:      "test-executor:v1.0.0",
 			workspaceDir:       "/workspace",
 			serviceAccountName: "test-sa",
@@ -3793,7 +3793,7 @@ func TestBuildPod_WithGitWorkspaceRoot(t *testing.T) {
 
 	t.Run("git context at workspace root with repoPath sets GIT_REPO_SUBPATH", func(t *testing.T) {
 		cfg := agentConfig{
-			agentImage:         "test-opencode:v1.0.0",
+			kubeadpImage:         "test-opencode:v1.0.0",
 			executorImage:      "test-executor:v1.0.0",
 			workspaceDir:       "/workspace",
 			serviceAccountName: "test-sa",
@@ -4031,7 +4031,7 @@ func TestBuildPod_ExtraEnvAllContainers(t *testing.T) {
 		{Name: "MY_FLAG", Value: "enabled"},
 	}
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -4071,7 +4071,7 @@ func TestBuildPod_SystemContainers_GitInit(t *testing.T) {
 		},
 	}
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -4113,7 +4113,7 @@ func TestBuildPod_SystemContainers_OpenCodeInit(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "test-task", Namespace: "default"},
 	}
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -4149,7 +4149,7 @@ func TestBuildPod_SystemContainers_ExtraVolumeMounts(t *testing.T) {
 		},
 	}
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -4189,7 +4189,7 @@ func TestBuildPod_ExtraEnvNilWhenNotSet(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "test-task", Namespace: "default"},
 	}
 	cfg := agentConfig{
-		agentImage:         "test-opencode:v1.0.0",
+		kubeadpImage:         "test-opencode:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -4528,7 +4528,7 @@ func TestBuildPod_OTelDisabled(t *testing.T) {
 	}
 
 	cfg := agentConfig{
-		agentImage:         "test-agent:v1.0.0",
+		kubeadpImage:         "test-agent:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -4558,7 +4558,7 @@ func TestBuildPod_OTelEnabled(t *testing.T) {
 	}
 
 	cfg := agentConfig{
-		agentImage:         "test-agent:v1.0.0",
+		kubeadpImage:         "test-agent:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -4644,7 +4644,7 @@ func TestBuildPod_OTelEnableLLMTraces(t *testing.T) {
 	}
 
 	cfg := agentConfig{
-		agentImage:         "test-agent:v1.0.0",
+		kubeadpImage:         "test-agent:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",
@@ -4695,7 +4695,7 @@ func TestBuildPod_OTelEnableLLMTracesWithContextFile(t *testing.T) {
 	}
 
 	cfg := agentConfig{
-		agentImage:         "test-agent:v1.0.0",
+		kubeadpImage:         "test-agent:v1.0.0",
 		executorImage:      "test-executor:v1.0.0",
 		workspaceDir:       "/workspace",
 		serviceAccountName: "test-sa",

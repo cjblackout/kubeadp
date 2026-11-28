@@ -63,19 +63,18 @@ spec:
               agentImage:
                 description: |-
                   AgentImage specifies the OpenCode init container image.
-                  This image contains the OpenCode binary that gets copied to /tools volume.
-                  If not specified, defaults to "ghcr.io/cjblackout/kubeopencode-agent-opencode:latest".
-                type: string
-              kubeadpImage:
-                description: |-
-                  KubeadpImage specifies the kubeadp-agent init container image.
-                  This image contains the kubeadp-agent and agent-run binaries that get copied to /tools volume.
-                  If not specified, defaults to "ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.64".
+
+                  Deprecated: ignored. The kubeadp-agent image bundles the opencode CLI
+                  engine (KA-16/KA-17), so no separate opencode init container image is
+                  used any more. Kept for CRD compatibility.
                 type: string
               attachImage:
                 description: |-
                   AttachImage specifies the lightweight image used for --attach Pods.
-                  If not specified, defaults to "ghcr.io/cjblackout/kubeopencode-agent-attach:latest".
+
+                  Deprecated: ignored. Task Pods submit jobs to the Agent's kubeadp-agent
+                  worker through kubeopencode task-submit from the system image; no
+                  attach image is used any more. Kept for CRD compatibility.
                 type: string
               caBundle:
                 description: CABundle configures custom CA certificates for TLS verification.
@@ -478,7 +477,7 @@ spec:
               executorImage:
                 description: |-
                   ExecutorImage specifies the main worker container image for task execution.
-                  If not specified, defaults to "ghcr.io/cjblackout/kubeopencode-agent-devbox:latest".
+                  If not specified, defaults to the kubeadp image itself.
                 type: string
               extraPorts:
                 description: |-
@@ -538,6 +537,12 @@ spec:
                   type: object
                   x-kubernetes-map-type: atomic
                 type: array
+              kubeadpImage:
+                description: |-
+                  KubeadpImage specifies the kubeadp-agent init container image.
+                  This image contains the kubeadp-agent and agent-run binaries that get copied to /tools volume.
+                  If not specified, defaults to "ghcr.io/cjblackout/kubeopencode/kubeadp-agent:2026.11.64".
+                type: string
               maxConcurrentTasks:
                 description: |-
                   MaxConcurrentTasks provides a default concurrency limit for Agents derived from this template.

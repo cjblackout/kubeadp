@@ -2775,10 +2775,10 @@ func TestBuildServerDeployment_SystemContainers_GitSync(t *testing.T) {
 		t.Error("git-sync-0 missing SYNC_EXTRA from systemContainers.gitSync")
 	}
 
-	// The main opencode-server container must NOT have SYNC_EXTRA
+	// The main kubeadp-agent container must NOT have SYNC_EXTRA
 	mainContainer := deployment.Spec.Template.Spec.Containers[0]
 	if hasEnvVar(mainContainer.Env, "SYNC_EXTRA", "sync-only") {
-		t.Error("opencode-server should NOT have SYNC_EXTRA (git-sync-specific)")
+		t.Error("kubeadp-agent container should NOT have SYNC_EXTRA (git-sync-specific)")
 	}
 }
 

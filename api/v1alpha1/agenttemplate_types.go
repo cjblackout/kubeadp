@@ -42,8 +42,10 @@ type AgentTemplate struct {
 //   - List fields (contexts, credentials, imagePullSecrets): Agent replaces template if non-nil
 type AgentTemplateSpec struct {
 	// AgentImage specifies the OpenCode init container image.
-	// This image contains the OpenCode binary that gets copied to /tools volume.
-	// If not specified, defaults to "ghcr.io/kubeopencode/kubeopencode-agent-opencode:latest".
+	//
+	// Deprecated: ignored. The kubeadp-agent image bundles the opencode CLI
+	// engine (KA-16/KA-17), so no separate opencode init container image is
+	// used any more. Kept for CRD compatibility.
 	// +optional
 	AgentImage string `json:"agentImage,omitempty"`
 
@@ -54,12 +56,15 @@ type AgentTemplateSpec struct {
 	KubeadpImage string `json:"kubeadpImage,omitempty"`
 
 	// ExecutorImage specifies the main worker container image for task execution.
-	// If not specified, defaults to "ghcr.io/kubeopencode/kubeopencode-agent-devbox:latest".
+	// If not specified, defaults to the kubeadp image itself.
 	// +optional
 	ExecutorImage string `json:"executorImage,omitempty"`
 
 	// AttachImage specifies the lightweight image used for --attach Pods.
-	// If not specified, defaults to "ghcr.io/kubeopencode/kubeopencode-agent-attach:latest".
+	//
+	// Deprecated: ignored. Task Pods submit jobs to the Agent's kubeadp-agent
+	// worker through kubeopencode task-submit from the system image; no
+	// attach image is used any more. Kept for CRD compatibility.
 	// +optional
 	AttachImage string `json:"attachImage,omitempty"`
 
