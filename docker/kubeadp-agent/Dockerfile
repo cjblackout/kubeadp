@@ -200,6 +200,7 @@ RUN apt_update() { for i in 1 2 3 4 5 6; do apt-get -o Acquire::Retries=5 update
     echo "Downloading OpenCode v${OPENCODE_VERSION} from ${URL}..."; \
     curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors "${URL}" -o /tmp/opencode.tar.gz; \
     tar -xzf /tmp/opencode.tar.gz -C /tmp; \
+    mkdir -p /payload/usr/local/bin; \
     mv /tmp/opencode /payload/usr/local/bin/opencode; \
     chmod 755 /payload/usr/local/bin/opencode; \
     rm -f /tmp/opencode.tar.gz
