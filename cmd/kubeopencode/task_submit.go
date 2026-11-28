@@ -56,27 +56,27 @@ This is used internally by KubeOpenCode for Task Pods that reference an Agent.`,
 }
 
 var (
-	taskSubmitServerURL          string
-	taskSubmitTaskFile           string
-	taskSubmitTokenFile          string
-	taskSubmitProject            string
-	taskSubmitModel              string
-	taskSubmitEngine             string
-	taskSubmitEffort             string
-	taskSubmitGitRef             string
-	taskSubmitSandbox            bool
-	taskSubmitPlan               bool
-	taskSubmitPrintTimeout       string
-	taskSubmitMode               string
-	taskSubmitProxy              string
-	taskSubmitJobsetID           string
-	taskSubmitAddDirs            []string
-	taskSubmitHindsight          string
-	taskSubmitHindsightBank      string
-	taskSubmitHindsightQuery     string
-	taskSubmitFromPatchContent   string
-	taskSubmitTimeout            time.Duration
-	taskSubmitTermination        string
+	taskSubmitServerURL        string
+	taskSubmitTaskFile         string
+	taskSubmitTokenFile        string
+	taskSubmitProject          string
+	taskSubmitModel            string
+	taskSubmitEngine           string
+	taskSubmitEffort           string
+	taskSubmitGitRef           string
+	taskSubmitSandbox          bool
+	taskSubmitPlan             bool
+	taskSubmitPrintTimeout     string
+	taskSubmitMode             string
+	taskSubmitProxy            string
+	taskSubmitJobsetID         string
+	taskSubmitAddDirs          []string
+	taskSubmitHindsight        string
+	taskSubmitHindsightBank    string
+	taskSubmitHindsightQuery   string
+	taskSubmitFromPatchContent string
+	taskSubmitTimeout          time.Duration
+	taskSubmitTermination      string
 )
 
 func init() {

@@ -11,22 +11,22 @@ import (
 
 // AgentSessionResponse represents an AgentSession in the API.
 type AgentSessionResponse struct {
-	Name             string                             `json:"name"`
-	Namespace        string                             `json:"namespace"`
-	AgentName        string                             `json:"agentName"`
-	Engine           string                             `json:"engine,omitempty"`
-	Phase            string                             `json:"phase"`
-	PID              *int                               `json:"pid,omitempty"`
-	StartTime        *time.Time                         `json:"startTime,omitempty"`
-	UptimeSecs       int64                              `json:"uptimeSecs,omitempty"`
-	RestartCount     int                                `json:"restartCount,omitempty"`
-	LastExitReason   string                             `json:"lastExitReason,omitempty"`
-	LastHealthResult string                             `json:"lastHealthResult,omitempty"`
-	Paused           bool                               `json:"paused"`
-	Controlled       bool                               `json:"controlled"`
-	EngineReady      *bool                              `json:"engineReady,omitempty"`
-	CreatedAt        time.Time                          `json:"createdAt"`
-	Conditions       []Condition                                        `json:"conditions,omitempty"`
+	Name             string      `json:"name"`
+	Namespace        string      `json:"namespace"`
+	AgentName        string      `json:"agentName"`
+	Engine           string      `json:"engine,omitempty"`
+	Phase            string      `json:"phase"`
+	PID              *int        `json:"pid,omitempty"`
+	StartTime        *time.Time  `json:"startTime,omitempty"`
+	UptimeSecs       int64       `json:"uptimeSecs,omitempty"`
+	RestartCount     int         `json:"restartCount,omitempty"`
+	LastExitReason   string      `json:"lastExitReason,omitempty"`
+	LastHealthResult string      `json:"lastHealthResult,omitempty"`
+	Paused           bool        `json:"paused"`
+	Controlled       bool        `json:"controlled"`
+	EngineReady      *bool       `json:"engineReady,omitempty"`
+	CreatedAt        time.Time   `json:"createdAt"`
+	Conditions       []Condition `json:"conditions,omitempty"`
 }
 
 // AgentSessionListResponse represents a list of AgentSessions.

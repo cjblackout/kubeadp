@@ -294,7 +294,7 @@ func (s *Server) setupRoutes() *chi.Mux {
 		})
 
 		// AgentSession endpoints
-		agentSessionHandler := handlers.NewAgentSessionHandler(s.k8sClient, s.opts.ClusterDomain)
+		agentSessionHandler := handlers.NewAgentSessionHandler(s.k8sClient, s.clusterDomain)
 		r.Get("/agentsessions", agentSessionHandler.ListAll)
 		r.Route("/namespaces/{namespace}/agentsessions", func(r chi.Router) {
 			r.Get("/", agentSessionHandler.List)
