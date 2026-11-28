@@ -32,82 +32,82 @@ export default function TaskActionBar({ namespace, name, agentName, isCompleted 
   const retryMut = useMutation({
     mutationFn: (p?: string) => api.retryTask(namespace, name, p),
     onSuccess: () => {
-      addToast({ type: 'success', title: 'Task Retried', message: 'Action succeeded' });
+      addToast('Task Retried: Action succeeded', 'success');
       queryClient.invalidateQueries({ queryKey: ['task', namespace, name] });
     },
-    onError: (err: any) => addToast({ type: 'error', title: 'Action Failed', message: err.message }),
+    onError: (err: any) => addToast(`Action Failed: ${err.message}`, 'error'),
   });
 
   const killMut = useMutation({
     mutationFn: () => api.killTask(namespace, name),
     onSuccess: () => {
-      addToast({ type: 'success', title: 'Task Killed', message: 'Action succeeded' });
+      addToast('Task Killed: Action succeeded', 'success');
       queryClient.invalidateQueries({ queryKey: ['task', namespace, name] });
     },
-    onError: (err: any) => addToast({ type: 'error', title: 'Action Failed', message: err.message }),
+    onError: (err: any) => addToast(`Action Failed: ${err.message}`, 'error'),
   });
 
   const commitMut = useMutation({
     mutationFn: (msg: string) => api.commitTask(namespace, name, msg),
     onSuccess: () => {
-      addToast({ type: 'success', title: 'Changes Committed', message: 'Action succeeded' });
+      addToast('Changes Committed: Action succeeded', 'success');
       queryClient.invalidateQueries({ queryKey: ['task', namespace, name] });
     },
-    onError: (err: any) => addToast({ type: 'error', title: 'Action Failed', message: err.message }),
+    onError: (err: any) => addToast(`Action Failed: ${err.message}`, 'error'),
   });
 
   const discardMut = useMutation({
     mutationFn: () => api.discardTask(namespace, name, []),
     onSuccess: () => {
-      addToast({ type: 'success', title: 'Changes Discarded', message: 'Action succeeded' });
+      addToast('Changes Discarded: Action succeeded', 'success');
       queryClient.invalidateQueries({ queryKey: ['task', namespace, name] });
     },
-    onError: (err: any) => addToast({ type: 'error', title: 'Action Failed', message: err.message }),
+    onError: (err: any) => addToast(`Action Failed: ${err.message}`, 'error'),
   });
 
   const reviewMut = useMutation({
     mutationFn: () => api.reviewTask(namespace, name),
     onSuccess: () => {
-      addToast({ type: 'success', title: 'Review Triggered', message: 'Action succeeded' });
+      addToast('Review Triggered: Action succeeded', 'success');
       queryClient.invalidateQueries({ queryKey: ['task', namespace, name] });
     },
-    onError: (err: any) => addToast({ type: 'error', title: 'Action Failed', message: err.message }),
+    onError: (err: any) => addToast(`Action Failed: ${err.message}`, 'error'),
   });
 
   const interruptMut = useMutation({
     mutationFn: () => api.interruptTask(namespace, name),
     onSuccess: () => {
-      addToast({ type: 'success', title: 'Task Interrupted', message: 'Action succeeded' });
+      addToast('Task Interrupted: Action succeeded', 'success');
       queryClient.invalidateQueries({ queryKey: ['task', namespace, name] });
     },
-    onError: (err: any) => addToast({ type: 'error', title: 'Action Failed', message: err.message }),
+    onError: (err: any) => addToast(`Action Failed: ${err.message}`, 'error'),
   });
 
   const compactMut = useMutation({
     mutationFn: () => api.compactTask(namespace, name),
     onSuccess: () => {
-      addToast({ type: 'success', title: 'Task Context Compacted', message: 'Action succeeded' });
+      addToast('Task Context Compacted: Action succeeded', 'success');
       queryClient.invalidateQueries({ queryKey: ['task', namespace, name] });
     },
-    onError: (err: any) => addToast({ type: 'error', title: 'Action Failed', message: err.message }),
+    onError: (err: any) => addToast(`Action Failed: ${err.message}`, 'error'),
   });
 
   const forkMut = useMutation({
     mutationFn: () => api.forkTask(namespace, name),
     onSuccess: (res) => {
-      addToast({ type: 'success', title: 'Task Forked', message: `New job id: ${res.job_id}` });
+      addToast(`Task Forked: New job id: ${res.job_id}`, 'success');
       queryClient.invalidateQueries({ queryKey: ['task', namespace, name] });
     },
-    onError: (err: any) => addToast({ type: 'error', title: 'Action Failed', message: err.message }),
+    onError: (err: any) => addToast(`Action Failed: ${err.message}`, 'error'),
   });
 
   const messageMut = useMutation({
     mutationFn: (text: string) => api.messageTask(namespace, name, text),
     onSuccess: () => {
-      addToast({ type: 'success', title: 'Message Sent', message: 'Action succeeded' });
+      addToast('Message Sent: Action succeeded', 'success');
       queryClient.invalidateQueries({ queryKey: ['task', namespace, name] });
     },
-    onError: (err: any) => addToast({ type: 'error', title: 'Action Failed', message: err.message }),
+    onError: (err: any) => addToast(`Action Failed: ${err.message}`, 'error'),
   });
 
   const isSupported = (endpoint: string) => {
@@ -271,7 +271,7 @@ export default function TaskActionBar({ namespace, name, agentName, isCompleted 
         title="Kill Task"
         message="Are you sure you want to kill this running job?"
         confirmLabel="Kill"
-        danger
+        variant="danger"
         onConfirm={() => {
           killMut.mutate();
           setConfirmAction(null);
@@ -284,7 +284,7 @@ export default function TaskActionBar({ namespace, name, agentName, isCompleted 
         title="Discard Changes"
         message="Are you sure you want to discard all uncommitted worktree changes?"
         confirmLabel="Discard"
-        danger
+        variant="danger"
         onConfirm={() => {
           discardMut.mutate();
           setConfirmAction(null);

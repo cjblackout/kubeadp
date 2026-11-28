@@ -520,7 +520,7 @@ function CronTaskDetailPage() {
                               {task.job.status}
                             </span>
                           )}
-                          {task.job?.diff && (task.job.diff.files > 0 || task.job.diff.additions > 0 || task.job.diff.deletions > 0) && (
+                          {task.job?.diff && ((task.job.diff.files ?? 0) > 0 || (task.job.diff.additions ?? 0) > 0 || (task.job.diff.deletions ?? 0) > 0) && (
                             <span className="text-[10px] font-mono text-stone-500">
                               <span className="text-emerald-600">+{task.job.diff.additions}</span>/<span className="text-rose-600">-{task.job.diff.deletions}</span>
                             </span>

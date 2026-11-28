@@ -407,7 +407,7 @@ function TasksPage() {
                             </span>
                           )}
                         </div>
-                        {task.job?.diff && (task.job.diff.files > 0 || task.job.diff.additions > 0 || task.job.diff.deletions > 0) ? (
+                        {task.job?.diff && ((task.job.diff.files ?? 0) > 0 || (task.job.diff.additions ?? 0) > 0 || (task.job.diff.deletions ?? 0) > 0) ? (
                           <div className="flex items-center gap-1 text-[11px] font-mono">
                             <span className="text-stone-500">{task.job.diff.files} files</span>
                             <span className="text-emerald-600 font-semibold">+{task.job.diff.additions}</span>

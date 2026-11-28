@@ -505,6 +505,8 @@ export interface CreateAgentSessionRequest {
   instructionsFile?: string;
   sandbox?: boolean;
 }
+
+export interface AgentTemplateListResponse {
   templates: AgentTemplate[];
   total: number;
   pagination?: Pagination;
