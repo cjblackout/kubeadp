@@ -474,12 +474,29 @@ func (c *Client) Diff(ctx context.Context, jobID string, stat bool) (string, err
 		q.Set("stat", "true")
 	}
 
-	var out string
-	_, err := c.do(ctx, http.MethodGet, path, q, nil, &out)
+	var raw string
+	_, err := c.do(ctx, http.MethodGet, path, q, nil, &raw)
 	if err != nil {
 		return "", err
 	}
-	return out, nil
+
+	// If worker returned JSON wrapper e.g. {"data":{"diff":"..."}}, extract diff string
+	var wrapper struct {
+		Data struct {
+			Diff string `json:"diff"`
+		} `json:"data"`
+		Diff string `json:"diff"`
+	}
+	if err := json.Unmarshal([]byte(raw), &wrapper); err == nil {
+		if wrapper.Data.Diff != "" {
+			return wrapper.Data.Diff, nil
+		}
+		if wrapper.Diff != "" {
+			return wrapper.Diff, nil
+		}
+	}
+
+	return raw, nil
 }
 
 // Files lists files in the job's worktree.

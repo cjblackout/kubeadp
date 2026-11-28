@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	kubeopenv1alpha1 "github.com/kubeopencode/kubeopencode/api/v1alpha1"
+	"github.com/kubeopencode/kubeopencode/internal/kubeadp"
 )
 
 const (
@@ -113,18 +114,16 @@ func isTaskTimedOut(task *kubeopenv1alpha1.Task) bool {
 // TaskReconciler reconciles a Task object
 type TaskReconciler struct {
 	client.Client
-	Scheme        *runtime.Scheme
-	Recorder      events.EventRecorder
-	kubeadpClient *KubeadpClient
+	Scheme   *runtime.Scheme
+	Recorder events.EventRecorder
 }
 
 // NewTaskReconciler creates a new TaskReconciler with all dependencies.
 func NewTaskReconciler(c client.Client, scheme *runtime.Scheme, recorder events.EventRecorder) *TaskReconciler {
 	return &TaskReconciler{
-		Client:        c,
-		Scheme:        scheme,
-		Recorder:      recorder,
-		kubeadpClient: NewKubeadpClient(),
+		Client:   c,
+		Scheme:   scheme,
+		Recorder: recorder,
 	}
 }
 
@@ -172,6 +171,13 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// If completed/failed, handle cleanup based on KubeOpenCodeConfig
 	if isTaskFinished(task.Status.Phase) {
 		return r.handleTaskCleanup(ctx, task)
+	}
+
+	// If task already has a job ID or pod published one, run jobSync
+	if task.Status.Job != nil && task.Status.Job.ID != "" {
+		if res, err := r.syncTaskJob(ctx, task); err != nil || res.RequeueAfter > 0 || res.Requeue {
+			return res, err
+		}
 	}
 
 	// For Running tasks: check timeout, user-initiated stop, and Pod status
@@ -637,8 +643,19 @@ func (r *TaskReconciler) updateTaskStatusFromPod(ctx context.Context, task *kube
 		log.Info("task completed", "pod", task.Status.PodName)
 		r.Recorder.Eventf(task, nil, corev1.EventTypeNormal, "Completed", "Completed", "Task completed successfully")
 		r.recordTaskDuration(task)
-		// Resolve session info from the Agent's kubeadp-agent worker (best-effort)
+		// Resolve session info and job ID from the Agent's kubeadp-agent worker (best-effort)
+		if id := jobIDFromPod(pod); id != "" {
+			if task.Status.Job == nil {
+				task.Status.Job = &kubeopenv1alpha1.JobStatus{
+					ID:     id,
+					Status: "running",
+				}
+			}
+		}
 		r.resolveSessionInfo(ctx, task, pod)
+		if task.Status.Job != nil && task.Status.Job.ID != "" {
+			_, _ = r.syncTaskJob(ctx, task)
+		}
 		return r.Status().Update(ctx, task)
 	case corev1.PodFailed:
 		task.Status.ObservedGeneration = task.Generation
@@ -656,8 +673,19 @@ func (r *TaskReconciler) updateTaskStatusFromPod(ctx context.Context, task *kube
 			r.Recorder.Eventf(task, nil, corev1.EventTypeWarning, "Failed", "Failed", "Task failed")
 		}
 		r.recordTaskDuration(task)
-		// Resolve session info from the Agent's kubeadp-agent worker (best-effort)
+		// Resolve session info and job ID from the Agent's kubeadp-agent worker (best-effort)
+		if id := jobIDFromPod(pod); id != "" {
+			if task.Status.Job == nil {
+				task.Status.Job = &kubeopenv1alpha1.JobStatus{
+					ID:     id,
+					Status: "running",
+				}
+			}
+		}
 		r.resolveSessionInfo(ctx, task, pod)
+		if task.Status.Job != nil && task.Status.Job.ID != "" {
+			_, _ = r.syncTaskJob(ctx, task)
+		}
 		return r.Status().Update(ctx, task)
 	}
 
@@ -773,7 +801,12 @@ func (r *TaskReconciler) resolveSessionInfo(ctx context.Context, task *kubeopenv
 	}
 	token := strings.TrimSpace(string(secret.Data[KubeadpAPITokenKey]))
 
-	result, err := r.kubeadpClient.GetJobResult(ctx, agent.Status.URL, token, jobID)
+	client, err := kubeadp.New(agent.Status.URL, token)
+	if err != nil {
+		log.V(1).Info("cannot initialize kubeadp client", "error", err)
+		return
+	}
+	result, err := client.Result(ctx, jobID)
 	if err != nil {
 		log.V(1).Info("cannot read job result", "jobID", jobID, "error", err)
 		return
@@ -789,6 +822,14 @@ func (r *TaskReconciler) resolveSessionInfo(ctx context.Context, task *kubeopenv
 			Reasoning: result.Usage.ReasoningTokens,
 			Cache:     result.Usage.CacheTokens,
 		},
+	}
+	if task.Status.Job == nil {
+		task.Status.Job = &kubeopenv1alpha1.JobStatus{
+			ID:     jobID,
+			Status: result.Status,
+		}
+	} else {
+		task.Status.Job.Status = result.Status
 	}
 }
 

@@ -107,6 +107,76 @@ func (w *Worker) Close() {
 	w.server.Close()
 }
 
+// AddJob registers or updates a job in the fake worker.
+func (w *Worker) AddJob(job *kubeadp.Job) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.jobs[job.JobID] = job
+}
+
+// SetResult sets the result for a job.
+func (w *Worker) SetResult(jobID string, res *kubeadp.JobResult) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.jobResults[jobID] = res
+}
+
+// SetTodos sets the todo items for a job.
+func (w *Worker) SetTodos(jobID string, todos []kubeadp.TodoItem) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.jobTodos[jobID] = todos
+}
+
+// SetDiff sets the diff text for a job.
+func (w *Worker) SetDiff(jobID string, diff string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.jobDiffs[jobID] = diff
+}
+
+// SetModels sets available models on the worker.
+func (w *Worker) SetModels(models []kubeadp.ModelEntry) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.models = models
+}
+
+// SetProjects sets projects on the worker.
+func (w *Worker) SetProjects(projects []kubeadp.ProjectEntry) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.projects = projects
+}
+
+// SetQuota sets the quota response on the worker.
+func (w *Worker) SetQuota(q *kubeadp.QuotaResponse) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.quota = q
+}
+
+// SetServerInfo sets the info snapshot on the worker.
+func (w *Worker) SetServerInfo(info *kubeadp.ServerInfo) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.serverInfo = info
+}
+
+// SetRemoteControlStatus sets remote control status on the worker.
+func (w *Worker) SetRemoteControlStatus(rc kubeadp.RemoteControlStatus) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.rcStatus = rc
+}
+
+// SetAuthStatus sets auth status on the worker.
+func (w *Worker) SetAuthStatus(auth kubeadp.AuthStatusResponse) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.authStatus = auth
+}
+
 // InjectFailure sets a forced failure for "METHOD /path".
 func (w *Worker) InjectFailure(key string, f InjectedFailure) {
 	w.mu.Lock()
@@ -576,9 +646,15 @@ func (w *Worker) handleJobSubroute(rw http.ResponseWriter, req *http.Request, p,
 	case m == http.MethodPost && action == "revert":
 		w.writeJSON(rw, http.StatusOK, map[string]any{"data": map[string]any{"reverted": true}})
 	case m == http.MethodGet && action == "todo":
-		w.writeJSON(rw, http.StatusOK, map[string]any{"data": map[string]any{"todos": []any{}}})
+		w.mu.RLock()
+		todos := w.jobTodos[jobID]
+		w.mu.RUnlock()
+		if todos == nil {
+			todos = []kubeadp.TodoItem{}
+		}
+		w.writeJSON(rw, http.StatusOK, map[string]any{"data": map[string]any{"todos": todos}, "todos": todos})
 	case m == http.MethodGet && action == "permissions":
-		w.writeJSON(rw, http.StatusOK, map[string]any{"data": map[string]any{"permissions": []any{}}})
+		w.writeJSON(rw, http.StatusOK, map[string]any{"data": map[string]any{"permissions": []any{}}, "permissions": []any{}})
 	default:
 		w.writeError(rw, http.StatusNotFound, "not_found", "unknown job route")
 	}

@@ -17,6 +17,7 @@ import (
 
 	kubeopenv1alpha1 "github.com/kubeopencode/kubeopencode/api/v1alpha1"
 	"github.com/kubeopencode/kubeopencode/internal/controller"
+	"github.com/kubeopencode/kubeopencode/internal/kubeadp"
 )
 
 var sessionLog = ctrl.Log.WithName("task-session")
@@ -104,7 +105,20 @@ func (h *TaskSessionHandler) GetSession(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	h.proxyToSession(w, r, serverURL, fmt.Sprintf("/api/v1/jobs/%s", sessionID), "", token)
+	client, err := kubeadp.New(serverURL, token)
+	if err != nil {
+		sessionLog.Error(err, "Failed to create worker client", "jobID", sessionID)
+		writeError(w, http.StatusBadGateway, "Worker client initialization failed", err.Error())
+		return
+	}
+	job, err := client.Get(ctx, sessionID)
+	if err != nil {
+		sessionLog.Error(err, "Failed to get job from worker", "jobID", sessionID)
+		writeError(w, http.StatusBadGateway, "Worker error getting job", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, job)
 }
 
 // GetSessionMessages proxies GET /api/v1/jobs/:id/log (the job log as text) of the
@@ -122,9 +136,22 @@ func (h *TaskSessionHandler) GetSessionMessages(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Forward query parameters (e.g., before, limit for pagination) separately
-	// to avoid embedding them in the path string.
-	h.proxyToSession(w, r, serverURL, fmt.Sprintf("/api/v1/jobs/%s/log", sessionID), r.URL.RawQuery, token)
+	client, err := kubeadp.New(serverURL, token)
+	if err != nil {
+		sessionLog.Error(err, "Failed to create worker client", "jobID", sessionID)
+		writeError(w, http.StatusBadGateway, "Worker client initialization failed", err.Error())
+		return
+	}
+	logText, _, err := client.Log(ctx, sessionID, 0)
+	if err != nil {
+		sessionLog.Error(err, "Failed to get job log from worker", "jobID", sessionID)
+		writeError(w, http.StatusBadGateway, "Worker error getting job log", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(logText))
 }
 
 // proxyToSession creates a reverse proxy to the Agent's OpenCode server

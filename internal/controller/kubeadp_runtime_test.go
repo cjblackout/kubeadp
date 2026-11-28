@@ -379,9 +379,8 @@ func TestResolveSessionInfoFillsJobIDAndUsage(t *testing.T) {
 	}}}}
 
 	r := &TaskReconciler{
-		Client:        fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, secret).Build(),
-		Scheme:        scheme,
-		kubeadpClient: NewKubeadpClient(),
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, secret).Build(),
+		Scheme: scheme,
 	}
 	r.resolveSessionInfo(context.Background(), task, pod)
 
@@ -412,7 +411,7 @@ func TestResolveSessionInfoKeepsJobIDWhenUsageUnavailable(t *testing.T) {
 		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: `{"jobId":"deadbeef"}`}},
 	}}}}
 	// No Agent object exists: usage cannot be read, the job id must survive.
-	r := &TaskReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Scheme: scheme, kubeadpClient: NewKubeadpClient()}
+	r := &TaskReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Scheme: scheme}
 	r.resolveSessionInfo(context.Background(), task, pod)
 	if task.Status.Session.ID != "deadbeef" || task.Status.Session.Summary != nil {
 		t.Errorf("session = %+v", task.Status.Session)

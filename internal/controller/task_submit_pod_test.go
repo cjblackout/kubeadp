@@ -55,6 +55,7 @@ func TestBuildTaskSubmitCommand(t *testing.T) {
 		"--task-file", "/work/task.md",
 		"--token-file", KubeadpClientMountPath + "/" + KubeadpAPITokenKey,
 		"--project", "proj",
+		"--engine", "opencode",
 	}
 	if strings.Join(cmd, "\x00") != strings.Join(want, "\x00") {
 		t.Errorf("command = %v, want %v", cmd, want)
