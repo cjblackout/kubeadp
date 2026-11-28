@@ -9,7 +9,41 @@ import (
 	kubeopenv1alpha1 "github.com/kubeopencode/kubeopencode/api/v1alpha1"
 )
 
-// ServerInfo represents server information
+// AgentSessionResponse represents an AgentSession in the API.
+type AgentSessionResponse struct {
+	Name             string      `json:"name"`
+	Namespace        string      `json:"namespace"`
+	AgentName        string      `json:"agentName"`
+	Engine           string      `json:"engine,omitempty"`
+	Phase            string      `json:"phase"`
+	PID              *int        `json:"pid,omitempty"`
+	StartTime        *time.Time  `json:"startTime,omitempty"`
+	UptimeSecs       int64       `json:"uptimeSecs,omitempty"`
+	RestartCount     int         `json:"restartCount,omitempty"`
+	LastExitReason   string      `json:"lastExitReason,omitempty"`
+	LastHealthResult string      `json:"lastHealthResult,omitempty"`
+	Paused           bool        `json:"paused"`
+	Controlled       bool        `json:"controlled"`
+	EngineReady      *bool       `json:"engineReady,omitempty"`
+	CreatedAt        time.Time   `json:"createdAt"`
+	Conditions       []Condition `json:"conditions,omitempty"`
+}
+
+// AgentSessionListResponse represents a list of AgentSessions.
+type AgentSessionListResponse struct {
+	Sessions   []AgentSessionResponse `json:"sessions"`
+	Total      int                    `json:"total"`
+	Pagination *Pagination            `json:"pagination,omitempty"`
+}
+
+// CreateAgentSessionRequest represents a request to create an AgentSession.
+type CreateAgentSessionRequest struct {
+	Name             string `json:"name"`
+	AgentName        string `json:"agentName"`
+	Engine           string `json:"engine,omitempty"`
+	InstructionsFile string `json:"instructionsFile,omitempty"`
+	Sandbox          *bool  `json:"sandbox,omitempty"`
+}
 type ServerInfo struct {
 	Version string `json:"version"`
 }
@@ -81,6 +115,10 @@ type CreateAgentRequest struct {
 	// Assembly: assets selected from a Registry catalog
 	Skills  []kubeopenv1alpha1.SkillSource `json:"skills,omitempty"`
 	Plugins []kubeopenv1alpha1.PluginSpec  `json:"plugins,omitempty"`
+
+	// Engine & Worker configuration
+	Engine *kubeopenv1alpha1.AgentEngine  `json:"engine,omitempty"`
+	Worker *kubeopenv1alpha1.WorkerConfig `json:"worker,omitempty"`
 }
 
 // CreatePersistenceConfig represents persistence settings in create request
@@ -199,56 +237,61 @@ type PluginInfo struct {
 
 // AgentResponse represents an agent in API responses
 type AgentResponse struct {
-	Name               string                 `json:"name"`
-	Namespace          string                 `json:"namespace"`
-	Profile            string                 `json:"profile,omitempty"`
-	TemplateRef        *AgentReference        `json:"templateRef,omitempty"`
-	ExecutorImage      string                 `json:"executorImage,omitempty"`
-	KubeadpImage       string                 `json:"kubeadpImage,omitempty"`
-	AgentImage         string                 `json:"agentImage,omitempty"`
-	WorkspaceDir       string                 `json:"workspaceDir,omitempty"`
-	ServiceAccountName string                 `json:"serviceAccountName,omitempty"`
-	ContextsCount      int                    `json:"contextsCount"`
-	CredentialsCount   int                    `json:"credentialsCount"`
-	SkillsCount        int                    `json:"skillsCount"`
-	PluginsCount       int                    `json:"pluginsCount"`
-	MaxConcurrentTasks *int32                 `json:"maxConcurrentTasks,omitempty"`
-	Quota              *QuotaInfo             `json:"quota,omitempty"`
-	Credentials        []CredentialInfo       `json:"credentials,omitempty"`
-	Contexts           []ContextItem          `json:"contexts,omitempty"`
-	Skills             []SkillInfo            `json:"skills,omitempty"`
-	Plugins            []PluginInfo           `json:"plugins,omitempty"`
-	Config             map[string]interface{} `json:"config,omitempty"`
-	CreatedAt          time.Time              `json:"createdAt"`
-	Labels             map[string]string      `json:"labels,omitempty"`
-	Standby            *StandbyInfo           `json:"standby,omitempty"`
-	Share              *ShareStatusInfo       `json:"share,omitempty"`
-	Conditions         []Condition            `json:"conditions,omitempty"`
-	ServerStatus       *ServerStatusInfo      `json:"serverStatus,omitempty"`
+	Name               string                         `json:"name"`
+	Namespace          string                         `json:"namespace"`
+	Profile            string                         `json:"profile,omitempty"`
+	TemplateRef        *AgentReference                `json:"templateRef,omitempty"`
+	ExecutorImage      string                         `json:"executorImage,omitempty"`
+	KubeadpImage       string                         `json:"kubeadpImage,omitempty"`
+	AgentImage         string                         `json:"agentImage,omitempty"`
+	WorkspaceDir       string                         `json:"workspaceDir,omitempty"`
+	ServiceAccountName string                         `json:"serviceAccountName,omitempty"`
+	ContextsCount      int                            `json:"contextsCount"`
+	CredentialsCount   int                            `json:"credentialsCount"`
+	SkillsCount        int                            `json:"skillsCount"`
+	PluginsCount       int                            `json:"pluginsCount"`
+	MaxConcurrentTasks *int32                         `json:"maxConcurrentTasks,omitempty"`
+	Quota              *QuotaInfo                     `json:"quota,omitempty"`
+	Credentials        []CredentialInfo               `json:"credentials,omitempty"`
+	Contexts           []ContextItem                  `json:"contexts,omitempty"`
+	Skills             []SkillInfo                    `json:"skills,omitempty"`
+	Plugins            []PluginInfo                   `json:"plugins,omitempty"`
+	Config             map[string]interface{}         `json:"config,omitempty"`
+	CreatedAt          time.Time                      `json:"createdAt"`
+	Labels             map[string]string              `json:"labels,omitempty"`
+	Standby            *StandbyInfo                   `json:"standby,omitempty"`
+	Share              *ShareStatusInfo               `json:"share,omitempty"`
+	Conditions         []Condition                    `json:"conditions,omitempty"`
+	ServerStatus       *ServerStatusInfo              `json:"serverStatus,omitempty"`
+	Engine             *kubeopenv1alpha1.AgentEngine  `json:"engine,omitempty"`
+	Worker             *kubeopenv1alpha1.WorkerConfig `json:"worker,omitempty"`
+	WorkerStatus       *kubeopenv1alpha1.WorkerStatus `json:"workerStatus,omitempty"`
 }
 
 // AgentTemplateResponse represents an agent template in API responses
 type AgentTemplateResponse struct {
-	Name               string                 `json:"name"`
-	Namespace          string                 `json:"namespace"`
-	AgentImage         string                 `json:"agentImage,omitempty"`
-	KubeadpImage       string                 `json:"kubeadpImage,omitempty"`
-	ExecutorImage      string                 `json:"executorImage,omitempty"`
-	WorkspaceDir       string                 `json:"workspaceDir,omitempty"`
-	ServiceAccountName string                 `json:"serviceAccountName,omitempty"`
-	ContextsCount      int                    `json:"contextsCount"`
-	CredentialsCount   int                    `json:"credentialsCount"`
-	SkillsCount        int                    `json:"skillsCount"`
-	PluginsCount       int                    `json:"pluginsCount"`
-	Credentials        []CredentialInfo       `json:"credentials,omitempty"`
-	Contexts           []ContextItem          `json:"contexts,omitempty"`
-	Skills             []SkillInfo            `json:"skills,omitempty"`
-	Plugins            []PluginInfo           `json:"plugins,omitempty"`
-	Config             map[string]interface{} `json:"config,omitempty"`
-	CreatedAt          time.Time              `json:"createdAt"`
-	Labels             map[string]string      `json:"labels,omitempty"`
-	Conditions         []Condition            `json:"conditions,omitempty"`
-	AgentCount         int                    `json:"agentCount"`
+	Name               string                         `json:"name"`
+	Namespace          string                         `json:"namespace"`
+	AgentImage         string                         `json:"agentImage,omitempty"`
+	KubeadpImage       string                         `json:"kubeadpImage,omitempty"`
+	ExecutorImage      string                         `json:"executorImage,omitempty"`
+	WorkspaceDir       string                         `json:"workspaceDir,omitempty"`
+	ServiceAccountName string                         `json:"serviceAccountName,omitempty"`
+	ContextsCount      int                            `json:"contextsCount"`
+	CredentialsCount   int                            `json:"credentialsCount"`
+	SkillsCount        int                            `json:"skillsCount"`
+	PluginsCount       int                            `json:"pluginsCount"`
+	Credentials        []CredentialInfo               `json:"credentials,omitempty"`
+	Contexts           []ContextItem                  `json:"contexts,omitempty"`
+	Skills             []SkillInfo                    `json:"skills,omitempty"`
+	Plugins            []PluginInfo                   `json:"plugins,omitempty"`
+	Config             map[string]interface{}         `json:"config,omitempty"`
+	CreatedAt          time.Time                      `json:"createdAt"`
+	Labels             map[string]string              `json:"labels,omitempty"`
+	Conditions         []Condition                    `json:"conditions,omitempty"`
+	AgentCount         int                            `json:"agentCount"`
+	Engine             *kubeopenv1alpha1.AgentEngine  `json:"engine,omitempty"`
+	Worker             *kubeopenv1alpha1.WorkerConfig `json:"worker,omitempty"`
 }
 
 // AgentTemplateListResponse represents a list of agent templates
@@ -407,6 +450,10 @@ type CreateAgentTemplateRequest struct {
 	// Assembly: assets selected from a Registry catalog
 	Skills  []kubeopenv1alpha1.SkillSource `json:"skills,omitempty"`
 	Plugins []kubeopenv1alpha1.PluginSpec  `json:"plugins,omitempty"`
+
+	// Engine & Worker configuration
+	Engine *kubeopenv1alpha1.AgentEngine  `json:"engine,omitempty"`
+	Worker *kubeopenv1alpha1.WorkerConfig `json:"worker,omitempty"`
 }
 
 // ShareTokenResponse is returned by GET /agents/{name}/share with the actual token value

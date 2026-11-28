@@ -60,11 +60,16 @@ spec:
           spec:
             description: Spec defines the desired state of Task
             properties:
+              addDirs:
+                description: |-
+                  AddDirs specifies additional directories to make available in the job worktree.
+                  Maps to POST /api/v1/jobs add_dirs.
+                items:
+                  type: string
+                type: array
               agentRef:
                 description: |-
                   AgentRef references a running Agent in the same namespace.
-                  The Task creates a lightweight Pod that connects to the Agent's server
-                  via `opencode run --attach`.
                   Exactly one of agentRef or templateRef must be set.
                 properties:
                   name:
@@ -329,11 +334,115 @@ spec:
                   Example:
                     description: "Update all dependencies and create a PR"
                 type: string
+              effort:
+                description: |-
+                  Effort specifies the reasoning effort level (e.g. low, medium, high).
+                  Maps to POST /api/v1/jobs effort.
+                type: string
+              fromPatch:
+                description: |-
+                  FromPatch specifies a patch to apply to the repository before the job runs.
+                  Maps to POST /api/v1/jobs from_patch_content.
+                properties:
+                  configMapKeyRef:
+                    description: ConfigMapKeyRef selects a key of a ConfigMap containing
+                      the patch content.
+                    properties:
+                      key:
+                        description: The key to select.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the ConfigMap or its key must
+                          be defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  text:
+                    description: Text contains the patch content directly inline.
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: exactly one of configMapKeyRef or non-empty text must be
+                    specified
+                  rule: (has(self.configMapKeyRef) && !has(self.text)) || (!has(self.configMapKeyRef)
+                    && has(self.text) && self.text != ”)
+              gitRef:
+                description: |-
+                  GitRef specifies the git ref (branch, tag, commit) to checkout for the job.
+                  Maps to POST /api/v1/jobs git_ref.
+                type: string
+              hindsight:
+                description: |-
+                  Hindsight specifies Hindsight memory parameters for this task.
+                  Maps to POST /api/v1/jobs hindsight, hindsight_bank, hindsight_query.
+                properties:
+                  bank:
+                    description: Bank specifies the memory bank id to use.
+                    type: string
+                  enabled:
+                    description: Enabled toggles Hindsight memory for this task run.
+                    type: boolean
+                  query:
+                    description: Query specifies a custom query to prime Hindsight
+                      context.
+                    type: string
+                type: object
+              jobset:
+                description: |-
+                  Jobset specifies jobset grouping ID for multi-agent coordination.
+                  Maps to POST /api/v1/jobs jobset_id.
+                type: string
+              mode:
+                description: |-
+                  Mode specifies execution mode for the agent harness.
+                  Maps to POST /api/v1/jobs mode.
+                type: string
+              model:
+                description: |-
+                  Model specifies the LLM model to use for this task execution.
+                  Maps to POST /api/v1/jobs model.
+                  Fallback annotation: kubeopencode.io/model.
+                type: string
+              plan:
+                description: |-
+                  Plan specifies whether the agent should run in plan-only mode.
+                  Maps to POST /api/v1/jobs plan.
+                type: boolean
+              printTimeout:
+                description: |-
+                  PrintTimeout specifies the timeout for printing job output.
+                  Maps to POST /api/v1/jobs print_timeout.
+                type: string
+              project:
+                description: |-
+                  Project specifies the target project repository name for this task.
+                  Maps to POST /api/v1/jobs project field.
+                  Fallback annotation: kubeopencode.io/project.
+                type: string
+              proxy:
+                description: |-
+                  Proxy specifies an explicit HTTP proxy URL for this job.
+                  Maps to POST /api/v1/jobs proxy.
+                type: string
+              sandbox:
+                description: |-
+                  Sandbox toggles OS sandbox isolation for this job.
+                  Maps to POST /api/v1/jobs sandbox.
+                type: boolean
               templateRef:
                 description: |-
                   TemplateRef references an AgentTemplate in the same namespace.
-                  The Task creates an ephemeral Pod using the template's configuration.
-                  The Pod runs standalone `opencode run` and has the same lifecycle as the Task.
                   Exactly one of agentRef or templateRef must be set.
                 properties:
                   name:
@@ -344,7 +453,7 @@ spec:
                 type: object
               timeout:
                 description: |-
-                  Timeout specifies the maximum duration for task execution.
+                  Timeout specifies the maximum duration for task execution (maps to max_runtime).
                   The timeout clock starts when the Task enters the Running phase (status.startTime),
                   not when the Task is created. Queue time (Pending/Queued phases) is excluded.
 
@@ -440,6 +549,112 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              job:
+                description: Job holds status mirrored from the kubeadp-agent worker.
+                properties:
+                  branch:
+                    description: Branch created for this job worktree.
+                    type: string
+                  commit:
+                    description: Commit hash produced by this job.
+                    type: string
+                  conversationId:
+                    description: ConversationID associated with this job run.
+                    type: string
+                  diff:
+                    description: Diff summarizes files changed, additions and deletions.
+                    properties:
+                      additions:
+                        description: Additions line count.
+                        format: int32
+                        type: integer
+                      deletions:
+                        description: Deletions line count.
+                        format: int32
+                        type: integer
+                      files:
+                        description: Files modified count.
+                        format: int32
+                        type: integer
+                    type: object
+                  elapsedSeconds:
+                    description: ElapsedSeconds is the duration of job execution in
+                      seconds.
+                    format: int64
+                    type: integer
+                  engine:
+                    description: Engine executing this job (e.g. opencode, agy, claude).
+                    type: string
+                  id:
+                    description: ID is the unique job identifier assigned by the worker
+                      daemon.
+                    type: string
+                  lastAction:
+                    description: LastAction records the last action performed on this
+                      job.
+                    properties:
+                      by:
+                        description: By indicates the identity that initiated the
+                          action.
+                        type: string
+                      result:
+                        description: Result summary of the action.
+                        type: string
+                      time:
+                        description: Time when the action was requested.
+                        format: date-time
+                        type: string
+                      type:
+                        description: Type of action (e.g. retry, kill, commit, discard,
+                          review, interrupt, pause).
+                        type: string
+                    required:
+                    - time
+                    - type
+                    type: object
+                  model:
+                    description: Model used for execution.
+                    type: string
+                  pendingPermissions:
+                    description: PendingPermissions count awaiting approval.
+                    format: int32
+                    type: integer
+                  status:
+                    description: Status of the job on the worker daemon.
+                    enum:
+                    - running
+                    - done
+                    - failed
+                    - self-terminated
+                    - killed
+                    - incomplete
+                    - quota-exhausted
+                    - lost
+                    type: string
+                  todo:
+                    description: Todo items reported by the agent.
+                    items:
+                      description: TodoItemStatus represents a todo item returned
+                        from the running agent.
+                      properties:
+                        content:
+                          description: Content of the todo item.
+                          type: string
+                        status:
+                          description: Status of the todo item (e.g. pending, in_progress,
+                            done).
+                          type: string
+                      required:
+                      - content
+                      type: object
+                    type: array
+                  worktree:
+                    description: Worktree directory path on the worker filesystem.
+                    type: string
+                required:
+                - id
+                - status
+                type: object
               observedGeneration:
                 description: ObservedGeneration is the most recent generation observed
                   by the controller.

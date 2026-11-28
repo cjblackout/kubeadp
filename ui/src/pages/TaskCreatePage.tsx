@@ -32,6 +32,14 @@ function TaskCreatePage() {
   const [selectedAgent, setSelectedAgent] = useState('');
   const [selectedTemplate, setSelectedTemplate] = useState('');
 
+  // Worker task options
+  const [project, setProject] = useState('');
+  const [gitRef, setGitRef] = useState('');
+  const [model, setModel] = useState('');
+  const [effort, setEffort] = useState('');
+  const [plan, setPlan] = useState(false);
+  const [mode, setMode] = useState('');
+
   const { data: namespacesData } = useQuery({
     queryKey: ['namespaces'],
     queryFn: () => api.getNamespaces(),
@@ -163,6 +171,13 @@ function TaskCreatePage() {
     if (timeout) {
       task.timeout = timeout;
     }
+
+    if (project) task.project = project;
+    if (gitRef) task.gitRef = gitRef;
+    if (model) task.model = model;
+    if (effort) task.effort = effort;
+    if (plan) task.plan = plan;
+    if (mode) task.mode = mode;
 
     if (sourceType === 'agent' && selectedAgent) {
       const agent = agentsData?.agents.find(
@@ -384,6 +399,78 @@ function TaskCreatePage() {
             <p className="mt-1.5 text-xs text-stone-400">
               Maximum execution time. Timer starts when the task begins running, not when queued. Leave empty for no limit.
             </p>
+          </div>
+
+          {/* Job Configuration Options */}
+          <div className="border-t border-stone-100 pt-5 space-y-4">
+            <h3 className="text-xs font-display font-semibold text-stone-600 uppercase tracking-wider">
+              Execution Options
+            </h3>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-[11px] font-display font-medium text-stone-400 uppercase tracking-wider mb-1.5">
+                  Project
+                </label>
+                <input
+                  type="text"
+                  value={project}
+                  onChange={(e) => setProject(e.target.value)}
+                  placeholder="e.g. backend, frontend"
+                  className="block w-full px-3 py-2 rounded-lg border border-stone-200 shadow-sm text-sm text-stone-700 font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-display font-medium text-stone-400 uppercase tracking-wider mb-1.5">
+                  Git Ref / Base Branch
+                </label>
+                <input
+                  type="text"
+                  value={gitRef}
+                  onChange={(e) => setGitRef(e.target.value)}
+                  placeholder="e.g. main, feat/api"
+                  className="block w-full px-3 py-2 rounded-lg border border-stone-200 shadow-sm text-sm text-stone-700 font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-display font-medium text-stone-400 uppercase tracking-wider mb-1.5">
+                  Model Override
+                </label>
+                <input
+                  type="text"
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  placeholder="e.g. claude-3-5-sonnet, gemini-2.0-flash"
+                  className="block w-full px-3 py-2 rounded-lg border border-stone-200 shadow-sm text-sm text-stone-700 font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-display font-medium text-stone-400 uppercase tracking-wider mb-1.5">
+                  Effort Level
+                </label>
+                <input
+                  type="text"
+                  value={effort}
+                  onChange={(e) => setEffort(e.target.value)}
+                  placeholder="e.g. low, medium, high"
+                  className="block w-full px-3 py-2 rounded-lg border border-stone-200 shadow-sm text-sm text-stone-700 font-mono"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center gap-6 pt-2">
+              <label className="flex items-center gap-2 text-xs font-medium text-stone-700 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={plan}
+                  onChange={(e) => setPlan(e.target.checked)}
+                  className="rounded border-stone-300 text-primary-600 focus:ring-primary-500"
+                />
+                Plan Mode (read-only plan before execution)
+              </label>
+            </div>
           </div>
 
           {createMutation.isError && (

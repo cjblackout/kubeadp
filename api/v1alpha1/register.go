@@ -45,6 +45,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&AgentList{},
 		&AgentTemplate{},
 		&AgentTemplateList{},
+		&AgentSession{},
+		&AgentSessionList{},
 		&KubeOpenCodeConfig{},
 		&KubeOpenCodeConfigList{},
 		&Registry{},

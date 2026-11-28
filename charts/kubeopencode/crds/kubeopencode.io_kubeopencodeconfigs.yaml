@@ -247,7 +247,7 @@ spec:
                     description: |-
                       Image specifies the system image to use for internal KubeOpenCode components.
                       If not specified, defaults to the built-in DefaultKubeOpenCodeImage.
-                      Example: "ghcr.io/cjblackout/kubeopencode:v0.2.0"
+                      Example: "ghcr.io/kubeopencode/kubeopencode:v0.2.0"
                     type: string
                   imagePullPolicy:
                     description: |-
@@ -258,6 +258,411 @@ spec:
                     - Never
                     - IfNotPresent
                     type: string
+                type: object
+              taskDefaults:
+                description: TaskDefaults provides cluster-wide default settings for
+                  task execution.
+                properties:
+                  effort:
+                    description: Effort default for tasks.
+                    type: string
+                  hindsight:
+                    description: Hindsight default for tasks.
+                    properties:
+                      bank:
+                        description: Bank specifies the memory bank id to use.
+                        type: string
+                      enabled:
+                        description: Enabled toggles Hindsight memory for this task
+                          run.
+                        type: boolean
+                      query:
+                        description: Query specifies a custom query to prime Hindsight
+                          context.
+                        type: string
+                    type: object
+                  model:
+                    description: Model default for tasks.
+                    type: string
+                  proxy:
+                    description: Proxy default for tasks.
+                    type: string
+                  sandbox:
+                    description: Sandbox default for tasks.
+                    type: boolean
+                type: object
+              workerDefaults:
+                description: |-
+                  WorkerDefaults provides cluster-wide default settings for kubeadp-agent workers.
+                  Merged into Agent/Template worker settings as the base layer.
+                properties:
+                  a2a:
+                    description: A2A defines Agent-to-Agent protocol configuration.
+                    properties:
+                      ackSecs:
+                        description: |-
+                          AckSecs specifies escalation ladder ack window in seconds.
+                          Maps to [worker] a2a_ack_secs / AGENT_RUN_A2A_ACK_SECS.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      echo:
+                        description: |-
+                          Echo specifies user-visible A2A echo in transcripts.
+                          Maps to [worker] a2a_echo / AGENT_RUN_A2A_ECHO.
+                        type: boolean
+                      enabled:
+                        description: |-
+                          Enabled enables or disables A2A messaging.
+                          Maps to [worker] a2a_mcp_enabled / AGENT_RUN_A2A_MCP_ENABLED (when false, disables tools).
+                        type: boolean
+                      forceSecs:
+                        description: |-
+                          ForceSecs specifies escalation ladder force timeout (0 = never kill).
+                          Maps to [worker] a2a_force_secs / AGENT_RUN_A2A_FORCE_SECS.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      inboxTtlSecs:
+                        description: |-
+                          InboxTTLDurationSecs specifies inbox message TTL in seconds (min 10).
+                          Maps to [worker] a2a_inbox_ttl_secs / AGENT_RUN_A2A_INBOX_TTL_SECS.
+                        format: int32
+                        minimum: 10
+                        type: integer
+                      interruptMinSecs:
+                        description: |-
+                          InterruptMinSecs specifies minimum seconds between interrupt steps on one job.
+                          Maps to [worker] a2a_interrupt_min_secs / AGENT_RUN_A2A_INTERRUPT_MIN_SECS.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      liveIdleSecs:
+                        description: |-
+                          LiveIdleSecs specifies idle seconds before live channel close (0 or >= 10).
+                          Maps to [worker] a2a_live_idle_secs / AGENT_RUN_A2A_LIVE_IDLE_SECS.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      liveStdin:
+                        description: |-
+                          LiveStdin specifies whether live stdin transport is enabled for idle turn channel.
+                          Maps to [worker] a2a_live_stdin / AGENT_RUN_A2A_LIVE_STDIN.
+                        type: boolean
+                      mcpEnabled:
+                        description: |-
+                          MCPEnabled specifies whether agent A2A MCP tools are enabled.
+                          Maps to [worker] a2a_mcp_enabled / AGENT_RUN_A2A_MCP_ENABLED.
+                        type: boolean
+                    type: object
+                  defaultBaseBranch:
+                    description: |-
+                      DefaultBaseBranch specifies default base branch for git worktrees.
+                      Maps to [worker] default_base_branch / AGENT_RUN_DEFAULT_BASE_BRANCH.
+                    type: string
+                  defaultEffort:
+                    description: |-
+                      DefaultEffort specifies default reasoning effort.
+                      Maps to [worker] default_effort / AGENT_RUN_DEFAULT_EFFORT.
+                    type: string
+                  defaultEngine:
+                    allOf:
+                    - enum:
+                      - opencode
+                      - agy
+                      - claude
+                    - enum:
+                      - opencode
+                      - agy
+                      - claude
+                    description: |-
+                      DefaultEngine specifies default engine.
+                      Maps to [worker] default_engine / AGENT_RUN_DEFAULT_ENGINE.
+                    type: string
+                  defaultModel:
+                    description: |-
+                      DefaultModel specifies default model name passed to jobs.
+                      Maps to [worker] default_model / AGENT_RUN_DEFAULT_MODEL.
+                    type: string
+                  gcMaxAgeDays:
+                    description: |-
+                      GCMaxAgeDays specifies maximum age in days before completed jobs are garbage collected.
+                      Maps to [worker] gc_max_age_days / AGENT_RUN_GC_MAX_AGE_DAYS.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  hindsight:
+                    description: Hindsight defines Hindsight memory configuration.
+                    properties:
+                      apiKeySecretRef:
+                        description: |-
+                          APIKeySecretRef references a Secret containing the Hindsight API key.
+                          Injected as AGENT_RUN_HINDSIGHT_API_KEY environment variable.
+                          Inline secrets are rejected.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must
+                              be a valid secret key.
+                            type: string
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must
+                              be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      autoRecall:
+                        description: |-
+                          AutoRecall specifies whether Hindsight context should automatically be recalled.
+                          Maps to [worker] hindsight_auto_recall / AGENT_RUN_HINDSIGHT_AUTO_RECALL.
+                        type: boolean
+                      autoRetain:
+                        description: |-
+                          AutoRetain specifies whether Hindsight memory should automatically retain learnings.
+                          Maps to [worker] hindsight_auto_retain / AGENT_RUN_HINDSIGHT_AUTO_RETAIN.
+                        type: boolean
+                      bank:
+                        description: |-
+                          Bank specifies the Hindsight memory bank id.
+                          Maps to [worker] hindsight_bank / AGENT_RUN_HINDSIGHT_BANK.
+                        type: string
+                      enabled:
+                        description: |-
+                          Enabled enables or disables Hindsight memory.
+                          Maps to [worker] hindsight_enabled / AGENT_RUN_HINDSIGHT_ENABLED.
+                        type: boolean
+                      profile:
+                        description: |-
+                          Profile specifies the Hindsight profile name.
+                          Maps to [worker] hindsight_profile / AGENT_RUN_HINDSIGHT_PROFILE.
+                        type: string
+                      tag:
+                        description: |-
+                          Tag specifies the project tag.
+                          Maps to [worker] hindsight_tag / AGENT_RUN_HINDSIGHT_TAG.
+                        type: string
+                      url:
+                        description: |-
+                          URL specifies the remote Hindsight API base URL.
+                          Maps to [worker] hindsight_url / AGENT_RUN_HINDSIGHT_URL.
+                        type: string
+                    type: object
+                  jobsDirName:
+                    description: |-
+                      JobsDirName specifies directory name for job worktrees under workspace root.
+                      Maps to [worker] jobs_dir_name / AGENT_RUN_JOBS_DIR_NAME.
+                    type: string
+                  launchTimeoutSecs:
+                    description: |-
+                      LaunchTimeoutSecs specifies timeout in seconds for agent process launch.
+                      Maps to [worker] launch_timeout_secs / AGENT_RUN_LAUNCH_TIMEOUT_SECS.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  maxParallel:
+                    description: |-
+                      MaxParallel limits concurrent jobs on this worker.
+                      Maps to [worker] max_parallel / AGENT_RUN_MAX_PARALLEL.
+                    format: int32
+                    maximum: 64
+                    minimum: 1
+                    type: integer
+                  maxRuntime:
+                    description: |-
+                      MaxRuntime specifies maximum execution duration string for jobs (e.g. "2h", "30m").
+                      Maps to [worker] max_runtime / AGENT_RUN_MAX_RUNTIME.
+                    type: string
+                  proxy:
+                    description: Proxy defines HTTP/HTTPS/NO_PROXY settings.
+                    properties:
+                      http:
+                        description: |-
+                          HTTP proxy URL.
+                          Maps to [common] http_proxy / AGENT_RUN_HTTP_PROXY.
+                        properties:
+                          secretKeyRef:
+                            description: SecretKeyRef selects a key of a Secret in
+                              the resource's namespace.
+                            properties:
+                              key:
+                                description: The key of the secret to select from.  Must
+                                  be a valid secret key.
+                                type: string
+                              name:
+                                default: ""
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                              optional:
+                                description: Specify whether the Secret or its key
+                                  must be defined
+                                type: boolean
+                            required:
+                            - key
+                            type: object
+                            x-kubernetes-map-type: atomic
+                          value:
+                            description: Value specified directly.
+                            type: string
+                        type: object
+                        x-kubernetes-validations:
+                        - message: exactly one of value or secretKeyRef must be specified
+                          rule: has(self.value) != has(self.secretKeyRef)
+                      https:
+                        description: |-
+                          HTTPS proxy URL.
+                          Maps to [common] https_proxy / AGENT_RUN_HTTPS_PROXY.
+                        properties:
+                          secretKeyRef:
+                            description: SecretKeyRef selects a key of a Secret in
+                              the resource's namespace.
+                            properties:
+                              key:
+                                description: The key of the secret to select from.  Must
+                                  be a valid secret key.
+                                type: string
+                              name:
+                                default: ""
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                              optional:
+                                description: Specify whether the Secret or its key
+                                  must be defined
+                                type: boolean
+                            required:
+                            - key
+                            type: object
+                            x-kubernetes-map-type: atomic
+                          value:
+                            description: Value specified directly.
+                            type: string
+                        type: object
+                        x-kubernetes-validations:
+                        - message: exactly one of value or secretKeyRef must be specified
+                          rule: has(self.value) != has(self.secretKeyRef)
+                      noProxy:
+                        description: |-
+                          NoProxy specifies comma-separated hosts to bypass proxy.
+                          Maps to [common] no_proxy / AGENT_RUN_NO_PROXY.
+                        properties:
+                          secretKeyRef:
+                            description: SecretKeyRef selects a key of a Secret in
+                              the resource's namespace.
+                            properties:
+                              key:
+                                description: The key of the secret to select from.  Must
+                                  be a valid secret key.
+                                type: string
+                              name:
+                                default: ""
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                              optional:
+                                description: Specify whether the Secret or its key
+                                  must be defined
+                                type: boolean
+                            required:
+                            - key
+                            type: object
+                            x-kubernetes-map-type: atomic
+                          value:
+                            description: Value specified directly.
+                            type: string
+                        type: object
+                        x-kubernetes-validations:
+                        - message: exactly one of value or secretKeyRef must be specified
+                          rule: has(self.value) != has(self.secretKeyRef)
+                    type: object
+                  remoteControl:
+                    description: RemoteControl defines remote control daemon settings.
+                    properties:
+                      autostart:
+                        description: |-
+                          Autostart automatically starts the remote control daemon when the worker starts.
+                          Maps to [worker] remote_control_autostart / AGENT_RUN_REMOTE_CONTROL_AUTOSTART.
+                        type: boolean
+                      checkSecs:
+                        description: |-
+                          CheckSecs specifies check interval in seconds (minimum 10).
+                          Maps to [worker] remote_control_check_secs / AGENT_RUN_REMOTE_CONTROL_CHECK_SECS.
+                        format: int32
+                        minimum: 10
+                        type: integer
+                      enabled:
+                        description: |-
+                          Enabled enables or disables remote control.
+                          Maps to [worker] remote_control / AGENT_RUN_REMOTE_CONTROL.
+                        type: boolean
+                    type: object
+                  reposRoot:
+                    description: |-
+                      ReposRoot specifies path to bare repository cache.
+                      Maps to [worker] repos_root / AGENT_RUN_REPOS_ROOT.
+                    type: string
+                  sandbox:
+                    description: Sandbox defines sandbox read-only paths and allowed
+                      environment variables.
+                    properties:
+                      envAllow:
+                        description: EnvAllow specifies environment variable names
+                          allowed into the sandbox.
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      roPaths:
+                        description: |-
+                          ROPaths specifies absolute paths appended to the read-only list of every sandbox policy.
+                          Must be absolute paths without '..' directory traversal.
+                          Maps to [common] sandbox_ro_paths / KUBEADP_SANDBOX_RO_PATHS.
+                        items:
+                          type: string
+                        maxItems: 100
+                        type: array
+                        x-kubernetes-list-type: atomic
+                        x-kubernetes-validations:
+                        - message: roPaths entries must be absolute paths without
+                            ..
+                          rule: self.all(p, p.startsWith('/') && !p.contains('..'))
+                    type: object
+                  shutdownGraceSecs:
+                    description: |-
+                      ShutdownGraceSecs specifies graceful shutdown period in seconds for job processes.
+                      Maps to [worker] shutdown_grace_secs / AGENT_RUN_SHUTDOWN_GRACE.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  stallMinutes:
+                    description: |-
+                      StallMinutes specifies inactivity timeout in minutes before a job is flagged stalled.
+                      Maps to [worker] stall_minutes / AGENT_RUN_STALL_MINUTES.
+                    format: int32
+                    minimum: 1
+                    type: integer
                 type: object
             type: object
         required:

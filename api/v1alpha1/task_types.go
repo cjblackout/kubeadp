@@ -3,6 +3,7 @@
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -35,6 +36,13 @@ const (
 	ConditionTypeQueued = "Queued"
 	// ConditionTypeStopped is the condition type for Task stop
 	ConditionTypeStopped = "Stopped"
+	// ConditionTypeSucceeded is the standard condition type for execution outcome
+	ConditionTypeSucceeded = "Succeeded"
+	// ConditionTypeWorkerReachable indicates whether the worker API was reachable
+	ConditionTypeWorkerReachable = "WorkerReachable"
+	// ConditionTypeConfigValid indicates whether the configuration is valid
+	ConditionTypeConfigValid = "ConfigValid"
+
 	// ReasonAgentError is the reason for Agent errors
 	ReasonAgentError = "AgentError"
 	// ReasonAgentAtCapacity is the reason for Agent capacity limit
@@ -63,6 +71,24 @@ const (
 	ReasonAgentServerNotReady = "AgentServerNotReady"
 	// ReasonTimeout is the reason when a task is stopped due to exceeding its timeout
 	ReasonTimeout = "Timeout"
+
+	// ReasonJobFailed is set when the worker job status is failed
+	ReasonJobFailed = "failed"
+	// ReasonJobIncomplete is set when the worker job status is incomplete
+	ReasonJobIncomplete = "incomplete"
+	// ReasonJobQuotaExhausted is set when the worker job status is quota-exhausted
+	ReasonJobQuotaExhausted = "quota-exhausted"
+	// ReasonJobKilled is set when the worker job was killed
+	ReasonJobKilled = "killed"
+	// ReasonJobSelfTerminated is set when the worker job self-terminated
+	ReasonJobSelfTerminated = "self-terminated"
+	// ReasonJobLost is set when the worker job record was lost on the worker
+	ReasonJobLost = "lost"
+
+	// AnnotationModelFallback is the annotation fallback key for model
+	AnnotationModelFallback = "kubeopencode.io/model"
+	// AnnotationProjectFallback is the annotation fallback key for project
+	AnnotationProjectFallback = "kubeopencode.io/project"
 )
 
 // +genclient
@@ -97,8 +123,38 @@ type AgentReference struct {
 	Name string `json:"name"`
 }
 
+// TaskHindsight specifies Hindsight memory configuration for a single task run.
+type TaskHindsight struct {
+	// Enabled toggles Hindsight memory for this task run.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Bank specifies the memory bank id to use.
+	// +optional
+	Bank string `json:"bank,omitempty"`
+
+	// Query specifies a custom query to prime Hindsight context.
+	// +optional
+	Query string `json:"query,omitempty"`
+}
+
+// FromPatchSource specifies a patch source to apply before job execution.
+// Exactly one of configMapKeyRef or text must be specified.
+//
+// +kubebuilder:validation:XValidation:rule="(has(self.configMapKeyRef) && !has(self.text)) || (!has(self.configMapKeyRef) && has(self.text) && self.text != ”)",message="exactly one of configMapKeyRef or non-empty text must be specified"
+type FromPatchSource struct {
+	// ConfigMapKeyRef selects a key of a ConfigMap containing the patch content.
+	// +optional
+	ConfigMapKeyRef *corev1.ConfigMapKeySelector `json:"configMapKeyRef,omitempty"`
+
+	// Text contains the patch content directly inline.
+	// +optional
+	Text string `json:"text,omitempty"`
+}
+
 // TaskSpec defines the Task configuration.
 // Exactly one of agentRef or templateRef must be set.
+// Note: Engine is NOT configurable on Task (engine is an Agent / AgentTemplate property only).
 //
 // +kubebuilder:validation:XValidation:rule="has(self.agentRef) || has(self.templateRef)",message="either agentRef or templateRef must be specified"
 // +kubebuilder:validation:XValidation:rule="!(has(self.agentRef) && has(self.templateRef))",message="only one of agentRef or templateRef can be specified"
@@ -134,20 +190,16 @@ type TaskSpec struct {
 	Contexts []ContextItem `json:"contexts,omitempty"`
 
 	// AgentRef references a running Agent in the same namespace.
-	// The Task creates a lightweight Pod that connects to the Agent's server
-	// via `opencode run --attach`.
 	// Exactly one of agentRef or templateRef must be set.
 	// +optional
 	AgentRef *AgentReference `json:"agentRef,omitempty"`
 
 	// TemplateRef references an AgentTemplate in the same namespace.
-	// The Task creates an ephemeral Pod using the template's configuration.
-	// The Pod runs standalone `opencode run` and has the same lifecycle as the Task.
 	// Exactly one of agentRef or templateRef must be set.
 	// +optional
 	TemplateRef *AgentTemplateReference `json:"templateRef,omitempty"`
 
-	// Timeout specifies the maximum duration for task execution.
+	// Timeout specifies the maximum duration for task execution (maps to max_runtime).
 	// The timeout clock starts when the Task enters the Running phase (status.startTime),
 	// not when the Task is created. Queue time (Pending/Queued phases) is excluded.
 	//
@@ -160,6 +212,73 @@ type TaskSpec struct {
 	// Example: "30m", "1h", "2h30m"
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
+
+	// Project specifies the target project repository name for this task.
+	// Maps to POST /api/v1/jobs project field.
+	// Fallback annotation: kubeopencode.io/project.
+	// +optional
+	Project string `json:"project,omitempty"`
+
+	// GitRef specifies the git ref (branch, tag, commit) to checkout for the job.
+	// Maps to POST /api/v1/jobs git_ref.
+	// +optional
+	GitRef string `json:"gitRef,omitempty"`
+
+	// Model specifies the LLM model to use for this task execution.
+	// Maps to POST /api/v1/jobs model.
+	// Fallback annotation: kubeopencode.io/model.
+	// +optional
+	Model string `json:"model,omitempty"`
+
+	// Effort specifies the reasoning effort level (e.g. low, medium, high).
+	// Maps to POST /api/v1/jobs effort.
+	// +optional
+	Effort string `json:"effort,omitempty"`
+
+	// Sandbox toggles OS sandbox isolation for this job.
+	// Maps to POST /api/v1/jobs sandbox.
+	// +optional
+	Sandbox *bool `json:"sandbox,omitempty"`
+
+	// AddDirs specifies additional directories to make available in the job worktree.
+	// Maps to POST /api/v1/jobs add_dirs.
+	// +optional
+	AddDirs []string `json:"addDirs,omitempty"`
+
+	// Plan specifies whether the agent should run in plan-only mode.
+	// Maps to POST /api/v1/jobs plan.
+	// +optional
+	Plan *bool `json:"plan,omitempty"`
+
+	// PrintTimeout specifies the timeout for printing job output.
+	// Maps to POST /api/v1/jobs print_timeout.
+	// +optional
+	PrintTimeout *metav1.Duration `json:"printTimeout,omitempty"`
+
+	// Mode specifies execution mode for the agent harness.
+	// Maps to POST /api/v1/jobs mode.
+	// +optional
+	Mode string `json:"mode,omitempty"`
+
+	// Hindsight specifies Hindsight memory parameters for this task.
+	// Maps to POST /api/v1/jobs hindsight, hindsight_bank, hindsight_query.
+	// +optional
+	Hindsight *TaskHindsight `json:"hindsight,omitempty"`
+
+	// Proxy specifies an explicit HTTP proxy URL for this job.
+	// Maps to POST /api/v1/jobs proxy.
+	// +optional
+	Proxy string `json:"proxy,omitempty"`
+
+	// FromPatch specifies a patch to apply to the repository before the job runs.
+	// Maps to POST /api/v1/jobs from_patch_content.
+	// +optional
+	FromPatch *FromPatchSource `json:"fromPatch,omitempty"`
+
+	// Jobset specifies jobset grouping ID for multi-agent coordination.
+	// Maps to POST /api/v1/jobs jobset_id.
+	// +optional
+	Jobset string `json:"jobset,omitempty"`
 }
 
 // SessionInfo contains information about the OpenCode session associated with a Task.
@@ -225,6 +344,102 @@ type TokenUsage struct {
 	Cache int64 `json:"cache,omitempty"`
 }
 
+// DiffStat represents summary diff statistics from a completed job.
+type DiffStat struct {
+	// Files modified count.
+	// +optional
+	Files int32 `json:"files,omitempty"`
+
+	// Additions line count.
+	// +optional
+	Additions int32 `json:"additions,omitempty"`
+
+	// Deletions line count.
+	// +optional
+	Deletions int32 `json:"deletions,omitempty"`
+}
+
+// TodoItemStatus represents a todo item returned from the running agent.
+type TodoItemStatus struct {
+	// Content of the todo item.
+	Content string `json:"content"`
+
+	// Status of the todo item (e.g. pending, in_progress, done).
+	// +optional
+	Status string `json:"status,omitempty"`
+}
+
+// TaskAction records the last administrative action performed on a task.
+type TaskAction struct {
+	// Type of action (e.g. retry, kill, commit, discard, review, interrupt, pause).
+	Type string `json:"type"`
+
+	// By indicates the identity that initiated the action.
+	// +optional
+	By string `json:"by,omitempty"`
+
+	// Time when the action was requested.
+	Time metav1.Time `json:"time"`
+
+	// Result summary of the action.
+	// +optional
+	Result string `json:"result,omitempty"`
+}
+
+// JobStatus reflects the live state mirrored from the kubeadp-agent worker job.
+type JobStatus struct {
+	// ID is the unique job identifier assigned by the worker daemon.
+	ID string `json:"id"`
+
+	// Status of the job on the worker daemon.
+	// +kubebuilder:validation:Enum=running;done;failed;self-terminated;killed;incomplete;quota-exhausted;lost
+	Status string `json:"status"`
+
+	// Engine executing this job (e.g. opencode, agy, claude).
+	// +optional
+	Engine string `json:"engine,omitempty"`
+
+	// Model used for execution.
+	// +optional
+	Model string `json:"model,omitempty"`
+
+	// ElapsedSeconds is the duration of job execution in seconds.
+	// +optional
+	ElapsedSeconds int64 `json:"elapsedSeconds,omitempty"`
+
+	// ConversationID associated with this job run.
+	// +optional
+	ConversationID string `json:"conversationId,omitempty"`
+
+	// Branch created for this job worktree.
+	// +optional
+	Branch string `json:"branch,omitempty"`
+
+	// Worktree directory path on the worker filesystem.
+	// +optional
+	Worktree string `json:"worktree,omitempty"`
+
+	// Commit hash produced by this job.
+	// +optional
+	Commit string `json:"commit,omitempty"`
+
+	// Diff summarizes files changed, additions and deletions.
+	// +optional
+	Diff *DiffStat `json:"diff,omitempty"`
+
+	// Todo items reported by the agent.
+	// +optional
+	Todo []TodoItemStatus `json:"todo,omitempty"`
+
+	// PendingPermissions count awaiting approval.
+	// +optional
+	PendingPermissions int32 `json:"pendingPermissions,omitempty"`
+
+	// LastAction records the last action performed on this job.
+	// +optional
+	LastAction *TaskAction `json:"lastAction,omitempty"`
+}
+
 // TaskExecutionStatus defines the observed state of Task
 type TaskExecutionStatus struct {
 	// ObservedGeneration is the most recent generation observed by the controller.
@@ -253,6 +468,10 @@ type TaskExecutionStatus struct {
 	// Only populated for agentRef Tasks where the session can be resolved.
 	// +optional
 	Session *SessionInfo `json:"session,omitempty"`
+
+	// Job holds status mirrored from the kubeadp-agent worker.
+	// +optional
+	Job *JobStatus `json:"job,omitempty"`
 
 	// Start time
 	// +optional

@@ -67,12 +67,10 @@ func MergeAgentWithTemplate(agent *kubeopenv1alpha1.Agent, tmpl *kubeopenv1alpha
 	mergedPodSpec := mergePodSpec(agent.Spec.PodSpec, tmpl.Spec.PodSpec)
 
 	merged := agentConfig{
-		agentImage:    defaultString(agent.Spec.AgentImage, defaultString(tmpl.Spec.AgentImage, DefaultAgentImage)),
 		kubeadpImage:  defaultString(agent.Spec.KubeadpImage, defaultString(tmpl.Spec.KubeadpImage, DefaultKubeadpImage)),
 		executorImage: defaultString(agent.Spec.ExecutorImage, defaultString(tmpl.Spec.ExecutorImage, DefaultExecutorImage)),
-		attachImage:   defaultString(agent.Spec.AttachImage, defaultString(tmpl.Spec.AttachImage, DefaultAttachImage)),
 
-		// Agent wins if non-empty; otherwise inherited from template
+		// workspaceDir: Agent wins if non-empty; otherwise inherited from template
 		workspaceDir:       defaultString(agent.Spec.WorkspaceDir, tmpl.Spec.WorkspaceDir),
 		serviceAccountName: defaultString(agent.Spec.ServiceAccountName, tmpl.Spec.ServiceAccountName),
 
@@ -95,12 +93,24 @@ func MergeAgentWithTemplate(agent *kubeopenv1alpha1.Agent, tmpl *kubeopenv1alpha
 		persistence:      agent.Spec.Persistence,
 		suspend:          agent.Spec.Suspend,
 		serverReady:      agent.Status.Ready,
+		engine:           firstNonNilPtr(agent.Spec.Engine, tmpl.Spec.Engine),
+		worker: func() *kubeopenv1alpha1.WorkerConfig {
+			m := MergeWorkerConfigs(agent.Spec.Worker, tmpl.Spec.Worker, nil)
+			return &m
+		}(),
 	}
 
 	// Populate extraEnv and systemContainers from the merged podSpec.
 	if mergedPodSpec != nil {
 		merged.extraEnv = mergedPodSpec.ExtraEnv
 		merged.systemContainers = mergedPodSpec.SystemContainers
+	}
+
+	// Track whether executorImage was explicitly set (by the Agent or the
+	// template); only an explicit executorImage triggers the kubeadp-init
+	// container path in server Deployments.
+	if agent.Spec.ExecutorImage != "" || tmpl.Spec.ExecutorImage != "" {
+		merged.executorImageExplicit = true
 	}
 
 	return merged

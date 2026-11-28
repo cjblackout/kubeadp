@@ -207,6 +207,7 @@ func (s *Server) setupRoutes() *chi.Mux {
 
 		// Task endpoints (namespace-scoped)
 		taskSessionHandler := handlers.NewTaskSessionHandler(s.k8sClient, s.clusterDomain)
+		taskActionHandler := handlers.NewTaskActionHandler(s.k8sClient, s.clientset, s.clusterDomain)
 		r.Route("/namespaces/{namespace}/tasks", func(r chi.Router) {
 			r.Get("/", taskHandler.List)
 			r.Post("/", taskHandler.Create)
@@ -218,6 +219,52 @@ func (s *Server) setupRoutes() *chi.Mux {
 			// Session proxy — forwards to Agent's OpenCode server
 			r.Get("/{name}/session", taskSessionHandler.GetSession)
 			r.Get("/{name}/session/messages", taskSessionHandler.GetSessionMessages)
+
+			// Imperative task actions (SAR guarded on "patch" tasks)
+			r.Group(func(ar chi.Router) {
+				ar.Use(func(next http.Handler) http.Handler {
+					return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						ns := chi.URLParam(r, "namespace")
+						if !RequireSubjectAccess(w, r, s.clientset, ns, "tasks", "patch", "") {
+							return
+						}
+						next.ServeHTTP(w, r)
+					})
+				})
+				ar.Post("/{name}/retry", taskActionHandler.Retry)
+				ar.Post("/{name}/kill", taskActionHandler.Kill)
+				ar.Post("/{name}/commit", taskActionHandler.Commit)
+				ar.Post("/{name}/discard", taskActionHandler.Discard)
+				ar.Post("/{name}/clean", taskActionHandler.Clean)
+				ar.Post("/{name}/review", taskActionHandler.Review)
+				ar.Post("/{name}/message", taskActionHandler.Message)
+				ar.Post("/{name}/interrupt", taskActionHandler.Interrupt)
+				ar.Post("/{name}/pause", taskActionHandler.Pause)
+				ar.Post("/{name}/compact", taskActionHandler.Compact)
+				ar.Post("/{name}/fork", taskActionHandler.Fork)
+				ar.Post("/{name}/revert", taskActionHandler.Revert)
+			})
+
+			// Task streams and inspections (SAR guarded on "get" tasks)
+			r.Group(func(gr chi.Router) {
+				gr.Use(func(next http.Handler) http.Handler {
+					return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						ns := chi.URLParam(r, "namespace")
+						if !RequireSubjectAccess(w, r, s.clientset, ns, "tasks", "get", "") {
+							return
+						}
+						next.ServeHTTP(w, r)
+					})
+				})
+				gr.Get("/{name}/export", taskActionHandler.Export)
+				gr.Get("/{name}/diff", taskActionHandler.Diff)
+				gr.Get("/{name}/files", taskActionHandler.Files)
+				gr.Get("/{name}/cat", taskActionHandler.Cat)
+				gr.Get("/{name}/job-log", taskActionHandler.Log)
+				gr.Get("/{name}/events", taskActionHandler.Events)
+				gr.Get("/{name}/todo", taskActionHandler.Todo)
+				gr.Get("/{name}/permissions", taskActionHandler.Permissions)
+			})
 		})
 
 		// CronTask endpoints
@@ -244,6 +291,21 @@ func (s *Server) setupRoutes() *chi.Mux {
 			r.Get("/{name}", agentTemplateHandler.Get)
 			r.Put("/{name}", agentTemplateHandler.Update)
 			r.Delete("/{name}", agentTemplateHandler.Delete)
+		})
+
+		// AgentSession endpoints
+		agentSessionHandler := handlers.NewAgentSessionHandler(s.k8sClient, s.clusterDomain)
+		r.Get("/agentsessions", agentSessionHandler.ListAll)
+		r.Route("/namespaces/{namespace}/agentsessions", func(r chi.Router) {
+			r.Get("/", agentSessionHandler.List)
+			r.Post("/", agentSessionHandler.Create)
+			r.Get("/{name}", agentSessionHandler.Get)
+			r.Delete("/{name}", agentSessionHandler.Delete)
+			r.Post("/{name}/start", agentSessionHandler.Start)
+			r.Post("/{name}/stop", agentSessionHandler.Stop)
+			r.Post("/{name}/restart", agentSessionHandler.Restart)
+			r.Get("/{name}/log", agentSessionHandler.Log)
+			r.Post("/{name}/message", agentSessionHandler.Message)
 		})
 
 		// Config endpoint (cluster-scoped singleton)
@@ -279,6 +341,53 @@ func (s *Server) setupRoutes() *chi.Mux {
 			// Agent terminal - WebSocket terminal to agent server pods
 			agentTerminalHandler := handlers.NewAgentTerminalHandler(s.k8sClient, s.clientset, s.restConfig)
 			r.Get("/{name}/terminal", agentTerminalHandler.ServeTerminal)
+
+			// Agent Worker endpoints (M6)
+			agentWorkerHandler := handlers.NewAgentWorkerHandler(s.k8sClient, s.clusterDomain)
+			r.Route("/{name}/worker", func(wr chi.Router) {
+				// Read worker info (SAR get agents)
+				wr.Group(func(gr chi.Router) {
+					gr.Use(func(next http.Handler) http.Handler {
+						return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							ns := chi.URLParam(r, "namespace")
+							if !RequireSubjectAccess(w, r, s.clientset, ns, "agents", "get", "") {
+								return
+							}
+							next.ServeHTTP(w, r)
+						})
+					})
+					gr.Get("/info", agentWorkerHandler.Info)
+					gr.Get("/capabilities", agentWorkerHandler.Capabilities)
+					gr.Get("/models", agentWorkerHandler.Models)
+					gr.Get("/quota", agentWorkerHandler.Quota)
+					gr.Get("/projects", agentWorkerHandler.Projects)
+					gr.Get("/jobs", agentWorkerHandler.Jobs)
+					gr.Get("/auth/status", agentWorkerHandler.AuthStatus)
+					gr.Get("/remote-control/status", agentWorkerHandler.RemoteControlStatus)
+				})
+
+				// Mutation worker operations (SAR patch agents)
+				wr.Group(func(pr chi.Router) {
+					pr.Use(func(next http.Handler) http.Handler {
+						return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							ns := chi.URLParam(r, "namespace")
+							if !RequireSubjectAccess(w, r, s.clientset, ns, "agents", "patch", "") {
+								return
+							}
+							next.ServeHTTP(w, r)
+						})
+					})
+					pr.Post("/auth/start", agentWorkerHandler.AuthStart)
+					pr.Post("/auth/code", agentWorkerHandler.AuthCode)
+					pr.Post("/auth/cancel", agentWorkerHandler.AuthCancel)
+					pr.Post("/remote-control/enable", agentWorkerHandler.RemoteControlEnable)
+					pr.Post("/remote-control/disable", agentWorkerHandler.RemoteControlDisable)
+					pr.Post("/gc", agentWorkerHandler.GC)
+					pr.Post("/init", agentWorkerHandler.Init)
+					pr.Post("/jobs/repair", agentWorkerHandler.RepairJobs)
+					pr.Post("/jobsets/{id}/end", agentWorkerHandler.JobsetEnd)
+				})
+			})
 		})
 
 	})

@@ -4,7 +4,9 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -129,6 +131,50 @@ func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	// Apply cluster-level defaults where Agent doesn't specify its own
 	agentCfg.applySystemDefaults(sysCfg)
 
+	// Fetch template if referenced for worker config rendering
+	var tmpl *kubeopenv1alpha1.AgentTemplate
+	if agent.Spec.TemplateRef != nil {
+		tmpl = &kubeopenv1alpha1.AgentTemplate{}
+		if err := r.Get(ctx, types.NamespacedName{Name: agent.Spec.TemplateRef.Name, Namespace: agent.Namespace}, tmpl); err != nil {
+			logger.Error(err, "Failed to get AgentTemplate for worker config", "template", agent.Spec.TemplateRef.Name)
+		}
+	}
+
+	// Render worker config and validate
+	renderedWorker := RenderWorkerConfig(&agent, tmpl, sysCfg.clusterConfig)
+	if len(renderedWorker.Errors) > 0 {
+		var errMsgs []string
+		for _, e := range renderedWorker.Errors {
+			errMsgs = append(errMsgs, e.Error())
+		}
+		errMsg := strings.Join(errMsgs, "; ")
+		logger.Error(fmt.Errorf("%s", errMsg), "Worker config validation failed")
+		meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+			Type:    kubeopenv1alpha1.ConditionTypeConfigValid,
+			Status:  metav1.ConditionFalse,
+			Reason:  "InvalidWorkerConfig",
+			Message: errMsg,
+		})
+		r.Recorder.Eventf(&agent, nil, corev1.EventTypeWarning, "InvalidWorkerConfig", "ConfigValidation", errMsg)
+		if err := r.Status().Update(ctx, &agent); err != nil {
+			logger.Error(err, "Failed to update Agent status after config validation failure")
+		}
+		return ctrl.Result{RequeueAfter: DefaultServerReconcileInterval}, nil
+	}
+
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:    kubeopenv1alpha1.ConditionTypeConfigValid,
+		Status:  metav1.ConditionTrue,
+		Reason:  "ValidWorkerConfig",
+		Message: "Worker configuration rendered successfully",
+	})
+
+	// Reconcile worker config ConfigMap (<agent>-worker-config)
+	if err := r.reconcileWorkerConfigMap(ctx, &agent, renderedWorker.ConfigTOML); err != nil {
+		logger.Error(err, "Failed to reconcile worker config ConfigMap")
+		return ctrl.Result{}, err
+	}
+
 	// Process Agent contexts (Text, ConfigMap, Git, Runtime)
 	contextConfigMap, fileMounts, dirMounts, gitMounts, err := r.processAgentContexts(ctx, &agent, agentCfg)
 	if err != nil {
@@ -170,14 +216,17 @@ func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
+	if gitHashAnnotations == nil {
+		gitHashAnnotations = make(map[string]string)
+	}
+	workerConfigHash := sha256.Sum256(renderedWorker.ConfigTOML)
+	gitHashAnnotations[WorkerConfigHashAnnotationKey] = fmt.Sprintf("%x", workerConfigHash)
+
 	// Add context ConfigMap content hash to pod template annotations.
 	// This triggers a Deployment rolling update when ConfigMap content changes
 	// (e.g., skills.paths, config JSON, text context content) — changes that
 	// don't affect the Deployment spec but require a Pod restart to take effect.
 	if contextConfigMap != nil && len(contextConfigMap.Data) > 0 {
-		if gitHashAnnotations == nil {
-			gitHashAnnotations = make(map[string]string)
-		}
 		gitHashAnnotations[ContextHashAnnotationKey] = hashConfigMapData(contextConfigMap.Data)
 	}
 
@@ -196,6 +245,18 @@ func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	// Update Agent status (needed before reconcileShare to have Ready status)
 	if err := r.updateAgentStatus(ctx, &agent); err != nil {
 		logger.Error(err, "Failed to update Agent status")
+		return ctrl.Result{}, err
+	}
+
+	// Worker sync: sync info, capabilities, models, quota, projects, auth status, remote-control status
+	workerSyncInterval, syncErr := r.syncAgentWorker(ctx, &agent)
+	if syncErr != nil {
+		logger.Error(syncErr, "Worker sync failed")
+	}
+
+	// If worker sync updated conditions or ready state, update Agent status again
+	if err := r.updateAgentStatus(ctx, &agent); err != nil {
+		logger.Error(err, "Failed to update Agent status after worker sync")
 		return ctrl.Result{}, err
 	}
 
@@ -221,8 +282,11 @@ func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	// Calculate optimal requeue interval.
-	// Use the shortest of: default interval, standby idle timeout, git sync interval, share expiry.
+	// Use the shortest of: default interval, standby idle timeout, git sync interval, share expiry, worker sync interval.
 	requeueAfter := DefaultServerReconcileInterval
+	if workerSyncInterval > 0 && workerSyncInterval < requeueAfter {
+		requeueAfter = workerSyncInterval
+	}
 	if agent.Spec.Standby != nil && !agent.Spec.Suspend && agent.Status.IdleSince != nil {
 		remaining := time.Until(agent.Status.IdleSince.Add(agent.Spec.Standby.IdleTimeout.Duration))
 		if remaining > 0 && remaining < requeueAfter {
@@ -363,9 +427,15 @@ func (r *AgentReconciler) updateAgentStatus(ctx context.Context, agent *kubeopen
 			agent.Status.Ready = false
 			setAgentCondition(agent, AgentConditionServerHealthy, metav1.ConditionFalse, "DeploymentNotFound", "Agent deployment not found")
 		} else {
-			agent.Status.Ready = deployment.Status.ReadyReplicas > 0
+			deploymentReady := deployment.Status.ReadyReplicas > 0
+			// Gate Agent readiness on deployment ready AND worker readiness if worker status is present
+			workerReady := true
+			if agent.Status.Worker != nil {
+				workerReady = agent.Status.Worker.Ready
+			}
+			agent.Status.Ready = deploymentReady && workerReady
 
-			if agent.Status.Ready {
+			if deploymentReady {
 				setAgentCondition(agent, AgentConditionServerHealthy, metav1.ConditionTrue, "DeploymentHealthy", "Agent deployment is ready")
 			} else {
 				setAgentCondition(agent, AgentConditionServerHealthy, metav1.ConditionFalse, "DeploymentNotReady", "Agent deployment is not ready")
@@ -374,9 +444,9 @@ func (r *AgentReconciler) updateAgentStatus(ctx context.Context, agent *kubeopen
 
 		// Set ServerReady condition
 		if agent.Status.Ready {
-			setAgentCondition(agent, AgentConditionServerReady, metav1.ConditionTrue, "DeploymentReady", "Agent deployment is ready")
+			setAgentCondition(agent, AgentConditionServerReady, metav1.ConditionTrue, "DeploymentReady", "Agent deployment is ready and worker is responding")
 		} else {
-			setAgentCondition(agent, AgentConditionServerReady, metav1.ConditionFalse, "DeploymentNotReady", "Agent deployment is not ready")
+			setAgentCondition(agent, AgentConditionServerReady, metav1.ConditionFalse, "DeploymentNotReady", "Agent deployment is not ready or worker is not responding")
 		}
 	}
 
@@ -476,6 +546,38 @@ func (r *AgentReconciler) processAgentContexts(ctx context.Context, agent *kubeo
 	}
 
 	return contextConfigMap, fileMounts, dirMounts, gitMounts, nil
+}
+
+// reconcileWorkerConfigMap ensures the worker config ConfigMap exists and is up-to-date.
+func (r *AgentReconciler) reconcileWorkerConfigMap(ctx context.Context, agent *kubeopenv1alpha1.Agent, configTOML []byte) error {
+	logger := log.FromContext(ctx)
+	desired := BuildServerWorkerConfigMap(agent, configTOML)
+
+	// Set owner reference for garbage collection
+	if err := controllerutil.SetControllerReference(agent, desired, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference on worker config ConfigMap: %w", err)
+	}
+
+	var existing corev1.ConfigMap
+	err := r.Get(ctx, client.ObjectKey{Namespace: desired.Namespace, Name: desired.Name}, &existing)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("Creating worker config ConfigMap for Agent", "configmap", desired.Name)
+			if err := r.Create(ctx, desired); err != nil {
+				return fmt.Errorf("failed to create worker config ConfigMap: %w", err)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to get worker config ConfigMap: %w", err)
+	}
+
+	existing.Data = desired.Data
+	existing.Labels = desired.Labels
+	if err := r.Update(ctx, &existing); err != nil {
+		return fmt.Errorf("failed to update worker config ConfigMap: %w", err)
+	}
+
+	return nil
 }
 
 // reconcileContextConfigMap ensures the context ConfigMap exists and is up-to-date.

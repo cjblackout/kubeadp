@@ -8,6 +8,10 @@ import (
 )
 
 func TestValidateServerURL(t *testing.T) {
+	// The guard is strict outside the fake-worker tests.
+	allowLoopbackWorkers = false
+	t.Cleanup(func() { allowLoopbackWorkers = true })
+
 	tests := []struct {
 		name          string
 		url           string

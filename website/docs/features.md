@@ -1,10 +1,13 @@
 
 ## Task execution on the kubeadp-agent worker
 
-An Agent's server Pod runs `kubeadp-agent worker` (the OpenCode binary stays available to it as an engine). A Task that references the Agent does not attach an OpenCode TUI to it: the Task Pod runs `kubeopencode task-submit`, which submits a job to the worker's `/api/v1/jobs` API, streams the job log into the Pod log and exits with a code that reflects the final job status (0 only for `done`).
+An Agent's server Pod runs `kubeadp-agent worker` (supporting OpenCode, Antigravity (`agy`), and Claude Code engines). A Task that references the Agent runs `kubeopencode task-submit`, which submits a job to the worker's `/api/v1/jobs` API, streams the job log into the Pod log and exits with a code reflecting the final job status.
 
-- **Where the work happens.** Every job runs in its own git worktree of a *project*, a git repository directory directly under the Agent `workspaceDir`. The project is chosen in this order: the Task annotation `kubeopencode.io/project`; the first git context of the Agent (cloned into the server Pod at its mount path); the default project `workspace`, an empty repository the server Pod creates once on start. Edits therefore land in the job worktree, not in the project directory itself; the patch of a job is available from the worker (`/api/v1/jobs/{id}/diff`).
-- **Model.** The model comes from the Agent's OpenCode configuration. The Task annotation `kubeopencode.io/model` (`provider/model`) overrides it for one Task.
-- **Timeout and stop.** `spec.timeout` is also sent to the worker as the job's `max_runtime`. When a Task is stopped (annotation `kubeopencode.io/stop`) or times out, the Pod is deleted; `task-submit` receives SIGTERM and kills the job on the worker.
-- **Session information.** `status.session.id` is the job ID. The Pod publishes it through its termination message; the controller reads it when the Pod ends. A Task that is stopped or times out has no published ID and keeps an empty `status.session.id`. When the worker reports usage in the job result, `status.session.summary` carries the token usage and cost; message counts and file change statistics are not reported for jobs.
-- **Web terminal.** The terminal of an Agent opens a plain shell (`/bin/bash`) in the server container; there is no OpenCode TUI to attach to.
+- **Where the work happens.** Every job runs in its own git worktree of a *project* under the Agent `workspaceDir`. The project is resolved from `spec.project`, Task annotations, or Agent git contexts. The patch is available via `/api/v1/jobs/{id}/diff` and mirrored in `Task.status.job.diff`.
+- **Engine Selection.** Each Agent or AgentTemplate can specify `spec.engine` (`opencode`, `agy`, or `claude`).
+- **Worker Configuration.** Agents and AgentTemplates define typed daemon configuration in `spec.worker` (e.g. `maxParallel`, `gcMaxAgeDays`, `stallMinutes`, `sandbox`, `hindsight`, `a2a`).
+- **Interactive Actions.** Running tasks support actions (retry, kill, commit, discard, clean, review, message, interrupt, pause, compact, fork, revert) via operator REST endpoints authorized with Kubernetes RBAC.
+- **Model and Effort.** Configured via `spec.model` and `spec.effort`, overriding worker defaults.
+- **Timeout and stop.** `spec.timeout` is sent to the worker as `max_runtime`. Stopping a Task signals the worker to terminate the underlying job.
+- **Live Status Mirroring.** `Task.status.job` reflects real-time job state, branch, commit, diff statistics, and todo items.
+- **Web terminal.** The terminal opens a shell in the server container for direct workspace access.

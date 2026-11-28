@@ -1,0 +1,226 @@
+[
+  {
+    "method": "DELETE",
+    "path": "/api/v1/jobs/{job_id}/clean"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/auth/status"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/capabilities"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/info"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/jobs"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/jobs/{job_id}"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/jobs/{job_id}/cat"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/jobs/{job_id}/diff"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/jobs/{job_id}/events"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/jobs/{job_id}/export"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/jobs/{job_id}/files"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/jobs/{job_id}/log"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/jobs/{job_id}/permissions"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/jobs/{job_id}/result"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/jobs/{job_id}/todo"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/models"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/projects"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/quota"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/remote-control/status"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/runs/{run_id}/permissions"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/runs/{run_id}/todo"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/sessions"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/sessions/{name}"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/sessions/{name}/log"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/auth"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/auth/cancel"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/auth/code"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/gc"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/init"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs/repair"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs/wait"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs/{job_id}/commit"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs/{job_id}/compact"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs/{job_id}/discard"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs/{job_id}/fork"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs/{job_id}/interrupt"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs/{job_id}/kill"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs/{job_id}/message"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs/{job_id}/pause"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs/{job_id}/repair"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs/{job_id}/retry"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs/{job_id}/revert"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobs/{job_id}/review"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/jobsets/{jobset_id}/end"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/remote-control/disable"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/remote-control/enable"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/runs/{run_id}/compact"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/runs/{run_id}/fork"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/runs/{run_id}/interrupt"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/runs/{run_id}/pause"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/runs/{run_id}/revert"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/sessions/{name}/message"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/sessions/{name}/restart"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/sessions/{name}/start"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/sessions/{name}/stop"
+  }
+]

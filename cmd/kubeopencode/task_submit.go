@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/kubeopencode/kubeopencode/internal/kubeadp"
 )
 
 const (
@@ -54,13 +56,27 @@ This is used internally by KubeOpenCode for Task Pods that reference an Agent.`,
 }
 
 var (
-	taskSubmitServerURL   string
-	taskSubmitTaskFile    string
-	taskSubmitTokenFile   string
-	taskSubmitProject     string
-	taskSubmitModel       string
-	taskSubmitTimeout     time.Duration
-	taskSubmitTermination string
+	taskSubmitServerURL        string
+	taskSubmitTaskFile         string
+	taskSubmitTokenFile        string
+	taskSubmitProject          string
+	taskSubmitModel            string
+	taskSubmitEngine           string
+	taskSubmitEffort           string
+	taskSubmitGitRef           string
+	taskSubmitSandbox          bool
+	taskSubmitPlan             bool
+	taskSubmitPrintTimeout     string
+	taskSubmitMode             string
+	taskSubmitProxy            string
+	taskSubmitJobsetID         string
+	taskSubmitAddDirs          []string
+	taskSubmitHindsight        string
+	taskSubmitHindsightBank    string
+	taskSubmitHindsightQuery   string
+	taskSubmitFromPatchContent string
+	taskSubmitTimeout          time.Duration
+	taskSubmitTermination      string
 )
 
 func init() {
@@ -69,6 +85,20 @@ func init() {
 	taskSubmitCmd.Flags().StringVar(&taskSubmitTokenFile, "token-file", "", "Path to the bearer token file")
 	taskSubmitCmd.Flags().StringVar(&taskSubmitProject, "project", "workspace", "Project (git repository directory under the worker workspace root) the job runs in")
 	taskSubmitCmd.Flags().StringVar(&taskSubmitModel, "model", "", "Model in provider/model form (empty: the engine default from its config)")
+	taskSubmitCmd.Flags().StringVar(&taskSubmitEngine, "engine", "opencode", "Engine for job execution (opencode, agy, claude)")
+	taskSubmitCmd.Flags().StringVar(&taskSubmitEffort, "effort", "", "Effort level")
+	taskSubmitCmd.Flags().StringVar(&taskSubmitGitRef, "git-ref", "", "Git ref to checkout")
+	taskSubmitCmd.Flags().BoolVar(&taskSubmitSandbox, "sandbox", false, "Sandbox mode toggle")
+	taskSubmitCmd.Flags().BoolVar(&taskSubmitPlan, "plan", false, "Plan-only mode")
+	taskSubmitCmd.Flags().StringVar(&taskSubmitPrintTimeout, "print-timeout", "", "Output print timeout")
+	taskSubmitCmd.Flags().StringVar(&taskSubmitMode, "mode", "", "Execution mode")
+	taskSubmitCmd.Flags().StringVar(&taskSubmitProxy, "proxy", "", "Proxy URL")
+	taskSubmitCmd.Flags().StringVar(&taskSubmitJobsetID, "jobset-id", "", "Jobset ID")
+	taskSubmitCmd.Flags().StringSliceVar(&taskSubmitAddDirs, "add-dir", nil, "Additional directories")
+	taskSubmitCmd.Flags().StringVar(&taskSubmitHindsight, "hindsight", "", "Hindsight toggle")
+	taskSubmitCmd.Flags().StringVar(&taskSubmitHindsightBank, "hindsight-bank", "", "Hindsight memory bank")
+	taskSubmitCmd.Flags().StringVar(&taskSubmitHindsightQuery, "hindsight-query", "", "Hindsight query")
+	taskSubmitCmd.Flags().StringVar(&taskSubmitFromPatchContent, "from-patch-content", "", "Inline patch content to apply")
 	taskSubmitCmd.Flags().DurationVar(&taskSubmitTimeout, "timeout", 0, "Maximum job runtime (sent as max_runtime); 0 means unbounded")
 	taskSubmitCmd.Flags().StringVar(&taskSubmitTermination, "termination-log", defaultTerminationLog, "File the job ID is written to for the Task controller")
 	_ = taskSubmitCmd.MarkFlagRequired("url")
@@ -76,17 +106,8 @@ func init() {
 	rootCmd.AddCommand(taskSubmitCmd)
 }
 
-// taskEngine is the engine every Task job runs on.
-const taskEngine = "opencode"
-
 // jobCreateRequest is the body of POST /api/v1/jobs.
-type jobCreateRequest struct {
-	Project    string `json:"project"`
-	Prompt     string `json:"prompt"`
-	Engine     string `json:"engine"`
-	Model      string `json:"model,omitempty"`
-	MaxRuntime string `json:"max_runtime,omitempty"`
-}
+type jobCreateRequest = kubeadp.StartRequest
 
 // commandOutput is the envelope the kubeadp-agent job API wraps every answer in.
 type commandOutput struct {
@@ -399,12 +420,29 @@ func runTaskSubmit(cmd *cobra.Command, args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	engine := taskSubmitEngine
+	if engine == "" {
+		engine = "opencode"
+	}
+
 	jobID, err := client.submit(ctx, jobCreateRequest{
-		Project:    project,
-		Prompt:     prompt,
-		Engine:     taskEngine,
-		Model:      taskSubmitModel,
-		MaxRuntime: formatMaxRuntime(taskSubmitTimeout),
+		Project:          project,
+		Prompt:           prompt,
+		Engine:           engine,
+		Model:            taskSubmitModel,
+		Effort:           taskSubmitEffort,
+		GitRef:           taskSubmitGitRef,
+		Sandbox:          taskSubmitSandbox,
+		Plan:             taskSubmitPlan,
+		PrintTimeout:     taskSubmitPrintTimeout,
+		Proxy:            taskSubmitProxy,
+		JobsetID:         taskSubmitJobsetID,
+		AddDirs:          taskSubmitAddDirs,
+		Hindsight:        taskSubmitHindsight,
+		HindsightBank:    taskSubmitHindsightBank,
+		HindsightQuery:   taskSubmitHindsightQuery,
+		FromPatchContent: taskSubmitFromPatchContent,
+		MaxRuntime:       formatMaxRuntime(taskSubmitTimeout),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create job: %w", err)

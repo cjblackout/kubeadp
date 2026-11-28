@@ -10,10 +10,14 @@ import TimeAgo from '../components/TimeAgo';
 import ConfirmDialog from '../components/ConfirmDialog';
 import Breadcrumbs from '../components/Breadcrumbs';
 import YamlViewer from '../components/YamlViewer';
+import TaskActionBar from '../components/TaskActionBar';
+import TaskFilesViewer from '../components/TaskFilesViewer';
+import TaskDiffViewer from '../components/TaskDiffViewer';
+import TaskTodoViewer from '../components/TaskTodoViewer';
 import { DetailSkeleton } from '../components/Skeleton';
 import { useToast } from '../contexts/ToastContext';
 
-type TaskTabId = 'overview' | 'logs' | 'yaml';
+type TaskTabId = 'overview' | 'logs' | 'diff' | 'files' | 'todo' | 'yaml';
 
 const TASK_TABS: { id: TaskTabId; label: string; icon: React.ReactNode }[] = [
   {
@@ -25,6 +29,34 @@ const TASK_TABS: { id: TaskTabId; label: string; icon: React.ReactNode }[] = [
         <rect x="14" y="3" width="7" height="7" rx="1" />
         <rect x="3" y="14" width="7" height="7" rx="1" />
         <rect x="14" y="14" width="7" height="7" rx="1" />
+      </svg>
+    ),
+  },
+  {
+    id: 'diff',
+    label: 'Diff',
+    icon: (
+      <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+        <path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5" />
+      </svg>
+    ),
+  },
+  {
+    id: 'files',
+    label: 'Files',
+    icon: (
+      <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+      </svg>
+    ),
+  },
+  {
+    id: 'todo',
+    label: 'Todo',
+    icon: (
+      <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+        <polyline points="9 11 12 14 22 4" />
+        <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
       </svg>
     ),
   },
@@ -210,6 +242,13 @@ function TaskDetailPage() {
         {/* Overview Tab */}
         {activeTab === 'overview' && (
           <div className="px-6 py-5 space-y-5">
+            {/* Task Action Bar */}
+            <TaskActionBar
+              namespace={namespace!}
+              name={name!}
+              agentName={task.agentRef?.name}
+              isCompleted={task.phase === 'Completed' || task.phase === 'Failed'}
+            />
             {/* Labels */}
             {task.labels && Object.keys(task.labels).length > 0 && (
               <div>
@@ -338,6 +377,27 @@ function TaskDetailPage() {
                 </dd>
               </div>
             )}
+          </div>
+        )}
+
+        {/* Diff Tab */}
+        {activeTab === 'diff' && (
+          <div className="px-6 py-5">
+            <TaskDiffViewer namespace={namespace!} name={name!} />
+          </div>
+        )}
+
+        {/* Files Tab */}
+        {activeTab === 'files' && (
+          <div className="px-6 py-5">
+            <TaskFilesViewer namespace={namespace!} name={name!} />
+          </div>
+        )}
+
+        {/* Todo Tab */}
+        {activeTab === 'todo' && (
+          <div className="px-6 py-5">
+            <TaskTodoViewer namespace={namespace!} name={name!} />
           </div>
         )}
 

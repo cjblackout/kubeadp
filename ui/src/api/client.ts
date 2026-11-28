@@ -35,6 +35,42 @@ export interface SessionInfo {
   summary?: SessionSummary;
 }
 
+export interface DiffStat {
+  files?: number;
+  additions?: number;
+  deletions?: number;
+}
+
+export interface TodoItem {
+  id?: string;
+  content: string;
+  status: string;
+  activeForm?: string;
+}
+
+export interface TaskAction {
+  type: string;
+  by?: string;
+  time?: string;
+  result?: string;
+}
+
+export interface TaskJobStatus {
+  id?: string;
+  status?: string;
+  engine?: string;
+  model?: string;
+  elapsedSeconds?: number;
+  conversationId?: string;
+  branch?: string;
+  worktree?: string;
+  commit?: string;
+  diff?: DiffStat;
+  todo?: TodoItem[];
+  pendingPermissions?: number;
+  lastAction?: TaskAction;
+}
+
 export interface Task {
   name: string;
   namespace: string;
@@ -45,6 +81,7 @@ export interface Task {
   timeout?: string;
   podName?: string;
   session?: SessionInfo;
+  job?: TaskJobStatus;
   startTime?: string;
   completionTime?: string;
   duration?: string;
@@ -84,6 +121,15 @@ export interface CreateTaskRequest {
   agentRef?: AgentReference;
   templateRef?: { name: string };
   timeout?: string;
+  project?: string;
+  gitRef?: string;
+  model?: string;
+  effort?: string;
+  sandbox?: boolean;
+  addDirs?: string[];
+  plan?: boolean;
+  printTimeout?: string;
+  mode?: string;
 }
 
 export interface CreateVolumePersistence {
@@ -113,6 +159,8 @@ export interface AssemblyPluginInput {
 
 export interface CreateAgentTemplateRequest {
   name: string;
+  engine?: 'opencode' | 'agy' | 'claude';
+  worker?: WorkerConfigInput;
   workspaceDir?: string;
   serviceAccountName?: string;
   agentImage?: string;
@@ -122,9 +170,90 @@ export interface CreateAgentTemplateRequest {
   plugins?: AssemblyPluginInput[];
 }
 
+export interface WorkerCapacityStatus {
+  maxParallel?: number;
+  running?: number;
+}
+
+export interface WorkerDiskStatus {
+  totalBytes?: number;
+  freeBytes?: number;
+}
+
+export interface WorkerEngineAuthState {
+  engine: string;
+  state: string;
+}
+
+export interface WorkerAuthStatus {
+  state?: string;
+  engines?: WorkerEngineAuthState[];
+}
+
+export interface WorkerCapability {
+  engine: string;
+  transport?: string;
+  endpoints?: Record<string, string>;
+}
+
+export interface WorkerQuotaStatus {
+  group: string;
+  window?: string;
+  remainingPercent?: number;
+  resetsAt?: string;
+}
+
+export interface WorkerProjectStatus {
+  name: string;
+  branch?: string;
+  head?: string;
+  lastSync?: string;
+  jobs?: number;
+}
+
+export interface WorkerRemoteControlStatus {
+  enabled?: boolean;
+  state?: string;
+}
+
+export interface WorkerStatus {
+  version?: string;
+  ready?: boolean;
+  lastSyncTime?: string;
+  capacity?: WorkerCapacityStatus;
+  disk?: WorkerDiskStatus;
+  auth?: WorkerAuthStatus;
+  capabilities?: WorkerCapability[];
+  models?: string[];
+  quota?: WorkerQuotaStatus[];
+  projects?: WorkerProjectStatus[];
+  remoteControl?: WorkerRemoteControlStatus;
+}
+
+export interface WorkerConfigInput {
+  maxParallel?: number;
+  gcMaxAgeDays?: number;
+  stallMinutes?: number;
+  launchTimeoutSecs?: number;
+  shutdownGraceSecs?: number;
+  defaultModel?: string;
+  defaultEffort?: string;
+  defaultBaseBranch?: string;
+  defaultEngine?: 'opencode' | 'agy' | 'claude';
+  maxRuntime?: string;
+  jobsDirName?: string;
+  reposRoot?: string;
+  sandbox?: {
+    roPaths?: string[];
+    envAllow?: string[];
+  };
+}
+
 export interface CreateAgentRequest {
   name: string;
   profile?: string;
+  engine?: 'opencode' | 'agy' | 'claude';
+  worker?: WorkerConfigInput;
   templateRef?: AgentReference;
   workspaceDir?: string;
   serviceAccountName?: string;
@@ -233,10 +362,67 @@ export interface UpdateShareRequest {
   allowedIPs?: string[];
 }
 
+export interface CapabilitiesResponse {
+  engine: string;
+  endpoints: Record<string, 'native' | 'emulated' | 'unsupported'>;
+}
+
+export interface ModelEntry {
+  id: string;
+  name?: string;
+  provider?: string;
+}
+
+export interface QuotaEntry {
+  limit?: number;
+  remaining?: number;
+  reset?: string;
+}
+
+export interface QuotaResponse {
+  groups?: Record<string, QuotaEntry>;
+}
+
+export interface ProjectEntry {
+  id: string;
+  name: string;
+  path?: string;
+}
+
+export interface WorkerJob {
+  id: string;
+  project?: string;
+  engine?: string;
+  status: string;
+  elapsed_seconds?: number;
+  task_name?: string;
+}
+
+export interface AuthStatusResponse {
+  authenticated: boolean;
+  user?: string;
+  engines?: Record<string, string>;
+}
+
+export interface RemoteControlStatusResponse {
+  enabled: boolean;
+}
+
+export interface GCRequest {
+  dry_run?: boolean;
+}
+
+export interface GCResult {
+  removed_jobs?: number;
+  freed_bytes?: number;
+}
+
 export interface Agent {
   name: string;
   namespace: string;
   profile?: string;
+  engine?: 'opencode' | 'agy' | 'claude';
+  worker?: WorkerConfigInput;
   templateRef?: AgentReference;
   executorImage?: string;
   kubeadpImage?: string;
@@ -260,11 +446,14 @@ export interface Agent {
   share?: ShareStatusInfo;
   conditions?: Condition[];
   serverStatus?: ServerStatusInfo;
+  workerStatus?: WorkerStatus;
 }
 
 export interface AgentTemplate {
   name: string;
   namespace: string;
+  engine?: 'opencode' | 'agy' | 'claude';
+  worker?: WorkerConfigInput;
   agentImage?: string;
   kubeadpImage?: string;
   executorImage?: string;
@@ -283,6 +472,38 @@ export interface AgentTemplate {
   labels?: Record<string, string>;
   conditions?: Condition[];
   agentCount: number;
+}
+
+export interface AgentSession {
+  name: string;
+  namespace: string;
+  agentName: string;
+  engine?: string;
+  phase: string;
+  pid?: number;
+  startTime?: string;
+  uptimeSecs?: number;
+  restartCount?: number;
+  lastExitReason?: string;
+  lastHealthResult?: string;
+  paused: boolean;
+  controlled: boolean;
+  engineReady?: boolean;
+  createdAt: string;
+}
+
+export interface AgentSessionListResponse {
+  sessions: AgentSession[];
+  total: number;
+  pagination?: Pagination;
+}
+
+export interface CreateAgentSessionRequest {
+  name: string;
+  agentName: string;
+  engine?: string;
+  instructionsFile?: string;
+  sandbox?: boolean;
 }
 
 export interface AgentTemplateListResponse {
@@ -319,6 +540,14 @@ export interface ConfigResponse {
   systemImage?: SystemImageConfig;
   cleanup?: CleanupConfig;
   proxy?: ProxyConfigInfo;
+  workerDefaults?: WorkerConfigInput;
+  taskDefaults?: {
+    model?: string;
+    effort?: string;
+    timeout?: string;
+    plan?: boolean;
+    sandbox?: boolean;
+  };
   labels?: Record<string, string>;
 }
 
@@ -366,6 +595,12 @@ export interface CreateCronTaskRequest {
   description?: string;
   agentRef?: AgentReference;
   templateRef?: { name: string };
+  project?: string;
+  gitRef?: string;
+  model?: string;
+  effort?: string;
+  plan?: boolean;
+  mode?: string;
   contexts?: ContextItem[];
 }
 
@@ -534,6 +769,117 @@ export const api = {
       method: 'POST',
     }),
 
+  // Task Actions
+  retryTask: (namespace: string, name: string, prompt?: string) =>
+    request<{ status: string }>(`/namespaces/${namespace}/tasks/${name}/retry`, {
+      method: 'POST',
+      body: JSON.stringify({ prompt }),
+    }),
+
+  killTask: (namespace: string, name: string) =>
+    request<{ status: string }>(`/namespaces/${namespace}/tasks/${name}/kill`, {
+      method: 'POST',
+    }),
+
+  commitTask: (namespace: string, name: string, message: string, only?: string[], exclude?: string[]) =>
+    request<{ status: string }>(`/namespaces/${namespace}/tasks/${name}/commit`, {
+      method: 'POST',
+      body: JSON.stringify({ message, only, exclude }),
+    }),
+
+  discardTask: (namespace: string, name: string, files: string[]) =>
+    request<{ status: string }>(`/namespaces/${namespace}/tasks/${name}/discard`, {
+      method: 'POST',
+      body: JSON.stringify({ files }),
+    }),
+
+  cleanTask: (namespace: string, name: string, force?: boolean, purgeLog?: boolean) =>
+    request<{ status: string }>(`/namespaces/${namespace}/tasks/${name}/clean`, {
+      method: 'POST',
+      body: JSON.stringify({ force, purge_log: purgeLog }),
+    }),
+
+  reviewTask: (namespace: string, name: string, reviewerModel?: string) =>
+    request<{ status: string }>(`/namespaces/${namespace}/tasks/${name}/review`, {
+      method: 'POST',
+      body: JSON.stringify({ reviewer_model: reviewerModel }),
+    }),
+
+  messageTask: (namespace: string, name: string, text: string) =>
+    request<{ status: string }>(`/namespaces/${namespace}/tasks/${name}/message`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    }),
+
+  interruptTask: (namespace: string, name: string) =>
+    request<{ status: string }>(`/namespaces/${namespace}/tasks/${name}/interrupt`, {
+      method: 'POST',
+    }),
+
+  pauseTask: (namespace: string, name: string, paused: boolean) =>
+    request<{ status: string }>(`/namespaces/${namespace}/tasks/${name}/pause`, {
+      method: 'POST',
+      body: JSON.stringify({ paused }),
+    }),
+
+  compactTask: (namespace: string, name: string) =>
+    request<{ status: string }>(`/namespaces/${namespace}/tasks/${name}/compact`, {
+      method: 'POST',
+    }),
+
+  forkTask: (namespace: string, name: string) =>
+    request<{ status: string; job_id: string }>(`/namespaces/${namespace}/tasks/${name}/fork`, {
+      method: 'POST',
+    }),
+
+  revertTask: (namespace: string, name: string, commit: string) =>
+    request<{ status: string }>(`/namespaces/${namespace}/tasks/${name}/revert`, {
+      method: 'POST',
+      body: JSON.stringify({ commit }),
+    }),
+
+  getTaskDiff: async (namespace: string, name: string, stat?: boolean): Promise<string> => {
+    const res = await fetch(`${API_BASE}/namespaces/${namespace}/tasks/${name}/diff${stat ? '?stat=true' : ''}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.text();
+  },
+
+  getTaskFiles: (namespace: string, name: string, path?: string, depth?: number) => {
+    const p = new URLSearchParams();
+    if (path) p.set('path', path);
+    if (depth) p.set('depth', depth.toString());
+    const q = p.toString();
+    return request<string[]>(`/namespaces/${namespace}/tasks/${name}/files${q ? `?${q}` : ''}`);
+  },
+
+  getTaskCat: async (namespace: string, name: string, path: string, lines?: string, maxBytes?: number): Promise<string> => {
+    const p = new URLSearchParams({ path });
+    if (lines) p.set('lines', lines);
+    if (maxBytes) p.set('max_bytes', maxBytes.toString());
+    const res = await fetch(`${API_BASE}/namespaces/${namespace}/tasks/${name}/cat?${p.toString()}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.text();
+  },
+
+  getTaskJobLog: (namespace: string, name: string, offset?: number) => {
+    const p = new URLSearchParams();
+    if (offset !== undefined) p.set('offset', offset.toString());
+    const q = p.toString();
+    return request<{ log: string; next_offset: number }>(`/namespaces/${namespace}/tasks/${name}/job-log${q ? `?${q}` : ''}`);
+  },
+
+  getTaskTodo: (namespace: string, name: string) =>
+    request<TodoItem[]>(`/namespaces/${namespace}/tasks/${name}/todo`),
+
+  getTaskPermissions: (namespace: string, name: string) =>
+    request<string[]>(`/namespaces/${namespace}/tasks/${name}/permissions`),
+
+  getTaskExportUrl: (namespace: string, name: string) =>
+    `${API_BASE}/namespaces/${namespace}/tasks/${name}/export`,
+
+  getTaskEventsUrl: (namespace: string, name: string) =>
+    `${API_BASE}/namespaces/${namespace}/tasks/${name}/events`,
+
   // Log streaming - returns an EventSource for SSE
   getTaskLogsUrl: (namespace: string, name: string, container?: string) => {
     const params = new URLSearchParams();
@@ -614,6 +960,62 @@ export const api = {
   deleteAgentShare: (namespace: string, name: string) =>
     request<Agent>(`/namespaces/${namespace}/agents/${name}/share`, {
       method: 'DELETE',
+    }),
+
+  // Agent Sessions
+  listAllAgentSessions: (params?: FilterParams) => {
+    const searchParams = new URLSearchParams();
+    if (params?.name) searchParams.set('name', params.name);
+    if (params?.limit) searchParams.set('limit', params.limit.toString());
+    if (params?.offset !== undefined) searchParams.set('offset', params.offset.toString());
+    if (params?.sortOrder) searchParams.set('sortOrder', params.sortOrder);
+    const queryString = searchParams.toString();
+    return request<AgentSessionListResponse>(`/agentsessions${queryString ? `?${queryString}` : ''}`);
+  },
+
+  listAgentSessions: (namespace: string, params?: FilterParams) => {
+    const searchParams = new URLSearchParams();
+    if (params?.name) searchParams.set('name', params.name);
+    if (params?.limit) searchParams.set('limit', params.limit.toString());
+    if (params?.offset !== undefined) searchParams.set('offset', params.offset.toString());
+    if (params?.sortOrder) searchParams.set('sortOrder', params.sortOrder);
+    const queryString = searchParams.toString();
+    return request<AgentSessionListResponse>(`/namespaces/${namespace}/agentsessions${queryString ? `?${queryString}` : ''}`);
+  },
+
+  getAgentSession: (namespace: string, name: string) =>
+    request<AgentSession>(`/namespaces/${namespace}/agentsessions/${name}`),
+
+  createAgentSession: (namespace: string, data: CreateAgentSessionRequest) =>
+    request<AgentSession>(`/namespaces/${namespace}/agentsessions`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  deleteAgentSession: (namespace: string, name: string) =>
+    request<void>(`/namespaces/${namespace}/agentsessions/${name}`, { method: 'DELETE' }),
+
+  startAgentSession: (namespace: string, name: string) =>
+    request<AgentSession>(`/namespaces/${namespace}/agentsessions/${name}/start`, { method: 'POST' }),
+
+  stopAgentSession: (namespace: string, name: string) =>
+    request<AgentSession>(`/namespaces/${namespace}/agentsessions/${name}/stop`, { method: 'POST' }),
+
+  restartAgentSession: (namespace: string, name: string) =>
+    request<AgentSession>(`/namespaces/${namespace}/agentsessions/${name}/restart`, { method: 'POST' }),
+
+  getAgentSessionLog: async (namespace: string, name: string, tail?: number): Promise<string> => {
+    const p = new URLSearchParams();
+    if (tail) p.set('tail', tail.toString());
+    const res = await fetch(`${API_BASE}/namespaces/${namespace}/agentsessions/${name}/log?${p.toString()}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.text();
+  },
+
+  messageAgentSession: (namespace: string, name: string, text: string) =>
+    request<any>(`/namespaces/${namespace}/agentsessions/${name}/message`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
     }),
 
   // Agent Templates
@@ -815,6 +1217,73 @@ export const api = {
       throw new Error(error.message || error.error || `HTTP ${response.status}`);
     }
   },
+
+  // Agent Worker API (M6)
+  getAgentWorkerInfo: (namespace: string, name: string) =>
+    request<any>(`/namespaces/${namespace}/agents/${name}/worker/info`),
+
+  getAgentWorkerCapabilities: (namespace: string, name: string) =>
+    request<CapabilitiesResponse>(`/namespaces/${namespace}/agents/${name}/worker/capabilities`),
+
+  getAgentWorkerModels: (namespace: string, name: string) =>
+    request<ModelEntry[]>(`/namespaces/${namespace}/agents/${name}/worker/models`),
+
+  getAgentWorkerQuota: (namespace: string, name: string, fresh?: boolean) =>
+    request<QuotaResponse>(`/namespaces/${namespace}/agents/${name}/worker/quota${fresh ? '?fresh=true' : ''}`),
+
+  getAgentWorkerProjects: (namespace: string, name: string) =>
+    request<ProjectEntry[]>(`/namespaces/${namespace}/agents/${name}/worker/projects`),
+
+  getAgentWorkerJobs: (namespace: string, name: string, filter?: { project?: string; engine?: string; status?: string }) => {
+    const p = new URLSearchParams();
+    if (filter?.project) p.set('project', filter.project);
+    if (filter?.engine) p.set('engine', filter.engine);
+    if (filter?.status) p.set('status', filter.status);
+    const q = p.toString();
+    return request<WorkerJob[]>(`/namespaces/${namespace}/agents/${name}/worker/jobs${q ? `?${q}` : ''}`);
+  },
+
+  getAgentWorkerAuthStatus: (namespace: string, name: string) =>
+    request<AuthStatusResponse>(`/namespaces/${namespace}/agents/${name}/worker/auth/status`),
+
+  startAgentWorkerAuth: (namespace: string, name: string) =>
+    request<{ url?: string; code?: string }>(`/namespaces/${namespace}/agents/${name}/worker/auth/start`, { method: 'POST' }),
+
+  submitAgentWorkerAuthCode: (namespace: string, name: string, code: string) =>
+    request<{ status: string }>(`/namespaces/${namespace}/agents/${name}/worker/auth/code`, {
+      method: 'POST',
+      body: JSON.stringify({ code }),
+    }),
+
+  cancelAgentWorkerAuth: (namespace: string, name: string) =>
+    request<{ status: string }>(`/namespaces/${namespace}/agents/${name}/worker/auth/cancel`, { method: 'POST' }),
+
+  getAgentWorkerRemoteControlStatus: (namespace: string, name: string) =>
+    request<RemoteControlStatusResponse>(`/namespaces/${namespace}/agents/${name}/worker/remote-control/status`),
+
+  enableAgentWorkerRemoteControl: (namespace: string, name: string) =>
+    request<{ status: string }>(`/namespaces/${namespace}/agents/${name}/worker/remote-control/enable`, { method: 'POST' }),
+
+  disableAgentWorkerRemoteControl: (namespace: string, name: string) =>
+    request<{ status: string }>(`/namespaces/${namespace}/agents/${name}/worker/remote-control/disable`, { method: 'POST' }),
+
+  runAgentWorkerGC: (namespace: string, name: string, req?: GCRequest) =>
+    request<GCResult>(`/namespaces/${namespace}/agents/${name}/worker/gc`, {
+      method: 'POST',
+      body: JSON.stringify(req || {}),
+    }),
+
+  initAgentWorker: (namespace: string, name: string, req?: any) =>
+    request<{ status: string }>(`/namespaces/${namespace}/agents/${name}/worker/init`, {
+      method: 'POST',
+      body: JSON.stringify(req || {}),
+    }),
+
+  repairAgentWorkerJobs: (namespace: string, name: string) =>
+    request<{ status: string }>(`/namespaces/${namespace}/agents/${name}/worker/jobs/repair`, { method: 'POST' }),
+
+  endAgentWorkerJobset: (namespace: string, name: string, jobsetId: string) =>
+    request<any>(`/namespaces/${namespace}/agents/${name}/worker/jobsets/${jobsetId}/end`, { method: 'POST' }),
 
 };
 

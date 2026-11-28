@@ -27,7 +27,7 @@ metadata:
 rules:
 # View tasks, crontasks, agents, templates, and registries
 - apiGroups: ["kubeopencode.io"]
-  resources: ["tasks", "crontasks", "agents", "agenttemplates", "registries"]
+  resources: ["tasks", "crontasks", "agents", "agenttemplates", "agentsessions", "registries"]
   verbs: ["get", "list", "watch"]
 # Manage registries (create, update, delete)
 - apiGroups: ["kubeopencode.io"]
@@ -49,6 +49,10 @@ rules:
 - apiGroups: ["kubeopencode.io"]
   resources: ["agenttemplates"]
   verbs: ["create", "update", "delete"]
+# Manage agent sessions (create, delete, start, stop, message)
+- apiGroups: ["kubeopencode.io"]
+  resources: ["agentsessions"]
+  verbs: ["create", "update", "delete", "patch"]
 # View and update cluster config
 - apiGroups: ["kubeopencode.io"]
   resources: ["kubeopencodeconfigs"]

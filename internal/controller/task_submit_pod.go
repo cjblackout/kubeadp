@@ -64,11 +64,13 @@ func buildKubeadpClientVolume(agentName string) corev1.Volume {
 	}
 }
 
-// taskProject returns the project a Task job runs in: the explicit annotation,
-// else the first git mount below the workspace directory (Agent git contexts are
-// listed first and are cloned into the server Pod at the same path), else the
-// default project.
+// taskProject returns the project a Task job runs in: explicit spec.project,
+// else the explicit annotation, else the first git mount below the workspace directory,
+// else the default project.
 func taskProject(task *kubeopenv1alpha1.Task, workspaceDir string, gitMounts []gitMount) string {
+	if task.Spec.Project != "" {
+		return path.Base(path.Clean(task.Spec.Project))
+	}
 	if p := strings.TrimSpace(task.Annotations[TaskProjectAnnotation]); p != "" {
 		return path.Base(path.Clean(p))
 	}
@@ -93,16 +95,72 @@ func taskProject(task *kubeopenv1alpha1.Task, workspaceDir string, gitMounts []g
 // `kubeopencode task-submit` with the worker URL, the prompt file written by
 // the context init, the token file, the project and the Task timeout.
 func buildTaskSubmitCommand(task *kubeopenv1alpha1.Task, cfg agentConfig, serverURL, project string) []string {
+	engine := "opencode"
+	if cfg.engine != nil && *cfg.engine != "" {
+		engine = string(*cfg.engine)
+	} else if cfg.worker != nil && cfg.worker.DefaultEngine != nil && *cfg.worker.DefaultEngine != "" {
+		engine = string(*cfg.worker.DefaultEngine)
+	}
+
 	cmd := []string{
 		"/kubeopencode", "task-submit",
 		"--url", serverURL,
 		"--task-file", cfg.workspaceDir + "/task.md",
 		"--token-file", KubeadpClientMountPath + "/" + KubeadpAPITokenKey,
 		"--project", project,
+		"--engine", engine,
 	}
-	if model := strings.TrimSpace(task.Annotations[TaskModelAnnotation]); model != "" {
+
+	model := task.Spec.Model
+	if model == "" {
+		model = strings.TrimSpace(task.Annotations[TaskModelAnnotation])
+	}
+	if model != "" {
 		cmd = append(cmd, "--model", model)
 	}
+
+	if task.Spec.Effort != "" {
+		cmd = append(cmd, "--effort", task.Spec.Effort)
+	}
+	if task.Spec.GitRef != "" {
+		cmd = append(cmd, "--git-ref", task.Spec.GitRef)
+	}
+	if task.Spec.Sandbox != nil {
+		cmd = append(cmd, "--sandbox="+strconv.FormatBool(*task.Spec.Sandbox))
+	}
+	if task.Spec.Plan != nil {
+		cmd = append(cmd, "--plan="+strconv.FormatBool(*task.Spec.Plan))
+	}
+	if task.Spec.Mode != "" {
+		cmd = append(cmd, "--mode", task.Spec.Mode)
+	}
+	if task.Spec.Proxy != "" {
+		cmd = append(cmd, "--proxy", task.Spec.Proxy)
+	}
+	if task.Spec.Jobset != "" {
+		cmd = append(cmd, "--jobset-id", task.Spec.Jobset)
+	}
+	for _, dir := range task.Spec.AddDirs {
+		cmd = append(cmd, "--add-dir", dir)
+	}
+	if task.Spec.PrintTimeout != nil && task.Spec.PrintTimeout.Duration > 0 {
+		cmd = append(cmd, "--print-timeout", task.Spec.PrintTimeout.Duration.String())
+	}
+	if task.Spec.Hindsight != nil {
+		if task.Spec.Hindsight.Enabled != nil {
+			cmd = append(cmd, "--hindsight="+strconv.FormatBool(*task.Spec.Hindsight.Enabled))
+		}
+		if task.Spec.Hindsight.Bank != "" {
+			cmd = append(cmd, "--hindsight-bank", task.Spec.Hindsight.Bank)
+		}
+		if task.Spec.Hindsight.Query != "" {
+			cmd = append(cmd, "--hindsight-query", task.Spec.Hindsight.Query)
+		}
+	}
+	if task.Spec.FromPatch != nil && task.Spec.FromPatch.Text != "" {
+		cmd = append(cmd, "--from-patch-content", task.Spec.FromPatch.Text)
+	}
+
 	if task.Spec.Timeout != nil && task.Spec.Timeout.Duration > 0 {
 		// Pass the timeout in whole seconds so the worker enforces max_runtime
 		// even if the Pod is not deleted on time.
@@ -118,10 +176,16 @@ func buildTaskSubmitCommand(task *kubeopenv1alpha1.Task, cfg agentConfig, server
 // workspaceInitScript returns the shell snippet that creates the default
 // project repository once (idempotent) and runs the worker command. The job API
 // creates a git worktree of a project, so the project must be a repository with
-// at least one commit.
-func workspaceInitScript(workspaceDir, workerCommand string) string {
+// at least one commit. When one or more homeDirs are given (e.g. HOME on a
+// persistent session volume), each is created first so the shell and the engine
+// have a writable home.
+func workspaceInitScript(workspaceDir, workerCommand string, homeDirs ...string) string {
 	repo := path.Join(workspaceDir, DefaultTaskProject)
-	return fmt.Sprintf(
+	init := fmt.Sprintf(
 		`mkdir -p %[1]s && if [ ! -d %[1]s/.git ]; then git -C %[1]s init -q -b main && git -C %[1]s -c user.name=kubeopencode -c user.email=kubeopencode@localhost commit -q --allow-empty -m "kubeopencode: initial commit"; fi; %[2]s`,
 		shellEscape(repo), workerCommand)
+	for _, home := range homeDirs {
+		init = "mkdir -p " + shellEscape(home) + " && " + init
+	}
+	return init
 }
