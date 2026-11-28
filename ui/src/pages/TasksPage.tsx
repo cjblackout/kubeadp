@@ -318,6 +318,9 @@ function TasksPage() {
                 <th className="px-5 py-3 text-left text-[11px] font-display font-medium text-stone-400 uppercase tracking-wider">
                   Status
                 </th>
+                <th className="px-5 py-3 text-left text-[11px] font-display font-medium text-stone-400 uppercase tracking-wider hidden md:table-cell">
+                  Worker / Diff
+                </th>
                 <th className="px-5 py-3 text-left text-[11px] font-display font-medium text-stone-400 uppercase tracking-wider hidden lg:table-cell">
                   Labels
                 </th>
@@ -376,7 +379,42 @@ function TasksPage() {
                       </td>
                     )}
                     <td className="px-5 py-3.5 whitespace-nowrap">
-                      <StatusBadge phase={task.phase || 'Pending'} />
+                      <div className="flex items-center gap-1.5">
+                        <StatusBadge phase={task.phase || 'Pending'} />
+                        {task.job?.status && (
+                          <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono uppercase font-semibold ${
+                            task.job.status === 'running' ? 'bg-blue-100 text-blue-700' :
+                            task.job.status === 'done' ? 'bg-emerald-100 text-emerald-700' :
+                            task.job.status === 'failed' || task.job.status === 'killed' ? 'bg-rose-100 text-rose-700' :
+                            'bg-stone-100 text-stone-600'
+                          }`}>
+                            {task.job.status}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="px-5 py-3.5 whitespace-nowrap hidden md:table-cell">
+                      <div className="flex flex-col gap-0.5">
+                        <div className="flex items-center gap-1.5">
+                          {task.job?.engine && (
+                            <span className="text-[11px] px-1.5 py-0.5 rounded bg-stone-100 text-stone-700 font-mono font-medium">
+                              {task.job.engine}
+                            </span>
+                          )}
+                          {task.job?.model && (
+                            <span className="text-[11px] text-stone-500 font-mono truncate max-w-[120px]" title={task.job.model}>
+                              {task.job.model}
+                            </span>
+                          )}
+                        </div>
+                        {task.job?.diff && (task.job.diff.files > 0 || task.job.diff.additions > 0 || task.job.diff.deletions > 0) ? (
+                          <div className="flex items-center gap-1 text-[11px] font-mono">
+                            <span className="text-stone-500">{task.job.diff.files} files</span>
+                            <span className="text-emerald-600 font-semibold">+{task.job.diff.additions}</span>
+                            <span className="text-rose-600 font-semibold">-{task.job.diff.deletions}</span>
+                          </div>
+                        ) : null}
+                      </div>
                     </td>
                     <td className="px-5 py-3.5 hidden lg:table-cell">
                       <Labels labels={task.labels} maxDisplay={2} />
