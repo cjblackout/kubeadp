@@ -147,6 +147,8 @@ type systemConfig struct {
 	// observability is the cluster-wide observability configuration from KubeOpenCodeConfig.
 	// When set and enabled, OTel env vars are injected into agent Pods.
 	observability *kubeopenv1alpha1.ObservabilitySpec
+	// clusterConfig is the cluster-wide KubeOpenCodeConfig singleton.
+	clusterConfig *kubeopenv1alpha1.KubeOpenCodeConfig
 }
 
 // applySystemDefaults merges cluster-level configuration from KubeOpenCodeConfig

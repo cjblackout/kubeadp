@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -41,6 +42,18 @@ const (
 
 	// KubeadpSecretMountPath is where the kubeadp secret is mounted in the server container.
 	KubeadpSecretMountPath = "/etc/kubeadp"
+
+	// KubeadpWorkerConfigMapSuffix is appended to Agent name for the worker configmap.
+	KubeadpWorkerConfigMapSuffix = "-worker-config"
+
+	// KubeadpWorkerConfigVolumeName is the volume name for mounting the worker config.
+	KubeadpWorkerConfigVolumeName = "worker-config"
+
+	// KubeadpWorkerConfigMountPath is where config.toml is mounted in the server container.
+	KubeadpWorkerConfigMountPath = "/etc/kubeadp-agent"
+
+	// WorkerConfigHashAnnotationKey is the annotation key for the rendered config hash.
+	WorkerConfigHashAnnotationKey = "kubeopencode.io/worker-config-hash"
 
 	// KubeadpAPITokenKey is the key in the secret containing the API Bearer token.
 	KubeadpAPITokenKey = "api-token"
@@ -94,6 +107,25 @@ const (
 	// DefaultReadinessPeriodSeconds is the period for the readiness probe.
 	DefaultReadinessPeriodSeconds = 10
 )
+
+// ServerWorkerConfigMapName returns the ConfigMap name for the Agent's worker config.
+func ServerWorkerConfigMapName(agentName string) string {
+	return agentName + KubeadpWorkerConfigMapSuffix
+}
+
+// BuildServerWorkerConfigMap creates a ConfigMap for an Agent's worker config.toml.
+func BuildServerWorkerConfigMap(agent *kubeopenv1alpha1.Agent, configTOML []byte) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ServerWorkerConfigMapName(agent.Name),
+			Namespace: agent.Namespace,
+			Labels:    getServerLabels(agent.Name),
+		},
+		Data: map[string]string{
+			"config.toml": string(configTOML),
+		},
+	}
+}
 
 // ServerDeploymentName returns the Deployment name for a Server-mode Agent.
 func ServerDeploymentName(agentName string) string {
@@ -281,6 +313,74 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 		{Name: "AGENT_RUN_API_LISTEN", Value: fmt.Sprintf("0.0.0.0:%d", port)},
 	}
 
+	// Engine default resolution (M4)
+	defaultEngine := "opencode"
+	if agentCfg.engine != nil && *agentCfg.engine != "" {
+		defaultEngine = string(*agentCfg.engine)
+	} else if agentCfg.worker != nil && agentCfg.worker.DefaultEngine != nil && *agentCfg.worker.DefaultEngine != "" {
+		defaultEngine = string(*agentCfg.worker.DefaultEngine)
+	}
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "AGENT_RUN_DEFAULT_ENGINE",
+		Value: defaultEngine,
+	})
+
+	// Sandbox RO Paths: default includes context mount paths, .kubeopencode, skills, plugins, config dir
+	roPathsMap := make(map[string]bool)
+	for _, fm := range ctxFileMounts {
+		if filepath.IsAbs(fm.filePath) {
+			roPathsMap[filepath.Clean(fm.filePath)] = true
+		} else {
+			roPathsMap[filepath.Join(agentCfg.workspaceDir, fm.filePath)] = true
+		}
+	}
+	for _, dm := range ctxDirMounts {
+		if filepath.IsAbs(dm.dirPath) {
+			roPathsMap[filepath.Clean(dm.dirPath)] = true
+		} else {
+			roPathsMap[filepath.Join(agentCfg.workspaceDir, dm.dirPath)] = true
+		}
+	}
+	roPathsMap[filepath.Join(agentCfg.workspaceDir, ".kubeopencode")] = true
+	roPathsMap[DefaultSkillsMountBase] = true
+	roPathsMap[DefaultPluginsMountBase] = true
+	roPathsMap[filepath.Dir(OpenCodeConfigPath)] = true
+
+	if agentCfg.worker != nil && agentCfg.worker.Sandbox != nil {
+		for _, p := range agentCfg.worker.Sandbox.ROPaths {
+			if filepath.IsAbs(p) && !strings.Contains(p, "..") {
+				roPathsMap[filepath.Clean(p)] = true
+			}
+		}
+	}
+
+	// Check extraEnv for existing KUBEADP_SANDBOX_RO_PATHS
+	for _, ev := range agentCfg.extraEnv {
+		if ev.Name == "KUBEADP_SANDBOX_RO_PATHS" && ev.Value != "" {
+			for _, p := range strings.Split(ev.Value, ":") {
+				p = strings.TrimSpace(p)
+				if filepath.IsAbs(p) && !strings.Contains(p, "..") {
+					roPathsMap[filepath.Clean(p)] = true
+				}
+			}
+		}
+	}
+
+	var roPathsList []string
+	for p := range roPathsMap {
+		// Never include workspace root itself
+		if p != filepath.Clean(agentCfg.workspaceDir) && p != "/" {
+			roPathsList = append(roPathsList, p)
+		}
+	}
+	sort.Strings(roPathsList)
+	if len(roPathsList) > 0 {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "KUBEADP_SANDBOX_RO_PATHS",
+			Value: strings.Join(roPathsList, ":"),
+		})
+	}
+
 	// Build sandbox env allow-list: default to OPENCODE_* plus any explicit credential env names.
 	sandboxAllowList := []string{"OPENCODE_*"}
 	for _, cred := range agentCfg.credentials {
@@ -323,6 +423,7 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 	volumeMounts := []corev1.VolumeMount{
 		{Name: ToolsVolumeName, MountPath: ToolsMountPath},
 		{Name: WorkspaceVolumeName, MountPath: agentCfg.workspaceDir},
+		{Name: KubeadpWorkerConfigVolumeName, MountPath: KubeadpWorkerConfigMountPath, ReadOnly: true},
 	}
 
 	// Build volumes
@@ -347,6 +448,16 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 		{
 			Name:         WorkspaceVolumeName,
 			VolumeSource: workspaceVolumeSource,
+		},
+		{
+			Name: KubeadpWorkerConfigVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: ServerWorkerConfigMapName(agent.Name),
+					},
+				},
+			},
 		},
 	}
 
@@ -654,6 +765,12 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 	// Note: git-sync sidecar overrides are applied separately below (after sidecar construction)
 	// because sidecars are not init containers and are only present in Agent Deployments.
 	applyExtraEnvAndSystemOverrides(initContainers, &envVars, agentCfg)
+
+	// Inject secret env vars from rendered worker config (e.g. AGENT_RUN_HINDSIGHT_API_KEY, proxy)
+	rendered := RenderWorkerConfig(agent, nil, sysCfg.clusterConfig)
+	for _, env := range rendered.EnvVars {
+		envVars = append(envVars, env)
+	}
 
 	// Build the worker command running kubeadp-agent worker.
 	// When context-init handles config file writing, we don't need inline heredoc.

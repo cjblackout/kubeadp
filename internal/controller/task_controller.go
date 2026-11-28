@@ -1484,6 +1484,8 @@ func resolveSystemConfig(ctx context.Context, reader client.Reader) systemConfig
 
 	cfg.observability = config.Spec.Observability
 
+	cfg.clusterConfig = config
+
 	return cfg
 }
 
