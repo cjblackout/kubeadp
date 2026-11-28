@@ -57,6 +57,15 @@ const (
 	// ServerSessionMountPath is where the session PVC is mounted in the server container.
 	ServerSessionMountPath = "/data/sessions"
 
+	// ServerSessionHomePath is the HOME directory of the server container when
+	// session persistence is enabled. It lives inside the session PVC so the
+	// opencode engine's own state (~/.config/opencode, its node_modules and
+	// database) survives pod restarts alongside the worker's AGENT_RUN_STATE_ROOT.
+	// The worker pod has no /etc/passwd entry for the running uid in SCC
+	// environments, so a fixed absolute path is used and pre-created by the
+	// workspace init script.
+	ServerSessionHomePath = ServerSessionMountPath + "/home"
+
 	// DefaultSessionPVCSize is the default size for the session PVC.
 	DefaultSessionPVCSize = "1Gi"
 
@@ -235,14 +244,23 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 	workerCommand := "exec kubeadp-agent worker"
 	containerImage := agentCfg.kubeadpImage
 	initPrefix := "true"
+	homeDir := DefaultHomeDir
 	if agentCfg.executorImageExplicit {
 		opencodeBinary = ToolsMountPath + "/opencode"
 		workerCommand = "exec /tools/kubeadp-agent worker"
 		containerImage = agentCfg.executorImage
 		initPrefix = OpenCodeSymlinkCmd
 	}
+	// When session persistence is enabled the opencode engine writes its state
+	// (~/.config/opencode, node_modules, DB) under HOME; point HOME into the
+	// session PVC so that state survives pod restarts instead of being wiped
+	// from the ephemeral /tmp.
+	sessionPersistence := agent.Spec.Persistence != nil && agent.Spec.Persistence.Sessions != nil
+	if sessionPersistence {
+		homeDir = ServerSessionHomePath
+	}
 	envVars := []corev1.EnvVar{
-		{Name: "HOME", Value: DefaultHomeDir},
+		{Name: "HOME", Value: homeDir},
 		{Name: "SHELL", Value: DefaultShell},
 		// Prepend /tools to PATH so the OpenCode and kubeadp-agent binaries (copied by kubeadp-init)
 		// are discoverable from interactive terminals.
@@ -259,7 +277,7 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 		// container HOME. Keep HOME on the session volume when session persistence
 		// is enabled so opencode's own state survives pod restarts alongside the
 		// worker's state_root.
-		{Name: "KUBEADP_SANDBOX_HOME", Value: DefaultHomeDir},
+		{Name: "KUBEADP_SANDBOX_HOME", Value: homeDir},
 		{Name: "AGENT_RUN_API_LISTEN", Value: fmt.Sprintf("0.0.0.0:%d", port)},
 	}
 
@@ -332,13 +350,14 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 		},
 	}
 
-	// Add session persistence volume and env var if configured.
-	// The kubeadp-agent worker persists ALL of its state (config.toml,
-	// state.sqlite, job metadata/logs, a2a-inbox, opencode serve state) under
-	// AGENT_RUN_STATE_ROOT, which is set to ServerSessionMountPath below, so
-	// the PVC already carries every persistent artifact; no separate OPENCODE_DB
-	// is needed any longer.
-	if agent.Spec.Persistence != nil && agent.Spec.Persistence.Sessions != nil {
+	// Add session persistence volume if configured. The kubeadp-agent worker
+	// persists ALL of its state (config.toml, state.sqlite, job
+	// metadata/logs, a2a-inbox, opencode serve state) under AGENT_RUN_STATE_ROOT,
+	// which is set to ServerSessionMountPath, so the PVC already carries every
+	// worker artifact; no separate OPENCODE_DB is needed any longer. HOME is
+	// pointed at ServerSessionHomePath on the same PVC so the opencode engine's
+	// own data (~/.config/opencode, node_modules, DB) survives restarts too.
+	if sessionPersistence {
 		volumes = append(volumes, corev1.Volume{
 			Name: ServerSessionVolumeName,
 			VolumeSource: corev1.VolumeSource{
@@ -645,6 +664,10 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 	// explicit executorImage is used, kubeadp-init provisions /tools with the
 	// binaries and the symlink makes /tools/opencode discoverable.
 	hasContextInit := len(ctxFileMounts) > 0 || len(ctxDirMounts) > 0
+	var homeInitDirs []string
+	if sessionPersistence {
+		homeInitDirs = append(homeInitDirs, homeDir)
+	}
 	var command []string
 	if !configIsEmpty(agentCfg.config) && !hasContextInit {
 		// No context-init container — write config inline in the command
@@ -652,14 +675,14 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 			"sh", "-c",
 			fmt.Sprintf("%s; cat > %s << 'KOCEOF'\n%s\nKOCEOF\n%s",
 				initPrefix, OpenCodeConfigPath, string(agentCfg.config.Raw),
-				workspaceInitScript(agentCfg.workspaceDir, workerCommand)),
+				workspaceInitScript(agentCfg.workspaceDir, workerCommand, homeInitDirs...)),
 		}
 	} else {
 		// Config is written by context-init, or no config at all
 		command = []string{
 			"sh", "-c",
 			fmt.Sprintf("%s; %s", initPrefix,
-				workspaceInitScript(agentCfg.workspaceDir, workerCommand)),
+				workspaceInitScript(agentCfg.workspaceDir, workerCommand, homeInitDirs...)),
 		}
 	}
 

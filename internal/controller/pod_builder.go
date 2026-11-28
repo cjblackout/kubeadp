@@ -22,46 +22,46 @@ import (
 
 // agentConfig holds the resolved configuration from Agent or AgentTemplate
 type agentConfig struct {
-	kubeadpImage           string   // kubeadp-agent image (server container by default; init container when executorImage is set)
-	executorImage          string   // Worker container image for task execution
-	executorImageExplicit  bool     // True when executorImage was explicitly set (Agent or template), false when defaulted
-	command                []string // Command for agent container (optional, has default)
-	workspaceDir       string
-	contexts           []kubeopenv1alpha1.ContextItem
-	skills             []kubeopenv1alpha1.SkillSource
-	plugins            []kubeopenv1alpha1.PluginSpec          // OpenCode plugins to load
-	config             *runtime.RawExtension                  // OpenCode config (inline JSON object, resolved from configRef if set)
-	configRef          *kubeopenv1alpha1.OpenCodeConfigSource // OpenCode config from external source (resolved into config by reconciler)
-	credentials        []kubeopenv1alpha1.Credential
-	podSpec            *kubeopenv1alpha1.AgentPodSpec
-	serviceAccountName string
-	maxConcurrentTasks *int32
-	quota              *kubeopenv1alpha1.QuotaConfig
-	caBundle           *kubeopenv1alpha1.CABundleConfig           // Custom CA bundle configuration (nil = no custom CA)
-	proxy              *kubeopenv1alpha1.ProxyConfig              // HTTP/HTTPS proxy configuration (nil = no proxy)
-	imagePullSecrets   []corev1.LocalObjectReference              // Image pull secrets for private registries
-	port               int32                                      // Server port (default 4096)
-	extraPorts         []kubeopenv1alpha1.ExtraPort               // Additional ports to expose on Service/Deployment
-	persistence        *kubeopenv1alpha1.PersistenceConfig        // Persistence configuration
-	suspend            bool                                       // Whether Agent is suspended
-	serverReady        bool                                       // Whether Agent server is ready (from status)
-	extraEnv           []corev1.EnvVar                            // Extra env vars injected into ALL containers
-	systemContainers   *kubeopenv1alpha1.SystemContainerOverrides // Per-container-type env/mount overrides
+	kubeadpImage          string   // kubeadp-agent image (server container by default; init container when executorImage is set)
+	executorImage         string   // Worker container image for task execution
+	executorImageExplicit bool     // True when executorImage was explicitly set (Agent or template), false when defaulted
+	command               []string // Command for agent container (optional, has default)
+	workspaceDir          string
+	contexts              []kubeopenv1alpha1.ContextItem
+	skills                []kubeopenv1alpha1.SkillSource
+	plugins               []kubeopenv1alpha1.PluginSpec          // OpenCode plugins to load
+	config                *runtime.RawExtension                  // OpenCode config (inline JSON object, resolved from configRef if set)
+	configRef             *kubeopenv1alpha1.OpenCodeConfigSource // OpenCode config from external source (resolved into config by reconciler)
+	credentials           []kubeopenv1alpha1.Credential
+	podSpec               *kubeopenv1alpha1.AgentPodSpec
+	serviceAccountName    string
+	maxConcurrentTasks    *int32
+	quota                 *kubeopenv1alpha1.QuotaConfig
+	caBundle              *kubeopenv1alpha1.CABundleConfig           // Custom CA bundle configuration (nil = no custom CA)
+	proxy                 *kubeopenv1alpha1.ProxyConfig              // HTTP/HTTPS proxy configuration (nil = no proxy)
+	imagePullSecrets      []corev1.LocalObjectReference              // Image pull secrets for private registries
+	port                  int32                                      // Server port (default 4096)
+	extraPorts            []kubeopenv1alpha1.ExtraPort               // Additional ports to expose on Service/Deployment
+	persistence           *kubeopenv1alpha1.PersistenceConfig        // Persistence configuration
+	suspend               bool                                       // Whether Agent is suspended
+	serverReady           bool                                       // Whether Agent server is ready (from status)
+	extraEnv              []corev1.EnvVar                            // Extra env vars injected into ALL containers
+	systemContainers      *kubeopenv1alpha1.SystemContainerOverrides // Per-container-type env/mount overrides
 }
 
 // ResolveAgentConfig extracts configuration from the Agent spec.
 func ResolveAgentConfig(agent *kubeopenv1alpha1.Agent) agentConfig {
 	cfg := agentConfig{
-		kubeadpImage:    defaultString(agent.Spec.KubeadpImage, DefaultKubeadpImage),
-		command:         agent.Spec.Command,
-		workspaceDir:    agent.Spec.WorkspaceDir,
-		contexts:        agent.Spec.Contexts,
-		skills:          agent.Spec.Skills,
-		plugins:         agent.Spec.Plugins,
-		config:          agent.Spec.Config,
-		configRef:       agent.Spec.ConfigRef,
-		credentials:     agent.Spec.Credentials,
-		podSpec:         agent.Spec.PodSpec,
+		kubeadpImage:       defaultString(agent.Spec.KubeadpImage, DefaultKubeadpImage),
+		command:            agent.Spec.Command,
+		workspaceDir:       agent.Spec.WorkspaceDir,
+		contexts:           agent.Spec.Contexts,
+		skills:             agent.Spec.Skills,
+		plugins:            agent.Spec.Plugins,
+		config:             agent.Spec.Config,
+		configRef:          agent.Spec.ConfigRef,
+		credentials:        agent.Spec.Credentials,
+		podSpec:            agent.Spec.PodSpec,
 		serviceAccountName: agent.Spec.ServiceAccountName,
 		maxConcurrentTasks: agent.Spec.MaxConcurrentTasks,
 		quota:              agent.Spec.Quota,
@@ -1248,17 +1248,17 @@ func applyExtraEnvAndSystemOverrides(initContainers []corev1.Container, executor
 
 	// Apply per-container-type overrides from systemContainers.
 	// These are applied after global extraEnv for maximum specificity.
-		if cfg.systemContainers != nil {
-			sc := cfg.systemContainers
-			for i := range initContainers {
-				switch initContainers[i].Name {
-				case "kubeadp-init":
-					applyInitContainerOverrides(&initContainers[i], sc.OpenCodeInit)
-				case "context-init":
-					applyInitContainerOverrides(&initContainers[i], sc.ContextInit)
-				case "plugin-init":
-					applyInitContainerOverrides(&initContainers[i], sc.PluginInit)
-				}
+	if cfg.systemContainers != nil {
+		sc := cfg.systemContainers
+		for i := range initContainers {
+			switch initContainers[i].Name {
+			case "kubeadp-init":
+				applyInitContainerOverrides(&initContainers[i], sc.OpenCodeInit)
+			case "context-init":
+				applyInitContainerOverrides(&initContainers[i], sc.ContextInit)
+			case "plugin-init":
+				applyInitContainerOverrides(&initContainers[i], sc.PluginInit)
+			}
 			// git-init-* containers: match by prefix
 			if strings.HasPrefix(initContainers[i].Name, "git-init-") {
 				applyInitContainerOverrides(&initContainers[i], sc.GitInit)

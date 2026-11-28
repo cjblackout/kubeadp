@@ -47,9 +47,6 @@ var (
 
 	// opencodeImage is the executor image used by the real-OpenCode e2e tests.
 	opencodeImage string
-
-	// echoImage is the lightweight executor image used for most e2e task tests.
-	echoImage string
 )
 
 const (

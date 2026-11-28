@@ -343,7 +343,7 @@ type InitContainerOverrides struct {
 }
 
 type SystemContainerOverrides struct {
-    OpenCodeInit *InitContainerOverrides // Overrides for the opencode-init container (copies OpenCode binary)
+    OpenCodeInit *InitContainerOverrides // Overrides for the kubeadp-init container (copies binaries to /tools)
     ContextInit  *InitContainerOverrides // Overrides for the context-init container (copies ConfigMap content)
     GitInit      *InitContainerOverrides // Overrides for ALL git-init-* containers (clones Git repos)
     GitSync      *InitContainerOverrides // Overrides for ALL git-sync-* sidecars (periodic Git sync)
