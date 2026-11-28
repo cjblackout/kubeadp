@@ -21,6 +21,8 @@ import (
 // Teams can maintain a single AgentTemplate with shared settings (images, contexts,
 // credentials, etc.) and individual users can create Agents that reference the
 // template, inheriting its configuration while optionally overriding specific fields.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.engine) || !has(self.spec.worker) || !has(self.spec.worker.defaultEngine) || self.spec.engine == self.spec.worker.defaultEngine",message="spec.engine must match spec.worker.defaultEngine when both are set"
 type AgentTemplate struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -152,6 +154,16 @@ type AgentTemplateSpec struct {
 	// Agents can override this value in their own spec.
 	// +optional
 	Quota *QuotaConfig `json:"quota,omitempty"`
+
+	// Engine specifies the default execution engine for Agents using this template.
+	// Maps to worker.default_engine.
+	// +optional
+	// +kubebuilder:validation:Enum=opencode;agy;claude
+	Engine *AgentEngine `json:"engine,omitempty"`
+
+	// Worker configures default worker daemon settings for Agents using this template.
+	// +optional
+	Worker *WorkerConfig `json:"worker,omitempty"`
 }
 
 // AgentTemplateStatus defines the observed state of AgentTemplate

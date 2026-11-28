@@ -239,12 +239,25 @@ type Task struct {
 }
 
 type TaskSpec struct {
-    Description *string                 // Syntactic sugar for /workspace/task.md
-    Contexts    []ContextItem           // Inline context definitions
-    AgentRef    *AgentReference         // Agent reference (same namespace)
-    TemplateRef *AgentTemplateReference // AgentTemplate reference (alternative to agentRef)
+    Description  *string                 // Syntactic sugar for /workspace/task.md
+    Contexts     []ContextItem           // Inline context definitions
+    AgentRef     *AgentReference         // Agent reference (same namespace)
+    TemplateRef  *AgentTemplateReference // AgentTemplate reference (alternative to agentRef)
     // Exactly one of AgentRef or TemplateRef must be set
-    Timeout     *metav1.Duration        // Max execution duration (from Running phase, excludes queue time)
+    Timeout      *metav1.Duration        // Max execution duration (from Running phase, excludes queue time)
+    Project      string                  // Target repository project name
+    GitRef       string                  // Git ref (branch/commit/tag) for worktree
+    Model        string                  // Model identifier
+    Effort       string                  // Reasoning effort level
+    Sandbox      *bool                   // Sandbox execution toggle
+    AddDirs      []string                // Additional directories exposed to job
+    Plan         *bool                   // Plan-only mode
+    PrintTimeout *metav1.Duration        // Output print timeout
+    Mode         string                  // Agent execution mode
+    Hindsight    *TaskHindsight          // Hindsight memory settings
+    Proxy        string                  // Job proxy URL
+    FromPatch    *FromPatchSource        // Patch applied before job execution
+    Jobset       string                  // Multi-agent jobset ID
 }
 
 // AgentReference references an Agent in the same namespace
@@ -273,6 +286,7 @@ type TaskExecutionStatus struct {
     TemplateRef        *AgentTemplateReference   // Resolved template reference (templateRef Tasks only)
     PodName            string
     Session            *SessionInfo             // OpenCode session info (agentRef Tasks only)
+    Job                *JobStatus               // Mirrored status from kubeadp-agent worker
     StartTime          *metav1.Time
     CompletionTime     *metav1.Time
     Conditions         []metav1.Condition
@@ -319,6 +333,8 @@ type AgentSpec struct {
     Suspend            bool
     Standby            *StandbyConfig
     Share              *ShareConfig
+    Engine             *AgentEngine              // Execution engine (opencode, agy, claude)
+    Worker             *WorkerConfig             // Typed worker configuration (SPEC 9.2)
 }
 
 type SessionInfo struct {

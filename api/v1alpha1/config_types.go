@@ -60,6 +60,38 @@ type KubeOpenCodeConfigSpec struct {
 	// If not specified, no telemetry is produced.
 	// +optional
 	Observability *ObservabilitySpec `json:"observability,omitempty"`
+
+	// WorkerDefaults provides cluster-wide default settings for kubeadp-agent workers.
+	// Merged into Agent/Template worker settings as the base layer.
+	// +optional
+	WorkerDefaults *WorkerConfig `json:"workerDefaults,omitempty"`
+
+	// TaskDefaults provides cluster-wide default settings for task execution.
+	// +optional
+	TaskDefaults *TaskDefaultsConfig `json:"taskDefaults,omitempty"`
+}
+
+// TaskDefaultsConfig defines cluster-wide default settings for tasks.
+type TaskDefaultsConfig struct {
+	// Model default for tasks.
+	// +optional
+	Model string `json:"model,omitempty"`
+
+	// Effort default for tasks.
+	// +optional
+	Effort string `json:"effort,omitempty"`
+
+	// Sandbox default for tasks.
+	// +optional
+	Sandbox *bool `json:"sandbox,omitempty"`
+
+	// Hindsight default for tasks.
+	// +optional
+	Hindsight *TaskHindsight `json:"hindsight,omitempty"`
+
+	// Proxy default for tasks.
+	// +optional
+	Proxy string `json:"proxy,omitempty"`
 }
 
 // CleanupConfig defines cleanup policies for completed/failed Tasks.

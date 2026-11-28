@@ -22,6 +22,8 @@ import (
 // Agent defines a running AI agent instance.
 // When created, the controller provisions a Deployment (running OpenCode server) and a Service.
 // Tasks reference Agents via agentRef and connect using `opencode run --attach`.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.engine) || !has(self.spec.worker) || !has(self.spec.worker.defaultEngine) || self.spec.engine == self.spec.worker.defaultEngine",message="spec.engine must match spec.worker.defaultEngine when both are set"
 type Agent struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -522,6 +524,18 @@ type AgentSpec struct {
 	//     expiresAt: "2026-05-01T00:00:00Z"
 	// +optional
 	Share *ShareConfig `json:"share,omitempty"`
+
+	// Engine specifies the execution engine for the Agent.
+	// Single source of truth that maps to worker.default_engine.
+	// +optional
+	// +kubebuilder:validation:Enum=opencode;agy;claude
+	Engine *AgentEngine `json:"engine,omitempty"`
+
+	// Worker configures the kubeadp-agent worker daemon settings.
+	// Mirrors SPEC 9.2 [common] and [worker] configuration keys.
+	// Rendered into ConfigMap <agent>-worker-config mounted at /etc/kubeadp-agent/config.toml.
+	// +optional
+	Worker *WorkerConfig `json:"worker,omitempty"`
 }
 
 // AgentStatus defines the observed state of Agent
@@ -583,6 +597,11 @@ type AgentStatus struct {
 	// Share contains the status of the share link feature.
 	// +optional
 	Share *ShareStatus `json:"share,omitempty"`
+
+	// Worker contains the observed status of the kubeadp-agent worker daemon.
+	// Mirrored from the worker API.
+	// +optional
+	Worker *WorkerStatus `json:"worker,omitempty"`
 }
 
 // GitSyncStatus tracks the observed sync state of a single Git context.
