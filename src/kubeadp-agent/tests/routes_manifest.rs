@@ -85,8 +85,12 @@ fn test_routes_manifest_matches_source() {
         .join("docs")
         .join("routes.json");
 
-    let server_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src").join("server");
-    let orchestrate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src").join("orchestrate");
+    let server_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("server");
+    let orchestrate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("orchestrate");
 
     let mut scanned = scan_routes_in_dir(&server_dir);
     for r in scan_routes_in_dir(&orchestrate_dir) {
@@ -103,8 +107,8 @@ fn test_routes_manifest_matches_source() {
 
     let manifest_content = fs::read_to_string(&manifest_path)
         .expect("docs/routes.json not found; run with UPDATE_ROUTES_MANIFEST=1 to create it");
-    let manifest: Vec<RouteEntry> = serde_json::from_str(&manifest_content)
-        .expect("failed to parse docs/routes.json");
+    let manifest: Vec<RouteEntry> =
+        serde_json::from_str(&manifest_content).expect("failed to parse docs/routes.json");
 
     assert_eq!(
         manifest, scanned_list,
