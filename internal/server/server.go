@@ -293,6 +293,21 @@ func (s *Server) setupRoutes() *chi.Mux {
 			r.Delete("/{name}", agentTemplateHandler.Delete)
 		})
 
+		// AgentSession endpoints
+		agentSessionHandler := handlers.NewAgentSessionHandler(s.k8sClient, s.opts.ClusterDomain)
+		r.Get("/agentsessions", agentSessionHandler.ListAll)
+		r.Route("/namespaces/{namespace}/agentsessions", func(r chi.Router) {
+			r.Get("/", agentSessionHandler.List)
+			r.Post("/", agentSessionHandler.Create)
+			r.Get("/{name}", agentSessionHandler.Get)
+			r.Delete("/{name}", agentSessionHandler.Delete)
+			r.Post("/{name}/start", agentSessionHandler.Start)
+			r.Post("/{name}/stop", agentSessionHandler.Stop)
+			r.Post("/{name}/restart", agentSessionHandler.Restart)
+			r.Get("/{name}/log", agentSessionHandler.Log)
+			r.Post("/{name}/message", agentSessionHandler.Message)
+		})
+
 		// Config endpoint (cluster-scoped singleton)
 		configHandler := handlers.NewConfigHandler(s.k8sClient)
 		r.Get("/config", configHandler.Get)

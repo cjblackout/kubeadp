@@ -158,6 +158,15 @@ func runController(cmd *cobra.Command, args []string) error {
 		os.Exit(1)
 	}
 
+	if err = (&controller.AgentSessionReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("agentsession-controller"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "AgentSession")
+		os.Exit(1)
+	}
+
 	if err = (&controller.RegistryReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),

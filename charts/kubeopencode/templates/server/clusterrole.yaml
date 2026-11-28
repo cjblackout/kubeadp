@@ -8,7 +8,7 @@ metadata:
 rules:
 # Read access to KubeOpenCode resources
 - apiGroups: ["kubeopencode.io"]
-  resources: ["tasks", "crontasks", "agents", "agenttemplates", "kubeopencodeconfigs", "registries"]
+  resources: ["tasks", "crontasks", "agents", "agenttemplates", "agentsessions", "kubeopencodeconfigs", "registries"]
   verbs: ["get", "list", "watch"]
 # Write access to Registries (create, update, delete via UI)
 - apiGroups: ["kubeopencode.io"]
@@ -30,6 +30,10 @@ rules:
 - apiGroups: ["kubeopencode.io"]
   resources: ["agenttemplates"]
   verbs: ["create", "update", "delete"]
+# Write access to AgentSessions (create, update, delete, patch via UI)
+- apiGroups: ["kubeopencode.io"]
+  resources: ["agentsessions"]
+  verbs: ["create", "update", "delete", "patch"]
 # Write access to KubeOpenCodeConfig (update via UI YAML editor)
 - apiGroups: ["kubeopencode.io"]
   resources: ["kubeopencodeconfigs"]

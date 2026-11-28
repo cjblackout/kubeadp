@@ -376,7 +376,7 @@ spec:
                 - message: exactly one of configMapKeyRef or non-empty text must be
                     specified
                   rule: (has(self.configMapKeyRef) && !has(self.text)) || (!has(self.configMapKeyRef)
-                    && has(self.text) && self.text != '')
+                    && has(self.text) && self.text != ”)
               gitRef:
                 description: |-
                   GitRef specifies the git ref (branch, tag, commit) to checkout for the job.

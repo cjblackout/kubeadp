@@ -9,7 +9,41 @@ import (
 	kubeopenv1alpha1 "github.com/kubeopencode/kubeopencode/api/v1alpha1"
 )
 
-// ServerInfo represents server information
+// AgentSessionResponse represents an AgentSession in the API.
+type AgentSessionResponse struct {
+	Name             string                             `json:"name"`
+	Namespace        string                             `json:"namespace"`
+	AgentName        string                             `json:"agentName"`
+	Engine           string                             `json:"engine,omitempty"`
+	Phase            string                             `json:"phase"`
+	PID              *int                               `json:"pid,omitempty"`
+	StartTime        *time.Time                         `json:"startTime,omitempty"`
+	UptimeSecs       int64                              `json:"uptimeSecs,omitempty"`
+	RestartCount     int                                `json:"restartCount,omitempty"`
+	LastExitReason   string                             `json:"lastExitReason,omitempty"`
+	LastHealthResult string                             `json:"lastHealthResult,omitempty"`
+	Paused           bool                               `json:"paused"`
+	Controlled       bool                               `json:"controlled"`
+	EngineReady      *bool                              `json:"engineReady,omitempty"`
+	CreatedAt        time.Time                          `json:"createdAt"`
+	Conditions       []Condition                                        `json:"conditions,omitempty"`
+}
+
+// AgentSessionListResponse represents a list of AgentSessions.
+type AgentSessionListResponse struct {
+	Sessions   []AgentSessionResponse `json:"sessions"`
+	Total      int                    `json:"total"`
+	Pagination *Pagination            `json:"pagination,omitempty"`
+}
+
+// CreateAgentSessionRequest represents a request to create an AgentSession.
+type CreateAgentSessionRequest struct {
+	Name             string `json:"name"`
+	AgentName        string `json:"agentName"`
+	Engine           string `json:"engine,omitempty"`
+	InstructionsFile string `json:"instructionsFile,omitempty"`
+	Sandbox          *bool  `json:"sandbox,omitempty"`
+}
 type ServerInfo struct {
 	Version string `json:"version"`
 }
