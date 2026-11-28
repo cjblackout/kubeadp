@@ -1,20 +1,35 @@
 name: build
 
 # Fork pipeline: builds the operator image, the devbox agent image and the
-# Helm chart, pushes them to GHCR under
-# ghcr.io/cjblackout and tags the commit.
+# Helm chart, pushes them to GHCR under ghcr.io/cjblackout and tags the commit.
 #
-# Versioning: <upstream-base>-fork.<N>, e.g. v0.1.9-fork.3. The base comes from
-# the file VERSION; N is the next free counter among the existing git tags
-# <base>-fork.* (so the pipeline sequences itself).
+# Runs on push to main and on pull_request (and via workflow_dispatch) so PR CI
+# exercises the same image builds. Versioning differences:
+#   push/dispatch (main) -> images tagged <VERSION>-fork.<N>, e.g. v0.2.0-fork.3
+#                           and the chart version matches (<VERSION> without the
+#                           leading v). Release path: the commit is git-tagged,
+#                           the chart is pushed to ghcr.io/cjblackout/helm-charts
+#                           and the images carry the fork.<N> tag.
+#   pull_request         -> operator/devbox images are tagged
+#                           pr-<number>-<shortsha> (unique per commit); the chart
+#                           version becomes <base>-pr.<number>.<run_number> and
+#                           the chart is only packaged and uploaded as an
+#                           artifact (never pushed). No git tag, no latest/stable
+#                           tag is ever moved.
+# PRs from forks (head repo != this repo) never get package write access: from a
+# fork the pipeline builds the images but skips log in and push.
+#
 # Chart.yaml version/appVersion are rewritten in the build workspace only
-# (nothing is committed back).
-#
-# Runs on GitHub-hosted runners.
+# (nothing is committed back). Runs on GitHub-hosted runners.
 
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'website/**'
+      - '**/*.md'
+  pull_request:
     paths-ignore:
       - 'docs/**'
       - 'website/**'
@@ -27,11 +42,14 @@ permissions:
 
 concurrency:
   group: build-${{ github.ref_name }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
   ORG: cjblackout
+  # Same-repo PRs (and main push / workflow_dispatch) may push to GHCR; PRs from
+  # forks cannot (no package write), so they build without pushing.
+  CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
 jobs:
   version:
@@ -43,17 +61,29 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - id: calc
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_NUMBER: ${{ github.run_number }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           BASE="$(tr -d '[:space:]' < VERSION)"
           case "$BASE" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "::error::VERSION must look like v0.1.9"; exit 1 ;; esac
-          ESC="${BASE//./\\.}"
-          TAGS="$(git ls-remote --tags origin | awk -F'\t' '{t=$2; sub(/^refs\/tags\//,"",t); print t}')"
-          MAX="$(printf '%s\n' "$TAGS" | grep -oE "^${ESC}-fork\.[0-9]+$" | grep -oE '[0-9]+$' | sort -n | tail -1 || true)"
-          V="${BASE}-fork.$(( ${MAX:-0} + 1 ))"
+          if [ "$EVENT" = "pull_request" ]; then
+            # PR build: unique per-commit image tag, no release tags touched.
+            V="pr-${PR_NUMBER}-${SHA:0:8}"
+            SEMVER="${BASE#v}-pr.${PR_NUMBER}.${RUN_NUMBER}"
+          else
+            ESC="${BASE//./\\.}"
+            TAGS="$(git ls-remote --tags origin | awk -F'\t' '{t=$2; sub(/^refs\/tags\//,"",t); print t}')"
+            MAX="$(printf '%s\n' "$TAGS" | grep -oE "^${ESC}-fork\.[0-9]+$" | grep -oE '[0-9]+$' | sort -n | tail -1 || true)"
+            V="${BASE}-fork.$(( ${MAX:-0} + 1 ))"
+            SEMVER="${V#v}"
+          fi
           echo "version=${V}" >> "$GITHUB_OUTPUT"
-          echo "semver=${V#v}" >> "$GITHUB_OUTPUT"
-          echo "Computed version: ${V}"
+          echo "semver=${SEMVER}" >> "$GITHUB_OUTPUT"
+          echo "Computed version: ${V} (chart: ${SEMVER})"
 
   operator:
     needs: version
@@ -74,6 +104,7 @@ jobs:
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
+        if: env.CAN_PUSH == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -82,7 +113,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
@@ -99,6 +130,7 @@ jobs:
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
+        if: env.CAN_PUSH == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -107,7 +139,7 @@ jobs:
         with:
           context: ./agents/devbox
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: ${{ env.REGISTRY }}/${{ env.ORG }}/kubeopencode-agent-devbox:${{ needs.version.outputs.version }}
@@ -119,7 +151,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: azure/setup-helm@v4
-      - name: Package and push the chart
+      - name: Package the chart
         env:
           VERSION: ${{ needs.version.outputs.version }}
           SEMVER: ${{ needs.version.outputs.semver }}
@@ -128,13 +160,29 @@ jobs:
           C=charts/kubeopencode
           sed -i -E "s/^version:.*/version: ${SEMVER}/; s/^appVersion:.*/appVersion: \"${VERSION}\"/" $C/Chart.yaml
           sed -i "s#ghcr.io/kubeopencode/kubeopencode#ghcr.io/cjblackout/kubeopencode#g" $C/values.yaml
-          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
           mkdir -p dist
           helm package $C -d dist/
+      - name: Push the chart
+        # Charts are never released from PRs (even same-repo ones): PR builds
+        # only package the chart as an artifact. Only push/dispatch publishes.
+        if: github.event_name != 'pull_request'
+        env:
+          SEMVER: ${{ needs.version.outputs.semver }}
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
           helm push dist/kubeopencode-${SEMVER}.tgz oci://ghcr.io/cjblackout/helm-charts
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request'
+        with:
+          name: kubeopencode-chart
+          path: dist/kubeopencode-*.tgz
+          if-no-files-found: error
 
   tag:
     needs: [version, operator, agent-devbox, chart]
+    # PR builds never create git tags; only real releases (push / dispatch) do.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

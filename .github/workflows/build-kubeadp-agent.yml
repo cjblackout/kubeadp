@@ -7,6 +7,17 @@ name: build-kubeadp-agent
 # deployment repository: consumers (such as a cluster deployment) PIN a released version
 # explicitly, so a rollout is a deliberate change on their side.
 #
+# Runs on push to main and on pull_request (and workflow_dispatch) so PR CI
+# exercises the same image build/checks. Tag differences:
+#   push/dispatch (main) -> YYYY.MM.<X> stable version, image tag
+#                           ghcr.io/cjblackout/kubeopencode/kubeadp-agent:YYYY.MM.<X>,
+#                           release git-tagged kubeadp-agent-YYYY.MM.<X>.
+#   pull_request         -> PR version YYYY.MM.<Major>-rc<N> (the existing rc
+#                           scheme), image tagged :YYYY.MM.<Major>-rc<N> pushed
+#                           to GHCR, but NO git tag is created.
+# PRs from forks (head repo != this repo) never get package write access: from
+# a fork the pipeline builds + checks the image but skips log in and push.
+#
 # Versioning: YYYY.MM.<X> with prerelease suffix -rc<N>; MajorVersion lives
 # in src/kubeadp-agent/VERSION and appears in rc tags only:
 #   PR build      -> YYYY.MM.<Major>-rc<N>   (N = next rc of the month)
@@ -60,6 +71,11 @@ permissions:
 concurrency:
   group: kubeadp-agent-${{ github.ref_name }}
   cancel-in-progress: ${{ github.ref_name != 'main' }}
+
+env:
+  # Same-repo PRs (and main push / workflow_dispatch) may push to GHCR; PRs from
+  # forks cannot (no package write), so they build without pushing.
+  CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
 jobs:
   version:
@@ -189,6 +205,7 @@ jobs:
           retry docker build --progress=plain --network=host --target check \
             -f docker/kubeadp-agent/Dockerfile .
       - uses: docker/login-action@v3
+        if: env.CAN_PUSH == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -196,6 +213,7 @@ jobs:
       - name: Build + push image
         env:
           VERSION: ${{ needs.version.outputs.version }}
+          CAN_PUSH: ${{ env.CAN_PUSH }}
         run: |
           set -euo pipefail
           # Transient network blips (fresh-runner DNS, registry hiccups) used
@@ -245,7 +263,11 @@ jobs:
           docker run --rm --network=host \
             -v "$PWD/docker/kubeadp-agent/smoke-test.sh:/smoke-test.sh:ro" \
             --entrypoint bash "$IMAGE" /smoke-test.sh
-          retry docker push "$IMAGE"
+          if [ "${CAN_PUSH}" = "true" ]; then
+            retry docker push "$IMAGE"
+          else
+            echo "Fork PR: skipping push (no package write access)"
+          fi
       - name: Tag release
         if: github.ref == 'refs/heads/main'
         env:
