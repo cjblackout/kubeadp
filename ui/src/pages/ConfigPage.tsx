@@ -236,6 +236,80 @@ function ConfigPage() {
               )}
             </div>
 
+            {/* Worker & Task Defaults */}
+            {(config.workerDefaults || config.taskDefaults) && (
+              <div>
+                <h3 className="text-[11px] font-display font-medium text-stone-400 uppercase tracking-wider mb-4">
+                  Worker & Task Cluster Defaults
+                </h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {config.workerDefaults && (
+                    <div className="bg-stone-50 border border-stone-200 rounded-lg p-4 space-y-2">
+                      <h4 className="text-xs font-semibold text-stone-800">Worker Defaults</h4>
+                      <dl className="text-xs space-y-1 font-mono text-stone-600">
+                        {config.workerDefaults.defaultEngine && (
+                          <div className="flex justify-between">
+                            <dt className="text-stone-400">Default Engine:</dt>
+                            <dd>{config.workerDefaults.defaultEngine}</dd>
+                          </div>
+                        )}
+                        {config.workerDefaults.defaultModel && (
+                          <div className="flex justify-between">
+                            <dt className="text-stone-400">Default Model:</dt>
+                            <dd>{config.workerDefaults.defaultModel}</dd>
+                          </div>
+                        )}
+                        {config.workerDefaults.maxParallel && (
+                          <div className="flex justify-between">
+                            <dt className="text-stone-400">Max Parallel:</dt>
+                            <dd>{config.workerDefaults.maxParallel}</dd>
+                          </div>
+                        )}
+                        {config.workerDefaults.gcMaxAgeDays && (
+                          <div className="flex justify-between">
+                            <dt className="text-stone-400">GC Max Age Days:</dt>
+                            <dd>{config.workerDefaults.gcMaxAgeDays}</dd>
+                          </div>
+                        )}
+                      </dl>
+                    </div>
+                  )}
+
+                  {config.taskDefaults && (
+                    <div className="bg-stone-50 border border-stone-200 rounded-lg p-4 space-y-2">
+                      <h4 className="text-xs font-semibold text-stone-800">Task Defaults</h4>
+                      <dl className="text-xs space-y-1 font-mono text-stone-600">
+                        {config.taskDefaults.model && (
+                          <div className="flex justify-between">
+                            <dt className="text-stone-400">Default Model:</dt>
+                            <dd>{config.taskDefaults.model}</dd>
+                          </div>
+                        )}
+                        {config.taskDefaults.effort && (
+                          <div className="flex justify-between">
+                            <dt className="text-stone-400">Default Effort:</dt>
+                            <dd>{config.taskDefaults.effort}</dd>
+                          </div>
+                        )}
+                        {config.taskDefaults.timeout && (
+                          <div className="flex justify-between">
+                            <dt className="text-stone-400">Default Timeout:</dt>
+                            <dd>{config.taskDefaults.timeout}</dd>
+                          </div>
+                        )}
+                        {config.taskDefaults.sandbox !== undefined && (
+                          <div className="flex justify-between">
+                            <dt className="text-stone-400">Default Sandbox:</dt>
+                            <dd>{config.taskDefaults.sandbox ? 'true' : 'false'}</dd>
+                          </div>
+                        )}
+                      </dl>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* Labels */}
             {config.labels && Object.keys(config.labels).length > 0 && (
               <div>

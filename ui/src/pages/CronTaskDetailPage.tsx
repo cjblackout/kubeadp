@@ -509,7 +509,23 @@ function CronTaskDetailPage() {
                         </Link>
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap">
-                        <StatusBadge phase={task.phase || 'Pending'} />
+                        <div className="flex items-center gap-1.5">
+                          <StatusBadge phase={task.phase || 'Pending'} />
+                          {task.job?.status && (
+                            <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono uppercase font-semibold ${
+                              task.job.status === 'running' ? 'bg-blue-100 text-blue-700' :
+                              task.job.status === 'done' ? 'bg-emerald-100 text-emerald-700' :
+                              'bg-rose-100 text-rose-700'
+                            }`}>
+                              {task.job.status}
+                            </span>
+                          )}
+                          {task.job?.diff && (task.job.diff.files > 0 || task.job.diff.additions > 0 || task.job.diff.deletions > 0) && (
+                            <span className="text-[10px] font-mono text-stone-500">
+                              <span className="text-emerald-600">+{task.job.diff.additions}</span>/<span className="text-rose-600">-{task.job.diff.deletions}</span>
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap text-sm text-stone-400 hidden sm:table-cell font-mono text-xs">
                         {task.duration || '-'}

@@ -508,6 +508,14 @@ export interface ConfigResponse {
   systemImage?: SystemImageConfig;
   cleanup?: CleanupConfig;
   proxy?: ProxyConfigInfo;
+  workerDefaults?: WorkerConfigInput;
+  taskDefaults?: {
+    model?: string;
+    effort?: string;
+    timeout?: string;
+    plan?: boolean;
+    sandbox?: boolean;
+  };
   labels?: Record<string, string>;
 }
 
@@ -555,6 +563,12 @@ export interface CreateCronTaskRequest {
   description?: string;
   agentRef?: AgentReference;
   templateRef?: { name: string };
+  project?: string;
+  gitRef?: string;
+  model?: string;
+  effort?: string;
+  plan?: boolean;
+  mode?: string;
   contexts?: ContextItem[];
 }
 
