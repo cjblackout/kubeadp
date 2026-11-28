@@ -474,7 +474,37 @@ export interface AgentTemplate {
   agentCount: number;
 }
 
-export interface AgentTemplateListResponse {
+export interface AgentSession {
+  name: string;
+  namespace: string;
+  agentName: string;
+  engine?: string;
+  phase: string;
+  pid?: number;
+  startTime?: string;
+  uptimeSecs?: number;
+  restartCount?: number;
+  lastExitReason?: string;
+  lastHealthResult?: string;
+  paused: boolean;
+  controlled: boolean;
+  engineReady?: boolean;
+  createdAt: string;
+}
+
+export interface AgentSessionListResponse {
+  sessions: AgentSession[];
+  total: number;
+  pagination?: Pagination;
+}
+
+export interface CreateAgentSessionRequest {
+  name: string;
+  agentName: string;
+  engine?: string;
+  instructionsFile?: string;
+  sandbox?: boolean;
+}
   templates: AgentTemplate[];
   total: number;
   pagination?: Pagination;
@@ -928,6 +958,62 @@ export const api = {
   deleteAgentShare: (namespace: string, name: string) =>
     request<Agent>(`/namespaces/${namespace}/agents/${name}/share`, {
       method: 'DELETE',
+    }),
+
+  // Agent Sessions
+  listAllAgentSessions: (params?: FilterParams) => {
+    const searchParams = new URLSearchParams();
+    if (params?.name) searchParams.set('name', params.name);
+    if (params?.limit) searchParams.set('limit', params.limit.toString());
+    if (params?.offset !== undefined) searchParams.set('offset', params.offset.toString());
+    if (params?.sortOrder) searchParams.set('sortOrder', params.sortOrder);
+    const queryString = searchParams.toString();
+    return request<AgentSessionListResponse>(`/agentsessions${queryString ? `?${queryString}` : ''}`);
+  },
+
+  listAgentSessions: (namespace: string, params?: FilterParams) => {
+    const searchParams = new URLSearchParams();
+    if (params?.name) searchParams.set('name', params.name);
+    if (params?.limit) searchParams.set('limit', params.limit.toString());
+    if (params?.offset !== undefined) searchParams.set('offset', params.offset.toString());
+    if (params?.sortOrder) searchParams.set('sortOrder', params.sortOrder);
+    const queryString = searchParams.toString();
+    return request<AgentSessionListResponse>(`/namespaces/${namespace}/agentsessions${queryString ? `?${queryString}` : ''}`);
+  },
+
+  getAgentSession: (namespace: string, name: string) =>
+    request<AgentSession>(`/namespaces/${namespace}/agentsessions/${name}`),
+
+  createAgentSession: (namespace: string, data: CreateAgentSessionRequest) =>
+    request<AgentSession>(`/namespaces/${namespace}/agentsessions`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  deleteAgentSession: (namespace: string, name: string) =>
+    request<void>(`/namespaces/${namespace}/agentsessions/${name}`, { method: 'DELETE' }),
+
+  startAgentSession: (namespace: string, name: string) =>
+    request<AgentSession>(`/namespaces/${namespace}/agentsessions/${name}/start`, { method: 'POST' }),
+
+  stopAgentSession: (namespace: string, name: string) =>
+    request<AgentSession>(`/namespaces/${namespace}/agentsessions/${name}/stop`, { method: 'POST' }),
+
+  restartAgentSession: (namespace: string, name: string) =>
+    request<AgentSession>(`/namespaces/${namespace}/agentsessions/${name}/restart`, { method: 'POST' }),
+
+  getAgentSessionLog: async (namespace: string, name: string, tail?: number): Promise<string> => {
+    const p = new URLSearchParams();
+    if (tail) p.set('tail', tail.toString());
+    const res = await fetch(`${API_BASE}/namespaces/${namespace}/agentsessions/${name}/log?${p.toString()}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.text();
+  },
+
+  messageAgentSession: (namespace: string, name: string, text: string) =>
+    request<any>(`/namespaces/${namespace}/agentsessions/${name}/message`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
     }),
 
   // Agent Templates

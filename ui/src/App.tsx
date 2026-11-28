@@ -11,6 +11,9 @@ import AgentCreatePage from './pages/AgentCreatePage';
 import AgentTemplatesPage from './pages/AgentTemplatesPage';
 import AgentTemplateDetailPage from './pages/AgentTemplateDetailPage';
 import AgentTemplateCreatePage from './pages/AgentTemplateCreatePage';
+import AgentSessionsPage from './pages/AgentSessionsPage';
+import AgentSessionDetailPage from './pages/AgentSessionDetailPage';
+import AgentSessionCreatePage from './pages/AgentSessionCreatePage';
 import RegistriesPage from './pages/RegistriesPage';
 import RegistryDetailPage from './pages/RegistryDetailPage';
 import RegistryAssemblePage from './pages/RegistryAssemblePage';
@@ -44,6 +47,9 @@ function App() {
           <Route path="templates" element={<AgentTemplatesPage />} />
           <Route path="templates/create" element={<AgentTemplateCreatePage />} />
           <Route path="templates/:namespace/:name" element={<AgentTemplateDetailPage />} />
+          <Route path="sessions" element={<AgentSessionsPage />} />
+          <Route path="sessions/create" element={<AgentSessionCreatePage />} />
+          <Route path="sessions/:namespace/:name" element={<AgentSessionDetailPage />} />
           <Route path="registries" element={<RegistriesPage />} />
           <Route path="registries/:namespace/:name/assemble" element={<RegistryAssemblePage />} />
           <Route path="registries/:namespace/:name" element={<RegistryDetailPage />} />

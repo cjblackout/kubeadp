@@ -146,6 +146,24 @@ function Layout() {
         </NavLink>
 
         <NavLink
+          to="/sessions"
+          className={({ isActive }) =>
+            `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-all ${
+              isActive || location.pathname.startsWith('/sessions/')
+                ? 'bg-primary-50 text-primary-700 font-medium'
+                : 'text-sidebar-muted hover:text-sidebar-text hover:bg-sidebar-hover'
+            }`
+          }
+          onClick={() => setMobileSidebarOpen(false)}
+        >
+          <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="4 17 10 11 4 5" />
+            <line x1="12" y1="19" x2="20" y2="19" />
+          </svg>
+          <span className="flex-1">Sessions</span>
+        </NavLink>
+
+        <NavLink
           to="/templates"
           className={({ isActive }) =>
             `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-all ${
