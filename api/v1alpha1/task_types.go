@@ -141,7 +141,7 @@ type TaskHindsight struct {
 // FromPatchSource specifies a patch source to apply before job execution.
 // Exactly one of configMapKeyRef or text must be specified.
 //
-// +kubebuilder:validation:XValidation:rule="(has(self.configMapKeyRef) && !has(self.text)) || (!has(self.configMapKeyRef) && has(self.text) && self.text != ”)",message="exactly one of configMapKeyRef or non-empty text must be specified"
+// +kubebuilder:validation:XValidation:rule="(has(self.configMapKeyRef) && !has(self.text)) || (!has(self.configMapKeyRef) && has(self.text) && self.text != '')",message="exactly one of configMapKeyRef or non-empty text must be specified"
 type FromPatchSource struct {
 	// ConfigMapKeyRef selects a key of a ConfigMap containing the patch content.
 	// +optional

@@ -481,6 +481,19 @@ func BuildServerDeployment(agent *kubeopenv1alpha1.Agent, agentCfg agentConfig, 
 			Name:      ServerSessionVolumeName,
 			MountPath: ServerSessionMountPath,
 		})
+	} else {
+		// Without session persistence the worker still needs a writable state
+		// directory (AGENT_RUN_STATE_ROOT), so use an emptyDir.
+		volumes = append(volumes, corev1.Volume{
+			Name: ServerSessionVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      ServerSessionVolumeName,
+			MountPath: ServerSessionMountPath,
+		})
 	}
 
 	// Add kubeadp auth secret volume and mount

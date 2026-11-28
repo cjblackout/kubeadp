@@ -640,6 +640,7 @@ spec:
                           Must be absolute paths without '..' directory traversal.
                           Maps to [common] sandbox_ro_paths / KUBEADP_SANDBOX_RO_PATHS.
                         items:
+                          maxLength: 4096
                           type: string
                         maxItems: 100
                         type: array

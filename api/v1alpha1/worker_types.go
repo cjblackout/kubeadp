@@ -181,6 +181,7 @@ type WorkerSandboxConfig struct {
 	// +optional
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:MaxLength=4096
 	// +kubebuilder:validation:XValidation:rule="self.all(p, p.startsWith('/') && !p.contains('..'))",message="roPaths entries must be absolute paths without .."
 	ROPaths []string `json:"roPaths,omitempty"`
 
